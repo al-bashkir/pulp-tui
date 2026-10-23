@@ -219,7 +219,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                     ap(move |app| {
                         app.confirm(format!("Publish {name}"), lines, move |app| {
                             app.job(format!("publish {name}"), move |ctx| async move {
-                                let v = ctx.cv()?.publish(id, &notes, &ctx.log(), &ctx.on_task()).await?;
+                                let v = ctx.cv()?.locked(id, "publish").await?.publish(id, &notes, &ctx.log(), &ctx.on_task()).await?;
                                 ap(move |app| {
                                     app.ok(format!("{name} version {} published and active in Library", v.number));
                                     app.reload();
@@ -293,7 +293,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             ];
             app.confirm_danger(format!("Delete content view {name}"), lines, &name.clone(), move |app| {
                 app.job(format!("delete content view {name}"), move |ctx| async move {
-                    ctx.cv()?.delete_view(id, &ctx.log(), &ctx.on_task()).await?;
+                    ctx.cv()?.locked(id, "delete").await?.delete_view(id, &ctx.log(), &ctx.on_task()).await?;
                     ap(move |app| {
                         app.ok(format!("content view {name} deleted"));
                         app.reload();
@@ -301,6 +301,33 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                 });
             });
         }
+        Act::BreakLock => app.job(format!("read lock of {name}"), move |ctx| async move {
+            let Some(h) = ctx.cv()?.store.lock_holder(id).await? else {
+                return ap(move |app| app.ok(format!("{name} is not locked")));
+            };
+            ap(move |app| {
+                let lines = vec![
+                    format!("Locked by {} ({}) since {}.", h.owner, h.operation, h.acquired_at),
+                    "Break it only if that session is dead. Its workflow stops before its next step.".into(),
+                ];
+                app.confirm_danger(format!("Break lock on {name}"), lines, &name.clone(), move |app| {
+                    app.job(format!("break lock on {name}"), move |ctx| async move {
+                        let svc = ctx.cv()?;
+                        let msg = match svc.store.break_lock(id).await? {
+                            Some(h) => {
+                                svc.audit("cv.lock.break", &format!("{name}: {} ({}) since {}", h.owner, h.operation, h.acquired_at)).await;
+                                format!("lock on {name} broken")
+                            }
+                            None => format!("{name} is not locked"),
+                        };
+                        ap(move |app| {
+                            app.ok(msg);
+                            app.reload();
+                        })
+                    });
+                });
+            })
+        }),
         _ => {}
     }
 }
@@ -353,26 +380,22 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
         let (title, danger_title, typed) = (format!("{name} -> {env}"), format!("{env} is protected"), env.clone());
         ap(move |app| {
             let go = move |app: &mut App| {
-                app.job(
-                    format!("{} {name} v{} -> {env}", if mode == Mode::Promote { "promote" } else { "rollback" }, v.number),
-                    move |ctx| async move {
-                        let svc = ctx.cv()?;
-                        let res = svc.promote(cv, vid, e.id, mode, &ctx.log(), &ctx.on_task()).await;
-                        let issues = svc.verify(cv, e.id).await.unwrap_or_else(|e| vec![e.to_string()]);
-                        ap(move |app| {
-                            match (res, issues.is_empty()) {
-                                (Ok(()), true) => app.ok(format!("{name} v{} active in {env}; served content verified", v.number)),
-                                (Ok(()), false) => {
-                                    app.notify(Level::Warn, format!("{name} in {env}: bound, verification found: {}", issues.join("; ")))
-                                }
-                                (Err(e), _) => {
-                                    app.error(format!("{e:#} (partial states are recorded; promote again to retry or roll back)"))
-                                }
+                let verb = if mode == Mode::Promote { "promote" } else { "rollback" };
+                app.job(format!("{verb} {name} v{} -> {env}", v.number), move |ctx| async move {
+                    let svc = ctx.cv()?.locked(cv, &format!("{verb} to {env}")).await?;
+                    let res = svc.promote(cv, vid, e.id, mode, &ctx.log(), &ctx.on_task()).await;
+                    let issues = svc.verify(cv, e.id).await.unwrap_or_else(|e| vec![e.to_string()]);
+                    ap(move |app| {
+                        match (res, issues.is_empty()) {
+                            (Ok(()), true) => app.ok(format!("{name} v{} active in {env}; served content verified", v.number)),
+                            (Ok(()), false) => {
+                                app.notify(Level::Warn, format!("{name} in {env}: bound, verification found: {}", issues.join("; ")))
                             }
-                            app.reload();
-                        })
-                    },
-                );
+                            (Err(e), _) => app.error(format!("{e:#} (partial states are recorded; promote again to retry or roll back)")),
+                        }
+                        app.reload();
+                    })
+                });
             };
             if protected {
                 app.confirm_danger(danger_title, lines, &typed, go);
@@ -426,7 +449,7 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                 return;
             }
             app.job(format!("resume {name} v{number}"), move |ctx| async move {
-                let v = ctx.cv()?.resume(vid, &ctx.log(), &ctx.on_task()).await?;
+                let v = ctx.cv()?.locked(cv, &format!("resume v{number}")).await?.resume(vid, &ctx.log(), &ctx.on_task()).await?;
                 ap(move |app| {
                     app.ok(format!("{name} v{} published", v.number));
                     app.reload();
@@ -441,7 +464,7 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
             ];
             app.confirm_danger(format!("Delete {name} v{number}"), lines, &format!("v{number}"), move |app| {
                 app.job(format!("delete {name} v{number}"), move |ctx| async move {
-                    ctx.cv()?.delete_version(vid, &ctx.log(), &ctx.on_task()).await?;
+                    ctx.cv()?.locked(cv, &format!("delete v{number}")).await?.delete_version(vid, &ctx.log(), &ctx.on_task()).await?;
                     ap(move |app| {
                         app.ok("version deleted");
                         app.reload();

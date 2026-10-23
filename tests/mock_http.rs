@@ -5,10 +5,10 @@
 use pulp_tui::config::{AuthMethod, Profile, Settings};
 use pulp_tui::pulp::models::Task;
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{Capabilities, Feature, PulpClient, PulpError};
+use pulp_tui::pulp::{Capabilities, Feature, PulpClient, PulpError, RepoType};
 use serde_json::{Value, json};
 use std::time::Duration;
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const API: &str = "/pulp/api/v3/";
@@ -340,4 +340,53 @@ async fn logs_every_exit_path() {
     let down = client(&server, |p, _| p.url = "http://127.0.0.1:1".into());
     down.post(&down.api("log-down/"), &json!({})).await.unwrap_err();
     assert!(logged("POST /pulp/api/v3/log-down/ network error").contains("error: network error"));
+}
+
+fn dist(labels: Value) -> Value {
+    json!({
+        "pulp_href": format!("{API}distributions/rpm/rpm/1/"),
+        "name": "d",
+        "base_path": "bp",
+        "publication": format!("{API}publications/rpm/rpm/1/"),
+        "pulp_labels": labels,
+    })
+}
+
+async fn serve_dist(server: &MockServer, d: Value) {
+    let page = json!({ "count": 1, "next": null, "results": [d] });
+    let list = Mock::given(method("GET")).and(path(format!("{API}distributions/rpm/rpm/")));
+    list.respond_with(ResponseTemplate::new(200).set_body_json(page)).mount(server).await;
+}
+
+#[tokio::test]
+async fn distribution_of_another_database_is_refused() {
+    let server = MockServer::start().await;
+    serve_dist(&server, dist(json!({ "pulp_tui_cv": "web", "pulp_tui_db": "other" }))).await;
+    Mock::given(method("PATCH")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+    let c = client(&server, |_, _| {});
+    let labels = json!({ "pulp_tui_cv": "web" });
+    let pubn = format!("{API}publications/rpm/rpm/1/");
+    let db = Some(("pulp_tui_db", "me", &[][..]));
+    let err = ops::ensure_distribution(&c, RepoType::Rpm, "d", "bp", Some(&pubn), &labels, db, &no_progress).await.unwrap_err();
+    let want = "distribution d is owned by another pulp-tui database (other)";
+    assert!(matches!(&err, PulpError::Api { status: 409, message } if message == want), "{err}");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn distribution_without_database_label_is_adopted_even_when_the_publication_is_right() {
+    let server = MockServer::start().await;
+    serve_dist(&server, dist(json!({ "pulp_tui_cv": "web", "keep": "x" }))).await;
+    Mock::given(method("PATCH"))
+        .and(body_partial_json(json!({ "pulp_labels": { "pulp_tui_cv": "web", "keep": "x", "pulp_tui_db": "me" } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+    let labels = json!({ "pulp_tui_cv": "web" });
+    let pubn = format!("{API}publications/rpm/rpm/1/");
+    let db = Some(("pulp_tui_db", "me", &[][..]));
+    ops::ensure_distribution(&c, RepoType::Rpm, "d", "bp", Some(&pubn), &labels, db, &no_progress).await.unwrap();
+    server.verify().await;
 }

@@ -243,7 +243,7 @@ async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror:
     let r: Repository = c.get(&repo, &[]).await?;
     let version = r.latest_version_href.ok_or_else(|| anyhow!("no repository version after sync"))?;
     let publication = ops::ensure_publication(c, t, &version, on).await?;
-    let dist = ops::ensure_distribution(c, t, &it.name, &it.base_path, Some(&publication), &labels, on).await?;
+    let dist = ops::ensure_distribution(c, t, &it.name, &it.base_path, Some(&publication), &labels, None, on).await?;
     let d: Distribution = c.get(&dist, &[]).await?;
     let check = ops::verify_served(c, t, d.base_url.as_deref().unwrap_or_default(), &version, "").await?;
     Ok(format!("{} served at {} ({check})", short_version(&version), d.base_url.unwrap_or_default()))

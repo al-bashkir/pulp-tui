@@ -124,6 +124,11 @@ pub const PG_MIGRATIONS: &[&str] = &[
      ALTER TABLE audit ADD COLUMN actor TEXT NOT NULL DEFAULT '';",
 ];
 
+/// A Content View lock not renewed for this long is expired; the next operator takes it over.
+pub const LOCK_TTL_SECS: i64 = 120;
+/// How often the holder renews its lock.
+pub const LOCK_RENEW_SECS: u64 = 30;
+
 /// `pg_advisory_lock` key held while `db migrate` runs.
 const MIGRATE_LOCK: i64 = 7_301_955;
 /// `scope_settings` key of the base path prefix a server's distributions use.
@@ -242,6 +247,15 @@ pub struct AuditEntry {
     pub detail: String,
     /// `user@host`; empty for rows written before schema 2.
     pub actor: String,
+}
+
+/// Who holds a Content View lock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LockHolder {
+    pub owner: String,
+    pub operation: String,
+    /// RFC 3339.
+    pub acquired_at: String,
 }
 
 pub const LIBRARY: &str = "Library";
@@ -852,6 +866,68 @@ impl Store {
             .await?)
     }
 
+    // ---- Content View locks (times are client unix seconds) ----------------------------
+
+    /// Take the lock of a Content View, or take over one not renewed for `LOCK_TTL_SECS`, in one statement.
+    /// `Ok(Err(holder))`: another operator holds it.
+    pub async fn try_lock(&self, cv_id: i64, owner: &str, token: &str, operation: &str, now: i64) -> Result<Result<(), LockHolder>> {
+        let n = sqlx::query(
+            "INSERT INTO locks(cv_id, owner, token, operation, acquired_at, renewed_at) VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT(cv_id) DO UPDATE SET owner = excluded.owner, token = excluded.token, operation = excluded.operation,
+                acquired_at = excluded.acquired_at, renewed_at = excluded.renewed_at
+             WHERE locks.renewed_at < $7",
+        )
+        .bind(cv_id)
+        .bind(owner)
+        .bind(token)
+        .bind(operation)
+        .bind(rfc3339(now.max(0) as u64))
+        .bind(now)
+        .bind(now - LOCK_TTL_SECS)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if n == 1 {
+            return Ok(Ok(()));
+        }
+        match self.lock_holder(cv_id).await? {
+            Some(h) => Ok(Err(h)),
+            None => bail!("the lock was released while taking it; try again"),
+        }
+    }
+
+    /// `false`: the lock is no longer ours (taken over after expiry, or broken).
+    pub async fn renew_lock(&self, cv_id: i64, token: &str, now: i64) -> Result<bool> {
+        let n = sqlx::query("UPDATE locks SET renewed_at = $3 WHERE cv_id = $1 AND token = $2")
+            .bind(cv_id)
+            .bind(token)
+            .bind(now)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n == 1)
+    }
+
+    pub async fn release_lock(&self, cv_id: i64, token: &str) -> Result<()> {
+        sqlx::query("DELETE FROM locks WHERE cv_id = $1 AND token = $2").bind(cv_id).bind(token).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Remove the lock whoever holds it; returns what was removed.
+    pub async fn break_lock(&self, cv_id: i64) -> Result<Option<LockHolder>> {
+        let r = sqlx::query("DELETE FROM locks WHERE cv_id = $1 RETURNING owner, operation, acquired_at")
+            .bind(cv_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        r.as_ref().map(lock_row).transpose()
+    }
+
+    pub async fn lock_holder(&self, cv_id: i64) -> Result<Option<LockHolder>> {
+        let r =
+            sqlx::query("SELECT owner, operation, acquired_at FROM locks WHERE cv_id = $1").bind(cv_id).fetch_optional(&self.pool).await?;
+        r.as_ref().map(lock_row).transpose()
+    }
+
     // ---- audit and replication -----------------------------------------------------
 
     pub async fn audit(&self, profile: &str, actor: &str, action: &str, detail: &str) -> Result<()> {
@@ -986,6 +1062,10 @@ pub struct ExportEnv {
     pub prior: String,
     #[serde(default)]
     pub protected: bool,
+}
+
+fn lock_row(r: &AnyRow) -> Result<LockHolder> {
+    Ok(LockHolder { owner: r.try_get(0)?, operation: r.try_get(1)?, acquired_at: r.try_get(2)? })
 }
 
 fn content_view_row(r: &AnyRow) -> Result<ContentView> {
@@ -1250,6 +1330,34 @@ mod tests {
         s.delete_cv(cv).await.unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM locks").fetch_one(&s.pool).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn lock_conflict_expiry_and_release() {
+        let s = Store::open_in_memory().await.unwrap();
+        let cv = s.create_cv("k", "web", "").await.unwrap();
+        assert!(s.try_lock(cv, "alice@a", "t1", "promote to Prod", 1000).await.unwrap().is_ok());
+        let h = s.try_lock(cv, "bob@b", "t2", "publish", 1050).await.unwrap().unwrap_err();
+        assert_eq!((h.owner.as_str(), h.operation.as_str()), ("alice@a", "promote to Prod"));
+        assert!(s.renew_lock(cv, "t1", 1100).await.unwrap());
+        assert!(s.try_lock(cv, "bob@b", "t2", "publish", 1100 + LOCK_TTL_SECS - 1).await.unwrap().is_err());
+        assert!(s.try_lock(cv, "bob@b", "t2", "publish", 1100 + LOCK_TTL_SECS + 1).await.unwrap().is_ok(), "expired lock taken over");
+        assert!(!s.renew_lock(cv, "t1", 1300).await.unwrap(), "old holder lost it");
+        s.release_lock(cv, "t1").await.unwrap(); // wrong token: no effect
+        assert!(s.lock_holder(cv).await.unwrap().is_some());
+        s.release_lock(cv, "t2").await.unwrap();
+        assert!(s.lock_holder(cv).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn break_lock_returns_the_removed_holder() {
+        let s = Store::open_in_memory().await.unwrap();
+        let cv = s.create_cv("k", "web", "").await.unwrap();
+        assert!(s.break_lock(cv).await.unwrap().is_none());
+        s.try_lock(cv, "alice@a", "t1", "publish", 1000).await.unwrap().unwrap();
+        let h = s.break_lock(cv).await.unwrap().unwrap();
+        assert_eq!((h.owner.as_str(), h.acquired_at.as_str()), ("alice@a", "1970-01-01T00:16:40Z"));
+        assert!(s.lock_holder(cv).await.unwrap().is_none());
     }
 
     #[tokio::test]

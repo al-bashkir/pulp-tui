@@ -25,15 +25,24 @@ async fn upstream_content(up: &PulpClient, prefix: &str) -> (String, String) {
     let (rpm_repo, _) = synced_repo(up, RepoType::Rpm, &format!("{prefix}-os"), "rpm/", "additive").await;
     let v = latest(up, &rpm_repo).await;
     let p = ops::ensure_publication(up, RepoType::Rpm, &v, &no_progress).await.unwrap();
-    ops::ensure_distribution(up, RepoType::Rpm, &format!("{prefix}-os"), &format!("{prefix}/os"), Some(&p), &json!({}), &no_progress)
+    ops::ensure_distribution(up, RepoType::Rpm, &format!("{prefix}-os"), &format!("{prefix}/os"), Some(&p), &json!({}), None, &no_progress)
         .await
         .unwrap();
     let (file_repo, _) = synced_repo(up, RepoType::File, &format!("{prefix}-docs"), "file/PULP_MANIFEST", "mirror").await;
     let v = latest(up, &file_repo).await;
     let p = ops::ensure_publication(up, RepoType::File, &v, &no_progress).await.unwrap();
-    ops::ensure_distribution(up, RepoType::File, &format!("{prefix}-docs"), &format!("{prefix}/docs"), Some(&p), &json!({}), &no_progress)
-        .await
-        .unwrap();
+    ops::ensure_distribution(
+        up,
+        RepoType::File,
+        &format!("{prefix}-docs"),
+        &format!("{prefix}/docs"),
+        Some(&p),
+        &json!({}),
+        None,
+        &no_progress,
+    )
+    .await
+    .unwrap();
     (rpm_repo, file_repo)
 }
 
@@ -45,7 +54,7 @@ async fn update_upstream_rpm(up: &PulpClient, prefix: &str, rpm_repo: &str) {
     ops::settle(up, ops::sync(up, RepoType::Rpm, rpm_repo, None, "additive").await.unwrap(), &no_progress).await.unwrap();
     let v = latest(up, rpm_repo).await;
     let p = ops::ensure_publication(up, RepoType::Rpm, &v, &no_progress).await.unwrap();
-    ops::ensure_distribution(up, RepoType::Rpm, &format!("{prefix}-os"), &format!("{prefix}/os"), Some(&p), &json!({}), &no_progress)
+    ops::ensure_distribution(up, RepoType::Rpm, &format!("{prefix}-os"), &format!("{prefix}/os"), Some(&p), &json!({}), None, &no_progress)
         .await
         .unwrap();
 }

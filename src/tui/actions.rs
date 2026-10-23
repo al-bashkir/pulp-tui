@@ -712,7 +712,7 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
             } else {
                 let v = version.ok_or_else(|| anyhow!("repository has no versions"))?;
                 let p = ops::ensure_publication(c, t, &v, &on).await?;
-                ops::ensure_distribution(c, t, &dist, &bp, Some(&p), &json!({}), &on).await?
+                ops::ensure_distribution(c, t, &dist, &bp, Some(&p), &json!({}), None, &on).await?
             };
             let d: Value = c.get(&href, &[]).await?;
             let url = s(&d, "base_url");
@@ -928,7 +928,7 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
                     let on = ctx.on_task();
                     let p = ops::ensure_publication(c, t, &version, &on).await?;
                     let base = s(&d, "base_path");
-                    ops::ensure_distribution(c, t, &dist, &base, Some(&p), &json!({}), &on).await?;
+                    ops::ensure_distribution(c, t, &dist, &base, Some(&p), &json!({}), None, &on).await?;
                     let check = ops::verify_served(c, t, &s(&d, "base_url"), &version, "").await;
                     ap(move |app| {
                         match check {

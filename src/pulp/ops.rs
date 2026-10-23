@@ -5,7 +5,7 @@ use super::client::{Mutation, Page, PulpClient, PulpError, Result, jitter};
 use super::models::*;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -119,7 +119,9 @@ pub async fn ensure_publication(c: &PulpClient, t: RepoType, version: &str, on: 
 
 /// Create or re-point a distribution. Refuses to take over a base path owned by a
 /// different distribution, or an existing distribution that lacks the given `labels`
-/// (labels mark ownership; pass `{}` for no ownership check).
+/// (labels mark ownership; pass `{}` for no ownership check). `db` = (label key, database id,
+/// aliases): a distribution of another database is refused; an unlabeled one is adopted.
+#[allow(clippy::too_many_arguments)]
 pub async fn ensure_distribution(
     c: &PulpClient,
     t: RepoType,
@@ -127,6 +129,7 @@ pub async fn ensure_distribution(
     base_path: &str,
     publication: Option<&str>,
     labels: &Value,
+    db: Option<(&str, &str, &[String])>,
     on: OnTask<'_>,
 ) -> Result<String> {
     let coll = c.api(t.distributions());
@@ -141,10 +144,29 @@ pub async fn ensure_distribution(
         if !owned {
             return Err(PulpError::Api { status: 409, message: format!("distribution {name} exists but lacks ownership labels {labels}") });
         }
-        if d.publication.as_deref() != publication || d.repository.is_some() || d.repository_version.is_some() {
-            let mut body = json!({ "publication": publication, "repository": null });
-            if d.repository_version.is_some() {
-                body["repository_version"] = Value::Null;
+        let adopt = match db {
+            Some((key, id, aliases)) => label_owner(&d.pulp_labels, key, id, aliases)
+                .map_err(|o| PulpError::Api {
+                    status: 409,
+                    message: format!("distribution {name} is owned by another pulp-tui database ({o})"),
+                })?
+                .then_some((key, id)),
+            None => None,
+        };
+        let repoint = d.publication.as_deref() != publication || d.repository.is_some() || d.repository_version.is_some();
+        if repoint || adopt.is_some() {
+            let mut body = json!({});
+            if repoint {
+                body = json!({ "publication": publication, "repository": null });
+                if d.repository_version.is_some() {
+                    body["repository_version"] = Value::Null;
+                }
+            }
+            if let Some((key, id)) = adopt {
+                // Pulp replaces the whole label map; `labels` are already present (checked above).
+                let mut all = d.pulp_labels.clone();
+                all.insert(key.into(), id.into());
+                body["pulp_labels"] = json!(all);
             }
             let m = c.patch(&d.pulp_href, &body).await?;
             settle(c, m, on).await?;
@@ -158,6 +180,10 @@ pub async fn ensure_distribution(
             message: format!("base path {base_path} is used by distribution {}", o["name"].as_str().unwrap_or("?")),
         });
     }
+    let mut labels = labels.clone();
+    if let Some((key, id, _)) = db {
+        labels[key] = id.into();
+    }
     create(
         c,
         &coll,
@@ -166,6 +192,16 @@ pub async fn ensure_distribution(
         on,
     )
     .await
+}
+
+/// Who owns an object by its database-id label: `Ok(false)` this database, `Ok(true)` nobody
+/// yet or an alias of this database (set the label), `Err(id)` another database.
+pub fn label_owner(labels: &BTreeMap<String, String>, key: &str, id: &str, aliases: &[String]) -> std::result::Result<bool, String> {
+    match labels.get(key) {
+        Some(v) if v == id => Ok(false),
+        Some(v) if !aliases.contains(v) => Err(v.clone()),
+        _ => Ok(true),
+    }
 }
 
 pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<Package>> {
@@ -380,6 +416,16 @@ pub async fn upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_owner_rules() {
+        let l = |v: Option<&str>| v.map(|x| BTreeMap::from([("pulp_tui_db".to_string(), x.to_string())])).unwrap_or_default();
+        let aliases = vec!["old".to_string()];
+        assert_eq!(label_owner(&l(Some("me")), "pulp_tui_db", "me", &aliases), Ok(false));
+        assert_eq!(label_owner(&l(None), "pulp_tui_db", "me", &aliases), Ok(true));
+        assert_eq!(label_owner(&l(Some("old")), "pulp_tui_db", "me", &aliases), Ok(true));
+        assert_eq!(label_owner(&l(Some("other")), "pulp_tui_db", "me", &aliases), Err("other".into()));
+    }
 
     #[test]
     fn diff_reports_added_and_removed() {

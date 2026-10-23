@@ -1,7 +1,8 @@
 //! Content View workflows against a live Pulp: multi-repository snapshots with filters,
 //! numbered versions, promotion through environments, rollback, served-content
 //! verification, retention protection, partial failure + recovery, and resuming a
-//! publish whose Pulp task was submitted before the client stopped.
+//! publish whose Pulp task was submitted before the client stopped, and objects owned by
+//! another database.
 
 mod common;
 
@@ -29,8 +30,17 @@ async fn content_view_lifecycle() {
 
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let profile = c.profile().to_string();
-    let svc = CvService { client: c.clone(), store: store.clone(), prefix: id.clone(), scope: profile.clone(), actor: "test@live".into() };
+    let svc = CvService {
+        client: c.clone(),
+        store: store.clone(),
+        prefix: id.clone(),
+        scope: profile.clone(),
+        actor: "test@live".into(),
+        lock: None,
+    };
     let cv = store.create_cv(&profile, &id, "test view").await.unwrap();
+    // Every workflow below runs under the view's lock (renewed every 30 s), as the TUI does.
+    let svc = svc.locked(cv, "live test").await.unwrap();
     let mut os = CvRepo {
         repo_href: rpm_repo.clone(),
         repo_name: "os".into(),
@@ -174,4 +184,62 @@ async fn content_view_lifecycle() {
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     assert!(c.get::<serde_json::Value>(os_v1.derived_repo.as_deref().unwrap(), &[]).await.unwrap_err().is_not_found());
     cleanup(&c, &[&rpm_repo, &file_repo, &rpm_remote, &file_remote]).await;
+}
+
+/// Two databases (stores with different ids) share one Pulp and one Content View name.
+#[tokio::test]
+async fn content_view_owned_by_another_database() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvdb");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let profile = c.profile().to_string();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    let mut services = vec![];
+    for actor in ["a@live", "b@live"] {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let cv = store.create_cv(&profile, &id, "").await.unwrap();
+        store.set_cv_repo(cv, &docs).await.unwrap();
+        let svc = CvService { client: c.clone(), store, prefix: id.clone(), scope: profile.clone(), actor: actor.into(), lock: None };
+        services.push((svc, cv));
+    }
+    let ((a, a_cv), (b, b_cv)) = (services.remove(0), services.remove(0));
+    let label = |h: String| {
+        let c = c.clone();
+        async move { c.get::<serde_json::Value>(&h, &[]).await.unwrap()["pulp_labels"]["pulp_tui_db"].as_str().map(String::from) }
+    };
+
+    // A publishes and promotes to Library: its derived repository and distribution carry A's id.
+    let v = a.publish(a_cv, "", &quiet, &no_progress).await.unwrap();
+    let derived = a.store.version_repos(v.id).await.unwrap().remove(0).derived_repo.unwrap();
+    let lib = a.store.ensure_library(&profile).await.unwrap();
+    let dist = a.store.binding_repos(lib, a_cv).await.unwrap().remove(0).distribution;
+    assert_eq!(label(derived.clone()).await.as_deref(), Some(a.store.db_id()));
+    assert_eq!(label(dist.clone()).await.as_deref(), Some(a.store.db_id()));
+
+    // B refuses the foreign derived repository, and writes nothing.
+    let err = format!("{:#}", b.publish(b_cv, "", &quiet, &no_progress).await.unwrap_err());
+    let foreign = format!("is owned by another pulp-tui database ({})", a.store.db_id());
+    assert!(err.contains(&foreign), "{err}");
+    assert_eq!(label(derived.clone()).await.as_deref(), Some(a.store.db_id()));
+
+    // Once B knows A's id as an alias, B adopts both objects.
+    b.store.add_alias(a.store.db_id()).await.unwrap();
+    b.publish(b_cv, "", &quiet, &no_progress).await.unwrap();
+    assert_eq!(label(derived.clone()).await.as_deref(), Some(b.store.db_id()));
+    assert_eq!(label(dist.clone()).await.as_deref(), Some(b.store.db_id()));
+
+    // Now A is the other database: deleting its view keeps what B owns.
+    let logs = Mutex::new(vec![]);
+    a.delete_view(a_cv, &|m| logs.lock().unwrap().push(m), &no_progress).await.unwrap();
+    let logs = logs.into_inner().unwrap().join("\n");
+    let kept = format!("owned by another pulp-tui database ({})", b.store.db_id());
+    assert!(logs.contains(&format!("keeping {derived}: {kept}")) && logs.contains(&format!("keeping {dist}: {kept}")), "{logs}");
+    assert!(c.get::<serde_json::Value>(&derived, &[]).await.is_ok());
+
+    b.delete_view(b_cv, &quiet, &no_progress).await.unwrap();
+    assert!(c.get::<serde_json::Value>(&derived, &[]).await.unwrap_err().is_not_found());
+    cleanup(&c, &[&repo, &remote]).await;
 }

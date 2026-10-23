@@ -99,6 +99,15 @@ idle group whose counts stay the same for three polls is also treated as final.
 * **Ownership**: pulp-tui never modifies a derived repository or CV distribution that does
   not carry its ownership labels. Deleting a CV version keeps Pulp objects that another
   live version or a binding still uses.
+* **Database ID label**: derived repositories and CV distributions also carry
+  `pulp_tui_db=<database id>` (`Store::db_id`). An object that carries the id of another
+  database is refused: publish and promote stop with "... is owned by another pulp-tui
+  database (<id>)", and deleting a Content View keeps such objects (it logs them). The check
+  also runs on hrefs recorded earlier: Resume stops before copying into a derived repository
+  that another database adopted, deleting a version keeps the publication and snapshot of
+  such a repository, and a promotion does not unbind such a distribution. An object
+  without the label, or with an id in this database's aliases (`meta` keys `alias:<id>`),
+  is adopted: the label is set to this database's id when the workflow touches it.
 
 ### No cross-resource transactions
 

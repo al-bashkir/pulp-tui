@@ -17,16 +17,19 @@ use crate::filters::Selector;
 use crate::pulp::models::{Distribution, Package, RepoVersion, Repository, Task};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, RepoType};
-use crate::store::{BindingRepo, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, Store};
+use crate::store::{BindingRepo, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, LOCK_RENEW_SECS, LockHolder, Store};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type Log<'a> = &'a (dyn Fn(String) + Send + Sync);
 
 pub const LABEL_CV: &str = "pulp_tui_cv";
 pub const LABEL_ENV: &str = "pulp_tui_env";
+/// Id of the pulp-tui database that created or adopted the object (`Store::db_id`).
+pub const LABEL_DB: &str = "pulp_tui_db";
 
 #[derive(Clone)]
 pub struct CvService {
@@ -37,6 +40,89 @@ pub struct CvService {
     pub scope: String,
     /// `store::actor`: who is shown in the audit log.
     pub actor: String,
+    /// Held by workflows started through `locked`; they stop at the next step once it is lost.
+    pub lock: Option<Arc<CvLock>>,
+}
+
+/// One operator's lock on one Content View, renewed in the background while held.
+/// Dropping it (workflow end, Esc) releases it.
+#[derive(Debug)]
+pub struct CvLock {
+    store: Arc<Store>,
+    cv_id: i64,
+    name: String,
+    token: String,
+    /// Why the lock was lost; set by the renewal task, read by `check` (no database round trip).
+    lost: Arc<Mutex<Option<String>>>,
+    renew: tokio::task::AbortHandle,
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn conflict(name: &str, h: &LockHolder) -> String {
+    let since = h.acquired_at.get(11..16).unwrap_or(&h.acquired_at);
+    format!("Content View {name} is locked by {} ({}) since {since}", h.owner, h.operation)
+}
+
+/// One renewal round; `false` (lock lost, reason recorded) stops the renewal task.
+async fn renew_step(store: &Store, cv_id: i64, token: &str, lost: &Mutex<Option<String>>) -> bool {
+    let reason = match store.renew_lock(cv_id, token, unix_now()).await {
+        Ok(true) => return true,
+        Ok(false) => "taken over or broken by another operator".to_string(),
+        Err(e) => format!("database unreachable: {e}"),
+    };
+    *lost.lock().unwrap() = Some(reason);
+    false
+}
+
+impl CvLock {
+    pub async fn acquire(store: Arc<Store>, cv_id: i64, name: &str, owner: &str, operation: &str) -> Result<Arc<CvLock>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let token = format!("{}-{nanos}", std::process::id());
+        if let Err(h) = store.try_lock(cv_id, owner, &token, operation, unix_now()).await? {
+            bail!("{}", conflict(name, &h));
+        }
+        let lost = Arc::new(Mutex::new(None));
+        let (st, tok, l) = (store.clone(), token.clone(), lost.clone());
+        let renew = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(LOCK_RENEW_SECS)).await;
+                if !renew_step(&st, cv_id, &tok, &l).await {
+                    break;
+                }
+            }
+        })
+        .abort_handle();
+        Ok(Arc::new(CvLock { store, cv_id, name: name.into(), token, lost, renew }))
+    }
+
+    pub fn check(&self) -> Result<()> {
+        match &*self.lost.lock().unwrap() {
+            Some(reason) => bail!("lock on {} lost: {reason}", self.name),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    async fn renew_now(&self) {
+        renew_step(&self.store, self.cv_id, &self.token, &self.lost).await;
+    }
+}
+
+impl Drop for CvLock {
+    fn drop(&mut self) {
+        self.renew.abort();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let (store, cv_id, token) = (self.store.clone(), self.cv_id, std::mem::take(&mut self.token));
+            rt.spawn(async move {
+                if let Err(e) = store.release_lock(cv_id, &token).await {
+                    tracing::warn!("releasing the lock of content view {cv_id} failed (it expires): {e:#}");
+                }
+            });
+        }
+    }
 }
 
 /// Turn any name into a safe Pulp name / base path segment.
@@ -72,9 +158,36 @@ struct Selection {
 }
 
 impl CvService {
-    async fn audit(&self, action: &str, detail: &str) {
+    pub async fn audit(&self, action: &str, detail: &str) {
         if let Err(e) = self.store.audit(&self.scope, &self.actor, action, detail).await {
             tracing::warn!("audit write failed: {e:#}");
+        }
+    }
+
+    /// This service with the lock of Content View `cv_id` for `operation` (shown to other operators).
+    pub async fn locked(mut self, cv_id: i64, operation: &str) -> Result<CvService> {
+        let name = self.store.content_view(cv_id).await?.name;
+        self.lock = Some(CvLock::acquire(self.store.clone(), cv_id, &name, &self.actor, operation).await?);
+        Ok(self)
+    }
+
+    /// Called before every Pulp mutation and checkpoint/binding write of a workflow.
+    fn alive(&self) -> Result<()> {
+        self.lock.as_ref().map_or(Ok(()), |l| l.check())
+    }
+
+    /// The id of another pulp-tui database that owns the object at `href` (database ID label);
+    /// `None` when it is ours, unlabeled, owned by an alias, or gone. Call it before acting on a recorded href.
+    async fn foreign_owner(&self, href: &str, aliases: &[String]) -> Result<Option<String>> {
+        #[derive(serde::Deserialize)]
+        struct Labeled {
+            #[serde(default)]
+            pulp_labels: BTreeMap<String, String>,
+        }
+        match self.client.get::<Labeled>(href, &[]).await {
+            Ok(o) => Ok(ops::label_owner(&o.pulp_labels, LABEL_DB, self.store.db_id(), aliases).err()),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -163,9 +276,11 @@ impl CvService {
             let sv = repo.latest_version_href.ok_or_else(|| anyhow!("{} has no versions", r.repo_name))?;
             sources.push(sv);
         }
+        self.alive()?;
         let v = self.store.begin_version(cv_id, notes, &repos).await?;
         for (mut vr, sv) in self.store.version_repos(v.id).await?.into_iter().zip(sources) {
             vr.source_version = Some(sv);
+            self.alive()?;
             self.store.save_version_repo(&vr).await?;
         }
         self.audit("cv.publish.start", &format!("{} version {}", cv.name, v.number)).await;
@@ -183,6 +298,7 @@ impl CvService {
         if v.state == "deleted" {
             bail!("version {} was deleted", v.number);
         }
+        self.alive()?;
         self.store.finish_version(v.id, "publishing", None).await?;
         let res = async {
             for mut vr in self.store.version_repos(v.id).await? {
@@ -193,6 +309,7 @@ impl CvService {
         .await;
         match res {
             Ok(()) => {
+                self.alive()?;
                 self.store.finish_version(v.id, "published", None).await?;
                 self.audit("cv.publish.done", &format!("{} version {}", cv.name, v.number)).await;
                 log(format!("{} v{} published", cv.name, v.number));
@@ -202,6 +319,7 @@ impl CvService {
             }
             Err(e) => {
                 let msg = format!("{e:#}");
+                // Runs even when the lock is lost: it records why the workflow stopped.
                 self.store.finish_version(v.id, "failed", Some(&msg)).await?;
                 self.audit("cv.publish.failed", &format!("{} version {}: {msg}", cv.name, v.number)).await;
                 Err(e)
@@ -216,23 +334,46 @@ impl CvService {
         if vr.publication.is_some() {
             return Ok(());
         }
+        let name = derived_repo_name(cv, &repo.repo_name);
+        let aliases = self.store.aliases().await?;
+        // Resuming: another database may have adopted the repository since the checkpoint.
+        if let Some(r) = &vr.derived_repo
+            && let Some(o) = self.foreign_owner(r, &aliases).await?
+        {
+            bail!("repository {name} is owned by another pulp-tui database ({o})");
+        }
         if vr.derived_repo.is_none() {
-            let name = derived_repo_name(cv, &repo.repo_name);
             let href = match ops::find_by_name::<Repository>(c, &c.api(t.repositories()), &name).await? {
                 // Never write into a repository this view does not own (name collision).
-                Some(r) if r.pulp_labels.get(LABEL_CV).map(String::as_str) == Some(slug(cv).as_str()) => r.pulp_href,
+                Some(r) if r.pulp_labels.get(LABEL_CV).map(String::as_str) == Some(slug(cv).as_str()) => {
+                    let id = self.store.db_id();
+                    match ops::label_owner(&r.pulp_labels, LABEL_DB, id, &aliases) {
+                        Err(o) => bail!("repository {name} is owned by another pulp-tui database ({o})"),
+                        Ok(true) => {
+                            let mut labels = r.pulp_labels.clone();
+                            labels.insert(LABEL_DB.into(), id.into());
+                            self.alive()?;
+                            let m = c.patch(&r.pulp_href, &json!({ "pulp_labels": labels })).await?;
+                            ops::settle(c, m, on).await?;
+                        }
+                        Ok(false) => {}
+                    }
+                    r.pulp_href
+                }
                 Some(_) => bail!("repository {name} exists but is not labeled {LABEL_CV}={}; refusing to modify it", slug(cv)),
                 None => {
                     log(format!("creating derived repository {name}"));
                     let body = json!({
                         "name": name,
                         "description": format!("Content View {cv} snapshot of {} (managed by pulp-tui)", repo.repo_name),
-                        "pulp_labels": { LABEL_CV: slug(cv) },
+                        "pulp_labels": { LABEL_CV: slug(cv), LABEL_DB: self.store.db_id() },
                     });
+                    self.alive()?;
                     ops::create(c, &c.api(t.repositories()), &body, "/repositories/", on).await?
                 }
             };
             vr.derived_repo = Some(href);
+            self.alive()?;
             self.store.save_version_repo(vr).await?;
         }
         let derived = vr.derived_repo.clone().unwrap_or_default();
@@ -246,6 +387,7 @@ impl CvService {
                     let sv = vr.source_version.clone().ok_or_else(|| anyhow!("missing source version"))?;
                     log(format!("{}: selecting content from {sv}", repo.repo_name));
                     let sel = self.select(&repo, &sv, false).await?;
+                    self.alive()?;
                     let m = match (t, sel.hrefs) {
                         (RepoType::Rpm, hrefs) => {
                             let mut cfg = json!({ "source_repo_version": sv, "dest_repo": derived, "dest_base_version": 0 });
@@ -261,7 +403,9 @@ impl CvService {
                     };
                     let Mutation::Task(h) = m else { bail!("copy did not return a task") };
                     vr.pending_task = Some(h.clone());
+                    // Saved even when the lock is lost: it records a task already sent, so Resume re-attaches.
                     self.store.save_version_repo(vr).await?;
+                    self.alive()?;
                     ops::wait_task(c, &h, on).await
                 }
             };
@@ -278,11 +422,14 @@ impl CvService {
             vr.content_count = Some(rv.content_summary.present.values().map(|x| x.count as i64).sum());
             vr.derived_version = Some(version);
             vr.pending_task = None;
+            self.alive()?;
             self.store.save_version_repo(vr).await?;
         }
         let dv = vr.derived_version.clone().unwrap_or_default();
         log(format!("{}: publishing {dv}", repo.repo_name));
+        self.alive()?;
         vr.publication = Some(ops::ensure_publication(c, t, &dv, on).await?);
+        self.alive()?;
         self.store.save_version_repo(vr).await?;
         Ok(())
     }
@@ -315,6 +462,7 @@ impl CvService {
             tracing::warn!("{msg}");
             log(msg);
         }
+        self.alive()?;
         self.store.set_binding(env_id, cv_id, version_id, "promoting").await?;
         log(format!("{} v{} -> {}", cv.name, v.number, env.name));
         let mut errors = vec![];
@@ -325,17 +473,26 @@ impl CvService {
             }
         }
         // Repositories no longer part of the view stop serving (distribution kept for rollback).
+        let aliases = self.store.aliases().await?;
         for b in self.store.binding_repos(env_id, cv_id).await? {
             if vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) || b.publication.is_none() {
                 continue;
             }
             let res = async {
+                if let Some(o) = self.foreign_owner(&b.distribution, &aliases).await? {
+                    bail!(
+                        "distribution {} is owned by another pulp-tui database ({o})",
+                        distribution_name(&cv.name, &env.name, &b.repo_name)
+                    );
+                }
+                self.alive()?;
                 let m = self.client.patch(&b.distribution, &json!({ "publication": null })).await?;
-                ops::settle(&self.client, m, on).await
+                ops::settle(&self.client, m, on).await?;
+                self.alive() // before the checkpoint below
             }
             .await;
             match res {
-                Ok(_) => self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await?,
+                Ok(()) => self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await?,
                 Err(e) => errors.push(format!("unbind {}: {e}", b.repo_name)),
             }
         }
@@ -346,6 +503,7 @@ impl CvService {
         } else {
             "failed"
         };
+        // Runs even when the lock is lost: it records the partial state (a retry is idempotent).
         self.store.set_binding(env_id, cv_id, version_id, state).await?;
         let what = if mode == Mode::Rollback && env.name != LIBRARY { "cv.rollback" } else { "cv.promote" };
         self.audit(what, &format!("{} v{} -> {}: {state} {}", cv.name, v.number, env.name, errors.join("; "))).await;
@@ -363,11 +521,16 @@ impl CvService {
         let name = distribution_name(cv, &env.name, &repo.repo_name);
         let bp = base_path(prefix, cv, &env.name, &repo.repo_name);
         let labels = json!({ LABEL_CV: slug(cv), LABEL_ENV: slug(&env.name) });
-        let href = ops::ensure_distribution(&self.client, repo.repo_type, &name, &bp, Some(publication), &labels, on).await?;
+        let aliases = self.store.aliases().await?;
+        self.alive()?;
+        let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice()));
+        let href = ops::ensure_distribution(&self.client, repo.repo_type, &name, &bp, Some(publication), &labels, db, on).await?;
+        let cv_id = vr_cv(&self.store, vr.version_id).await?;
+        self.alive()?;
         self.store
             .save_binding_repo(&BindingRepo {
                 env_id: env.id,
-                cv_id: vr_cv(&self.store, vr.version_id).await?,
+                cv_id,
                 repo_href: repo.repo_href.clone(),
                 repo_name: repo.repo_name.clone(),
                 repo_type: repo.repo_type,
@@ -522,12 +685,23 @@ impl CvService {
         for b in self.store.all_binding_repos(v.cv_id).await? {
             shared.extend(b.publication);
         }
+        let aliases = self.store.aliases().await?;
         for vr in self.store.version_repos(version_id).await? {
+            // Publications and versions belong to the derived repository.
+            let foreign = match &vr.derived_repo {
+                Some(r) => self.foreign_owner(r, &aliases).await?,
+                None => None,
+            };
             for href in [vr.publication.as_ref(), vr.derived_version.as_ref()].into_iter().flatten() {
+                if let Some(o) = &foreign {
+                    log(format!("keeping {href}: owned by another pulp-tui database ({o})"));
+                    continue;
+                }
                 if shared.contains(href) {
                     log(format!("keeping shared {href}"));
                     continue;
                 }
+                self.alive()?;
                 match self.client.delete(href).await {
                     Ok(m) => {
                         ops::settle(&self.client, m, on).await?;
@@ -537,6 +711,7 @@ impl CvService {
                 }
             }
         }
+        self.alive()?;
         self.store.finish_version(version_id, "deleted", None).await?;
         self.audit("cv.version.delete", &format!("cv {} version {}", v.cv_id, v.number)).await;
         Ok(())
@@ -551,8 +726,14 @@ impl CvService {
             repos.extend(self.store.version_repos(v.id).await?.into_iter().filter_map(|vr| vr.derived_repo));
         }
         hrefs.extend(repos);
+        let aliases = self.store.aliases().await?;
         for h in hrefs {
+            if let Some(o) = self.foreign_owner(&h, &aliases).await? {
+                log(format!("keeping {h}: owned by another pulp-tui database ({o})"));
+                continue;
+            }
             log(format!("deleting {h}"));
+            self.alive()?;
             match self.client.delete(&h).await {
                 Ok(m) => {
                     ops::settle(&self.client, m, on).await?;
@@ -561,6 +742,7 @@ impl CvService {
                 Err(e) => return Err(e.into()),
             }
         }
+        self.alive()?;
         self.store.delete_cv(cv_id).await?;
         self.audit("cv.delete", &cv.name).await;
         Ok(())
@@ -585,5 +767,166 @@ mod tests {
         assert_eq!(derived_repo_name("web", "rhel9 baseos"), "pulp-tui-cv-web-rhel9-baseos");
         assert_eq!(distribution_name("web", "Prod", "os"), "pulp-tui-cv-web-Prod-os");
         assert_eq!(base_path("cv", "web", "Prod", "os"), "cv/prod/web/os");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_lock_releases_it() {
+        let s = Arc::new(Store::open_in_memory().await.unwrap());
+        let cv = s.create_cv("k", "web", "").await.unwrap();
+        let l = CvLock::acquire(s.clone(), cv, "web", "a@h", "publish").await.unwrap();
+        let e = CvLock::acquire(s.clone(), cv, "web", "b@h", "promote to Dev").await.unwrap_err();
+        assert!(e.to_string().starts_with("Content View web is locked by a@h (publish) since "), "{e}");
+        drop(l);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(s.lock_holder(cv).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renew_failure_marks_lost() {
+        let s = Arc::new(Store::open_in_memory().await.unwrap());
+        let cv = s.create_cv("k", "web", "").await.unwrap();
+        let l = CvLock::acquire(s.clone(), cv, "web", "a@h", "publish").await.unwrap();
+        l.renew_now().await;
+        assert!(l.check().is_ok(), "renewal of a held lock succeeds");
+        s.break_lock(cv).await.unwrap();
+        l.renew_now().await; // one renewal round without waiting 30 s
+        assert!(l.check().unwrap_err().to_string().starts_with("lock on web lost: taken over or broken"));
+    }
+
+    /// Pulp accepts the copy while another operator breaks the lock.
+    struct LoseLockOnPost(Arc<Mutex<Option<String>>>);
+
+    impl wiremock::Respond for LoseLockOnPost {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            *self.0.lock().unwrap() = Some("taken over or broken by another operator".into());
+            wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": "/pulp/api/v3/tasks/1/" }))
+        }
+    }
+
+    const DERIVED: &str = "/pulp/api/v3/repositories/rpm/rpm/2/";
+    const DIST: &str = "/pulp/api/v3/distributions/rpm/rpm/5/";
+
+    /// A service against a mock Pulp, with an in-memory store.
+    async fn mock_service(server: &wiremock::MockServer) -> CvService {
+        let p = crate::config::Profile { url: server.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
+        let client = PulpClient::new("t", &p, &crate::config::Settings::default()).unwrap();
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        CvService { client, store, prefix: "cv".into(), scope: "k".into(), actor: "a@h".into(), lock: None }
+    }
+
+    /// The object at `href` carries the database ID label `db`.
+    async fn serve_owner(server: &wiremock::MockServer, href: &str, db: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(href))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_labels": { LABEL_DB: db } })))
+            .mount(server)
+            .await;
+    }
+
+    /// No request of this HTTP method reached the server.
+    async fn assert_none(server: &wiremock::MockServer, method: &str) {
+        let sent: Vec<_> = server.received_requests().await.unwrap().into_iter().filter(|r| r.method.as_str() == method).collect();
+        assert!(sent.is_empty(), "unexpected {method}: {sent:?}");
+    }
+
+    async fn rpm_version(svc: &CvService) -> (i64, CvVersionRepo) {
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        // RPM without filters: the copy is the first mutation (selection needs no content listing).
+        let repo = CvRepo {
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/1/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            filters: vec![],
+        };
+        let v = svc.store.begin_version(cv, "", &[repo]).await.unwrap();
+        let mut vr = svc.store.version_repos(v.id).await.unwrap().remove(0);
+        vr.source_version = Some("/pulp/api/v3/repositories/rpm/rpm/1/versions/1/".into());
+        vr.derived_repo = Some(DERIVED.into());
+        (cv, vr)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_sent_before_the_lock_is_lost_is_recorded() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (cv, mut vr) = rpm_version(&svc).await;
+        let svc = svc.locked(cv, "publish").await.unwrap();
+        serve_owner(&server, DERIVED, svc.store.db_id()).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/pulp/api/v3/rpm/copy/"))
+            .respond_with(LoseLockOnPost(svc.lock.as_ref().unwrap().lost.clone()))
+            .mount(&server)
+            .await;
+        let e = svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert!(e.to_string().starts_with("lock on web lost: "), "{e}");
+        let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
+        assert_eq!(saved.pending_task.as_deref(), Some("/pulp/api/v3/tasks/1/"), "Resume re-attaches instead of copying again");
+        let methods: Vec<_> = server.received_requests().await.unwrap().iter().map(|r| r.method.to_string()).collect();
+        assert_eq!(methods, ["GET", "POST"], "label check, then the copy; stopped before waiting for the task");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_does_not_copy_into_a_repository_of_another_database() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, mut vr) = rpm_version(&svc).await;
+        serve_owner(&server, DERIVED, "other").await;
+        let e = svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), "repository pulp-tui-cv-web-os is owned by another pulp-tui database (other)");
+        assert_none(&server, "POST").await;
+        assert_none(&server, "PATCH").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_version_keeps_objects_of_a_repository_of_another_database() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, mut vr) = rpm_version(&svc).await;
+        vr.publication = Some("/pulp/api/v3/publications/rpm/rpm/3/".into());
+        vr.derived_version = Some(format!("{DERIVED}versions/1/"));
+        svc.store.save_version_repo(&vr).await.unwrap();
+        serve_owner(&server, DERIVED, "other").await;
+        let logs = Mutex::new(vec![]);
+        svc.delete_version(vr.version_id, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+        assert_none(&server, "DELETE").await;
+        let logs = logs.into_inner().unwrap();
+        let kept = |h: &str| format!("keeping {h}: owned by another pulp-tui database (other)");
+        assert_eq!(logs, [kept(vr.publication.as_deref().unwrap()), kept(vr.derived_version.as_deref().unwrap())]);
+        assert_eq!(svc.store.version(vr.version_id).await.unwrap().state, "deleted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unbind_does_not_touch_a_distribution_of_another_database() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        // A version without repositories: the bound repository "old" is no longer part of it.
+        let v = svc.store.begin_version(cv, "", &[]).await.unwrap();
+        svc.store.finish_version(v.id, "published", None).await.unwrap();
+        let lib = svc.store.ensure_library("k").await.unwrap();
+        let old = BindingRepo {
+            env_id: lib,
+            cv_id: cv,
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/9/".into(),
+            repo_name: "old".into(),
+            repo_type: RepoType::Rpm,
+            distribution: DIST.into(),
+            base_path: "cv/library/web/old".into(),
+            publication: Some("/pulp/api/v3/publications/rpm/rpm/3/".into()),
+        };
+        svc.store.save_binding_repo(&old).await.unwrap();
+        serve_owner(&server, DIST, "other").await;
+        let e = svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap_err();
+        let want =
+            format!("unbind old: distribution {} is owned by another pulp-tui database (other)", distribution_name("web", LIBRARY, "old"));
+        assert!(e.to_string().ends_with(&want), "{e}");
+        assert_none(&server, "PATCH").await;
+        assert_eq!(svc.store.binding_repos(lib, cv).await.unwrap()[0].publication, old.publication, "still recorded as served");
+    }
+
+    #[test]
+    fn conflict_message_shows_hours_and_minutes() {
+        let h = LockHolder { owner: "alice@ws12".into(), operation: "promote to Prod".into(), acquired_at: "2026-10-23T14:02:33Z".into() };
+        assert_eq!(conflict("web", &h), "Content View web is locked by alice@ws12 (promote to Prod) since 14:02");
     }
 }

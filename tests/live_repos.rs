@@ -46,7 +46,7 @@ async fn rpm_lifecycle() {
     // Publish exact version and distribute it.
     let pub1 = ops::ensure_publication(&c, t, &v1, &no_progress).await.unwrap();
     assert_eq!(ops::ensure_publication(&c, t, &v1, &no_progress).await.unwrap(), pub1, "publication is reused");
-    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), &no_progress).await.unwrap();
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
     let msg = ops::verify_served(&c, t, &base, &v1, "nested_alphabetically").await.unwrap();
     assert!(msg.contains("matching digest"), "{msg}");
@@ -66,20 +66,21 @@ async fn rpm_lifecycle() {
     assert!(d.removed.is_empty());
 
     let pub2 = ops::ensure_publication(&c, t, &v2, &no_progress).await.unwrap();
-    ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), &no_progress).await.unwrap();
+    ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), None, &no_progress).await.unwrap();
     assert_eq!(served(&c, &alpha11).await.0, 200);
     assert_ne!(served(&c, &format!("{base}repodata/repomd.xml")).await.1, repomd1);
 
     // Rollback = re-point to the older publication. Newer versions stay. Metadata switches
     // immediately; files of the superseded publication may stay downloadable during
     // DISTRIBUTED_PUBLICATION_RETENTION_PERIOD (pulpcore grace period), so no 404 check here.
-    ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), &no_progress).await.unwrap();
+    ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     assert_eq!(served(&c, &format!("{base}repodata/repomd.xml")).await.1, repomd1);
     ops::verify_served(&c, t, &base, &v1, "nested_alphabetically").await.unwrap();
     let _: RepoVersion = c.get(&v2, &[]).await.unwrap();
 
     // A base path owned by another distribution is refused.
-    let err = ops::ensure_distribution(&c, t, &format!("{name}-other"), &name, Some(&pub1), &json!({}), &no_progress).await.unwrap_err();
+    let err =
+        ops::ensure_distribution(&c, t, &format!("{name}-other"), &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap_err();
     assert_eq!(err.status(), Some(409), "{err}");
 
     cleanup(&c, &[&dist, &repo, &local, &remote]).await;
@@ -130,7 +131,7 @@ async fn file_lifecycle() {
     let v1 = latest(&c, &repo).await;
     assert_eq!(ops::files_in(&c, &v1).await.unwrap().len(), 3);
     let pub1 = ops::ensure_publication(&c, t, &v1, &no_progress).await.unwrap();
-    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), &no_progress).await.unwrap();
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
     ops::verify_served(&c, t, &base, &v1, "").await.unwrap();
     let (status, body) = served(&c, &format!("{base}docs/readme.txt")).await;
@@ -142,11 +143,11 @@ async fn file_lifecycle() {
     ops::settle(&c, m, &no_progress).await.unwrap();
     let v2 = latest(&c, &repo).await;
     let pub2 = ops::ensure_publication(&c, t, &v2, &no_progress).await.unwrap();
-    ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), &no_progress).await.unwrap();
+    ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), None, &no_progress).await.unwrap();
     assert_eq!(served(&c, &format!("{base}big.bin")).await.0, 200);
     ops::verify_served(&c, t, &base, &v2, "").await.unwrap();
     // Rollback: the served manifest is exactly v1 again (see grace-period note in rpm_lifecycle).
-    ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), &no_progress).await.unwrap();
+    ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     ops::verify_served(&c, t, &base, &v1, "").await.unwrap();
     assert!(ops::verify_served(&c, t, &base, &v2, "").await.is_err(), "detects mismatch");
 

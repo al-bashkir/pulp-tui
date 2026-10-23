@@ -171,6 +171,7 @@ pub enum Act {
     ToggleActive,
     Roles,
     Members,
+    BreakLock,
 }
 
 impl Act {
@@ -207,6 +208,7 @@ impl Act {
             Resume | Replicate | Roles => 'R',
             ToggleProtected => 'L',
             ToggleActive => 'A',
+            BreakLock => 'U',
         }
     }
 
@@ -256,6 +258,7 @@ impl Act {
             ToggleActive => "Enable / disable",
             Roles => "Roles",
             Members => "Members",
+            BreakLock => "Break lock",
         }
     }
 
@@ -268,7 +271,7 @@ impl Act {
             Kind::Profiles => shared && matches!(self, ImportCv),
             Kind::Environments => shared,
             Kind::ContentViews => {
-                matches!(self, Delete | CvPublish | Promote | Rollback)
+                matches!(self, Delete | CvPublish | Promote | Rollback | BreakLock)
                     || shared && matches!(self, Create | Edit | CvAddRepo | CvFilters | CvRemoveRepo)
             }
             Kind::CvVersions { .. } => matches!(self, Delete | Promote | Rollback | Resume),
@@ -596,6 +599,7 @@ impl Kind {
                 CvAddRepo,
                 CvFilters,
                 CvRemoveRepo,
+                BreakLock,
                 Create,
                 Edit,
                 Delete,
@@ -837,6 +841,8 @@ mod tests {
         assert!(Act::ToggleProtected.mutates(&Kind::Environments, true));
         assert!(!Act::ToggleProtected.mutates(&Kind::Environments, false));
         assert!(Act::CvPublish.mutates(&Kind::ContentViews, false));
+        assert!(Act::BreakLock.mutates(&Kind::ContentViews, false), "removes another operator's lock");
+        assert!(Kind::ContentViews.actions().contains(&Act::BreakLock) && Act::BreakLock.needs_item());
         assert!(!Act::Delete.mutates(&Kind::Profiles, true));
         assert!(Act::ImportCv.mutates(&Kind::Profiles, true), "bulk create in the shared database");
         assert!(!Act::ImportCv.mutates(&Kind::Profiles, false));

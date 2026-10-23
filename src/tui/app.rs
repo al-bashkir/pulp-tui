@@ -104,6 +104,7 @@ impl Ctx {
             prefix: self.settings.cv_base_path_prefix.clone(),
             scope: self.scope.clone(),
             actor: self.actor.clone(),
+            lock: None,
         })
     }
 }
