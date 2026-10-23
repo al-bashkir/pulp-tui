@@ -98,6 +98,18 @@ pub enum Level {
     Error,
 }
 
+impl Level {
+    /// The word in `[tag]` before a notice text, in the footer and in the Logs screen.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Level::Info => "info",
+            Level::Ok => "ok",
+            Level::Warn => "warning",
+            Level::Error => "error",
+        }
+    }
+}
+
 pub struct Notice {
     pub level: Level,
     pub text: String,
@@ -189,6 +201,8 @@ pub struct App {
     pub quit: bool,
     pub tx: UnboundedSender<Msg>,
     pub rx: Option<UnboundedReceiver<Msg>>,
+    /// Newest session-log row the Logs screen has loaded.
+    pub logs_seen: u64,
     next_id: u64,
 }
 
@@ -218,6 +232,7 @@ impl App {
             quit: false,
             tx,
             rx: Some(rx),
+            logs_seen: 0,
             next_id: 1,
         }
     }
@@ -230,6 +245,8 @@ impl App {
             Level::Error => tracing::warn!("{text}"),
             _ => tracing::info!("{text}"),
         }
+        let server = self.profile.as_deref().unwrap_or_default();
+        crate::session_log::record("notice", server, format!("[{}] {text}", level.tag()), vec![text.clone()]);
         self.notices.push_back(Notice { level, text, at: Instant::now() });
         while self.notices.len() > 200 {
             self.notices.pop_front();
@@ -379,6 +396,12 @@ impl App {
 
     /// Called every UI tick: schedule due task polls.
     pub fn tick(&mut self) {
+        // Local screen: it must follow the log with or without a connection.
+        let last = crate::session_log::last_id();
+        if matches!(self.screen, Screen::List(Kind::Logs { .. })) && !self.list.loading && last != self.logs_seen {
+            self.logs_seen = last;
+            self.reload();
+        }
         let Some(ctx) = self.ctx() else { return };
         for href in self.tasks.due() {
             let (c, tx) = (ctx.client.clone(), self.tx.clone());
@@ -542,10 +565,7 @@ impl App {
                             return; // stale response
                         }
                         app.list.loading = false;
-                        app.list.items = items;
-                        app.list.count = count;
-                        app.apply_sort();
-                        app.list.selected = app.list.selected.min(app.list.items.len().saturating_sub(1));
+                        app.set_items(items, count);
                     });
                     anyhow::Ok(apply)
                 };
@@ -573,6 +593,17 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Replace the rows of the list. A cursor below the first row stays on the same item when rows move
+    /// (new rows at the top of Logs); on the first row it keeps following the top.
+    fn set_items(&mut self, items: Vec<Value>, count: u64) {
+        let keep = if self.list.selected > 0 { self.list.current().map(item_key).filter(|k| !k.is_empty()) } else { None };
+        self.list.items = items;
+        self.list.count = count;
+        self.apply_sort();
+        let clamped = self.list.selected.min(self.list.items.len().saturating_sub(1));
+        self.list.selected = keep.and_then(|k| self.list.items.iter().position(|v| item_key(v) == k)).unwrap_or(clamped);
     }
 
     fn apply_sort(&mut self) {
@@ -832,6 +863,13 @@ impl App {
 
     fn open_menu(&mut self) {
         let item = self.list.current().cloned().unwrap_or(Value::Null);
+        // The Logs screen has one action: Enter opens it without a menu.
+        if matches!(self.list.kind, Kind::Logs { .. }) {
+            if item.is_object() {
+                super::actions::run(self, Act::Inspect, item);
+            }
+            return;
+        }
         let items = self.available_actions(&item);
         if items.is_empty() {
             return;
@@ -1034,5 +1072,112 @@ mod tests {
         app.apply_pick(id, 0, Ok(vec![PickItem { label: "x".into(), value: "x".into(), note: String::new() }]));
         let Some(Modal::Form { form, .. }) = &app.modal else { panic!() };
         assert!(form.fields[0].options.is_none());
+    }
+
+    fn app_on(kind: Kind) -> App {
+        let mut app = App::new(Config::default(), "/dev/null".into(), Arc::new(Store::open_in_memory().unwrap()));
+        app.profile = Some("lab".into());
+        app.screen = Screen::List(kind.clone());
+        app.list = ListState::new(kind);
+        app
+    }
+
+    fn row_with(summary: &str) -> Value {
+        crate::session_log::rows(true).into_iter().find(|r| r["summary"] == summary).unwrap_or_else(|| panic!("no log row {summary:?}"))
+    }
+
+    fn text_lines(app: &App) -> Vec<String> {
+        match &app.modal {
+            Some(Modal::Text { lines, .. }) => lines.clone(),
+            _ => panic!("no text modal"),
+        }
+    }
+
+    #[test]
+    fn notices_and_actions_are_logged_and_their_rows_open_as_text() {
+        let mut app = app_on(Kind::Profiles);
+        app.notify(Level::Warn, "notice-row-needle");
+        let r = row_with("[warning] notice-row-needle");
+        assert_eq!((r["kind"].as_str(), r["server"].as_str()), (Some("notice"), Some("lab")));
+        assert_eq!(crate::session_log::detail(r["id"].as_u64().unwrap()), Some(vec!["notice-row-needle".to_string()]));
+
+        // A profile has `name`; the action row names it. It is not a Logs inspect, so it is recorded.
+        super::super::actions::run(&mut app, Act::Inspect, serde_json::json!({"name": "action-row-needle"}));
+        let a = row_with("Inspect (full JSON) on action-row-needle");
+        assert_eq!(a["kind"], "action");
+
+        // Logs: Enter opens the text view with no menu; empty detail shows the summary; the log is not extended.
+        let mut app = app_on(Kind::Logs { polls: false });
+        app.profile = Some("logs-inspect-profile".into()); // only this App records under it
+        app.list.items = vec![a.clone()];
+        app.open_menu();
+        assert_eq!(text_lines(&app), ["Inspect (full JSON) on action-row-needle"]);
+        app.list.items = vec![r];
+        app.open_menu();
+        assert_eq!(text_lines(&app), ["notice-row-needle"]);
+        // Inspecting a log row is not itself logged (that would add a row for every look).
+        let own = |r: &Value| {
+            r["server"] == "logs-inspect-profile" && r["summary"].as_str().is_some_and(|s| s.starts_with("Inspect (full JSON)"))
+        };
+        assert!(!crate::session_log::rows(true).iter().any(own));
+        app.list.items = vec![serde_json::json!({"id": u64::MAX, "summary": "gone"})];
+        app.open_menu();
+        assert_eq!(text_lines(&app), ["This entry is older than the last 1000 and was dropped."]);
+    }
+
+    #[test]
+    fn reload_keeps_the_cursor_on_the_same_item() {
+        let row = |id: u64| serde_json::json!({"id": id});
+        let mut app = app_on(Kind::Logs { polls: false });
+        app.list.items = vec![row(3), row(2), row(1)];
+        app.list.selected = 1;
+        // A new row on top pushes everything down: the cursor follows id 2.
+        app.set_items(vec![row(4), row(3), row(2), row(1)], 4);
+        assert_eq!(app.list.selected, 2);
+        assert_eq!(item_key(app.list.current().unwrap()), "2");
+        // On the first row the cursor keeps following the newest row.
+        app.list.selected = 0;
+        app.set_items(vec![row(5), row(4), row(3), row(2), row(1)], 5);
+        assert_eq!(app.list.selected, 0);
+        // The selected item is gone: the old index, clamped.
+        app.list.selected = 4;
+        app.set_items(vec![row(9), row(8)], 2);
+        assert_eq!(app.list.selected, 1);
+        // Rows without a key cannot be followed: the old index, clamped.
+        app.list.items = vec![serde_json::json!({}), serde_json::json!({})];
+        app.list.selected = 1;
+        app.set_items(vec![serde_json::json!({}), serde_json::json!({}), serde_json::json!({})], 3);
+        assert_eq!(app.list.selected, 1);
+    }
+
+    #[test]
+    fn action_rows_name_a_target_only_for_actions_that_need_an_item() {
+        let mut app = app_on(Kind::Profiles);
+        app.profile = Some("action-rows-server".into());
+        let item = serde_json::json!({"name": "target-needle"});
+        // Create needs no item: a selected row is not its target.
+        super::super::actions::run(&mut app, Act::Create, item.clone());
+        super::super::actions::run(&mut app, Act::Inspect, item);
+        let mut seen: Vec<String> = crate::session_log::rows(true)
+            .into_iter()
+            .filter(|r| r["kind"] == "action" && r["server"] == "action-rows-server")
+            .map(|r| r["summary"].as_str().unwrap().to_string())
+            .collect();
+        seen.reverse();
+        assert_eq!(seen, ["Create", "Inspect (full JSON) on target-needle"]);
+    }
+
+    #[tokio::test]
+    async fn logs_screen_reloads_on_new_rows_even_without_a_connection() {
+        crate::session_log::record("notice", "lab", "tick-needle".into(), vec![]);
+        let mut app = app_on(Kind::Logs { polls: false });
+        assert!(app.ctx().is_none());
+        app.tick();
+        assert!(app.list.loading, "a row newer than logs_seen starts a reload");
+        assert!(app.logs_seen > 0);
+        // Other screens do not reload.
+        let mut other = app_on(Kind::Profiles);
+        other.tick();
+        assert!(!other.list.loading);
     }
 }

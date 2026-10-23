@@ -81,7 +81,15 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         app.error("read-only mode: this action changes the server");
         return;
     }
+    if !matches!((&kind, act), (Kind::Logs { .. }, Act::Inspect)) {
+        let name = ["name", "username"].iter().map(|k| s(&item, k)).find(|n| !n.is_empty());
+        let name = name.unwrap_or_else(|| short(&s(&item, "pulp_href")));
+        // An action without an item (Create, ...) has no target, even when a row is selected.
+        let on = if act.needs_item() && !name.is_empty() { format!(" on {name}") } else { String::new() };
+        crate::session_log::record("action", app.profile.as_deref().unwrap_or_default(), format!("{}{on}", act.label()), vec![]);
+    }
     match (&kind, act) {
+        (Kind::Logs { .. }, Act::Inspect) => app.text(s(&item, "summary"), log_lines(&item)),
         (_, Act::Inspect) => inspect(app, &kind, item),
         (Kind::Profiles, _) => profile_action(app, act, item),
         (Kind::Repos(t), _) => repo_action(app, *t, act, item),
@@ -93,6 +101,15 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         (Kind::Tasks | Kind::ServerTasks, _) => task_action(app, act, item),
         (Kind::ContentViews | Kind::CvVersions { .. } | Kind::Environments, _) => super::actions_cv::run(app, act, item),
         _ => super::actions_admin::run(app, act, item),
+    }
+}
+
+/// Detail of a Logs row: the stored lines, the summary for rows without any, a note for a dropped row.
+pub fn log_lines(row: &Value) -> Vec<String> {
+    match row["id"].as_u64().and_then(crate::session_log::detail) {
+        Some(d) if d.is_empty() => vec![s(row, "summary")],
+        Some(d) => d,
+        None => vec!["This entry is older than the last 1000 and was dropped.".into()],
     }
 }
 

@@ -46,6 +46,10 @@ pub enum Kind {
     Roles,
     Tasks,
     ServerTasks,
+    /// This session's requests, actions and notices; `polls` also shows task polling.
+    Logs {
+        polls: bool,
+    },
 }
 
 pub const NAV: &[(&str, Kind)] = &[
@@ -63,6 +67,7 @@ pub const NAV: &[(&str, Kind)] = &[
     ("Groups", Kind::Groups),
     ("Roles", Kind::Roles),
     ("Tasks", Kind::Tasks),
+    ("Logs", Kind::Logs { polls: false }),
 ];
 
 /// API collection path, extra query and search parameter of a screen.
@@ -312,11 +317,17 @@ impl Kind {
             Kind::Roles => "Roles".into(),
             Kind::Tasks => "Task Center (tracked tasks)  [t: all server tasks]".into(),
             Kind::ServerTasks => "Server tasks  [t: tracked tasks]".into(),
+            Kind::Logs { polls } => {
+                format!("Logs (this session, UTC)  [t: show/hide task polling]{}", if *polls { " — polling shown" } else { "" })
+            }
         }
     }
 
     pub fn needs_connection(&self) -> bool {
-        !matches!(self, Kind::Profiles | Kind::Environments | Kind::ContentViews | Kind::CvVersions { .. } | Kind::Tasks)
+        !matches!(
+            self,
+            Kind::Profiles | Kind::Environments | Kind::ContentViews | Kind::CvVersions { .. } | Kind::Tasks | Kind::Logs { .. }
+        )
     }
 
     /// Precise message when the server lacks what this screen needs.
@@ -356,6 +367,7 @@ impl Kind {
             }
             Kind::Tasks => Kind::ServerTasks,
             Kind::ServerTasks => Kind::Tasks,
+            Kind::Logs { polls } => Kind::Logs { polls: !polls },
             _ => return None,
         })
     }
@@ -547,6 +559,12 @@ impl Kind {
                 col("name", 44, |v| s(v, "name").trim_start_matches("pulpcore.app.tasks.").to_string()),
                 col("created", 19, |v| ts(v, "pulp_created")),
             ],
+            Kind::Logs { .. } => vec![
+                col("time", 8, |v| s(v, "at")),
+                col("kind", 7, |v| s(v, "kind")),
+                col("server", 10, |v| s(v, "server")),
+                col("summary", 80, |v| s(v, "summary")),
+            ],
         }
     }
 
@@ -585,6 +603,7 @@ impl Kind {
             Kind::Groups => vec![Members, Roles, Create, Delete, Inspect],
             Kind::Tasks => vec![Inspect, CancelTask, DismissTasks],
             Kind::ServerTasks => vec![Inspect, TrackTask, CancelTask],
+            Kind::Logs { .. } => vec![Inspect],
         }
     }
 }
@@ -728,6 +747,7 @@ pub async fn load(
                 })
                 .collect()
         }
+        Kind::Logs { polls } => crate::session_log::rows(*polls),
         _ => vec![],
     };
     let items: Vec<Value> = items.into_iter().filter(keep).collect();
@@ -760,6 +780,30 @@ mod tests {
             assert!(keys.iter().all(|c| !reserved.contains(*c)), "{k:?} uses a reserved key: {keys:?}");
             assert!(!k.columns().is_empty());
         }
+    }
+
+    #[test]
+    fn logs_screen_is_local_and_toggles_polling() {
+        let k = Kind::Logs { polls: false };
+        assert!(!k.needs_connection());
+        assert_eq!(k.toggle(), Some(Kind::Logs { polls: true }));
+        assert_eq!(k.actions(), vec![Act::Inspect]);
+        assert!(NAV.iter().any(|(l, k)| *l == "Logs" && *k == Kind::Logs { polls: false }));
+        assert!(k.title().ends_with("[t: show/hide task polling]"));
+        assert!(Kind::Logs { polls: true }.title().ends_with(" — polling shown"));
+        assert!(!Act::Inspect.mutates(&k));
+    }
+
+    #[tokio::test]
+    async fn logs_load_reads_the_session_log_and_applies_the_filter() {
+        crate::session_log::record("notice", "lab", "[ok] logs-load-needle".into(), vec![]);
+        let (store, cfg, k) = (Store::open_in_memory().unwrap(), Config::default(), Kind::Logs { polls: false });
+        let (all, n) = load(&k, None, &store, "lab", &cfg, 0, "").await.unwrap();
+        assert_eq!(n as usize, all.len());
+        let (hit, _) = load(&k, None, &store, "lab", &cfg, 0, "LOGS-LOAD-NEEDLE").await.unwrap();
+        assert_eq!(hit.len(), 1);
+        let cols: Vec<String> = k.columns().iter().map(|c| (c.get)(&hit[0])).collect();
+        assert_eq!(cols[1..], ["notice", "lab", "[ok] logs-load-needle"]);
     }
 
     #[test]

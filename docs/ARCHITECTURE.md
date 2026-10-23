@@ -8,7 +8,7 @@ tools for normal operation.
 
 | Layer | Module | Responsibility |
 |---|---|---|
-| Transport | `src/pulp/client.rs` | Auth (basic, bearer, mTLS), TLS (always verified, custom CA bundles), proxies, timeouts, bounded concurrency (semaphore), retries for reads only, pagination, response size limit, error mapping, href confinement to the configured API root |
+| Transport | `src/pulp/client.rs` | Auth (basic, bearer, mTLS), TLS (always verified, custom CA bundles), proxies, timeouts, bounded concurrency (semaphore), retries for reads only, pagination, response size limit, error mapping, href confinement to the configured API root, recording of each request attempt in the in-memory session log |
 | Capabilities | `src/pulp/caps.rs` | `status/` (component versions, health, content origin), `login/` or `users/?username=` (current user), live OpenAPI schema (endpoints, fields, enums) |
 | Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs` | RPM/File endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification |
 | Services | `src/cv.rs`, `src/replication.rs`, `src/filters.rs` | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules and `rpmvercmp` |
@@ -32,6 +32,8 @@ dropped. Esc aborts the client-side job (the HTTP request); it never cancels a P
   safe on their own level: find-or-create by name, publication reuse, and checkpoints that
   store submitted task hrefs.
 * Responses larger than `max_response_mb` are rejected.
+* The client records each attempt (method, URL, status, duration, redacted bodies) in the
+  in-memory session log, so a retried read shows as several rows.
 * Hrefs from the server (including `next` links) must stay on the same origin and below
   the configured API root.
 
@@ -153,9 +155,13 @@ state.
 * Secrets are references in the config (`env:VAR`, `file:/path`, `keyring`). The config
   parser rejects unknown keys such as `password`. Secret files that are readable by group
   or others cause a warning in the log.
-* The `Authorization` header is marked sensitive. Logs (file only, never the terminal)
-  record method, path and status only. Write-only fields (remote passwords, keys) are
+* The `Authorization` header is marked sensitive. The log file (never the terminal)
+  records method, path and status only. Write-only fields (remote passwords, keys) are
   never pre-filled in forms and are displayed masked.
+* The Logs screen (`src/session_log.rs`) keeps the last 1000 requests, actions and notices
+  of the session in memory, with request and response bodies cut at 64 KiB. Secret JSON
+  keys are redacted before a body is stored, the `Authorization` header is never recorded
+  and upload bodies are replaced by their size. The log is never written to disk.
 * Read-only profiles block every mutating request in the client before it is sent, and
   the UI hides mutating actions.
 * RBAC is enforced by Pulp. pulp-tui adds warnings (granting owner/admin roles, setting

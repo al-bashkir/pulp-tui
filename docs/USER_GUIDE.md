@@ -34,7 +34,7 @@
 | `s` / `S` | sort by next column / reverse (current page) |
 | `n` / `p` | next / previous page (100 items per page) |
 | `Space` | mark item (compare, bulk remove or add content) |
-| `t` | toggle RPM/File, content type, or tracked/server tasks |
+| `t` | toggle RPM/File, content type, tracked/server tasks, or task polling in Logs |
 | `r` | refresh |
 | `Esc` | cancel a loading request, clear marks, or go back |
 
@@ -190,6 +190,24 @@ Tracked tasks with state, progress (only what Pulp reports; no invented percenta
 start time and errors. The top box lists client operations still running. **i** details
 with all progress reports, **X** cancel on the server (confirmation), **z** dismiss
 finished tasks from the list. `t` switches to all server tasks (**a** tracks one).
+
+### Logs
+Everything that happened in this session, newest first, with the time in UTC. It works
+without a connection and follows new rows while it is open. Three kinds of rows:
+`request` (every HTTP request to Pulp: method, path, status or error, duration),
+`action` (every action you started, also ones you then cancelled, for example "Delete on os-repo") and `notice` (every
+message that the footer showed, with its `[ok]`/`[warning]`/`[error]` tag). `Enter` opens
+a row: for a request the full request and response bodies, for the others the message.
+`/` filters the rows. The polling of tasks (a GET of one task or task group, repeated
+while a job runs) is hidden by default; `t` shows or hides it.
+
+Secrets are redacted: the `Authorization` header is never recorded, JSON values of
+`password`, `token`, `secret`, `client_key` and keys that end in `_password`, `_token`
+or `_secret` (for example `proxy_password` and `sles_auth_token`) show as `•••`, and
+uploads show only their size. A body is cut at 64 KiB.
+The log keeps the last 1000 rows in memory for this session only. When it is full, the
+hidden polling rows are dropped first. It is never written to disk and is gone when you
+quit.
 
 ## Server profiles
 

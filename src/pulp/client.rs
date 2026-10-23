@@ -2,13 +2,14 @@
 //! pagination, size limits, error mapping and safe HREF handling.
 
 use crate::config::{AuthMethod, Profile, Settings, parse_secret_ref, resolve_secret};
+use crate::session_log::{self, Body};
 use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -294,17 +295,18 @@ impl PulpClient {
         }
         let url = self.url_for(href)?;
         let mut form = fields.iter().fold(reqwest::multipart::Form::new(), |f, (k, v)| f.text(k.to_string(), v.clone()));
+        let mut sent = 0;
         if let Some((name, bytes)) = file {
+            sent = bytes.len() as u64;
             form = form.part("file", reqwest::multipart::Part::bytes(bytes).file_name(name));
         }
         let _permit = self.inner.sem.acquire().await.map_err(|_| PulpError::Network("client closed".into()))?;
+        let shown = display_url(&url, &[]);
         let mut rb = self.inner.http.post(url).multipart(form);
         if let Some(a) = &self.inner.auth {
             rb = rb.header(AUTHORIZATION, a.clone());
         }
-        let resp = rb.send().await.map_err(map_reqwest)?;
-        let status = resp.status();
-        let body = read_limited(resp, self.inner.max_bytes).await?;
+        let (status, _, body) = self.exchange(rb, self.inner.max_bytes, "POST", &shown, Body::Upload(sent), json_or_text).await?;
         if !status.is_success() {
             return Err(PulpError::Api { status: status.as_u16(), message: error_text(&body) });
         }
@@ -318,16 +320,16 @@ impl PulpClient {
             return Err(PulpError::ReadOnly(format!("PUT {href}")));
         }
         let url = self.url_for(href)?;
+        let sent = data.len() as u64;
         let part = reqwest::multipart::Part::bytes(data).file_name("chunk");
         let form = reqwest::multipart::Form::new().part("file", part);
         let _permit = self.inner.sem.acquire().await.map_err(|_| PulpError::Network("client closed".into()))?;
+        let shown = display_url(&url, &[]);
         let mut rb = self.inner.http.put(url).header("Content-Range", format!("bytes {}-{}/{}", range.0, range.1, range.2)).multipart(form);
         if let Some(a) = &self.inner.auth {
             rb = rb.header(AUTHORIZATION, a.clone());
         }
-        let resp = rb.send().await.map_err(map_reqwest)?;
-        let status = resp.status();
-        let body = read_limited(resp, self.inner.max_bytes).await?;
+        let (status, _, body) = self.exchange(rb, self.inner.max_bytes, "PUT", &shown, Body::Upload(sent), json_or_text).await?;
         if !status.is_success() {
             return Err(PulpError::Api { status: status.as_u16(), message: error_text(&body) });
         }
@@ -347,9 +349,64 @@ impl PulpClient {
         {
             rb = rb.header(AUTHORIZATION, a.clone());
         }
-        let resp = rb.send().await.map_err(map_reqwest)?;
-        let status = resp.status().as_u16();
-        Ok((status, read_limited(resp, max_bytes).await?))
+        // Served files are not stored in the log, only their size.
+        let served = |b: &[u8]| Body::Text(format!("<content, {} bytes>", b.len()).into_bytes());
+        let (status, _, body) = self.exchange(rb, max_bytes, "GET", &display_url(&u, &[]), Body::None, served).await?;
+        Ok((status.as_u16(), body))
+    }
+
+    /// Send `rb`, read at most `max` bytes of the answer and record the exchange in the session log
+    /// (`shown` makes the logged response body). Headers are never logged.
+    async fn exchange(
+        &self,
+        rb: reqwest::RequestBuilder,
+        max: u64,
+        method: &str,
+        url: &str,
+        request: Body,
+        shown: fn(&[u8]) -> Body,
+    ) -> Result<(StatusCode, Option<Duration>, Vec<u8>)> {
+        let started = Instant::now();
+        let log = |status: std::result::Result<u16, String>, response: Body| {
+            let server = &self.inner.profile;
+            session_log::record_request(session_log::Request {
+                server,
+                method,
+                url,
+                status,
+                elapsed: started.elapsed(),
+                request,
+                response,
+            });
+        };
+        let resp = match rb.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let e = map_reqwest(e);
+                log(Err(e.to_string()), Body::None);
+                return Err(e);
+            }
+        };
+        let status = resp.status();
+        // Written before the body read, so a body that is too large or fails to read still reaches the file log.
+        let path = url::Url::parse(url).map(|u| u.path().to_string()).unwrap_or_default();
+        tracing::debug!(%method, path, status = status.as_u16(), "pulp api");
+        let retry_after = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|s| Duration::from_secs(s.min(30)));
+        match read_limited(resp, max).await {
+            Ok(bytes) => {
+                log(Ok(status.as_u16()), shown(&bytes));
+                Ok((status, retry_after, bytes))
+            }
+            Err(e) => {
+                log(Err(e.to_string()), Body::None);
+                Err(e)
+            }
+        }
     }
 
     async fn request(
@@ -383,24 +440,18 @@ impl PulpClient {
         body: Option<&impl Serialize>,
     ) -> std::result::Result<(StatusCode, Value), (PulpError, Option<Duration>)> {
         let _permit = self.inner.sem.acquire().await.map_err(|_| (PulpError::Network("client closed".into()), None))?;
-        let path = url.path().to_string();
+        let shown = display_url(&url, query);
         let mut rb = self.inner.http.request(method.clone(), url).query(query);
         if let Some(a) = &self.inner.auth {
             rb = rb.header(AUTHORIZATION, a.clone());
         }
+        let mut logged = Body::None;
         if let Some(b) = body {
             rb = rb.json(b);
+            logged = serde_json::to_value(b).map_or(Body::None, Body::Json);
         }
-        let resp = rb.send().await.map_err(|e| (map_reqwest(e), None))?;
-        let status = resp.status();
-        tracing::debug!(%method, path, status = status.as_u16(), "pulp api");
-        let retry_after = resp
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|s| Duration::from_secs(s.min(30)));
-        let bytes = read_limited(resp, self.inner.max_bytes).await.map_err(|e| (e, None))?;
+        let (status, retry_after, bytes) =
+            self.exchange(rb, self.inner.max_bytes, method.as_str(), &shown, logged, json_or_text).await.map_err(|e| (e, None))?;
         if !status.is_success() {
             return Err((PulpError::Api { status: status.as_u16(), message: error_text(&bytes) }, retry_after));
         }
@@ -410,6 +461,22 @@ impl PulpClient {
         let v = serde_json::from_slice(&bytes).map_err(|e| (PulpError::Decode(e.to_string()), None))?;
         Ok((status, v))
     }
+}
+
+/// The URL as shown in the log: the query is appended and any user info is dropped (credentials go in the header only).
+fn display_url(url: &url::Url, query: &[(&str, String)]) -> String {
+    let mut u = url.clone();
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    if !query.is_empty() {
+        u.query_pairs_mut().extend_pairs(query);
+    }
+    u.to_string()
+}
+
+/// A response body for the log: JSON when it parses, else the raw text.
+fn json_or_text(b: &[u8]) -> Body {
+    if b.is_empty() { Body::None } else { serde_json::from_slice(b).map_or_else(|_| Body::Text(b.to_vec()), Body::Json) }
 }
 
 fn retryable(e: &PulpError) -> bool {

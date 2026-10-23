@@ -6,7 +6,8 @@ Guidance for contributors and coding agents working on pulp-tui.
 
 `src/pulp/` is the REST layer (transport, capabilities, typed models, plugin operations).
 `src/cv.rs`, `src/replication.rs`, `src/filters.rs` are services built only on that layer.
-`src/store.rs` is the SQLite store for application-owned state. `src/tui/` is the UI:
+`src/store.rs` is the SQLite store for application-owned state. `src/session_log.rs` is the
+in-memory request/action log for the Logs screen. `src/tui/` is the UI:
 `app.rs` (state, jobs, keys, modals), `kinds.rs` (screens: source, columns, actions),
 `actions*.rs` (what actions do), `view.rs` (rendering only), `form.rs`, `pick.rs` (picker
 option loading), `tasks.rs`.

@@ -1,6 +1,6 @@
 //! Rendering only: reads `App`, never performs I/O.
 
-use super::actions::pretty;
+use super::actions::{log_lines, pretty};
 use super::app::{App, Focus, Level, Modal, Screen, item_key};
 use super::form::{FieldKind, Form, Picker};
 use super::kinds::{self, Kind, s};
@@ -200,6 +200,7 @@ fn detail_lines(kind: &Kind, v: &serde_json::Value) -> Vec<String> {
             }
             return out;
         }
+        Kind::Logs { .. } => return log_lines(v),
         _ => {}
     }
     out.extend(pretty(v));
@@ -225,13 +226,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 Level::Warn => Color::Yellow,
                 Level::Error => Color::Red,
             };
-            let tag = match x.level {
-                Level::Info => "info",
-                Level::Ok => "ok",
-                Level::Warn => "warning",
-                Level::Error => "error",
-            };
-            Line::styled(format!("[{tag}] {}", x.text), Style::default().fg(color))
+            Line::styled(format!("[{}] {}", x.level.tag(), x.text), Style::default().fg(color))
         }
         (None, Some(j)) => Line::raw(format!("… {} {} ({}s)", j.label, j.progress, j.started.elapsed().as_secs())),
         _ => Line::raw(""),
@@ -449,7 +444,7 @@ pub fn help_lines() -> Vec<String> {
         "  ↑↓ j k PgUp PgDn g G   move        Enter  action menu (shortcut letters shown)",
         "  /   server-side search  s/S sort column / reverse   n/p next/previous page",
         "  Space  mark item (multi-select: compare, remove/add content)",
-        "  t   toggle RPM/File, content type, or tracked/server tasks",
+        "  t   toggle RPM/File, content type, tracked/server tasks, or task polling in Logs",
         "  r   refresh   Esc  cancel loading request / clear marks / go back",
         "",
         "Cancelling: Esc cancels only the client-side request. Pulp tasks keep running on the",

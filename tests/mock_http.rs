@@ -256,3 +256,88 @@ async fn oversized_responses_are_rejected() {
     let c = client(&server, |_, s| s.max_response_mb = 1);
     assert!(matches!(c.get::<Value>(&c.api("big/"), &[]).await.unwrap_err(), PulpError::TooLarge(1)));
 }
+
+#[tokio::test]
+async fn logs_never_contain_credentials() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("{API}remotes/rpm/rpm/")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "name": "r1", "pulp_href": "/x/" })))
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+    c.post(&c.api("remotes/rpm/rpm/"), &json!({ "name": "r1", "url": "https://u/", "password": "hunter2" })).await.unwrap();
+    let rows = pulp_tui::session_log::rows(true);
+    let row = rows.iter().find(|r| r["summary"].as_str().unwrap().starts_with("POST /pulp/api/v3/remotes/rpm/rpm/")).unwrap();
+    let text = pulp_tui::session_log::detail(row["id"].as_u64().unwrap()).unwrap().join("\n");
+    assert!(text.contains("\"r1\""));
+    for bad in ["hunter2", "s3cret", "Basic ", "YWRtaW46czNjcmV0"] {
+        assert!(!text.contains(bad), "{bad} in {text}");
+    }
+}
+
+/// Detail text of the newest logged row whose summary starts with `prefix`.
+fn logged(prefix: &str) -> String {
+    let rows = pulp_tui::session_log::rows(true);
+    let row =
+        rows.iter().find(|r| r["summary"].as_str().unwrap().starts_with(prefix)).unwrap_or_else(|| panic!("no row {prefix}: {rows:?}"));
+    pulp_tui::session_log::detail(row["id"].as_u64().unwrap()).unwrap().join("\n")
+}
+
+#[tokio::test]
+async fn logs_every_exit_path() {
+    let server = MockServer::start().await;
+    let get = |p: &str, r: ResponseTemplate| Mock::given(method("GET")).and(path(format!("{API}{p}"))).respond_with(r);
+    get("log-plain/", ResponseTemplate::new(200).set_body_json(json!({ "ok": 1 }))).mount(&server).await;
+    get("log-q/", ResponseTemplate::new(200).set_body_json(json!({ "ok": 1 }))).mount(&server).await;
+    get("log-html/", ResponseTemplate::new(200).set_body_string("<html>not json</html>")).mount(&server).await;
+    get("log-err/", ResponseTemplate::new(404).set_body_json(json!({ "detail": "gone" }))).mount(&server).await;
+    get("log-big/", ResponseTemplate::new(200).set_body_string("x".repeat(2 * 1024 * 1024))).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("{API}log-form/")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": "/x/" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT")).and(path(format!("{API}log-chunk/"))).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/content/log-file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("0123456789"))
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+
+    // No query: no trailing '?'. With a query: it is part of the shown URL.
+    c.get::<Value>(&c.api("log-plain/"), &[]).await.unwrap();
+    assert!(logged("GET /pulp/api/v3/log-plain/ 200").contains("\"ok\": 1"));
+    c.get::<Value>(&c.api("log-q/"), &[("limit", "5".into())]).await.unwrap();
+    assert!(logged("GET /pulp/api/v3/log-q/?limit=5 200").contains("status: 200"));
+
+    // A body that is not JSON is kept as text, even though the call itself fails to decode.
+    assert!(matches!(c.get::<Value>(&c.api("log-html/"), &[]).await.unwrap_err(), PulpError::Decode(_)));
+    assert!(logged("GET /pulp/api/v3/log-html/ 200").contains("<html>not json</html>"));
+
+    // A non-success status keeps its body.
+    c.get::<Value>(&c.api("log-err/"), &[]).await.unwrap_err();
+    let text = logged("GET /pulp/api/v3/log-err/ 404");
+    assert!(text.contains("status: 404") && text.contains("gone"), "{text}");
+
+    // The body is rejected as too large: the failure is recorded.
+    let small = client(&server, |_, s| s.max_response_mb = 1);
+    assert!(matches!(small.get::<Value>(&small.api("log-big/"), &[]).await.unwrap_err(), PulpError::TooLarge(1)));
+    assert!(logged("GET /pulp/api/v3/log-big/ response larger than 1 MiB rejected").contains("error: response larger"));
+
+    // Uploads and served content are logged by size only.
+    c.post_form(&c.api("log-form/"), &[("sha256", "abc".into())], Some(("a.rpm".into(), vec![7; 5]))).await.unwrap();
+    let text = logged("POST /pulp/api/v3/log-form/ 201");
+    assert!(text.contains("<upload, 5 bytes>") && !text.contains("sha256"), "{text}");
+    c.put_chunk(&c.api("log-chunk/"), (0, 3, 4), vec![1; 4]).await.unwrap();
+    assert!(logged("PUT /pulp/api/v3/log-chunk/ 200").contains("<upload, 4 bytes>"));
+    c.fetch_content(&format!("{}/content/log-file", server.uri()), 1024).await.unwrap();
+    let text = logged("GET /content/log-file 200");
+    assert!(text.contains("<content, 10 bytes>") && !text.contains("0123456789"), "{text}");
+
+    // A network error has no status.
+    let down = client(&server, |p, _| p.url = "http://127.0.0.1:1".into());
+    down.post(&down.api("log-down/"), &json!({})).await.unwrap_err();
+    assert!(logged("POST /pulp/api/v3/log-down/ network error").contains("error: network error"));
+}
