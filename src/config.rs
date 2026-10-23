@@ -48,7 +48,9 @@ impl Database {
         if !matches!(u.scheme(), "postgres" | "postgresql" | "sqlite") {
             bail!("database url must use postgres, postgresql or sqlite");
         }
-        if u.password().is_some() || u.query_pairs().any(|(k, _)| k == "password") {
+        if u.password().is_some()
+            || u.query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("password") || k.eq_ignore_ascii_case("sslpassword"))
+        {
             bail!("put the database password in secret, not in the URL");
         }
         Ok(u)
@@ -70,6 +72,9 @@ impl Database {
         }
         if let Some(s) = &self.secret {
             let pw = resolve_secret(DATABASE_KEYRING_USER, &parse_secret_ref(s)?)?;
+            // `set_password` leaves `%` as is and sqlx percent-decodes: encode every byte but ASCII alphanumerics.
+            let pw: String =
+                pw.bytes().map(|b| if b.is_ascii_alphanumeric() { char::from(b).to_string() } else { format!("%{b:02X}") }).collect();
             u.set_password(Some(&pw)).map_err(|_| anyhow::anyhow!("database url needs a host to set the password"))?;
         }
         // sqlx connects to the last `host`/`hostaddr` parameter, else to the URL host.
@@ -332,7 +337,11 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                let cfg: Config = toml::from_str(&s).with_context(|| format!("invalid config {}", path.display()))?;
+                // The toml error text quotes the source line, which can hold a password: report its message and line only.
+                let cfg: Config = toml::from_str(&s).map_err(|e| {
+                    let line = e.span().map_or(0, |r| s[..r.start].matches('\n').count() + 1);
+                    anyhow::anyhow!("invalid config {} line {line}: {}", path.display(), e.message())
+                })?;
                 for (name, p) in &cfg.profiles {
                     p.validate().with_context(|| format!("profile {name}"))?;
                 }
@@ -364,10 +373,10 @@ impl Config {
         self.default_profile.clone().filter(|d| self.profiles.contains_key(d)).or_else(|| self.profiles.keys().next().cloned())
     }
 
-    /// `import-cv` creates objects in the `[database]`: a read-only profile must not do that.
-    pub fn check_import_cv(&self, profile: &str) -> Result<()> {
+    /// `import-cv` and `db copy` create objects in the `[database]`: a read-only profile must not do that.
+    pub fn check_shared_write(&self, profile: &str, command: &str) -> Result<()> {
         if self.database.is_some() && self.profiles.get(profile).is_some_and(|p| p.read_only) {
-            bail!("profile {profile} is read-only; import-cv writes to the shared database");
+            bail!("profile {profile} is read-only; {command} writes to the shared database");
         }
         Ok(())
     }
@@ -444,14 +453,18 @@ read_only = true
     }
 
     #[test]
-    fn import_cv_needs_a_writable_profile_only_with_a_shared_database() {
+    fn shared_database_writes_need_a_writable_profile() {
         let mut cfg: Config = toml::from_str(EXAMPLE).unwrap();
-        assert!(cfg.check_import_cv("prod").is_ok(), "the local file: nothing changes");
+        assert!(cfg.check_shared_write("prod", "import-cv").is_ok(), "the local file: nothing changes");
         cfg.database = Some(Database { url: "postgres://u@h/x".into(), secret: None, ca_cert: None });
-        assert!(cfg.check_import_cv("lab").is_ok());
+        assert!(cfg.check_shared_write("lab", "db copy").is_ok());
         assert_eq!(
-            cfg.check_import_cv("prod").unwrap_err().to_string(),
+            cfg.check_shared_write("prod", "import-cv").unwrap_err().to_string(),
             "profile prod is read-only; import-cv writes to the shared database"
+        );
+        assert_eq!(
+            cfg.check_shared_write("prod", "db copy").unwrap_err().to_string(),
+            "profile prod is read-only; db copy writes to the shared database"
         );
     }
 
@@ -461,10 +474,41 @@ read_only = true
         assert!(d.validate().unwrap_err().to_string().contains("secret"));
         let c: Result<Config, _> = toml::from_str("[database]\nurl = \"postgres://u@h/x\"\npassword = \"x\"\n");
         assert!(c.is_err());
-        // sqlx also reads a password from the query string.
-        let q = Database { url: "postgres://u@h/x?password=pw".into(), secret: None, ca_cert: None };
-        assert!(q.validate().unwrap_err().to_string().contains("secret"));
+        // sqlx also reads a password (and the client key password) from the query string.
+        for q in ["password=pw", "PassWord=pw", "sslpassword=pw", "SSLPASSWORD=pw"] {
+            let d = Database { url: format!("postgres://u@h/x?sslmode=require&{q}"), secret: None, ca_cert: None };
+            assert_eq!(d.validate().unwrap_err().to_string(), "put the database password in secret, not in the URL", "{q}");
+        }
         assert!(Database { url: "mysql://u@h/x".into(), secret: None, ca_cert: None }.validate().is_err());
+    }
+
+    #[test]
+    fn connect_url_keeps_every_password_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("pw");
+        let d = Database { url: "postgres://u@127.0.0.1/x".into(), secret: Some(format!("file:{}", f.display())), ca_cert: None };
+        for pw in ["a%41b", "p@ss:w/rd", "p@ss word+"] {
+            std::fs::write(&f, pw).unwrap();
+            let u = url::Url::parse(&d.connect_url().unwrap()).unwrap();
+            // sqlx percent-decodes the password (the encoded form has no `+`, `&` or `=`, so this decodes the same).
+            let got = url::form_urlencoded::parse(u.password().unwrap().as_bytes()).next().unwrap().0;
+            assert_eq!(got, pw);
+        }
+    }
+
+    #[test]
+    fn parse_errors_do_not_echo_the_config_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for text in [
+            "[database]\nurl = \"postgres://u@h/x\"\npassword = \"hunter2\"\n",
+            "[profiles.x]\nurl = \"http://h\"\npassword = \"hunter2\"\n",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let e = format!("{:#}", Config::load(&path).unwrap_err());
+            assert!(!e.contains("hunter2"), "{e}");
+            assert!(e.starts_with(&format!("invalid config {} line 3: unknown field `password`, expected ", path.display())), "{e}");
+        }
     }
 
     #[test]

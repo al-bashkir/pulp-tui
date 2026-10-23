@@ -308,20 +308,29 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             ap(move |app| {
                 let lines = vec![
                     format!("Locked by {} ({}) since {}.", h.owner, h.operation, h.acquired_at),
-                    "Break it only if that session is dead. Its workflow stops before its next step.".into(),
+                    "Break it only if that session is dead. Its workflow stops within 30 s.".into(),
                 ];
                 app.confirm_danger(format!("Break lock on {name}"), lines, &name.clone(), move |app| {
                     app.job(format!("break lock on {name}"), move |ctx| async move {
                         let svc = ctx.cv()?;
-                        let msg = match svc.store.break_lock(id).await? {
-                            Some(h) => {
-                                svc.audit("cv.lock.break", &format!("{name}: {} ({}) since {}", h.owner, h.operation, h.acquired_at)).await;
-                                format!("lock on {name} broken")
-                            }
-                            None => format!("{name} is not locked"),
+                        // Only the lock shown: another operator may hold it by now.
+                        let res = if svc.store.break_lock(id, &h).await? {
+                            svc.audit("cv.lock.break", &format!("{name}: {} ({}) since {}", h.owner, h.operation, h.acquired_at)).await;
+                            Ok(format!("lock on {name} broken"))
+                        } else {
+                            Err(match svc.store.lock_holder(id).await? {
+                                Some(n) => format!(
+                                    "lock on {name} changed, not broken: now locked by {} ({}) since {}",
+                                    n.owner, n.operation, n.acquired_at
+                                ),
+                                None => format!("{name} is not locked any more"),
+                            })
                         };
                         ap(move |app| {
-                            app.ok(msg);
+                            match res {
+                                Ok(m) => app.ok(m),
+                                Err(m) => app.error(m),
+                            }
                             app.reload();
                         })
                     });

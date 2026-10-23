@@ -12,7 +12,7 @@ tools for normal operation.
 | Capabilities | `src/pulp/caps.rs` | `status/` (component versions, health, content origin), `login/` or `users/?username=` (current user), live OpenAPI schema (endpoints, fields, enums) |
 | Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs` | RPM/File endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification |
 | Services | `src/cv.rs`, `src/replication.rs`, `src/filters.rs` | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules and `rpmvercmp` |
-| Storage | `src/store.rs` | SQLite: task references, Content View definitions, versions, checkpoints, environments, bindings, audit log, replication runs |
+| Storage | `src/store.rs` | sqlx (SQLite, optionally PostgreSQL): task references, Content View definitions, versions, checkpoints, environments, bindings, audit log with operator, locks, replication runs |
 | TUI | `src/tui/*` | Event loop, state, screens, forms, confirmations, Task Center |
 
 ### Event model
@@ -39,7 +39,7 @@ dropped. Esc aborts the client-side job (the HTTP request); it never cancels a P
 
 ### Task tracking
 
-Pulp tasks are the source of truth. The Task Center stores task references in SQLite and
+Pulp tasks are the source of truth. The Task Center stores task references in the local file and
 polls each unfinished task on its own schedule: the interval starts at `poll_min_ms`,
 grows by 1.5x while nothing changes, resets on progress, and has ±20 % jitter. At most
 three polls run at the same time. A task that a workflow already waits on is not polled
@@ -55,7 +55,7 @@ idle group whose counts stay the same for three polls is also treated as final.
 | Concept | Owner | Notes |
 |---|---|---|
 | Repository, Remote, Repository Version, Publication, Distribution, Task, Task Group, User, Group, Role, Upstream Pulp | **Pulp** | Used as documented. The Repository and the Remote are separate objects. |
-| Content View, Content View Version, Lifecycle Environment, Promotion, Binding | **pulp-tui** | Not a Pulp API and not Katello. Stored in the local SQLite database and built from the Pulp objects above. |
+| Content View, Content View Version, Lifecycle Environment, Promotion, Binding | **pulp-tui** | Not a Pulp API and not Katello. Stored in the local SQLite file, or in the shared `[database]` when one is configured (see "Storage"), and built from the Pulp objects above. |
 
 ### Content View implementation
 
@@ -133,25 +133,118 @@ failed publish keeps its checkpoints; *Resume* continues from them.
 
 ## Storage
 
-SQLite (`<data_dir>/pulp-tui.db`, WAL mode). Migrations are numbered SQL batches applied
-in a transaction and tracked with `PRAGMA user_version`. A database from a newer version
-is refused. All rows are scoped by profile name.
+`Store` (`src/store.rs`) uses sqlx with its `Any` driver, so one implementation of each
+method serves SQLite and PostgreSQL. All store calls are `async`; the UI thread never
+calls them (they run in jobs). pulp-tui holds up to two stores:
 
-**Limits of local-only orchestration**
+| Store | Opened | Holds | Rows scoped by |
+|---|---|---|---|
+| Local file `<data_dir>/pulp-tui.db` (SQLite, WAL) | always, migrated on open | task references, replication runs; also the Content View data when no `[database]` is set | profile name |
+| External `[database]` (PostgreSQL, or SQLite at a path) | at start, never migrated | Content Views, repositories and filters, versions and checkpoints, environments, bindings, audit log, locks | server key |
 
-* One operator per database file. Two operators with two databases can create Content
-  Views with the same name on one Pulp server; ownership labels prevent silent takeover,
-  but they do not coordinate work.
-* Workflows run only while the TUI runs. Pulp tasks continue without the client; the
-  client-side orchestration (next steps of a publish or promotion) waits for the next
-  *Resume* or promotion.
+`App.store` is the local file. `App.cv_store` is the store of Content View data: the same
+local store without `[database]`, else the external one. If the external database cannot
+be opened, `cv_store` holds the error, Content View screens and actions report
+`shared database unavailable: ...`, and nothing falls back to the local file (the state
+would split).
 
-**Migration path to a shared service.** The schema uses only portable SQL (integer keys,
-text, no SQLite-specific types). To support several operators or unattended multi-stage
-workflows, move `Store` behind a small service with PostgreSQL, keep the same tables, and
-run the existing `CvService` / `replication` code there as a worker that resumes
-checkpointed versions. The TUI would call that service instead of opening SQLite. No such
-daemon is needed for single-operator use.
+**Server key scope.** In the external database the scope value is the server key
+`<origin><api_root>#<domain>` (`Profile::server_key`, applied by `Store::scope`), so two
+operators with different profile names for one server share rows. In the local file the
+scope stays the profile name, so existing data stays valid. The key comes from the URL as
+the operator typed it (`url::Url` only makes the host lower case and removes a default
+port). So every operator must use the same scheme, host, port, `api_root` and domain for a
+server; a short host name or an IP address gives another key and other rows. `db copy`
+writes under the key of the profile that runs it. The Dashboard shows the key
+(`shared database scope: <key>`), so operators can compare it.
+
+**Schema and upgrades.** `MIGRATIONS` (SQLite, `PRAGMA user_version`) and `PG_MIGRATIONS`
+(PostgreSQL, a `schema_version` table) are lists of numbered SQL batches of the same length
+(a unit test checks this). PostgreSQL uses `BIGINT` for every integer and identity
+columns, because sqlx `Any` reads integers as `i64`. A batch and its version number are
+applied in one transaction. The local file migrates on open. The external database changes
+only with `pulp-tui db migrate` (`Store::migrate_external`), which also creates the schema
+and, on PostgreSQL, holds a `pg_advisory_lock` so two administrators cannot migrate at the
+same time. A normal start (`Store::open_external`) compares versions and refuses an
+uninitialized, older or newer schema with a message. Operators need only
+`SELECT/INSERT/UPDATE/DELETE`; the database ID is created with an `INSERT`.
+Schema 2 added the `meta` table (database ID `db_id` and aliases `alias:<id>`),
+`scope_settings` (the base path prefix per server, first value wins), `locks` and
+`audit.actor`.
+
+**Connection.** `Database::connect_url` (`src/config.rs`) builds the URL: it adds the
+password from the secret reference and forces `sslmode=verify-full` for every PostgreSQL
+host except a Unix socket or a loopback address. sqlx uses rustls with the root
+certificates built into the binary; `ca_cert` (`sslrootcert`) is added to them and the
+operating system store is not read (see COMPATIBILITY.md). A first plain connection attempt
+has a 10 s limit, so an unreachable host fails with a clear error. Error text uses the URL
+without the password (`Database::display_url`).
+
+**Operator and audit.** The operator is `username@host` (`store::actor`). It goes into
+the `audit.actor` column and into locks.
+
+**Locks.** One row per Content View in `locks` (`owner`, a random `token`, `operation`,
+`renewed_at` in client Unix seconds). `Store::try_lock` is one statement: `INSERT ... ON
+CONFLICT(cv_id) DO UPDATE ... WHERE locks.renewed_at < now - 120`. It wins when there is
+no row or the row has expired (TTL `LOCK_TTL_SECS` = 120 s), so the takeover is atomic on
+both backends. `CvLock` (`src/cv.rs`) holds the lock for one workflow and renews it every
+`LOCK_RENEW_SECS` = 30 s in a background task. `Store::renew_lock` updates only the row
+with its own token: if it matches nothing (another operator took over after expiry, or
+*Break lock* removed it), the database is unreachable, or the round takes longer than
+30 s (`database unreachable: renewal timed out`), the task sets a flag and stops.
+`CvService::alive()` calls `CvLock::check` before every Pulp mutation and before every
+checkpoint or binding write (no database round trip per step) and stops the workflow with
+`lock on <view> lost: <reason>`. `check` reads that flag, and it also fails with `not
+renewed for <n> s` when the last successful renewal (or the acquire) is more than
+`LOCK_TTL_SECS - LOCK_RENEW_SECS` = 90 s old in wall-clock time (`CvLock::ok_at`). Tokio
+timers do not count the time a computer sleeps, so after a resume the renewal task may not
+have run yet while the row has already expired and another operator holds it; the 90 s
+check stops the workflow before its next step.
+Three writes still happen after a lost lock, because they record work already sent to Pulp
+or why the workflow stopped: the href of a copy task that was just submitted; the `failed`
+state of a stopped publish; and the final state of a promotion (`partial`, or `failed` when
+no repository was done). The last two are conditional when the lock is lost:
+`Store::fail_publishing_version` changes the version only while it is `publishing`, and
+`Store::finish_promoting_binding` changes the binding only while it is still this
+version's `promoting` row. So they do not overwrite the result of an operator who took the
+lock over and finished the work (the audit row is still written). A stopped publish keeps
+its checkpoints, so *Resume* continues it; a promotion is retried. *Break lock*
+(`Store::break_lock`) deletes the row only when its owner and `acquired_at` still match the
+holder shown in the dialog, so it cannot remove a lock that another operator took meanwhile.
+Dropping the `CvLock` (workflow end, Esc) releases the row
+by token. A crash leaves the row until it expires. The same code runs for the local file, so
+two pulp-tui processes on one host also exclude each other. Publish, resume, promote
+(rollback, reconcile), delete view and delete version lock; preview, compare, verify and
+edits do not.
+
+**Read-only mode.** With a `[database]`, edits of Content Views and environments and
+`import-cv` change shared state, so `Act::mutates(kind, shared)` counts them as mutating.
+Without it they are not (they touch only the local file).
+
+**Moving data.** `pulp-tui db copy` (`Store::copy_from`) copies one profile's Content View
+data from the local file into the external database in one target transaction, with new
+ids and remapped references. It refuses name clashes and never merges. The local file's
+database ID becomes an alias in the target `meta`.
+
+**Limits.**
+
+* The database coordinates operators through locks only. There is no daemon: workflows run
+  only while a TUI runs. Pulp tasks continue without the client; the client-side
+  orchestration (next steps of a publish or promotion) waits for the next *Resume* or
+  promotion, which any operator can start.
+* Lock times come from the clients' clocks. The 2-minute TTL covers normal clock skew, not
+  hours of it.
+* Other operators' changes show after a refresh. There is no push.
+* A shared SQLite file works only when all operators use one host, and every operator's
+  account must be able to write the file and its `-wal` and `-shm` files (a group-writable
+  directory). SQLite WAL does not work on NFS or SMB.
+* The operator name contains the host name. In a container it is a random ID unless the
+  container is started with `--hostname`.
+* Two *different* databases that manage the same Pulp server do not coordinate. The
+  ownership labels (including `pulp_tui_db`) stop silent takeover but do not lock.
+* A server that later needs unattended multi-stage workflows can run the existing
+  `CvService` / `replication` code as a worker against the same PostgreSQL tables and resume
+  checkpointed versions. That daemon does not exist.
 
 Export/import (`pulp-tui export-cv`, `import-cv`, or the Servers screen) moves Content
 View and environment definitions between databases. It contains no secrets and no Pulp
@@ -161,9 +254,12 @@ state.
 
 * TLS is always verified. A custom CA bundle is added to the system roots. There is no
   option to disable verification or to fall back from HTTPS to HTTP.
+* The database connection to a remote PostgreSQL always uses TLS with `verify-full`
+  (chain and host name); only a Unix socket or a loopback host is exempt. The URL may not
+  contain a password, and errors show the URL without it.
 * Secrets are references in the config (`env:VAR`, `file:/path`, `keyring`). The config
   parser rejects unknown keys such as `password`. Secret files that are readable by group
-  or others cause a warning in the log.
+  or others cause a warning in the log. The `[database]` secret uses the same references.
 * The `Authorization` header is marked sensitive. The log file (never the terminal)
   records method, path and status only. Write-only fields (remote passwords, keys) are
   never pre-filled in forms and are displayed masked.

@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions, AnyRow};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -638,6 +639,18 @@ impl Store {
         Ok(())
     }
 
+    /// `finish_version(id, "failed", error)` only while the version is `publishing`: a workflow that lost
+    /// its lock must not overwrite the result of the operator who took it over.
+    pub async fn fail_publishing_version(&self, id: i64, error: &str) -> Result<()> {
+        sqlx::query("UPDATE cv_versions SET state = 'failed', error = $2, finished_at = $3 WHERE id = $1 AND state = 'publishing'")
+            .bind(id)
+            .bind(error)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn versions(&self, cv_id: i64) -> Result<Vec<CvVersion>> {
         let rows = sqlx::query(
             "SELECT id, cv_id, number, notes, state, created_at, finished_at, error FROM cv_versions WHERE cv_id = $1 ORDER BY number DESC",
@@ -815,6 +828,21 @@ impl Store {
         Ok(())
     }
 
+    /// `set_binding` only while the binding is still this promotion's `promoting` row (see `fail_publishing_version`).
+    pub async fn finish_promoting_binding(&self, env_id: i64, cv_id: i64, version_id: i64, state: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE bindings SET state = $4, updated_at = $5 WHERE env_id = $1 AND cv_id = $2 AND version_id = $3 AND state = 'promoting'",
+        )
+        .bind(env_id)
+        .bind(cv_id)
+        .bind(version_id)
+        .bind(state)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn binding_repos(&self, env_id: i64, cv_id: i64) -> Result<Vec<BindingRepo>> {
         let rows = sqlx::query(
             "SELECT env_id, cv_id, repo_href, repo_name, repo_type, distribution, base_path, publication
@@ -913,13 +941,16 @@ impl Store {
         Ok(())
     }
 
-    /// Remove the lock whoever holds it; returns what was removed.
-    pub async fn break_lock(&self, cv_id: i64) -> Result<Option<LockHolder>> {
-        let r = sqlx::query("DELETE FROM locks WHERE cv_id = $1 RETURNING owner, operation, acquired_at")
+    /// Remove the lock of holder `h` (the one shown to the operator); `false`: the lock changed or is gone.
+    pub async fn break_lock(&self, cv_id: i64, h: &LockHolder) -> Result<bool> {
+        let n = sqlx::query("DELETE FROM locks WHERE cv_id = $1 AND owner = $2 AND acquired_at = $3")
             .bind(cv_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        r.as_ref().map(lock_row).transpose()
+            .bind(&h.owner)
+            .bind(&h.acquired_at)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n == 1)
     }
 
     pub async fn lock_holder(&self, cv_id: i64) -> Result<Option<LockHolder>> {
@@ -1039,6 +1070,189 @@ impl Store {
         }
         Ok((cvs, envs))
     }
+
+    // ---- db copy ---------------------------------------------------------------------
+
+    /// `pulp-tui db copy`, on the target: copy the Content View data of `src_scope` in `src` (the local file)
+    /// into `dst_scope` here, in one transaction with new ids. It never merges: a name that exists is refused.
+    /// Task references, replication runs and locks stay behind. `src` is only read.
+    pub async fn copy_from(&self, src: &Store, src_scope: &str, dst_scope: &str) -> Result<CopyReport> {
+        let (views, envs) = (src.content_views(src_scope).await?, src.environments(src_scope).await?);
+        let have = self.content_views(dst_scope).await?;
+        if let Some(v) = views.iter().find(|v| have.iter().any(|h| h.name == v.name)) {
+            bail!("target already has content view {} for this server; db copy never merges", v.name);
+        }
+        let have = self.environments(dst_scope).await?;
+        if let Some(e) = envs.iter().find(|e| e.prior_id.is_some() && have.iter().any(|h| h.name == e.name)) {
+            bail!("target already has environment {} for this server; db copy never merges", e.name);
+        }
+        let mut log = src.audit_log(src_scope, i64::MAX as usize).await?;
+        log.reverse(); // oldest first, so the new ids keep the order
+        let mut report = CopyReport {
+            views: views.len(),
+            environments: envs.iter().filter(|e| e.prior_id.is_some()).count(),
+            audit: log.len(),
+            ..Default::default()
+        };
+
+        let mut tx = self.pool.begin().await?;
+        // Source ids to target ids; environments come in path order, so a prior is always mapped first.
+        let mut env_ids = HashMap::new();
+        sqlx::query("INSERT INTO environments(profile, name, prior_id) VALUES ($1, $2, NULL) ON CONFLICT(profile, name) DO NOTHING")
+            .bind(dst_scope)
+            .bind(LIBRARY)
+            .execute(&mut *tx)
+            .await?;
+        let library: i64 = sqlx::query_scalar("SELECT id FROM environments WHERE profile = $1 AND name = $2")
+            .bind(dst_scope)
+            .bind(LIBRARY)
+            .fetch_one(&mut *tx)
+            .await?;
+        for e in &envs {
+            let id = match e.prior_id {
+                None => library,
+                Some(prior) => {
+                    sqlx::query_scalar("INSERT INTO environments(profile, name, prior_id, protected) VALUES ($1, $2, $3, $4) RETURNING id")
+                        .bind(dst_scope)
+                        .bind(&e.name)
+                        .bind(env_ids[&prior])
+                        .bind(e.protected as i64)
+                        .fetch_one(&mut *tx)
+                        .await?
+                }
+            };
+            env_ids.insert(e.id, id);
+        }
+        for v in &views {
+            let cv_id: i64 = sqlx::query_scalar(
+                "INSERT INTO content_views(profile, name, description, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+            )
+            .bind(dst_scope)
+            .bind(&v.name)
+            .bind(&v.description)
+            .bind(&v.created_at)
+            .fetch_one(&mut *tx)
+            .await?;
+            for r in src.cv_repos(v.id).await? {
+                sqlx::query("INSERT INTO cv_repos(cv_id, repo_href, repo_name, repo_type, filters) VALUES ($1, $2, $3, $4, $5)")
+                    .bind(cv_id)
+                    .bind(&r.repo_href)
+                    .bind(&r.repo_name)
+                    .bind(type_str(r.repo_type))
+                    .bind(serde_json::to_string(&r.filters)?)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            let mut version_ids = HashMap::new();
+            let mut versions = src.versions(v.id).await?;
+            versions.reverse();
+            report.versions += versions.len();
+            for ver in &versions {
+                let id: i64 = sqlx::query_scalar(
+                    "INSERT INTO cv_versions(cv_id, number, notes, state, created_at, finished_at, error)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+                )
+                .bind(cv_id)
+                .bind(ver.number)
+                .bind(&ver.notes)
+                .bind(&ver.state)
+                .bind(&ver.created_at)
+                .bind(&ver.finished_at)
+                .bind(&ver.error)
+                .fetch_one(&mut *tx)
+                .await?;
+                version_ids.insert(ver.id, id);
+                for vr in src.version_repos(ver.id).await? {
+                    let r = vr.repo();
+                    sqlx::query(
+                        "INSERT INTO cv_version_repos(version_id, repo_href, repo_name, repo_type, filters, source_version, derived_repo,
+                                derived_version, publication, pending_task, content_count)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                    )
+                    .bind(id)
+                    .bind(&r.repo_href)
+                    .bind(&r.repo_name)
+                    .bind(type_str(r.repo_type))
+                    .bind(serde_json::to_string(&r.filters)?)
+                    .bind(&vr.source_version)
+                    .bind(&vr.derived_repo)
+                    .bind(&vr.derived_version)
+                    .bind(&vr.publication)
+                    .bind(&vr.pending_task)
+                    .bind(vr.content_count)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            let bindings = src.bindings_for_cv(v.id).await?;
+            report.bindings += bindings.len();
+            for b in &bindings {
+                let env_id = env_ids.get(&b.env_id).copied().context("a binding points at an environment outside the path")?;
+                let version_id = version_ids.get(&b.version_id).copied().context("a binding points at a version of another view")?;
+                sqlx::query("INSERT INTO bindings(env_id, cv_id, version_id, state, updated_at) VALUES ($1, $2, $3, $4, $5)")
+                    .bind(env_id)
+                    .bind(cv_id)
+                    .bind(version_id)
+                    .bind(&b.state)
+                    .bind(&b.updated_at)
+                    .execute(&mut *tx)
+                    .await?;
+                for r in src.binding_repos(b.env_id, v.id).await? {
+                    sqlx::query(
+                        "INSERT INTO binding_repos(env_id, cv_id, repo_href, repo_name, repo_type, distribution, base_path, publication)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                    )
+                    .bind(env_id)
+                    .bind(cv_id)
+                    .bind(&r.repo_href)
+                    .bind(&r.repo_name)
+                    .bind(type_str(r.repo_type))
+                    .bind(&r.distribution)
+                    .bind(&r.base_path)
+                    .bind(&r.publication)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+        for a in &log {
+            sqlx::query("INSERT INTO audit(profile, at, action, detail, actor) VALUES ($1, $2, $3, $4, $5)")
+                .bind(dst_scope)
+                .bind(&a.at)
+                .bind(&a.action)
+                .bind(&a.detail)
+                .bind(if a.actor.is_empty() { "copied" } else { &a.actor })
+                .execute(&mut *tx)
+                .await?;
+        }
+        // The base path prefix stays with the server: promotions after the copy keep the same paths.
+        if let Some(prefix) = src.stored_prefix(src_scope).await? {
+            sqlx::query("INSERT INTO scope_settings(scope, key, value) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                .bind(dst_scope)
+                .bind(PREFIX_KEY)
+                .bind(prefix)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // Pulp objects the local file labeled with its id are now this database's.
+        sqlx::query("INSERT INTO meta(key, value) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(format!("alias:{}", src.db_id()))
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(report)
+    }
+}
+
+/// What `Store::copy_from` copied; `environments` does not count Library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CopyReport {
+    pub views: usize,
+    pub versions: usize,
+    pub environments: usize,
+    pub bindings: usize,
+    pub audit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1350,14 +1564,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn break_lock_returns_the_removed_holder() {
+    async fn break_lock_removes_only_the_shown_holder() {
         let s = Store::open_in_memory().await.unwrap();
         let cv = s.create_cv("k", "web", "").await.unwrap();
-        assert!(s.break_lock(cv).await.unwrap().is_none());
         s.try_lock(cv, "alice@a", "t1", "publish", 1000).await.unwrap().unwrap();
-        let h = s.break_lock(cv).await.unwrap().unwrap();
-        assert_eq!((h.owner.as_str(), h.acquired_at.as_str()), ("alice@a", "1970-01-01T00:16:40Z"));
+        let shown = s.lock_holder(cv).await.unwrap().unwrap();
+        assert_eq!((shown.owner.as_str(), shown.acquired_at.as_str()), ("alice@a", "1970-01-01T00:16:40Z"));
+        // While the dialog was open, Alice's lock expired and Bob took it over.
+        s.try_lock(cv, "bob@b", "t2", "promote to Prod", 1000 + LOCK_TTL_SECS + 1).await.unwrap().unwrap();
+        assert!(!s.break_lock(cv, &shown).await.unwrap(), "Bob's lock is not the one shown");
+        let now = s.lock_holder(cv).await.unwrap().unwrap();
+        assert_eq!(now.owner, "bob@b");
+        assert!(s.break_lock(cv, &now).await.unwrap());
         assert!(s.lock_holder(cv).await.unwrap().is_none());
+        assert!(!s.break_lock(cv, &now).await.unwrap(), "nothing left to remove");
+    }
+
+    #[tokio::test]
+    async fn writes_after_a_lost_lock_keep_the_new_holders_result() {
+        let s = Store::open_in_memory().await.unwrap();
+        let cv = s.create_cv("k", "web", "").await.unwrap();
+        let lib = s.ensure_library("k").await.unwrap();
+        let (v1, v2) = (s.begin_version(cv, "", &[]).await.unwrap(), s.begin_version(cv, "", &[]).await.unwrap());
+        // Still publishing: the stop is recorded.
+        s.fail_publishing_version(v1.id, "lock lost").await.unwrap();
+        let v = s.version(v1.id).await.unwrap();
+        assert_eq!((v.state.as_str(), v.error.as_deref()), ("failed", Some("lock lost")));
+        // The new holder published it meanwhile: unchanged.
+        s.finish_version(v2.id, "published", None).await.unwrap();
+        s.fail_publishing_version(v2.id, "lock lost").await.unwrap();
+        let v = s.version(v2.id).await.unwrap();
+        assert_eq!((v.state.as_str(), v.error), ("published", None));
+
+        // Still this promotion: the final state is recorded.
+        s.set_binding(lib, cv, v1.id, "promoting").await.unwrap();
+        s.finish_promoting_binding(lib, cv, v1.id, "partial").await.unwrap();
+        assert_eq!(s.binding(lib, cv).await.unwrap().unwrap().state, "partial");
+        // The new holder finished the same or another version meanwhile: unchanged.
+        for (vid, state) in [(v1.id, "active"), (v2.id, "active"), (v2.id, "promoting")] {
+            s.set_binding(lib, cv, vid, state).await.unwrap();
+            s.finish_promoting_binding(lib, cv, v1.id, "partial").await.unwrap();
+            let b = s.binding(lib, cv).await.unwrap().unwrap();
+            assert_eq!((b.version_id, b.state.as_str()), (vid, state));
+        }
     }
 
     #[tokio::test]
@@ -1398,5 +1647,183 @@ mod tests {
         let t = s.tasks("lab", 10).await.unwrap();
         assert_eq!(t[0].href, "/t/2/"); // unfinished first
         assert_eq!(t[1].state, "completed");
+    }
+
+    #[tokio::test]
+    async fn copy_remaps_ids_and_keeps_history() {
+        let src = Store::open_in_memory().await.unwrap();
+        let lib = src.ensure_library("lab").await.unwrap();
+        let dev = src.create_env("lab", "Dev", lib, true).await.unwrap();
+        let cv = src.create_cv("lab", "web", "d").await.unwrap();
+        let repo = CvRepo { repo_href: "/r/1/".into(), repo_name: "os".into(), repo_type: RepoType::Rpm, filters: vec![] };
+        src.set_cv_repo(cv, &repo).await.unwrap();
+        let v = src.begin_version(cv, "n", std::slice::from_ref(&repo)).await.unwrap();
+        src.finish_version(v.id, "published", None).await.unwrap();
+        src.set_binding(dev, cv, v.id, "active").await.unwrap();
+        src.audit("lab", "", "cv.promote", "web v1 -> Dev").await.unwrap();
+
+        let dst = Store::open_in_memory().await.unwrap();
+        dst.create_cv("other-server", "web", "").await.unwrap(); // other scope: no clash
+        let r = dst.copy_from(&src, "lab", "https://h/pulp/#default").await.unwrap();
+        assert_eq!((r.views, r.versions, r.environments, r.bindings, r.audit), (1, 1, 1, 1, 1));
+        let k = "https://h/pulp/#default";
+        let cvs = dst.content_views(k).await.unwrap();
+        let envs = dst.environments(k).await.unwrap();
+        let dev2 = envs.iter().find(|e| e.name == "Dev").unwrap();
+        assert!(dev2.protected);
+        let b = dst.binding(dev2.id, cvs[0].id).await.unwrap().unwrap();
+        assert_eq!(dst.version(b.version_id).await.unwrap().number, 1);
+        assert_eq!(dst.audit_log(k, 5).await.unwrap()[0].actor, "copied");
+        assert_eq!(dst.aliases().await.unwrap(), vec![src.db_id().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn copy_keeps_everything_and_leaves_the_source_alone() {
+        let src = Store::open_in_memory().await.unwrap();
+        let lib = src.ensure_library("lab").await.unwrap();
+        let dev = src.create_env("lab", "Dev", lib, false).await.unwrap();
+        let prod = src.create_env("lab", "Prod", dev, true).await.unwrap();
+        let cv = src.create_cv("lab", "web", "d").await.unwrap();
+        let (os, tools) = (repo("os", RepoType::Rpm), repo("tools", RepoType::File));
+        for r in [&os, &tools] {
+            src.set_cv_repo(cv, r).await.unwrap();
+        }
+        let v1 = src.begin_version(cv, "one", &[os.clone(), tools.clone()]).await.unwrap();
+        src.finish_version(v1.id, "failed", Some("boom")).await.unwrap();
+        let v2 = src.begin_version(cv, "two", std::slice::from_ref(&os)).await.unwrap();
+        src.finish_version(v2.id, "published", None).await.unwrap();
+        let vr = CvVersionRepo {
+            version_id: v2.id,
+            repo: Some(os.clone()),
+            source_version: Some("/rv/1/".into()),
+            derived_repo: Some("/dr/".into()),
+            derived_version: Some("/dr/versions/1/".into()),
+            publication: Some("/pub/1/".into()),
+            pending_task: Some("/t/9/".into()),
+            content_count: Some(7),
+        };
+        src.save_version_repo(&vr).await.unwrap();
+        for (env, ver) in [(dev, v1.id), (prod, v2.id)] {
+            src.set_binding(env, cv, ver, "active").await.unwrap();
+            let b = BindingRepo {
+                env_id: env,
+                cv_id: cv,
+                repo_href: os.repo_href.clone(),
+                repo_name: "os".into(),
+                repo_type: RepoType::Rpm,
+                distribution: format!("/d/{env}/"),
+                base_path: format!("cv/{env}/os"),
+                publication: Some("/pub/1/".into()),
+            };
+            src.save_binding_repo(&b).await.unwrap();
+        }
+        src.cv_prefix("lab", "acme").await.unwrap();
+        src.audit("lab", "ann@h", "cv.create", "web").await.unwrap();
+        src.audit("lab", "", "cv.publish", "web v1").await.unwrap();
+
+        let dst = Store::open_in_memory().await.unwrap();
+        // Rows in the target shift every id: a copy that kept source ids would point at the wrong rows.
+        let other = dst.create_cv("x", "pad", "").await.unwrap();
+        let pad = dst.begin_version(other, "", &[]).await.unwrap();
+        dst.set_binding(dst.ensure_library("x").await.unwrap(), other, pad.id, "active").await.unwrap();
+        let r = dst.copy_from(&src, "lab", "k").await.unwrap();
+        assert_eq!((r.views, r.versions, r.environments, r.bindings, r.audit), (1, 2, 2, 2, 2));
+
+        let cv2 = dst.content_views("k").await.unwrap().remove(0);
+        assert_eq!(
+            (cv2.name.as_str(), cv2.description.as_str(), cv2.created_at.as_str()),
+            ("web", "d", src.content_view(cv).await.unwrap().created_at.as_str())
+        );
+        assert_eq!(dst.cv_repos(cv2.id).await.unwrap().len(), 2);
+        let (s1, s2) = (src.version(v1.id).await.unwrap(), src.version(v2.id).await.unwrap());
+        let vs = dst.versions(cv2.id).await.unwrap();
+        assert_eq!(vs.iter().map(|v| v.number).collect::<Vec<_>>(), vec![2, 1]);
+        let (n2, n1) = (&vs[0], &vs[1]);
+        assert_eq!(
+            (&n1.notes, &n1.state, &n1.error, &n1.created_at, &n1.finished_at),
+            (&s1.notes, &s1.state, &s1.error, &s1.created_at, &s1.finished_at)
+        );
+        assert_eq!(
+            (&n2.notes, &n2.state, &n2.error, &n2.created_at, &n2.finished_at),
+            (&s2.notes, &s2.state, &s2.error, &s2.created_at, &s2.finished_at)
+        );
+        assert_eq!(dst.version_repos(n1.id).await.unwrap().len(), 2);
+        assert_eq!(dst.version_repos(n2.id).await.unwrap(), vec![CvVersionRepo { version_id: n2.id, ..vr.clone() }]);
+
+        let envs = dst.environments("k").await.unwrap();
+        assert_eq!(
+            envs.iter().map(|e| (e.name.as_str(), e.protected)).collect::<Vec<_>>(),
+            [("Library", false), ("Dev", false), ("Prod", true)]
+        );
+        assert_eq!((envs[1].prior_id, envs[2].prior_id), (Some(envs[0].id), Some(envs[1].id)));
+        let b = dst.binding(envs[2].id, cv2.id).await.unwrap().unwrap();
+        assert_eq!((b.version_id, b.state), (n2.id, "active".to_string()));
+        assert_eq!(dst.binding(envs[1].id, cv2.id).await.unwrap().unwrap().version_id, n1.id);
+        let brs = dst.binding_repos(envs[2].id, cv2.id).await.unwrap();
+        assert_eq!((brs.len(), brs[0].cv_id, brs[0].base_path.as_str()), (1, cv2.id, format!("cv/{prod}/os").as_str()));
+        assert_eq!(dst.stored_prefix("k").await.unwrap().as_deref(), Some("acme"));
+        let log = dst.audit_log("k", 5).await.unwrap();
+        assert_eq!(
+            log.iter().map(|a| (a.action.as_str(), a.actor.as_str())).collect::<Vec<_>>(),
+            [("cv.publish", "copied"), ("cv.create", "ann@h")]
+        );
+        assert_eq!(dst.content_views("x").await.unwrap().len(), 1, "other scopes are untouched");
+
+        // The source still has everything, and no alias.
+        assert_eq!(src.content_views("lab").await.unwrap().len(), 1);
+        assert_eq!(src.versions(cv).await.unwrap().len(), 2);
+        assert_eq!(src.environments("lab").await.unwrap().len(), 3);
+        assert_eq!(src.audit_log("lab", 5).await.unwrap().len(), 2);
+        assert!(src.aliases().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn copy_refuses_name_clash() {
+        let src = Store::open_in_memory().await.unwrap();
+        src.create_cv("lab", "web", "").await.unwrap();
+        let dst = Store::open_in_memory().await.unwrap();
+        dst.create_cv("k", "web", "").await.unwrap();
+        let e = dst.copy_from(&src, "lab", "k").await.unwrap_err().to_string();
+        assert!(e.contains("never merges"), "{e}");
+        assert_eq!(dst.content_views("k").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn copy_refuses_environment_clash_and_writes_nothing() {
+        let src = Store::open_in_memory().await.unwrap();
+        let lib = src.ensure_library("lab").await.unwrap();
+        src.create_env("lab", "Dev", lib, false).await.unwrap();
+        src.create_cv("lab", "api", "").await.unwrap();
+        src.audit("lab", "a", "x", "y").await.unwrap();
+        let dst = Store::open_in_memory().await.unwrap();
+        let dlib = dst.ensure_library("k").await.unwrap();
+        dst.create_env("k", "Dev", dlib, false).await.unwrap();
+        let e = dst.copy_from(&src, "lab", "k").await.unwrap_err().to_string();
+        assert_eq!(e, "target already has environment Dev for this server; db copy never merges");
+        assert!(dst.content_views("k").await.unwrap().is_empty());
+        assert!(dst.audit_log("k", 5).await.unwrap().is_empty());
+        assert!(dst.aliases().await.unwrap().is_empty());
+        let e = Store::open_in_memory().await.unwrap();
+        e.create_cv("k", "api", "").await.unwrap();
+        let msg = e.copy_from(&src, "lab", "k").await.unwrap_err().to_string();
+        assert_eq!(msg, "target already has content view api for this server; db copy never merges");
+    }
+
+    #[tokio::test]
+    async fn copy_failure_rolls_back_the_whole_target() {
+        let src = Store::open_in_memory().await.unwrap();
+        let cv = src.create_cv("lab", "web", "").await.unwrap();
+        src.begin_version(cv, "", &[]).await.unwrap();
+        src.audit("lab", "a", "x", "y").await.unwrap();
+        let dst = Store::open_in_memory().await.unwrap();
+        // A failure in the last step of the copy (the audit rows): everything written before it must go.
+        sqlx::raw_sql("CREATE TRIGGER stop BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT, 'stop'); END")
+            .execute(&dst.pool)
+            .await
+            .unwrap();
+        assert!(dst.copy_from(&src, "lab", "k").await.is_err());
+        assert!(dst.content_views("k").await.unwrap().is_empty());
+        assert!(dst.environments("k").await.unwrap().is_empty());
+        assert!(dst.aliases().await.unwrap().is_empty());
     }
 }

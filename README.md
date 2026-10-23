@@ -10,7 +10,8 @@ the Pulp REST API:
 * **Content Views and lifecycle environments** (Katello-inspired, implemented by pulp-tui
   on top of Pulp; not a Pulp or Katello API): filtered multi-repository snapshots,
   numbered immutable versions, promotion along `Library -> Dev -> … -> Prod`, rollback,
-  drift detection, checkpointed and resumable workflows.
+  drift detection, checkpointed and resumable workflows. Several operators can share
+  them through an optional PostgreSQL database, with a lock per Content View.
 * **Replication** from an upstream Pulp: native Upstream Pulp replication (tech preview)
   and a content-sync fallback with dry run and idempotent reruns.
 * **Users, groups and roles** with escalation and self-lockout warnings.
@@ -46,9 +47,13 @@ podman run --rm -it --read-only \
 ```
 
 * `-it` is required: the TUI needs a TTY. Without one pulp-tui exits with a message.
-* The image (about 26 MB) runs as UID 10001 with a read-only root filesystem.
+* The image (about 30 MB) runs as UID 10001 with a read-only root filesystem.
   `/config/config.toml` is mounted read-only; `/data` holds the SQLite database and the
   log (Content Views, task references). Without a volume, that state is lost at exit.
+  With a `[database]` section the Content Views live in that database instead, and `/data`
+  keeps only the task references and the log. Add `--hostname <name>` then: locks and audit
+  rows name the operator as `user@host`, and without it the host is a new container ID
+  each run.
 * Secrets: a container secret readable by UID 10001 (above), or `-e PULP_PASSWORD` with
   `secret = "env:PULP_PASSWORD"`. A plain bind-mounted file with mode 0600 is not readable
   by the container user under rootless Podman. The container build has no keyring.
@@ -72,10 +77,13 @@ podman run --rm -it --read-only \
 ```sh
 cargo test                     # unit + mock HTTP tests (live tests skip themselves)
 tests/run-live.sh              # starts Pulp in Podman/Docker, runs all live scenarios
-tests/run-live.sh repos cv     # selected scenarios
+tests/run-live.sh repos cv     # selected scenarios (repos cv rbac failures replication shared_db)
 tests/env/pulp-env.sh down pulp1; tests/env/pulp-env.sh down pulp2; tests/env/pulp-env.sh http-down
+tests/env/pulp-env.sh pg-down  # remove the PostgreSQL container
 ```
 
 The live environment uses `quay.io/pulp/pulp` (pulpcore, pulp_rpm, pulp_file), local RPM
 and File fixtures built with `rpmbuild`/`createrepo_c`, and a static HTTP server as the
-upstream repository. A second Pulp instance starts only for replication tests.
+upstream repository. A second Pulp instance starts only for replication tests, and a
+PostgreSQL 16 container (`127.0.0.1:55432`, test password `pulp_tui_test`) only for the
+`shared_db` scenario.

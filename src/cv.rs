@@ -17,10 +17,13 @@ use crate::filters::Selector;
 use crate::pulp::models::{Distribution, Package, RepoVersion, Repository, Task};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, RepoType};
-use crate::store::{BindingRepo, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, LOCK_RENEW_SECS, LockHolder, Store};
+use crate::store::{
+    BindingRepo, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, LOCK_RENEW_SECS, LOCK_TTL_SECS, LockHolder, Store,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +57,9 @@ pub struct CvLock {
     token: String,
     /// Why the lock was lost; set by the renewal task, read by `check` (no database round trip).
     lost: Arc<Mutex<Option<String>>>,
+    /// Wall-clock unix seconds of the acquire and of the last successful renewal. Tokio timers stop
+    /// during suspend, so `check` also fails when this is too old, even if no renewal round has run.
+    ok_at: Arc<AtomicI64>,
     renew: tokio::task::AbortHandle,
 }
 
@@ -63,15 +69,20 @@ fn unix_now() -> i64 {
 
 fn conflict(name: &str, h: &LockHolder) -> String {
     let since = h.acquired_at.get(11..16).unwrap_or(&h.acquired_at);
-    format!("Content View {name} is locked by {} ({}) since {since}", h.owner, h.operation)
+    format!("Content View {name} is locked by {} ({}) since {since} UTC", h.owner, h.operation)
 }
 
 /// One renewal round; `false` (lock lost, reason recorded) stops the renewal task.
-async fn renew_step(store: &Store, cv_id: i64, token: &str, lost: &Mutex<Option<String>>) -> bool {
-    let reason = match store.renew_lock(cv_id, token, unix_now()).await {
-        Ok(true) => return true,
-        Ok(false) => "taken over or broken by another operator".to_string(),
-        Err(e) => format!("database unreachable: {e}"),
+async fn renew_step(store: &Store, cv_id: i64, token: &str, lost: &Mutex<Option<String>>, ok_at: &AtomicI64) -> bool {
+    let now = unix_now();
+    let reason = match tokio::time::timeout(Duration::from_secs(LOCK_RENEW_SECS), store.renew_lock(cv_id, token, now)).await {
+        Ok(Ok(true)) => {
+            ok_at.store(now, Ordering::Relaxed);
+            return true;
+        }
+        Ok(Ok(false)) => "taken over or broken by another operator".to_string(),
+        Ok(Err(e)) => format!("database unreachable: {e}"),
+        Err(_) => "database unreachable: renewal timed out".to_string(),
     };
     *lost.lock().unwrap() = Some(reason);
     false
@@ -81,33 +92,39 @@ impl CvLock {
     pub async fn acquire(store: Arc<Store>, cv_id: i64, name: &str, owner: &str, operation: &str) -> Result<Arc<CvLock>> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let token = format!("{}-{nanos}", std::process::id());
-        if let Err(h) = store.try_lock(cv_id, owner, &token, operation, unix_now()).await? {
+        let now = unix_now();
+        if let Err(h) = store.try_lock(cv_id, owner, &token, operation, now).await? {
             bail!("{}", conflict(name, &h));
         }
-        let lost = Arc::new(Mutex::new(None));
-        let (st, tok, l) = (store.clone(), token.clone(), lost.clone());
+        let (lost, ok_at) = (Arc::new(Mutex::new(None)), Arc::new(AtomicI64::new(now)));
+        let (st, tok, l, ok) = (store.clone(), token.clone(), lost.clone(), ok_at.clone());
         let renew = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(LOCK_RENEW_SECS)).await;
-                if !renew_step(&st, cv_id, &tok, &l).await {
+                if !renew_step(&st, cv_id, &tok, &l, &ok).await {
                     break;
                 }
             }
         })
         .abort_handle();
-        Ok(Arc::new(CvLock { store, cv_id, name: name.into(), token, lost, renew }))
+        Ok(Arc::new(CvLock { store, cv_id, name: name.into(), token, lost, ok_at, renew }))
     }
 
     pub fn check(&self) -> Result<()> {
-        match &*self.lost.lock().unwrap() {
-            Some(reason) => bail!("lock on {} lost: {reason}", self.name),
-            None => Ok(()),
+        if let Some(reason) = &*self.lost.lock().unwrap() {
+            bail!("lock on {} lost: {reason}", self.name);
         }
+        // Past this age the row can expire (TTL) before the next renewal round would notice.
+        let n = unix_now() - self.ok_at.load(Ordering::Relaxed);
+        if n > LOCK_TTL_SECS - LOCK_RENEW_SECS as i64 {
+            bail!("lock on {} lost: not renewed for {n} s", self.name);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
     async fn renew_now(&self) {
-        renew_step(&self.store, self.cv_id, &self.token, &self.lost).await;
+        renew_step(&self.store, self.cv_id, &self.token, &self.lost, &self.ok_at).await;
     }
 }
 
@@ -319,8 +336,13 @@ impl CvService {
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                // Runs even when the lock is lost: it records why the workflow stopped.
-                self.store.finish_version(v.id, "failed", Some(&msg)).await?;
+                // Runs even when the lock is lost (it records why the workflow stopped), but then
+                // only over this workflow's own `publishing` state.
+                if self.alive().is_ok() {
+                    self.store.finish_version(v.id, "failed", Some(&msg)).await?;
+                } else {
+                    self.store.fail_publishing_version(v.id, &msg).await?;
+                }
                 self.audit("cv.publish.failed", &format!("{} version {}: {msg}", cv.name, v.number)).await;
                 Err(e)
             }
@@ -503,8 +525,13 @@ impl CvService {
         } else {
             "failed"
         };
-        // Runs even when the lock is lost: it records the partial state (a retry is idempotent).
-        self.store.set_binding(env_id, cv_id, version_id, state).await?;
+        // Runs even when the lock is lost (it records the partial state; a retry is idempotent), but
+        // then only over this promotion's own `promoting` row.
+        if self.alive().is_ok() {
+            self.store.set_binding(env_id, cv_id, version_id, state).await?;
+        } else {
+            self.store.finish_promoting_binding(env_id, cv_id, version_id, state).await?;
+        }
         let what = if mode == Mode::Rollback && env.name != LIBRARY { "cv.rollback" } else { "cv.promote" };
         self.audit(what, &format!("{} v{} -> {}: {state} {}", cv.name, v.number, env.name, errors.join("; "))).await;
         if errors.is_empty() {
@@ -788,9 +815,22 @@ mod tests {
         let l = CvLock::acquire(s.clone(), cv, "web", "a@h", "publish").await.unwrap();
         l.renew_now().await;
         assert!(l.check().is_ok(), "renewal of a held lock succeeds");
-        s.break_lock(cv).await.unwrap();
+        assert!(s.break_lock(cv, &s.lock_holder(cv).await.unwrap().unwrap()).await.unwrap());
         l.renew_now().await; // one renewal round without waiting 30 s
         assert!(l.check().unwrap_err().to_string().starts_with("lock on web lost: taken over or broken"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_renewal_fails_the_check() {
+        let s = Arc::new(Store::open_in_memory().await.unwrap());
+        let cv = s.create_cv("k", "web", "").await.unwrap();
+        let l = CvLock::acquire(s.clone(), cv, "web", "a@h", "publish").await.unwrap();
+        l.check().unwrap();
+        // The laptop slept: tokio timers stood still, no renewal ran, and the row may be expired and taken over.
+        l.ok_at.fetch_sub(LOCK_TTL_SECS, Ordering::Relaxed);
+        let e = l.check().unwrap_err().to_string();
+        let n: i64 = e.strip_prefix("lock on web lost: not renewed for ").and_then(|r| r.strip_suffix(" s")).expect(&e).parse().unwrap();
+        assert!((LOCK_TTL_SECS..LOCK_TTL_SECS + 5).contains(&n), "{e}");
     }
 
     /// Pulp accepts the copy while another operator breaks the lock.
@@ -927,6 +967,6 @@ mod tests {
     #[test]
     fn conflict_message_shows_hours_and_minutes() {
         let h = LockHolder { owner: "alice@ws12".into(), operation: "promote to Prod".into(), acquired_at: "2026-10-23T14:02:33Z".into() };
-        assert_eq!(conflict("web", &h), "Content View web is locked by alice@ws12 (promote to Prod) since 14:02");
+        assert_eq!(conflict("web", &h), "Content View web is locked by alice@ws12 (promote to Prod) since 14:02 UTC");
     }
 }

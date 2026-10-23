@@ -6,7 +6,7 @@ Guidance for contributors and coding agents working on pulp-tui.
 
 `src/pulp/` is the REST layer (transport, capabilities, typed models, plugin operations).
 `src/cv.rs`, `src/replication.rs`, `src/filters.rs` are services built only on that layer.
-`src/store.rs` is the SQLite store for application-owned state. `src/session_log.rs` is the
+`src/store.rs` is the SQLite/PostgreSQL store for application-owned state. `src/session_log.rs` is the
 in-memory request/action log for the Logs screen. `src/tui/` is the UI:
 `app.rs` (state, jobs, keys, modals), `kinds.rs` (screens: source, columns, actions),
 `actions*.rs` (what actions do), `view.rs` (rendering only), `form.rs`, `pick.rs` (picker
@@ -28,7 +28,8 @@ Read `docs/ARCHITECTURE.md` before changing workflows.
 * Pulp tasks are the source of truth. Do not mark something done because a POST returned
   202; wait for the task and, where it matters, verify served content.
 * Content View objects in Pulp carry ownership labels (`pulp_tui_cv`, `pulp_tui_env`,
-  `pulp_tui_replica`). Never modify objects without them.
+  `pulp_tui_replica`) and the database id (`pulp_tui_db`). Never modify objects without
+  their ownership labels, or with the id of another database.
 * Keep code small and direct; prefer existing helpers over new abstractions.
 * Each action key must be unique per screen and must not collide with list keys (a unit
   test checks this).
@@ -50,8 +51,11 @@ against the same containers; `tests/env/pulp-env.sh down …` resets everything.
 
 ## Database migrations
 
-Append a new SQL batch to `MIGRATIONS` in `src/store.rs`; never edit an existing one.
-Keep SQL portable (future PostgreSQL service). Add a test.
+Append a new SQL batch to both `MIGRATIONS` (SQLite) and `PG_MIGRATIONS` (PostgreSQL) in
+`src/store.rs`; never edit an existing one. The lists must stay the same length (a unit
+test checks it). Store code is shared by both backends, so keep SQL portable. Add a unit
+test, and a case in `tests/live_shared_db.rs` when PostgreSQL behaves differently. The
+external database changes only with `pulp-tui db migrate`; the local file migrates on open.
 
 ## When Pulp behaves unexpectedly
 

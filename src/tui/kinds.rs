@@ -705,7 +705,8 @@ pub async fn load(
                         "number": v.number, "state": v.state, "notes": v.notes, "created_at": v.created_at, "error": v.error
                     })).collect::<Vec<_>>(),
                     "audit": store.audit_log(scope, 200).await?.into_iter().filter(|a| a.detail.starts_with(&cv.name)).take(10)
-                        .map(|a| format!("{} {} {}", a.at, a.action, a.detail)).collect::<Vec<_>>(),
+                        .map(|a| format!("{} {} {}{}", a.at, a.action, a.detail, if a.actor.is_empty() { String::new() } else { format!(" by {}", a.actor) }))
+                        .collect::<Vec<_>>(),
                 }));
             }
             out

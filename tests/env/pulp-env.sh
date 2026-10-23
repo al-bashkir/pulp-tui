@@ -4,15 +4,21 @@
 #   tests/env/pulp-env.sh up   [pulp1|pulp2]   start (reuses a running container)
 #   tests/env/pulp-env.sh down [pulp1|pulp2]   stop and remove container + volumes
 #   tests/env/pulp-env.sh status
+#   tests/env/pulp-env.sh pg-up | pg-down   PostgreSQL for the shared-database tests
 #
 # pulp1 (port 8080) is the main/downstream server. pulp2 (port 8081) is only
 # needed by the replication tests (upstream). Both use admin/password.
+# PostgreSQL (pg-up) listens on 127.0.0.1:55432, user and database pulp_tui,
+# password $PG_PASSWORD (default pulp_tui_test, a test-only value).
 set -euo pipefail
 
 RUNTIME=${CONTAINER_RUNTIME:-podman}
 IMAGE=${PULP_IMAGE:-quay.io/pulp/pulp:latest}
 ENV_DIR=${PULP_ENV_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/target/pulp-env}
 ADMIN_PASSWORD=${PULP_ADMIN_PASSWORD:-password}
+PG_IMAGE=${PG_IMAGE:-docker.io/library/postgres:16}
+PG_PASSWORD=${PG_PASSWORD:-pulp_tui_test}
+PG_NAME=pulp-tui-pg
 
 port_of() { case "$1" in pulp1) echo 8080 ;; pulp2) echo 8081 ;; *) echo "unknown instance $1" >&2; exit 2 ;; esac; }
 
@@ -71,6 +77,34 @@ down() {
   echo "$name removed"
 }
 
+pg_up() {
+  if [ "$($RUNTIME inspect -f '{{.State.Running}}' "$PG_NAME" 2>/dev/null || true)" = "true" ]; then
+    echo "$PG_NAME already running on port 55432"
+    return 0
+  fi
+  $RUNTIME rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  $RUNTIME run --detach --name "$PG_NAME" --publish 127.0.0.1:55432:5432 \
+    --env POSTGRES_USER=pulp_tui --env POSTGRES_DB=pulp_tui --env POSTGRES_PASSWORD="$PG_PASSWORD" \
+    --volume "$PG_NAME-data:/var/lib/postgresql/data" "$PG_IMAGE" >/dev/null
+  # The first start runs a temporary server on the socket only; a TCP answer means the real one is up.
+  local i
+  for i in $(seq 1 60); do
+    if $RUNTIME exec "$PG_NAME" pg_isready -q -h 127.0.0.1 -U pulp_tui -d pulp_tui; then
+      echo "$PG_NAME ready: postgres://pulp_tui@127.0.0.1:55432/pulp_tui (password in \$PG_PASSWORD, default pulp_tui_test)"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "PostgreSQL did not become ready" >&2
+  return 1
+}
+
+pg_down() {
+  $RUNTIME rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  $RUNTIME volume rm -f "$PG_NAME-data" >/dev/null 2>&1 || true
+  echo "$PG_NAME removed"
+}
+
 # Static HTTP server for the upstream fixture repositories (port 8000). Pulp containers
 # reach it as http://host.containers.internal:8000/.
 http_up() {
@@ -92,8 +126,10 @@ shift || true
 case "$cmd" in
   up) up "${1:-pulp1}" ;;
   down) down "${1:-pulp1}" ;;
+  pg-up) pg_up ;;
+  pg-down) pg_down ;;
   http-up) http_up ;;
   http-down) http_down ;;
   status) $RUNTIME ps -a --filter name=pulp --format '{{.Names}} {{.Status}} {{.Ports}}' ;;
-  *) echo "usage: $0 up|down|status [pulp1|pulp2] | http-up|http-down" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|status [pulp1|pulp2] | pg-up|pg-down | http-up|http-down" >&2; exit 2 ;;
 esac

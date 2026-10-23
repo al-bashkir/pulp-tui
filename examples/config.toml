@@ -22,7 +22,10 @@ cv_base_path_prefix = "cv"    # Content View distributions: <prefix>/<env>/<view
 # [database]
 # url = "postgres://pulp_tui@db.example.com:5432/pulp_tui"   # never a password in the URL
 # secret = "env:PULP_TUI_DB_PASSWORD"   # env:VAR, file:/path or keyring (user "[database]")
-# ca_cert = "/etc/pki/tls/certs/internal-ca.pem"   # TLS is always verify-full, except localhost or a Unix socket
+# ca_cert = "/etc/pki/tls/certs/internal-ca.pem"   # PEM file, one or more CA certificates
+# PostgreSQL TLS is always verify-full (certificate chain and host name), except for localhost or a Unix socket.
+# ca_cert is ADDED to the root certificates built into pulp-tui. The operating system trust store is NOT
+# used for the database (unlike ca_cert in a profile), so a private CA always needs ca_cert.
 # SQLite instead: safe only when every operator runs pulp-tui on this one host.
 # SQLite WAL does not work on network shares (NFS/SMB).
 # url = "sqlite:///srv/pulp-tui/cv.db"

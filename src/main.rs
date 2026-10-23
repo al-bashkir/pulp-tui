@@ -103,7 +103,23 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
-        Some(Cmd::Db { cmd: DbCmd::Copy }) => bail!("not implemented yet"),
+        Some(Cmd::Db { cmd: DbCmd::Copy }) => {
+            let d = cfg.database.as_ref().context("db copy needs a [database] section")?;
+            let name = profile.context("no profile configured")?;
+            cfg.check_shared_write(&name, "db copy")?;
+            let dst = cv_store(&cfg, &store).await.map_err(|e| anyhow!("shared database unavailable: {e}"))?;
+            let r = dst.copy_from(&store, &name, &dst.scope(&name, &cfg.profiles[&name])).await?;
+            println!(
+                "copied {} content view(s), {} version(s), {} environment(s), {} binding(s), {} audit row(s) from {name} into {}",
+                r.views,
+                r.versions,
+                r.environments,
+                r.bindings,
+                r.audit,
+                d.display_url()
+            );
+            Ok(())
+        }
         Some(Cmd::ExportCv { output }) => {
             let name = profile.context("no profile configured")?;
             let cv = cv_store(&cfg, &store).await.map_err(|e| anyhow!("shared database unavailable: {e}"))?;
@@ -116,7 +132,7 @@ async fn run() -> Result<()> {
         }
         Some(Cmd::ImportCv { file }) => {
             let name = profile.context("no profile configured")?;
-            cfg.check_import_cv(&name)?;
+            cfg.check_shared_write(&name, "import-cv")?;
             let ex = serde_json::from_slice(&std::fs::read(&file).with_context(|| format!("read {}", file.display()))?)?;
             let cv = cv_store(&cfg, &store).await.map_err(|e| anyhow!("shared database unavailable: {e}"))?;
             let (cvs, envs) = cv.import(&cv.scope(&name, &cfg.profiles[&name]), &ex).await?;

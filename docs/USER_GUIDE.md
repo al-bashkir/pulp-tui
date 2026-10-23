@@ -66,13 +66,17 @@ and keeps the old value).
 ### Dashboard
 Server health (database, Redis, workers, content apps, storage), the current user,
 installed plugins with versions, detected capabilities, counts of repositories,
-distributions, content and tasks, and the number of local Content Views. `r` refreshes.
+distributions, content and tasks, and the number of Content Views and environments (it
+says if they are in the local file or in the shared database). `r` refreshes.
 
 ### Servers
 Named profiles from the config file. Actions: **o** connect, **T** test connection (shows
 user, content origin, plugin versions), **c**/**e** create/edit, **d** remove from the
-config, **K** store a password/token in the system keyring, **E**/**I** export/import
-Content View definitions. See "Server profiles" below.
+config (after typing the name; Pulp is not changed, and the Content View definitions of the
+server stay in the local file, or in the shared database when `[database]` is set),
+**K** store a password/token in the system keyring, **E**/**I** export/import Content
+View definitions (with a shared database, import writes to it, so a read-only profile
+cannot import). See "Server profiles" and "Shared database" below.
 
 ### RPM Repositories / File Repositories
 Columns: name, latest version, default remote, retention, description. Details explain
@@ -143,6 +147,12 @@ environments with bound versions and states.
 | M | promote a version to an environment (preview of every distribution; protected environments require typing their name) |
 | b | roll back an environment to an earlier version |
 | D | verify all environments (drift check) |
+| U | break the lock of the selected view (shows who holds it; you type the view name). See "Shared database". |
+
+Publish, promote, roll back, delete (the view or a version) and *Resume* take a lock on
+the view while they run; a second operator (or a second pulp-tui on this host) gets
+`Content View web is locked by alice@ws12 (promote to Prod) since 14:02 UTC` before
+anything is sent to Pulp. Preview, compare and the drift check do not lock.
 
 Filter syntax (rules separated by `;`):
 
@@ -160,12 +170,14 @@ compared.
 ### Content View versions
 **M** promote, **b** roll back, **m** compare with the marked version, **R** resume a
 publish that failed or was interrupted (continues from checkpoints and re-attaches to a
-submitted task), **d** delete (refused while bound), **i** details (source versions,
+submitted task; with a shared database it can also continue a publish that another
+operator started), **d** delete (refused while bound), **i** details (source versions,
 snapshot versions, publications, unit counts).
 
 ### Lifecycle Environments
 Library exists automatically. **c** creates an environment after an existing one
-(paths can branch). **L** toggles protection. **d** deletes an unused environment.
+(paths can branch). **L** toggles protection. **d** deletes an unused environment. With a
+shared database, environments belong to the server and every operator sees them.
 
 ### Replication
 Native Upstream Pulp objects (tech preview). **c**/**e** create/edit: upstream base URL
@@ -229,6 +241,164 @@ Auth methods: `basic` (username + secret), `bearer` (secret is the token), `none
 (PEM bundle added to the system roots), `client_cert` + `client_key` (mTLS). `proxy`,
 `timeout_secs`, `read_only`, `production`.
 
+## Shared database
+
+Without a `[database]` section, Content Views, versions, environments, promotions and
+their history live in a SQLite file in the data directory. Only one operator uses it.
+With a `[database]` section, several operators use one database and see the same Content
+Views, versions, environments, promotions and history. There is no pulp-tui server: each
+pulp-tui connects to the database directly. A change of another operator shows after a
+refresh (`r`); nothing is pushed.
+
+```toml
+[database]
+url = "postgres://pulp_tui@db.example.com:5432/pulp_tui"   # or "sqlite:///srv/pulp-tui/cv.db"
+secret = "env:PULP_TUI_DB_PASSWORD"                         # env:VAR, file:/path or keyring
+ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreSQL only
+```
+
+* There is one `[database]` for the whole config file, not one per profile.
+* The password is never in the URL. A URL with a password is rejected. `secret` is a
+  reference, as for profiles. For `keyring` the entry has the service `pulp-tui` and the
+  user `[database]`; the **K** key of the Servers screen cannot store it, so use `env:` or
+  `file:` unless you create the entry with the system keyring tool. Error messages show the
+  URL without the password.
+* PostgreSQL traffic is always encrypted and verified (certificate chain and host name),
+  except through a Unix socket or to `localhost`, `127.0.0.1` or `::1`, where it does not
+  leave the machine. For other hosts pulp-tui overrides any `sslmode` in the URL with
+  `verify-full`. The server certificate must list the host name (or IP address) that the
+  URL uses.
+* `ca_cert` is a PEM file with one or more CA certificates. It is **added to the root
+  certificates that are built into pulp-tui. The trust store of the operating system is not
+  used for the database.** An internal CA therefore needs `ca_cert`, also when the host
+  already trusts it. (This differs from the `ca_cert` of a profile, which adds to the
+  system roots.)
+* If the database cannot be opened, the Pulp screens still work. The Content View screens
+  and actions show `shared database unavailable: <reason>` and do nothing. pulp-tui does not
+  use the local file instead, because the state would split. Fix the cause and restart.
+  This is also true for a schema that `db migrate` did not create or upgrade. The TUI
+  starts and the Content View screens show, for example, `shared database unavailable:
+  postgres://pulp_tui@db.example.com:5432/pulp_tui: database schema 1 is older than this
+  pulp-tui (2); run pulp-tui db migrate`, or `...: database is not initialized; run
+  pulp-tui db migrate`. The command-line Content View commands (`export-cv`, `import-cv`,
+  `db copy`) stop with the same message.
+
+### Set up (administrator)
+
+1. Create the PostgreSQL database and a role for the operators.
+2. Run `pulp-tui db migrate` with a role that can create tables. It creates the schema the
+   first time and upgrades it after you upgrade pulp-tui. A normal start never changes the
+   schema. If the schema is older, the Content View screens show `... database schema 1 is
+   older than this pulp-tui (2); run pulp-tui db migrate` (see above). If it is newer,
+   upgrade pulp-tui. When two administrators migrate at the same time, the second one waits.
+3. Give the operators' role only `SELECT`, `INSERT`, `UPDATE` and `DELETE`. After a migration
+   that adds tables, grant again (or use `ALTER DEFAULT PRIVILEGES`).
+
+   ```sql
+   GRANT USAGE ON SCHEMA public TO pulp_tui_op;
+   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pulp_tui_op;
+   ```
+
+4. Each operator puts the same `[database]` in the config and starts pulp-tui.
+
+### Move the data of one operator
+
+`pulp-tui --profile lab db copy` copies the Content View data of the profile `lab` from the
+local file into the shared database: Content Views with repositories and filters, versions
+and their checkpoints, environments, bindings and the audit log. The rows get new IDs. The
+local profile name becomes the server key (see below). The copy runs in one transaction. It
+**never merges**: if the shared database already has a Content View, or an environment
+other than Library, with the same name for this server, it stops and writes nothing. Task
+references, replication history and locks are not copied. The local file stays as it is. A
+read-only profile cannot run `db copy`. Run it once for each server.
+
+After the copy, objects that the local file published get the database ID label of the
+shared database on the next publish or promotion (see "Database ID" below). After that, the
+old local file cannot change them any more.
+
+### What is shared
+
+| Shared (in `[database]`) | Always local (`<data-dir>/pulp-tui.db`) |
+|---|---|
+| Content Views, repositories and filters, versions and checkpoints, environments, bindings, audit log (with the operator), locks | Task Center references, replication history |
+
+* **Server key.** In the shared database, rows belong to the server, not to a profile name:
+  the key is the URL, the API root and the domain (for example
+  `https://pulp.example.com/pulp/#default`). Two operators can name their profiles
+  differently and still see the same Content Views. The local file keeps the profile name.
+  Deleting a profile (Servers, **d**) changes nothing in the database.
+  The key comes from the URL that you type: **every operator must use the same scheme,
+  host name, port, `api_root` and domain for a server.** `https://pulp.example.com` and
+  `https://pulp.example.com:443` give the same key, but `https://pulp` (a short name),
+  an IP address or `http://` give a different key, and that operator sees other (or no)
+  Content Views. `db copy` uses the URL of the profile that runs it. The Dashboard shows
+  the key as `shared database scope: <key>`; compare it between operators.
+* **Operator.** Locks and audit rows name the operator as `username@host`, for example
+  `alice@ws12`. The audit lines in the Content View details show it: `<time>
+  cv.publish.done web version 3 by alice@ws12`. A row without a name (written before the
+  upgrade) shows no `by`; `db copy` marks such rows `by copied`. In a container the host
+  name is a random container ID: start the container with `--hostname` (for example
+  `--hostname ws12`), so that the lock owner and the audit actor stay the same.
+* **Base path prefix.** `cv_base_path_prefix` is stored per server the first time a
+  promotion uses it. Later promotions use the stored value. If your setting is different,
+  the workflow log says so and pulp-tui uses the stored value, so served URLs do not move.
+* **Read-only profiles.** With a shared database, creating or editing a Content View,
+  adding or removing repositories and filters, and creating, deleting or protecting an
+  environment change state that other operators publish from. A read-only profile does not
+  show these actions. `import-cv` and `db copy` refuse a read-only profile. Without a
+  shared database these actions stay available, because they change only the local file.
+
+### Locks
+
+* Publish, *Resume*, promote, roll back, reconcile (promote again), delete a Content View
+  and delete a version take a lock on **one Content View**. A second operator gets
+  `Content View web is locked by alice@ws12 (promote to Prod) since 14:02 UTC` before
+  anything is sent to Pulp. The lock is also taken when two pulp-tui processes use one
+  local file.
+* Preview, compare and the drift check do not lock. Edits (create, add or remove
+  repositories, filters, environments) do not lock either: the last write wins.
+* The holder renews the lock every 30 seconds. A lock that is not renewed for 2 minutes is
+  expired, and the next operator takes it over. Times come from the client clocks.
+* The lock is released when the workflow ends (also with an error), and when you press Esc
+  on its job. If pulp-tui crashes, the lock stays until it expires.
+* If a holder loses the lock (someone broke it, another operator took it over after it
+  expired, or the database is not reachable or does not answer a renewal within 30 s), the
+  workflow stops before its next change in Pulp and before its next checkpoint: `lock on
+  web lost: <reason>`. A workflow also stops when its lock was not renewed for 90 seconds,
+  for example after the computer slept: `lock on web lost: not renewed for 412 s`. A
+  stopped publish keeps its checkpoints, so *Resume* continues it. A stopped promotion is
+  stored as `partial` (or `failed` if no repository was done); promote again. If another
+  operator has changed that version or that promotion since then, the stopped workflow
+  does not overwrite their result.
+* **Break lock** (**U** on Content Views) removes a lock whoever holds it. It shows the
+  holder and asks you to type the view name. Use it only when the session of the holder is
+  dead; its workflow stops within 30 s. Only the lock that the dialog showed is removed: if
+  another operator took the lock meanwhile, nothing is removed and the message shows the
+  new holder. The audit log records it.
+
+### Database ID
+
+Each CV database (the local file too) has a random ID. Derived repositories and Content
+View distributions carry it as the label `pulp_tui_db=<id>`. pulp-tui refuses to change an
+object with the ID of another database: `... is owned by another pulp-tui database (<id>)`.
+Objects without the label (made by an older pulp-tui) are adopted and labeled on the next
+change. This stops two databases that manage the same Pulp server from taking over each
+other's objects, for example an old local file after you moved to a shared database.
+
+### SQLite as the shared database
+
+`url = "sqlite:///srv/pulp-tui/cv.db"` is safe only when every operator runs pulp-tui on
+that one host (for example several users of a jump server). **Do not put the file on a
+network share (NFS, SMB):** SQLite locking and WAL do not work there and the file can be
+damaged. For operators on different hosts, use PostgreSQL. `db migrate` creates the SQLite
+file; a normal start does not.
+
+Every operator's account must be able to write the file and its `-wal` and `-shm` files,
+which SQLite creates next to it. Put the file in a directory of a group that has all
+operators, make the directory group-writable with the setgid bit (`chmod 2770`, so new
+files get that group), and after `db migrate` make the file group-writable (`chmod 660`).
+SQLite gives the `-wal` and `-shm` files the permissions of the database file.
+
 ## Command line
 
 ```
@@ -236,6 +406,9 @@ pulp-tui [--config FILE] [--profile NAME] [--data-dir DIR]     start the TUI
 pulp-tui check                       test a profile non-interactively
 pulp-tui export-cv [-o FILE]         export Content View definitions (JSON, no secrets)
 pulp-tui import-cv FILE              import them (existing names are kept)
+pulp-tui db migrate                  create or upgrade the schema of the [database]
+pulp-tui --profile NAME db copy      copy that profile's Content View data from the local file
+                                     into the [database] (never merges)
 pulp-tui config-example              print an example config
 ```
 

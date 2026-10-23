@@ -265,9 +265,14 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
             });
         }
         Act::Delete => {
+            let kept = if app.cfg.database.is_some() {
+                "stay in the shared database (they belong to the server, not to the profile name)"
+            } else {
+                "stay in the local database file"
+            };
             let lines = vec![
                 format!("Remove profile {name} from the config file."),
-                "Pulp is not changed. Content View definitions stored for this profile stay in the local database.".into(),
+                format!("Pulp is not changed. Content View definitions stored for this profile {kept}."),
             ];
             let n = name.clone();
             app.confirm_danger(format!("Delete profile {name}"), lines, &name, move |app| {
@@ -1317,6 +1322,10 @@ pub fn load_dashboard(app: &mut App) {
             Ok((cvs, envs, place)) => format!("  Content Views {cvs}   lifecycle environments {envs}   ({place})"),
             Err(e) => format!("  Content Views: {e:#}"),
         });
+        // Operators compare it: only the same key shares Content Views.
+        if ctx.cv_store.as_ref().is_ok_and(|st| st.external) {
+            lines.push(format!("  shared database scope: {}", ctx.scope));
+        }
         let caps = std::sync::Arc::new(caps);
         ap(move |app| {
             if let Some(conn) = app.conn.as_mut() {
