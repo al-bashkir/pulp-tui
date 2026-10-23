@@ -1,0 +1,7 @@
+# RUSTSEC-2023-0071 (rsa, Marvin timing attack): `rsa` is in Cargo.lock only because sqlx's
+# `any` feature names the optional `sqlx-mysql` driver (a weak dependency). pulp-tui does not
+# enable `mysql`, so sqlx-mysql and rsa are never compiled: `cargo tree -i rsa --target all`
+# is empty with and without default features. Remove this entry when sqlx-mysql is enabled
+# (then the advisory applies) or when rsa leaves Cargo.lock.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

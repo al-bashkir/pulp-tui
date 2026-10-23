@@ -259,12 +259,18 @@ impl Act {
         }
     }
 
-    /// Whether the action changes state on the Pulp server (blocked in read-only mode).
-    pub fn mutates(self, k: &Kind) -> bool {
+    /// Whether the action changes state on the Pulp server or in the shared database (blocked in read-only mode).
+    /// `shared`: Content View definitions and environments live in a `[database]` other operators use.
+    pub fn mutates(self, k: &Kind, shared: bool) -> bool {
         use Act::*;
         match k {
-            Kind::Profiles | Kind::Environments => false,
-            Kind::ContentViews => matches!(self, Delete | CvPublish | Promote | Rollback),
+            // Import creates Content Views and environments in the shared database.
+            Kind::Profiles => shared && matches!(self, ImportCv),
+            Kind::Environments => shared,
+            Kind::ContentViews => {
+                matches!(self, Delete | CvPublish | Promote | Rollback)
+                    || shared && matches!(self, Create | Edit | CvAddRepo | CvFilters | CvRemoveRepo)
+            }
             Kind::CvVersions { .. } => matches!(self, Delete | Promote | Rollback | Resume),
             _ => !matches!(
                 self,
@@ -612,11 +618,14 @@ fn sum_counts(v: &Value) -> String {
     v.as_object().map(|m| m.values().filter_map(|x| x["count"].as_u64()).sum::<u64>().to_string()).unwrap_or_default()
 }
 
-/// Load one page of a screen. API screens query Pulp; local screens read the store.
+/// Load one page of a screen. API screens query Pulp; Content View screens read the CV store
+/// (`cv`: the store or why it is unavailable) under `scope`; `profile` marks the active server.
+#[allow(clippy::too_many_arguments)]
 pub async fn load(
     k: &Kind,
     ctx: Option<&Ctx>,
-    store: &Store,
+    cv: Result<&Store, &str>,
+    scope: &str,
     profile: &str,
     cfg: &Config,
     offset: u64,
@@ -635,6 +644,7 @@ pub async fn load(
     }
     let f = filter.to_lowercase();
     let keep = |v: &Value| f.is_empty() || v.to_string().to_lowercase().contains(&f);
+    let store = cv.map_err(|e| super::app::unavailable(e.into()));
     let items: Vec<Value> = match k {
         Kind::Profiles => cfg
             .profiles
@@ -656,13 +666,15 @@ pub async fn load(
             })
             .collect(),
         Kind::ContentViews => {
-            let envs = store.environments(profile)?;
+            let store = store?;
+            let envs = store.environments(scope).await?;
             let mut out = vec![];
-            for cv in store.content_views(profile)? {
-                let versions = store.versions(cv.id)?;
+            for cv in store.content_views(scope).await? {
+                let versions = store.versions(cv.id).await?;
                 let numbers: std::collections::HashMap<i64, i64> = versions.iter().map(|v| (v.id, v.number)).collect();
                 let bound: Vec<String> = store
-                    .bindings_for_cv(cv.id)?
+                    .bindings_for_cv(cv.id)
+                    .await?
                     .iter()
                     .filter_map(|b| {
                         let e = envs.iter().find(|e| e.id == b.env_id)?;
@@ -676,7 +688,8 @@ pub async fn load(
                     .into_values()
                     .collect();
                 let repos: Vec<Value> = store
-                    .cv_repos(cv.id)?
+                    .cv_repos(cv.id)
+                    .await?
                     .into_iter()
                     .map(|r| json!({ "name": r.repo_name, "type": r.repo_type, "href": r.repo_href, "filters": format_rules(&r.filters) }))
                     .collect();
@@ -687,65 +700,66 @@ pub async fn load(
                     "versions": versions.iter().filter(|v| v.state != "deleted").map(|v| json!({
                         "number": v.number, "state": v.state, "notes": v.notes, "created_at": v.created_at, "error": v.error
                     })).collect::<Vec<_>>(),
-                    "audit": store.audit_log(profile, 200)?.into_iter().filter(|a| a.detail.starts_with(&cv.name)).take(10)
+                    "audit": store.audit_log(scope, 200).await?.into_iter().filter(|a| a.detail.starts_with(&cv.name)).take(10)
                         .map(|a| format!("{} {} {}", a.at, a.action, a.detail)).collect::<Vec<_>>(),
                 }));
             }
             out
         }
         Kind::CvVersions { cv, .. } => {
-            let envs = store.environments(profile)?;
-            let bindings = store.bindings_for_cv(*cv)?;
-            store
-                .versions(*cv)?
-                .into_iter()
-                .map(|v| {
-                    let in_envs: Vec<String> = bindings
-                        .iter()
-                        .filter(|b| b.version_id == v.id)
-                        .filter_map(|b| envs.iter().find(|e| e.id == b.env_id).map(|e| e.name.clone()))
-                        .collect();
-                    let repos: Vec<Value> = store
-                        .version_repos(v.id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|r| {
-                            json!({
-                                "repository": r.repo().repo_name, "type": r.repo().repo_type, "filters": format_rules(&r.repo().filters),
-                                "source_version": r.source_version, "snapshot_version": r.derived_version,
-                                "publication": r.publication, "units": r.content_count, "pending_task": r.pending_task,
-                            })
+            let store = store?;
+            let envs = store.environments(scope).await?;
+            let bindings = store.bindings_for_cv(*cv).await?;
+            let mut out = vec![];
+            for v in store.versions(*cv).await? {
+                let in_envs: Vec<String> = bindings
+                    .iter()
+                    .filter(|b| b.version_id == v.id)
+                    .filter_map(|b| envs.iter().find(|e| e.id == b.env_id).map(|e| e.name.clone()))
+                    .collect();
+                let repos: Vec<Value> = store
+                    .version_repos(v.id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| {
+                        json!({
+                            "repository": r.repo().repo_name, "type": r.repo().repo_type, "filters": format_rules(&r.repo().filters),
+                            "source_version": r.source_version, "snapshot_version": r.derived_version,
+                            "publication": r.publication, "units": r.content_count, "pending_task": r.pending_task,
                         })
-                        .collect();
-                    json!({
-                        "id": v.id, "cv_id": v.cv_id, "number": v.number, "state": v.state, "notes": v.notes,
-                        "created_at": v.created_at, "finished_at": v.finished_at, "error": v.error,
-                        "environments": in_envs.join(", "), "repositories": repos,
                     })
-                })
-                .collect()
+                    .collect();
+                out.push(json!({
+                    "id": v.id, "cv_id": v.cv_id, "number": v.number, "state": v.state, "notes": v.notes,
+                    "created_at": v.created_at, "finished_at": v.finished_at, "error": v.error,
+                    "environments": in_envs.join(", "), "repositories": repos,
+                }));
+            }
+            out
         }
         Kind::Environments => {
-            store.ensure_library(profile)?;
-            let envs = store.environments(profile)?;
-            let cvs = store.content_views(profile)?;
-            envs.iter()
-                .map(|e| {
-                    let bound: Vec<String> = cvs
-                        .iter()
-                        .filter_map(|cv| {
-                            let b = store.binding(e.id, cv.id).ok()??;
-                            let n = store.version(b.version_id).ok()?.number;
-                            Some(format!("{}:v{n}", cv.name))
-                        })
-                        .collect();
-                    json!({
-                        "id": e.id, "name": e.name, "library": e.name == LIBRARY && e.prior_id.is_none(),
-                        "prior": e.prior_id.and_then(|p| envs.iter().find(|x| x.id == p)).map(|x| x.name.clone()).unwrap_or_default(),
-                        "protected": e.protected, "bound": bound.join(", "),
-                    })
-                })
-                .collect()
+            let store = store?;
+            store.ensure_library(scope).await?;
+            let envs = store.environments(scope).await?;
+            let cvs = store.content_views(scope).await?;
+            let mut out = vec![];
+            for e in &envs {
+                let mut bound = vec![];
+                for cv in &cvs {
+                    if let Ok(Some(b)) = store.binding(e.id, cv.id).await
+                        && let Ok(v) = store.version(b.version_id).await
+                    {
+                        bound.push(format!("{}:v{}", cv.name, v.number));
+                    }
+                }
+                out.push(json!({
+                    "id": e.id, "name": e.name, "library": e.name == LIBRARY && e.prior_id.is_none(),
+                    "prior": e.prior_id.and_then(|p| envs.iter().find(|x| x.id == p)).map(|x| x.name.clone()).unwrap_or_default(),
+                    "protected": e.protected, "bound": bound.join(", "),
+                }));
+            }
+            out
         }
         Kind::Logs { polls } => crate::session_log::rows(*polls),
         _ => vec![],
@@ -791,28 +805,41 @@ mod tests {
         assert!(NAV.iter().any(|(l, k)| *l == "Logs" && *k == Kind::Logs { polls: false }));
         assert!(k.title().ends_with("[t: show/hide task polling]"));
         assert!(Kind::Logs { polls: true }.title().ends_with(" — polling shown"));
-        assert!(!Act::Inspect.mutates(&k));
+        assert!(!Act::Inspect.mutates(&k, false));
     }
 
     #[tokio::test]
     async fn logs_load_reads_the_session_log_and_applies_the_filter() {
         crate::session_log::record("notice", "lab", "[ok] logs-load-needle".into(), vec![]);
-        let (store, cfg, k) = (Store::open_in_memory().unwrap(), Config::default(), Kind::Logs { polls: false });
-        let (all, n) = load(&k, None, &store, "lab", &cfg, 0, "").await.unwrap();
+        let (store, cfg, k) = (Store::open_in_memory().await.unwrap(), Config::default(), Kind::Logs { polls: false });
+        let (all, n) = load(&k, None, Ok(&store), "lab", "lab", &cfg, 0, "").await.unwrap();
         assert_eq!(n as usize, all.len());
-        let (hit, _) = load(&k, None, &store, "lab", &cfg, 0, "LOGS-LOAD-NEEDLE").await.unwrap();
+        let (hit, _) = load(&k, None, Ok(&store), "lab", "lab", &cfg, 0, "LOGS-LOAD-NEEDLE").await.unwrap();
         assert_eq!(hit.len(), 1);
         let cols: Vec<String> = k.columns().iter().map(|c| (c.get)(&hit[0])).collect();
         assert_eq!(cols[1..], ["notice", "lab", "[ok] logs-load-needle"]);
     }
 
+    #[tokio::test]
+    async fn cv_screens_report_unavailable_store() {
+        let e = load(&Kind::ContentViews, None, Err("timeout"), "s", "p", &Config::default(), 0, "").await.unwrap_err();
+        assert_eq!(e.to_string(), "shared database unavailable: timeout");
+        // Screens that do not use the store still load.
+        assert!(load(&Kind::Profiles, None, Err("timeout"), "s", "p", &Config::default(), 0, "").await.is_ok());
+    }
+
     #[test]
     fn read_only_classification() {
-        assert!(Act::Delete.mutates(&Kind::Repos(RepoType::Rpm)));
-        assert!(!Act::Inspect.mutates(&Kind::Repos(RepoType::Rpm)));
-        assert!(!Act::Create.mutates(&Kind::ContentViews), "CV definitions are local");
-        assert!(Act::CvPublish.mutates(&Kind::ContentViews));
-        assert!(!Act::Delete.mutates(&Kind::Profiles));
+        assert!(Act::Delete.mutates(&Kind::Repos(RepoType::Rpm), false));
+        assert!(!Act::Inspect.mutates(&Kind::Repos(RepoType::Rpm), false));
+        assert!(!Act::Create.mutates(&Kind::ContentViews, false), "local CV definitions");
+        assert!(Act::Create.mutates(&Kind::ContentViews, true), "shared CV definitions");
+        assert!(Act::ToggleProtected.mutates(&Kind::Environments, true));
+        assert!(!Act::ToggleProtected.mutates(&Kind::Environments, false));
+        assert!(Act::CvPublish.mutates(&Kind::ContentViews, false));
+        assert!(!Act::Delete.mutates(&Kind::Profiles, true));
+        assert!(Act::ImportCv.mutates(&Kind::Profiles, true), "bulk create in the shared database");
+        assert!(!Act::ImportCv.mutates(&Kind::Profiles, false));
     }
 
     #[test]

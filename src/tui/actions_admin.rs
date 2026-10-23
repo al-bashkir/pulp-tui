@@ -514,7 +514,7 @@ pub fn fallback(app: &mut App) {
                 String::new(),
             ];
             lines.extend(plan.iter().map(ToString::to_string));
-            let last = ctx.store.last_replications(ctx.client.profile(), &src_name)?;
+            let last = ctx.store.last_replications(ctx.client.profile(), &src_name).await?;
             if !last.is_empty() {
                 lines.push(String::new());
                 lines.push("Last successful runs:".into());

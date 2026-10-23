@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const KEYRING_SERVICE: &str = "pulp-tui";
+/// Keyring user of `[database].secret = "keyring"`. Profiles use their name as the user; a
+/// profile name cannot hold brackets, so the two never share an entry.
+pub const DATABASE_KEYRING_USER: &str = "[database]";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -19,8 +22,90 @@ pub struct Config {
     pub default_profile: Option<String>,
     #[serde(default)]
     pub settings: Settings,
+    /// External Content View / lifecycle database; without it they stay in the local file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<Database>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Database {
+    /// `postgres://user@host:5432/db` or `sqlite:///path/cv.db`; never with a password.
+    pub url: String,
+    /// `env:VAR`, `file:/path` or `keyring` (keyring user `[database]`, see `DATABASE_KEYRING_USER`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<PathBuf>,
+}
+
+impl Database {
+    /// Errors never repeat the URL: it could hold a password.
+    fn parsed(&self) -> Result<url::Url> {
+        let u = url::Url::parse(&self.url).map_err(|e| anyhow::anyhow!("invalid database url: {e}"))?;
+        if !matches!(u.scheme(), "postgres" | "postgresql" | "sqlite") {
+            bail!("database url must use postgres, postgresql or sqlite");
+        }
+        if u.password().is_some() || u.query_pairs().any(|(k, _)| k == "password") {
+            bail!("put the database password in secret, not in the URL");
+        }
+        Ok(u)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.parsed()?;
+        if let Some(s) = &self.secret {
+            parse_secret_ref(s)?;
+        }
+        Ok(())
+    }
+
+    /// The URL for sqlx, with the password and the TLS settings. Never show or log it.
+    pub fn connect_url(&self) -> Result<String> {
+        let mut u = self.parsed()?;
+        if u.scheme() == "sqlite" {
+            return Ok(self.url.clone());
+        }
+        if let Some(s) = &self.secret {
+            let pw = resolve_secret(DATABASE_KEYRING_USER, &parse_secret_ref(s)?)?;
+            u.set_password(Some(&pw)).map_err(|_| anyhow::anyhow!("database url needs a host to set the password"))?;
+        }
+        // sqlx connects to the last `host`/`hostaddr` parameter, else to the URL host.
+        let host = u.query_pairs().filter(|(k, _)| k == "host" || k == "hostaddr").map(|(_, v)| v.into_owned()).last();
+        let host = host.or_else(|| u.host_str().map(|h| h.to_ascii_lowercase()));
+        // A socket path (`%2F...` in the URL host) or a loopback address: traffic stays on this machine.
+        let local = host.is_some_and(|h| {
+            h.starts_with('/') || h.starts_with("%2f") || matches!(h.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
+        });
+        let ca = self.ca_cert.as_ref().map(|p| p.to_string_lossy().into_owned());
+        // sqlx applies parameters in order, so the ones appended below win over any alias left in the URL.
+        let replaced = |k: &str| (k == "sslrootcert" && ca.is_some()) || (k == "sslmode" && !local);
+        let keep: Vec<(String, String)> =
+            u.query_pairs().filter(|(k, _)| !replaced(k)).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        let mut q = u.query_pairs_mut();
+        q.clear().extend_pairs(keep);
+        if !local {
+            q.append_pair("sslmode", "verify-full");
+        }
+        if let Some(ca) = ca {
+            q.append_pair("sslrootcert", &ca);
+        }
+        drop(q);
+        Ok(u.to_string())
+    }
+
+    /// The URL without a password, for messages.
+    pub fn display_url(&self) -> String {
+        match url::Url::parse(&self.url) {
+            Ok(mut u) => {
+                let _ = u.set_password(None);
+                u.to_string()
+            }
+            Err(_) => "invalid database url".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -158,6 +243,11 @@ impl Profile {
     pub fn origin(&self) -> String {
         url::Url::parse(&self.url).map(|u| u.origin().ascii_serialization()).unwrap_or_else(|_| self.url.clone())
     }
+
+    /// Scope of Content View rows in a shared database: the same server under any profile name.
+    pub fn server_key(&self) -> String {
+        format!("{}{}#{}", self.origin(), self.api_root, self.domain.as_deref().unwrap_or("default"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +336,9 @@ impl Config {
                 for (name, p) in &cfg.profiles {
                     p.validate().with_context(|| format!("profile {name}"))?;
                 }
+                if let Some(d) = &cfg.database {
+                    d.validate().context("[database]")?;
+                }
                 Ok(cfg)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -269,6 +362,14 @@ impl Config {
             return self.profiles.contains_key(r).then(|| r.to_string());
         }
         self.default_profile.clone().filter(|d| self.profiles.contains_key(d)).or_else(|| self.profiles.keys().next().cloned())
+    }
+
+    /// `import-cv` creates objects in the `[database]`: a read-only profile must not do that.
+    pub fn check_import_cv(&self, profile: &str) -> Result<()> {
+        if self.database.is_some() && self.profiles.get(profile).is_some_and(|p| p.read_only) {
+            bail!("profile {profile} is read-only; import-cv writes to the shared database");
+        }
+        Ok(())
     }
 }
 
@@ -340,5 +441,60 @@ read_only = true
         std::fs::write(&f, "pw\n").unwrap();
         assert_eq!(resolve_secret("p", &SecretRef::File(f)).unwrap(), "pw");
         assert!(resolve_secret("p", &SecretRef::Env("PULP_TUI_SURELY_UNSET_VAR".into())).is_err());
+    }
+
+    #[test]
+    fn import_cv_needs_a_writable_profile_only_with_a_shared_database() {
+        let mut cfg: Config = toml::from_str(EXAMPLE).unwrap();
+        assert!(cfg.check_import_cv("prod").is_ok(), "the local file: nothing changes");
+        cfg.database = Some(Database { url: "postgres://u@h/x".into(), secret: None, ca_cert: None });
+        assert!(cfg.check_import_cv("lab").is_ok());
+        assert_eq!(
+            cfg.check_import_cv("prod").unwrap_err().to_string(),
+            "profile prod is read-only; import-cv writes to the shared database"
+        );
+    }
+
+    #[test]
+    fn database_password_in_url_rejected() {
+        let d = Database { url: "postgres://u:pw@db.example.com/x".into(), secret: None, ca_cert: None };
+        assert!(d.validate().unwrap_err().to_string().contains("secret"));
+        let c: Result<Config, _> = toml::from_str("[database]\nurl = \"postgres://u@h/x\"\npassword = \"x\"\n");
+        assert!(c.is_err());
+        // sqlx also reads a password from the query string.
+        let q = Database { url: "postgres://u@h/x?password=pw".into(), secret: None, ca_cert: None };
+        assert!(q.validate().unwrap_err().to_string().contains("secret"));
+        assert!(Database { url: "mysql://u@h/x".into(), secret: None, ca_cert: None }.validate().is_err());
+    }
+
+    #[test]
+    fn connect_url_tls_rules() {
+        unsafe { std::env::set_var("PTUI_TEST_DBPW", "p@ss word") };
+        let d = |u: &str| Database { url: u.into(), secret: Some("env:PTUI_TEST_DBPW".into()), ca_cert: Some("/ca.pem".into()) };
+        let remote = d("postgres://u@db.example.com:5432/x?sslmode=disable").connect_url().unwrap();
+        assert!(remote.contains("sslmode=verify-full") && !remote.contains("sslmode=disable"));
+        assert!(remote.contains("sslrootcert=%2Fca.pem") || remote.contains("sslrootcert=/ca.pem"));
+        assert!(remote.contains("p%40ss%20word"));
+        assert!(!d("postgres://u@127.0.0.1/x").connect_url().unwrap().contains("verify-full"));
+        assert!(!d("postgres://u@db.example.com/x").display_url().contains("p%40ss"));
+        // sqlx connects to the `host` parameter, not the URL host; a socket path stays on the machine.
+        assert!(d("postgres://u@127.0.0.1/x?host=db.example.com").connect_url().unwrap().contains("verify-full"));
+        assert!(!d("postgres://u@%2Frun%2Fpostgresql/x").connect_url().unwrap().contains("verify-full"));
+        assert!(!d("postgres://u@db.example.com/x?host=/run/postgresql").connect_url().unwrap().contains("verify-full"));
+    }
+
+    #[test]
+    fn database_keyring_user_cannot_be_a_profile_name() {
+        assert_eq!(DATABASE_KEYRING_USER, "[database]");
+        // Profiles created in the TUI pass validate_name, so they never share this keyring entry.
+        assert!(crate::store::validate_name(DATABASE_KEYRING_USER).is_err());
+        assert!(crate::store::validate_name("database").is_ok(), "the old user was a valid profile name");
+    }
+
+    #[test]
+    fn server_key_normalizes() {
+        let p = |u: &str| Profile { url: u.into(), ..Default::default() };
+        assert_eq!(p("https://Pulp.Example.com:443").server_key(), p("https://pulp.example.com").server_key());
+        assert_eq!(p("https://pulp.example.com").server_key(), "https://pulp.example.com/pulp/#default");
     }
 }

@@ -15,6 +15,18 @@ max_response_mb = 64          # larger API responses are rejected
 upload_chunk_mb = 8           # chunked upload size
 cv_base_path_prefix = "cv"    # Content View distributions: <prefix>/<env>/<view>/<repo>
 
+# Shared Content View / lifecycle database (optional, one for all profiles). Without it they
+# stay in the local file. `pulp-tui db migrate` creates or upgrades the schema; a normal start
+# never changes it. When it cannot be opened, Pulp screens still work and Content View screens
+# show "shared database unavailable: ...".
+# [database]
+# url = "postgres://pulp_tui@db.example.com:5432/pulp_tui"   # never a password in the URL
+# secret = "env:PULP_TUI_DB_PASSWORD"   # env:VAR, file:/path or keyring (user "[database]")
+# ca_cert = "/etc/pki/tls/certs/internal-ca.pem"   # TLS is always verify-full, except localhost or a Unix socket
+# SQLite instead: safe only when every operator runs pulp-tui on this one host.
+# SQLite WAL does not work on network shares (NFS/SMB).
+# url = "sqlite:///srv/pulp-tui/cv.db"
+
 [profiles.lab]
 url = "http://localhost:8080"
 username = "admin"

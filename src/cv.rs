@@ -33,6 +33,10 @@ pub struct CvService {
     pub client: PulpClient,
     pub store: Arc<Store>,
     pub prefix: String,
+    /// Store scope of this server (`Store::scope`).
+    pub scope: String,
+    /// `store::actor`: who is shown in the audit log.
+    pub actor: String,
 }
 
 /// Turn any name into a safe Pulp name / base path segment.
@@ -68,12 +72,8 @@ struct Selection {
 }
 
 impl CvService {
-    fn profile(&self) -> &str {
-        self.client.profile()
-    }
-
-    fn audit(&self, action: &str, detail: &str) {
-        if let Err(e) = self.store.audit(self.profile(), action, detail) {
+    async fn audit(&self, action: &str, detail: &str) {
+        if let Err(e) = self.store.audit(&self.scope, &self.actor, action, detail).await {
             tracing::warn!("audit write failed: {e:#}");
         }
     }
@@ -150,8 +150,8 @@ impl CvService {
 
     /// Create a new numbered version from the current definition and publish it.
     pub async fn publish(&self, cv_id: i64, notes: &str, log: Log<'_>, on: OnTask<'_>) -> Result<CvVersion> {
-        let cv = self.store.content_view(cv_id)?;
-        let repos = self.store.cv_repos(cv_id)?;
+        let cv = self.store.content_view(cv_id).await?;
+        let repos = self.store.cv_repos(cv_id).await?;
         if repos.is_empty() {
             bail!("content view {} has no repositories", cv.name);
         }
@@ -163,29 +163,29 @@ impl CvService {
             let sv = repo.latest_version_href.ok_or_else(|| anyhow!("{} has no versions", r.repo_name))?;
             sources.push(sv);
         }
-        let v = self.store.begin_version(cv_id, notes, &repos)?;
-        for (mut vr, sv) in self.store.version_repos(v.id)?.into_iter().zip(sources) {
+        let v = self.store.begin_version(cv_id, notes, &repos).await?;
+        for (mut vr, sv) in self.store.version_repos(v.id).await?.into_iter().zip(sources) {
             vr.source_version = Some(sv);
-            self.store.save_version_repo(&vr)?;
+            self.store.save_version_repo(&vr).await?;
         }
-        self.audit("cv.publish.start", &format!("{} version {}", cv.name, v.number));
+        self.audit("cv.publish.start", &format!("{} version {}", cv.name, v.number)).await;
         log(format!("{} v{}: publishing {} repositories", cv.name, v.number, repos.len()));
         self.resume(v.id, log, on).await
     }
 
     /// Run (or continue) the publish workflow of a version from its checkpoints.
     pub async fn resume(&self, version_id: i64, log: Log<'_>, on: OnTask<'_>) -> Result<CvVersion> {
-        let v = self.store.version(version_id)?;
-        let cv = self.store.content_view(v.cv_id)?;
+        let v = self.store.version(version_id).await?;
+        let cv = self.store.content_view(v.cv_id).await?;
         if v.state == "published" {
             return Ok(v);
         }
         if v.state == "deleted" {
             bail!("version {} was deleted", v.number);
         }
-        self.store.finish_version(v.id, "publishing", None)?;
+        self.store.finish_version(v.id, "publishing", None).await?;
         let res = async {
-            for mut vr in self.store.version_repos(v.id)? {
+            for mut vr in self.store.version_repos(v.id).await? {
                 self.publish_repo(&cv.name, &mut vr, log, on).await.with_context(|| format!("repository {}", vr.repo().repo_name))?;
             }
             anyhow::Ok(())
@@ -193,17 +193,17 @@ impl CvService {
         .await;
         match res {
             Ok(()) => {
-                self.store.finish_version(v.id, "published", None)?;
-                self.audit("cv.publish.done", &format!("{} version {}", cv.name, v.number));
+                self.store.finish_version(v.id, "published", None).await?;
+                self.audit("cv.publish.done", &format!("{} version {}", cv.name, v.number)).await;
                 log(format!("{} v{} published", cv.name, v.number));
-                let lib = self.store.ensure_library(self.profile())?;
+                let lib = self.store.ensure_library(&self.scope).await?;
                 self.promote(v.cv_id, v.id, lib, Mode::Rollback, log, on).await?;
-                Ok(self.store.version(v.id)?)
+                Ok(self.store.version(v.id).await?)
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                self.store.finish_version(v.id, "failed", Some(&msg))?;
-                self.audit("cv.publish.failed", &format!("{} version {}: {msg}", cv.name, v.number));
+                self.store.finish_version(v.id, "failed", Some(&msg)).await?;
+                self.audit("cv.publish.failed", &format!("{} version {}: {msg}", cv.name, v.number)).await;
                 Err(e)
             }
         }
@@ -233,7 +233,7 @@ impl CvService {
                 }
             };
             vr.derived_repo = Some(href);
-            self.store.save_version_repo(vr)?;
+            self.store.save_version_repo(vr).await?;
         }
         let derived = vr.derived_repo.clone().unwrap_or_default();
         if vr.derived_version.is_none() {
@@ -261,7 +261,7 @@ impl CvService {
                     };
                     let Mutation::Task(h) = m else { bail!("copy did not return a task") };
                     vr.pending_task = Some(h.clone());
-                    self.store.save_version_repo(vr)?;
+                    self.store.save_version_repo(vr).await?;
                     ops::wait_task(c, &h, on).await
                 }
             };
@@ -278,12 +278,12 @@ impl CvService {
             vr.content_count = Some(rv.content_summary.present.values().map(|x| x.count as i64).sum());
             vr.derived_version = Some(version);
             vr.pending_task = None;
-            self.store.save_version_repo(vr)?;
+            self.store.save_version_repo(vr).await?;
         }
         let dv = vr.derived_version.clone().unwrap_or_default();
         log(format!("{}: publishing {dv}", repo.repo_name));
         vr.publication = Some(ops::ensure_publication(c, t, &dv, on).await?);
-        self.store.save_version_repo(vr)?;
+        self.store.save_version_repo(vr).await?;
         Ok(())
     }
 
@@ -292,33 +292,40 @@ impl CvService {
     /// Bind `version_id` to `env_id`. Re-points stable distributions; repositories that
     /// are bound in the environment but not part of the version stop being served.
     pub async fn promote(&self, cv_id: i64, version_id: i64, env_id: i64, mode: Mode, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
-        let cv = self.store.content_view(cv_id)?;
-        let v = self.store.version(version_id)?;
+        let cv = self.store.content_view(cv_id).await?;
+        let v = self.store.version(version_id).await?;
         if v.cv_id != cv_id || v.state != "published" {
             bail!("version {} is not a published version of {}", v.number, cv.name);
         }
-        let envs = self.store.environments(self.profile())?;
+        let envs = self.store.environments(&self.scope).await?;
         let env = envs.iter().find(|e| e.id == env_id).ok_or_else(|| anyhow!("unknown environment"))?;
         if mode == Mode::Promote
             && let Some(prior) = env.prior_id
         {
-            let pb = self.store.binding(prior, cv_id)?;
+            let pb = self.store.binding(prior, cv_id).await?;
             if pb.as_ref().map(|b| (b.version_id, b.state.as_str())) != Some((version_id, "active")) {
                 let pname = envs.iter().find(|e| e.id == prior).map(|e| e.name.as_str()).unwrap_or("?");
                 bail!("version {} is not active in {pname}; promote it there first (or use rollback)", v.number);
             }
         }
-        self.store.set_binding(env_id, cv_id, version_id, "promoting")?;
+        // The first prefix used for this server stays: a changed setting must not move served paths.
+        let prefix = self.store.cv_prefix(&self.scope, &self.prefix).await?;
+        if prefix != self.prefix {
+            let msg = format!("cv_base_path_prefix {} differs from the stored {prefix} for this server; using {prefix}", self.prefix);
+            tracing::warn!("{msg}");
+            log(msg);
+        }
+        self.store.set_binding(env_id, cv_id, version_id, "promoting").await?;
         log(format!("{} v{} -> {}", cv.name, v.number, env.name));
         let mut errors = vec![];
-        let vrs = self.store.version_repos(version_id)?;
+        let vrs = self.store.version_repos(version_id).await?;
         for vr in &vrs {
-            if let Err(e) = self.bind_repo(&cv.name, env, vr, on).await {
+            if let Err(e) = self.bind_repo(&prefix, &cv.name, env, vr, on).await {
                 errors.push(format!("{}: {e:#}", vr.repo().repo_name));
             }
         }
         // Repositories no longer part of the view stop serving (distribution kept for rollback).
-        for b in self.store.binding_repos(env_id, cv_id)? {
+        for b in self.store.binding_repos(env_id, cv_id).await? {
             if vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) || b.publication.is_none() {
                 continue;
             }
@@ -328,7 +335,7 @@ impl CvService {
             }
             .await;
             match res {
-                Ok(_) => self.store.save_binding_repo(&BindingRepo { publication: None, ..b })?,
+                Ok(_) => self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await?,
                 Err(e) => errors.push(format!("unbind {}: {e}", b.repo_name)),
             }
         }
@@ -339,9 +346,9 @@ impl CvService {
         } else {
             "failed"
         };
-        self.store.set_binding(env_id, cv_id, version_id, state)?;
+        self.store.set_binding(env_id, cv_id, version_id, state).await?;
         let what = if mode == Mode::Rollback && env.name != LIBRARY { "cv.rollback" } else { "cv.promote" };
-        self.audit(what, &format!("{} v{} -> {}: {state} {}", cv.name, v.number, env.name, errors.join("; ")));
+        self.audit(what, &format!("{} v{} -> {}: {state} {}", cv.name, v.number, env.name, errors.join("; "))).await;
         if errors.is_empty() {
             log(format!("{} v{} active in {}", cv.name, v.number, env.name));
             Ok(())
@@ -350,23 +357,25 @@ impl CvService {
         }
     }
 
-    async fn bind_repo(&self, cv: &str, env: &Environment, vr: &CvVersionRepo, on: OnTask<'_>) -> Result<()> {
+    async fn bind_repo(&self, prefix: &str, cv: &str, env: &Environment, vr: &CvVersionRepo, on: OnTask<'_>) -> Result<()> {
         let repo = vr.repo();
         let publication = vr.publication.as_deref().ok_or_else(|| anyhow!("version has no publication"))?;
         let name = distribution_name(cv, &env.name, &repo.repo_name);
-        let bp = base_path(&self.prefix, cv, &env.name, &repo.repo_name);
+        let bp = base_path(prefix, cv, &env.name, &repo.repo_name);
         let labels = json!({ LABEL_CV: slug(cv), LABEL_ENV: slug(&env.name) });
         let href = ops::ensure_distribution(&self.client, repo.repo_type, &name, &bp, Some(publication), &labels, on).await?;
-        self.store.save_binding_repo(&BindingRepo {
-            env_id: env.id,
-            cv_id: vr_cv(&self.store, vr.version_id)?,
-            repo_href: repo.repo_href.clone(),
-            repo_name: repo.repo_name.clone(),
-            repo_type: repo.repo_type,
-            distribution: href,
-            base_path: bp,
-            publication: Some(publication.into()),
-        })?;
+        self.store
+            .save_binding_repo(&BindingRepo {
+                env_id: env.id,
+                cv_id: vr_cv(&self.store, vr.version_id).await?,
+                repo_href: repo.repo_href.clone(),
+                repo_name: repo.repo_name.clone(),
+                repo_type: repo.repo_type,
+                distribution: href,
+                base_path: bp,
+                publication: Some(publication.into()),
+            })
+            .await?;
         Ok(())
     }
 
@@ -376,13 +385,13 @@ impl CvService {
     /// Returns human-readable findings; empty means verified.
     pub async fn verify(&self, cv_id: i64, env_id: i64) -> Result<Vec<String>> {
         let c = &self.client;
-        let Some(b) = self.store.binding(env_id, cv_id)? else { return Ok(vec!["not bound".into()]) };
+        let Some(b) = self.store.binding(env_id, cv_id).await? else { return Ok(vec!["not bound".into()]) };
         let mut issues = vec![];
         if b.state != "active" {
             issues.push(format!("binding state is {}", b.state));
         }
-        let vrs = self.store.version_repos(b.version_id)?;
-        for br in self.store.binding_repos(env_id, cv_id)? {
+        let vrs = self.store.version_repos(b.version_id).await?;
+        for br in self.store.binding_repos(env_id, cv_id).await? {
             let vr = vrs.iter().find(|vr| vr.repo().repo_href == br.repo_href);
             let want = vr.and_then(|v| v.publication.clone());
             let d: Distribution = match c.get(&br.distribution, &[]).await {
@@ -447,9 +456,9 @@ impl CvService {
 
     /// Exact content the current definition would select, compared to a published version.
     pub async fn preview(&self, cv_id: i64, against: Option<i64>) -> Result<Vec<String>> {
-        let repos = self.store.cv_repos(cv_id)?;
+        let repos = self.store.cv_repos(cv_id).await?;
         let old = match against {
-            Some(v) => self.store.version_repos(v)?,
+            Some(v) => self.store.version_repos(v).await?,
             None => vec![],
         };
         let mut out = vec![];
@@ -477,7 +486,7 @@ impl CvService {
     }
 
     pub async fn compare_versions(&self, a: i64, b: i64) -> Result<Vec<String>> {
-        let (va, vb) = (self.store.version_repos(a)?, self.store.version_repos(b)?);
+        let (va, vb) = (self.store.version_repos(a).await?, self.store.version_repos(b).await?);
         let mut hrefs: Vec<&CvRepo> = va.iter().chain(vb.iter()).map(|v| v.repo()).collect();
         hrefs.sort_by(|x, y| x.repo_name.cmp(&y.repo_name));
         hrefs.dedup_by(|x, y| x.repo_href == y.repo_href);
@@ -497,23 +506,23 @@ impl CvService {
 
     /// Delete a version's Pulp objects unless shared with another live version or bound.
     pub async fn delete_version(&self, version_id: i64, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
-        let v = self.store.version(version_id)?;
-        let used = self.store.version_in_use(version_id)?;
+        let v = self.store.version(version_id).await?;
+        let used = self.store.version_in_use(version_id).await?;
         if !used.is_empty() {
             bail!("version {} is bound to {}", v.number, used.join(", "));
         }
         let mut shared: HashSet<String> = HashSet::new();
-        for other in self.store.versions(v.cv_id)? {
+        for other in self.store.versions(v.cv_id).await? {
             if other.id != v.id && other.state != "deleted" {
-                for vr in self.store.version_repos(other.id)? {
+                for vr in self.store.version_repos(other.id).await? {
                     shared.extend(vr.publication.into_iter().chain(vr.derived_version));
                 }
             }
         }
-        for b in self.store.all_binding_repos(v.cv_id)? {
+        for b in self.store.all_binding_repos(v.cv_id).await? {
             shared.extend(b.publication);
         }
-        for vr in self.store.version_repos(version_id)? {
+        for vr in self.store.version_repos(version_id).await? {
             for href in [vr.publication.as_ref(), vr.derived_version.as_ref()].into_iter().flatten() {
                 if shared.contains(href) {
                     log(format!("keeping shared {href}"));
@@ -528,18 +537,18 @@ impl CvService {
                 }
             }
         }
-        self.store.finish_version(version_id, "deleted", None)?;
-        self.audit("cv.version.delete", &format!("cv {} version {}", v.cv_id, v.number));
+        self.store.finish_version(version_id, "deleted", None).await?;
+        self.audit("cv.version.delete", &format!("cv {} version {}", v.cv_id, v.number)).await;
         Ok(())
     }
 
     /// Remove a whole content view: its distributions and derived repositories.
     pub async fn delete_view(&self, cv_id: i64, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
-        let cv = self.store.content_view(cv_id)?;
-        let mut hrefs: Vec<String> = self.store.all_binding_repos(cv_id)?.into_iter().map(|b| b.distribution).collect();
+        let cv = self.store.content_view(cv_id).await?;
+        let mut hrefs: Vec<String> = self.store.all_binding_repos(cv_id).await?.into_iter().map(|b| b.distribution).collect();
         let mut repos: BTreeSet<String> = BTreeSet::new();
-        for v in self.store.versions(cv_id)? {
-            repos.extend(self.store.version_repos(v.id)?.into_iter().filter_map(|vr| vr.derived_repo));
+        for v in self.store.versions(cv_id).await? {
+            repos.extend(self.store.version_repos(v.id).await?.into_iter().filter_map(|vr| vr.derived_repo));
         }
         hrefs.extend(repos);
         for h in hrefs {
@@ -552,8 +561,8 @@ impl CvService {
                 Err(e) => return Err(e.into()),
             }
         }
-        self.store.delete_cv(cv_id)?;
-        self.audit("cv.delete", &cv.name);
+        self.store.delete_cv(cv_id).await?;
+        self.audit("cv.delete", &cv.name).await;
         Ok(())
     }
 }
@@ -562,8 +571,8 @@ fn norm_epoch(e: &str) -> String {
     if e.is_empty() || e == "null" { "0".into() } else { e.into() }
 }
 
-fn vr_cv(store: &Store, version_id: i64) -> Result<i64> {
-    Ok(store.version(version_id)?.cv_id)
+async fn vr_cv(store: &Store, version_id: i64) -> Result<i64> {
+    Ok(store.version(version_id).await?.cv_id)
 }
 
 #[cfg(test)]

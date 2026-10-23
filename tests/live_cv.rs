@@ -27,24 +27,24 @@ async fn content_view_lifecycle() {
     let (rpm_repo, rpm_remote) = synced_repo(&c, RepoType::Rpm, &format!("{id}-os"), "rpm/", "additive").await;
     let (file_repo, file_remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
 
-    let store = Arc::new(Store::open_in_memory().unwrap());
-    let svc = CvService { client: c.clone(), store: store.clone(), prefix: id.clone() };
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
     let profile = c.profile().to_string();
-    let cv = store.create_cv(&profile, &id, "test view").unwrap();
+    let svc = CvService { client: c.clone(), store: store.clone(), prefix: id.clone(), scope: profile.clone(), actor: "test@live".into() };
+    let cv = store.create_cv(&profile, &id, "test view").await.unwrap();
     let mut os = CvRepo {
         repo_href: rpm_repo.clone(),
         repo_name: "os".into(),
         repo_type: RepoType::Rpm,
         filters: parse_rules("exclude name=*-debuginfo", RepoType::Rpm).unwrap(),
     };
-    store.set_cv_repo(cv, &os).unwrap();
+    store.set_cv_repo(cv, &os).await.unwrap();
     let docs = CvRepo {
         repo_href: file_repo.clone(),
         repo_name: "docs".into(),
         repo_type: RepoType::File,
         filters: parse_rules("exclude path=isos/*", RepoType::File).unwrap(),
     };
-    store.set_cv_repo(cv, &docs).unwrap();
+    store.set_cv_repo(cv, &docs).await.unwrap();
 
     // Preview shows the exact selection.
     let preview = svc.preview(cv, None).await.unwrap().join("\n");
@@ -56,9 +56,9 @@ async fn content_view_lifecycle() {
     // v1: publish auto-binds Library and is verified against served content.
     let v1 = svc.publish(cv, "first", &quiet, &no_progress).await.unwrap();
     assert_eq!((v1.number, v1.state.as_str()), (1, "published"));
-    let lib = store.ensure_library(&profile).unwrap();
+    let lib = store.ensure_library(&profile).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
-    let vrs = store.version_repos(v1.id).unwrap();
+    let vrs = store.version_repos(v1.id).await.unwrap();
     let os_v1 = vrs.iter().find(|v| v.repo().repo_name == "os").unwrap();
     let rv: RepoVersion = c.get(os_v1.derived_version.as_deref().unwrap(), &[]).await.unwrap();
     assert_eq!(rv.content_summary.present["rpm.package"].count, 2);
@@ -66,8 +66,8 @@ async fn content_view_lifecycle() {
     assert_eq!(vrs.iter().find(|v| v.repo().repo_name == "docs").unwrap().content_count, Some(2));
 
     // Environments: Library -> Dev -> Prod. Promotion must follow the path.
-    let dev = store.create_env(&profile, "Dev", lib, false).unwrap();
-    let prod = store.create_env(&profile, "Prod", dev, true).unwrap();
+    let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
+    let prod = store.create_env(&profile, "Prod", dev, true).await.unwrap();
     let err = svc.promote(cv, v1.id, prod, Mode::Promote, &quiet, &no_progress).await.unwrap_err();
     assert!(err.to_string().contains("not active in Dev"), "{err}");
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
@@ -85,7 +85,7 @@ async fn content_view_lifecycle() {
     ops::settle(&c, m, &no_progress).await.unwrap();
     let v2 = svc.publish(cv, "upstream update", &quiet, &no_progress).await.unwrap();
     assert_eq!(v2.number, 2);
-    assert_eq!(store.binding(lib, cv).unwrap().unwrap().version_id, v2.id);
+    assert_eq!(store.binding(lib, cv).await.unwrap().unwrap().version_id, v2.id);
     svc.promote(cv, v2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
     assert!(svc.verify(cv, dev).await.unwrap().is_empty());
     let cmp = svc.compare_versions(v1.id, v2.id).await.unwrap().join("\n");
@@ -93,26 +93,26 @@ async fn content_view_lifecycle() {
 
     // Rollback Dev to v1: bindings change, history stays, served content is v1 again.
     svc.promote(cv, v1.id, dev, Mode::Rollback, &quiet, &no_progress).await.unwrap();
-    assert_eq!(store.binding(dev, cv).unwrap().unwrap().version_id, v1.id);
+    assert_eq!(store.binding(dev, cv).await.unwrap().unwrap().version_id, v1.id);
     assert!(svc.verify(cv, dev).await.unwrap().is_empty());
-    assert_eq!(store.version(v2.id).unwrap().state, "published");
+    assert_eq!(store.version(v2.id).await.unwrap().state, "published");
 
     // Retention protection: referenced snapshots are listed; bound versions cannot be deleted.
-    let protected = store.protected_versions(&profile).unwrap();
+    let protected = store.protected_versions(&profile).await.unwrap();
     assert!(protected.contains(os_v1.derived_version.as_ref().unwrap()));
     assert!(svc.delete_version(v1.id, &quiet, &no_progress).await.unwrap_err().to_string().contains("bound to Dev"));
 
     // Advisory filtering: excluding the package referenced by the advisory drops it.
     os.filters = parse_rules("exclude name=*-debuginfo; exclude name=fixture-beta", RepoType::Rpm).unwrap();
-    store.set_cv_repo(cv, &os).unwrap();
+    store.set_cv_repo(cv, &os).await.unwrap();
     let v3 = svc.publish(cv, "no beta", &quiet, &no_progress).await.unwrap();
-    let os_v3 = store.version_repos(v3.id).unwrap().into_iter().find(|v| v.repo().repo_name == "os").unwrap();
+    let os_v3 = store.version_repos(v3.id).await.unwrap().into_iter().find(|v| v.repo().repo_name == "os").unwrap();
     let rv: RepoVersion = c.get(os_v3.derived_version.as_deref().unwrap(), &[]).await.unwrap();
     assert!(!rv.content_summary.present.contains_key("rpm.advisory"));
     assert_eq!(rv.content_summary.present["rpm.package"].count, 3);
 
     // Partial failure: a foreign distribution occupies the File base path of QA.
-    let qa = store.create_env(&profile, "QA", lib, false).unwrap();
+    let qa = store.create_env(&profile, "QA", lib, false).await.unwrap();
     let blocker = create(
         &c,
         RepoType::File.distributions(),
@@ -122,19 +122,19 @@ async fn content_view_lifecycle() {
     .await;
     let err = svc.promote(cv, v3.id, qa, Mode::Promote, &quiet, &no_progress).await.unwrap_err();
     assert!(err.to_string().contains("partial"), "{err}");
-    assert_eq!(store.binding(qa, cv).unwrap().unwrap().state, "partial");
+    assert_eq!(store.binding(qa, cv).await.unwrap().unwrap().state, "partial");
     assert!(!svc.verify(cv, qa).await.unwrap().is_empty());
     cleanup(&c, &[&blocker]).await;
     svc.promote(cv, v3.id, qa, Mode::Promote, &quiet, &no_progress).await.unwrap(); // idempotent retry
-    assert_eq!(store.binding(qa, cv).unwrap().unwrap().state, "active");
+    assert_eq!(store.binding(qa, cv).await.unwrap().unwrap().state, "active");
     assert!(svc.verify(cv, qa).await.unwrap().is_empty());
 
     // Resume: the copy task was submitted, then the client "crashed" before waiting.
     os.filters = vec![];
-    store.set_cv_repo(cv, &os).unwrap();
-    let v4 = store.begin_version(cv, "resume", &store.cv_repos(cv).unwrap()).unwrap();
+    store.set_cv_repo(cv, &os).await.unwrap();
+    let v4 = store.begin_version(cv, "resume", &store.cv_repos(cv).await.unwrap()).await.unwrap();
     let mut pending = String::new();
-    for mut vr in store.version_repos(v4.id).unwrap() {
+    for mut vr in store.version_repos(v4.id).await.unwrap() {
         let latest_src = latest(&c, &vr.repo().repo_href).await;
         vr.source_version = Some(latest_src.clone());
         if vr.repo().repo_type == RepoType::Rpm {
@@ -147,7 +147,7 @@ async fn content_view_lifecycle() {
             vr.pending_task = Some(t.clone());
             pending = t;
         }
-        store.save_version_repo(&vr).unwrap();
+        store.save_version_repo(&vr).await.unwrap();
     }
     let seen: Mutex<Vec<Task>> = Mutex::new(vec![]);
     let on = |t: &Task| seen.lock().unwrap().push(t.clone());
@@ -163,12 +163,12 @@ async fn content_view_lifecycle() {
         .into_iter()
         .collect();
     assert_eq!(copies, vec![pending], "resume re-attached instead of resubmitting");
-    let os_v4 = store.version_repos(v4.id).unwrap().into_iter().find(|v| v.repo().repo_name == "os").unwrap();
+    let os_v4 = store.version_repos(v4.id).await.unwrap().into_iter().find(|v| v.repo().repo_name == "os").unwrap();
     assert_eq!(os_v4.content_count, Some(6), "5 packages + advisory");
 
     // Unbound versions can be deleted; their Pulp objects go away unless shared.
     svc.delete_version(v2.id, &quiet, &no_progress).await.unwrap();
-    assert_eq!(store.version(v2.id).unwrap().state, "deleted");
+    assert_eq!(store.version(v2.id).await.unwrap().state, "deleted");
 
     // Full cleanup through the service removes distributions and derived repositories.
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();

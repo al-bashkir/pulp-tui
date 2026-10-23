@@ -77,7 +77,7 @@ pub fn copy_to_clipboard(s: &str) {
 
 pub fn run(app: &mut App, act: Act, item: Value) {
     let kind = app.list.kind.clone();
-    if act.mutates(&kind) && app.read_only() {
+    if act.mutates(&kind, app.cfg.database.is_some()) && app.read_only() {
         app.error("read-only mode: this action changes the server");
         return;
     }
@@ -299,13 +299,13 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
         }
         Act::ExportCv => {
             let profile = if name.is_empty() { app.profile.clone().unwrap_or_default() } else { name };
-            let store = app.store.clone();
+            let Some((store, scope)) = super::actions_cv::cv_target(app, &profile) else { return };
             app.input(
                 format!("Export Content View definitions of {profile} to file"),
                 &format!("pulp-tui-{profile}-cv.json"),
                 move |app, path| {
                     let fut = async move {
-                        let ex = store.export(&profile)?;
+                        let ex = store.export(&scope).await?;
                         tokio::fs::write(&path, serde_json::to_vec_pretty(&ex)?).await.with_context(|| format!("write {path}"))?;
                         ap(move |app| {
                             app.ok(format!("exported {} content view(s) to {path} (no secrets, no Pulp state)", ex.content_views.len()))
@@ -317,12 +317,12 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
         }
         Act::ImportCv => {
             let profile = app.profile.clone().unwrap_or_default();
-            let store = app.store.clone();
+            let Some((store, scope)) = super::actions_cv::cv_target(app, &profile) else { return };
             app.input(format!("Import Content View definitions into {profile} from file"), "", move |app, path| {
                 let fut = async move {
                     let ex: crate::store::Export =
                         serde_json::from_slice(&tokio::fs::read(&path).await.with_context(|| format!("read {path}"))?)?;
-                    let (cvs, envs) = store.import(&profile, &ex)?;
+                    let (cvs, envs) = store.import(&scope, &ex).await?;
                     ap(move |app| app.ok(format!("imported {cvs} content view(s), {envs} environment(s); existing names were kept")))
                 };
                 app.spawn("import".into(), false, fut);
@@ -463,7 +463,8 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 let dists: Page<Value> =
                     c.list(&c.api(t.distributions()), &[("repository", href.clone()), ("limit", "100".into())]).await?;
                 let versions: Page<Value> = c.list(&format!("{href}versions/"), &[("limit", "1".into())]).await?;
-                let protected = ctx.store.protected_versions(c.profile())?.iter().filter(|v| v.starts_with(&href)).count();
+                // Fails closed: without the Content View store the snapshot check cannot run.
+                let protected = ctx.cv()?.store.protected_versions(&ctx.scope).await?.iter().filter(|v| v.starts_with(&href)).count();
                 let mut lines = vec![
                     format!("Deletes repository {name} with all {} versions and {} publications.", versions.count, pubs.count),
                     "Distributions pinned to its publications stop serving content.".into(),
@@ -877,18 +878,20 @@ fn version_action(app: &mut App, act: Act, item: Value) {
             });
         }
         Act::Delete => {
-            let protected = app.profile.as_ref().and_then(|p| app.store.protected_versions(p).ok()).unwrap_or_default();
-            if protected.contains(&href) {
-                app.error("refused: this version is a snapshot of a Content View version (delete the CV version instead)");
-                return;
-            }
             let lines = vec![
                 format!("Delete repository version {number} ({}).", short(&href)),
                 "Its publications are deleted too; distributions pinned to them stop serving.".into(),
                 "Deleting versions is never needed for rollback: re-point a distribution instead.".into(),
             ];
+            let profile = app.profile.clone().unwrap_or_default();
+            let Some((store, scope)) = super::actions_cv::cv_target(app, &profile) else { return };
             app.confirm_danger(format!("Delete version {number}"), lines, &format!("v{number}"), move |app| {
-                submit(app, format!("delete version {number}"), move |c| async move { Ok(c.delete(&href).await?) })
+                submit(app, format!("delete version {number}"), move |c| async move {
+                    if store.protected_versions(&scope).await?.contains(&href) {
+                        bail!("refused: this version is a snapshot of a Content View version (delete the CV version instead)");
+                    }
+                    Ok(c.delete(&href).await?)
+                })
             });
         }
         _ => {}
@@ -1221,7 +1224,6 @@ pub fn load_dashboard(app: &mut App) {
         app.dashboard = lines;
         return;
     }
-    let profile = app.profile.clone().unwrap_or_default();
     app.job("load dashboard", move |ctx: Ctx| async move {
         let c = &ctx.client;
         let caps = crate::pulp::Capabilities::detect(c).await?;
@@ -1305,9 +1307,16 @@ pub fn load_dashboard(app: &mut App) {
             count("tasks/".into(), vec![("state", "waiting".into())]).await,
             count("tasks/".into(), vec![("state", "failed".into())]).await
         ));
-        let cvs = ctx.store.content_views(&profile)?.len();
-        let envs = ctx.store.environments(&profile)?.len();
-        lines.push(format!("  Content Views {cvs}   lifecycle environments {envs}   (local to this pulp-tui database)"));
+        // A shared database that is down must not hide the Pulp part of the dashboard.
+        let counts = async {
+            let st = ctx.cv()?.store;
+            let place = if st.external { "shared database" } else { "local to this pulp-tui database" };
+            anyhow::Ok((st.content_views(&ctx.scope).await?.len(), st.environments(&ctx.scope).await?.len(), place))
+        };
+        lines.push(match counts.await {
+            Ok((cvs, envs, place)) => format!("  Content Views {cvs}   lifecycle environments {envs}   ({place})"),
+            Err(e) => format!("  Content Views: {e:#}"),
+        });
         let caps = std::sync::Arc::new(caps);
         ap(move |app| {
             if let Some(conn) = app.conn.as_mut() {

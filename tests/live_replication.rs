@@ -114,7 +114,7 @@ async fn fallback_replication() {
     assert!(replication::guard_self("http://localhost:8080", "http://localhost:8080").is_err());
     let prefix = unique("fb");
     let (rpm_repo, _) = upstream_content(&up, &prefix).await;
-    let store = Store::open_in_memory().unwrap();
+    let store = Store::open_in_memory().await.unwrap();
 
     // Dry run, then execute.
     let plan = replication::plan(&up, &dst, &RepoType::ALL, &prefix, Some("http://localhost:8080/pulp/content/")).await.unwrap();
@@ -131,7 +131,7 @@ async fn fallback_replication() {
     let res = replication::run(&dst, &store, up.profile(), &plan, false, &|_| {}, &no_progress).await.unwrap();
     assert!(res.iter().all(|l| l.starts_with("completed")), "{res:?}");
     assert!(downstream_has(&dst, &format!("{prefix}-os"), "fixture-alpha-1.1-1.noarch").await);
-    assert_eq!(store.last_replications(dst.profile(), up.profile()).unwrap().len(), 2);
+    assert_eq!(store.last_replications(dst.profile(), up.profile()).await.unwrap().len(), 2);
 
     // Loop guard: distributions served by the destination itself are skipped.
     let plan = replication::plan(&dst, &dst, &[RepoType::Rpm], &prefix, Some("http://localhost:8080/pulp/content/")).await.unwrap();

@@ -1,36 +1,64 @@
 //! Content View, CV version and lifecycle environment actions.
 
 use super::actions::{ap, pretty};
-use super::app::{App, Level};
+use super::app::{App, Level, NO_PROFILE, unavailable};
 use super::form::{Field, FieldKind, Form, PickItem, Source};
 use super::kinds::{Act, Kind, s};
 use crate::cv::{Mode, base_path, distribution_name};
 use crate::filters::{format_rules, parse_rules};
 use crate::pulp::RepoType;
-use crate::store::{CvRepo, LIBRARY};
+use crate::store::{CvRepo, LIBRARY, Store};
 use anyhow::anyhow;
 use serde_json::Value;
+use std::future::Future;
+use std::sync::Arc;
 
 pub fn run(app: &mut App, act: Act, item: Value) {
     let Some(profile) = app.profile.clone() else {
-        app.error("select a server profile first (Content Views belong to a server)");
+        app.error(NO_PROFILE);
         return;
     };
+    let Some((_, scope)) = cv_target(app, &profile) else { return };
     match app.list.kind.clone() {
-        Kind::ContentViews => cv_action(app, &profile, act, item),
-        Kind::CvVersions { cv, name } => version_action(app, &profile, cv, name, act, item),
-        Kind::Environments => env_action(app, &profile, act, item),
+        Kind::ContentViews => cv_action(app, &scope, act, item),
+        Kind::CvVersions { cv, name } => version_action(app, &scope, cv, name, act, item),
+        Kind::Environments => env_action(app, &scope, act, item),
         _ => {}
     }
 }
 
-fn local<F>(app: &mut App, label: &str, f: F)
+/// The Content View store; when the shared database is unavailable, an error notice and `None`.
+pub fn cv_store(app: &mut App) -> Option<Arc<Store>> {
+    match app.cv_store.clone() {
+        Ok(st) => Some(st),
+        Err(e) => {
+            app.error(unavailable(e).to_string());
+            None
+        }
+    }
+}
+
+/// The Content View store and the scope of profile `name` (`App::scope`); on failure, an error notice and `None`.
+pub fn cv_target(app: &mut App, name: &str) -> Option<(Arc<Store>, String)> {
+    let st = cv_store(app)?;
+    match app.scope(name) {
+        Ok(scope) => Some((st, scope)),
+        Err(e) => {
+            app.error(e);
+            None
+        }
+    }
+}
+
+fn local<F, Fut>(app: &mut App, label: &str, f: F)
 where
-    F: FnOnce(&crate::store::Store) -> anyhow::Result<String> + Send + 'static,
+    F: FnOnce(Arc<Store>) -> Fut,
+    Fut: Future<Output = anyhow::Result<String>> + Send + 'static,
 {
-    let store = app.store.clone();
+    let Some(st) = cv_store(app) else { return };
+    let fut = f(st);
     let fut = async move {
-        let msg = tokio::task::spawn_blocking(move || f(&store)).await??;
+        let msg = fut.await?;
         ap(move |app| {
             app.ok(msg);
             app.reload();
@@ -63,16 +91,16 @@ fn new_cv_repos(picked: &[PickItem], rules: &str) -> Result<Vec<CvRepo>, String>
     Ok(repos)
 }
 
-fn env_names(app: &App, profile: &str) -> Vec<String> {
-    let _ = app.store.ensure_library(profile);
-    app.store.environments(profile).map(|e| e.into_iter().map(|e| e.name).collect()).unwrap_or_default()
+async fn env_names(st: &Store, scope: &str) -> anyhow::Result<Vec<String>> {
+    st.ensure_library(scope).await?;
+    Ok(st.environments(scope).await?.into_iter().map(|e| e.name).collect())
 }
 
-fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
+fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
     let id = item["id"].as_i64().unwrap_or_default();
     let name = s(&item, "name");
     let repos: Vec<String> = item["repos"].as_array().into_iter().flatten().map(|r| s(r, "name")).collect();
-    let p = profile.to_string();
+    let p = scope.to_string();
     match act {
         Act::Create => {
             let form = Form::new(
@@ -85,8 +113,8 @@ fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
             app.form(form, move |app, f| {
                 let (n, d, p) = (f.get("name").to_string(), f.get("description").to_string(), p.clone());
                 crate::store::validate_name(&n).map_err(|e| e.to_string())?;
-                local(app, "create content view", move |st| {
-                    st.create_cv(&p, &n, &d)?;
+                local(app, "create content view", async move |st| {
+                    st.create_cv(&p, &n, &d).await?;
                     Ok(format!("content view {n} created; add repositories with a"))
                 });
                 Ok(())
@@ -96,8 +124,8 @@ fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
             let form = Form::new(format!("Edit {name}"), vec![Field::text("description", "Description").value(s(&item, "description"))]);
             app.form(form, move |app, f| {
                 let d = f.get("description").to_string();
-                local(app, "update content view", move |st| {
-                    st.update_cv(id, &d)?;
+                local(app, "update content view", async move |st| {
+                    st.update_cv(id, &d).await?;
                     Ok("saved".into())
                 });
                 Ok(())
@@ -118,9 +146,9 @@ fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
             .note("Filter rules apply to every selected repository, so they need repositories of one type.");
             app.form(form, move |app, f| {
                 let repos = new_cv_repos(&f.picked("repos"), f.get("filters"))?;
-                local(app, "add repositories", move |st| {
+                local(app, "add repositories", async move |st| {
                     for r in &repos {
-                        st.set_cv_repo(id, r)?;
+                        st.set_cv_repo(id, r).await?;
                     }
                     let n = repos.len();
                     Ok(format!("added {n} {} (takes effect on next publish)", if n == 1 { "repository" } else { "repositories" }))
@@ -146,28 +174,34 @@ fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
             for c in current {
                 form = form.note(c);
             }
-            let defs = app.store.cv_repos(id).unwrap_or_default();
-            app.form(form, move |app, f| {
-                let r = defs.iter().find(|d| d.repo_name == f.get("repo")).cloned().ok_or("unknown repository")?;
-                if act == Act::CvRemoveRepo {
-                    local(app, "remove repository", move |st| {
-                        st.remove_cv_repo(id, &r.repo_href)?;
-                        Ok(format!("{} removed from the definition; published versions are unchanged", r.repo_name))
-                    });
-                } else {
-                    let filters = parse_rules(f.get("filters"), r.repo_type)?;
-                    local(app, "update filters", move |st| {
-                        let msg = format!("filters of {}: {}", r.repo_name, format_rules(&filters));
-                        st.set_cv_repo(id, &CvRepo { filters, ..r })?;
-                        Ok(msg)
-                    });
-                }
-                Ok(())
+            let Some(st) = cv_store(app) else { return };
+            app.spawn("read repositories".into(), true, async move {
+                let defs = st.cv_repos(id).await?;
+                ap(move |app| {
+                    app.form(form, move |app, f| {
+                        let r = defs.iter().find(|d| d.repo_name == f.get("repo")).cloned().ok_or("unknown repository")?;
+                        if act == Act::CvRemoveRepo {
+                            local(app, "remove repository", async move |st| {
+                                st.remove_cv_repo(id, &r.repo_href).await?;
+                                Ok(format!("{} removed from the definition; published versions are unchanged", r.repo_name))
+                            });
+                        } else {
+                            let filters = parse_rules(f.get("filters"), r.repo_type)?;
+                            local(app, "update filters", async move |st| {
+                                let msg = format!("filters of {}: {}", r.repo_name, format_rules(&filters));
+                                st.set_cv_repo(id, &CvRepo { filters, ..r }).await?;
+                                Ok(msg)
+                            });
+                        }
+                        Ok(())
+                    })
+                })
             });
         }
         Act::CvPreview => app.job(format!("preview {name}"), move |ctx| async move {
-            let latest = ctx.store.versions(id)?.into_iter().find(|v| v.state == "published").map(|v| v.id);
-            let lines = ctx.cv().preview(id, latest).await?;
+            let svc = ctx.cv()?;
+            let latest = svc.store.versions(id).await?.into_iter().find(|v| v.state == "published").map(|v| v.id);
+            let lines = svc.preview(id, latest).await?;
             ap(move |app| app.text(format!("Preview of {name} (draft vs latest published)"), lines))
         }),
         Act::CvPublish => {
@@ -177,14 +211,15 @@ fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
                 let notes = f.get("notes").to_string();
                 let name = name.clone();
                 app.job(format!("preview {name}"), move |ctx| async move {
-                    let latest = ctx.store.versions(id)?.into_iter().find(|v| v.state == "published").map(|v| v.id);
-                    let mut lines = ctx.cv().preview(id, latest).await?;
+                    let svc = ctx.cv()?;
+                    let latest = svc.store.versions(id).await?.into_iter().find(|v| v.state == "published").map(|v| v.id);
+                    let mut lines = svc.preview(id, latest).await?;
                     lines.insert(0, "Publishing creates a new immutable version and makes it active in Library.".into());
                     lines.insert(1, String::new());
                     ap(move |app| {
                         app.confirm(format!("Publish {name}"), lines, move |app| {
                             app.job(format!("publish {name}"), move |ctx| async move {
-                                let v = ctx.cv().publish(id, &notes, &ctx.log(), &ctx.on_task()).await?;
+                                let v = ctx.cv()?.publish(id, &notes, &ctx.log(), &ctx.on_task()).await?;
                                 ap(move |app| {
                                     app.ok(format!("{name} version {} published and active in Library", v.number));
                                     app.reload();
@@ -198,7 +233,6 @@ fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
         }
         Act::CvVersions => app.push(Kind::CvVersions { cv: id, name }),
         Act::Promote | Act::Rollback => {
-            let envs = env_names(app, profile);
             let published: Vec<String> =
                 item["versions"].as_array().into_iter().flatten().filter(|v| v["state"] == "published").map(|v| s(v, "number")).collect();
             if published.is_empty() {
@@ -206,32 +240,33 @@ fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
                 return;
             }
             let mode = if act == Act::Promote { Mode::Promote } else { Mode::Rollback };
-            let form = Form::new(
-                format!("{} {name}", if mode == Mode::Promote { "Promote" } else { "Roll back" }),
-                vec![
-                    Field::new("version", "Version", FieldKind::Choice(published)),
-                    Field::new("env", "Environment", FieldKind::Choice(envs)),
-                ],
-            );
-            app.form(form, move |app, f| {
-                let number: i64 = f.get("version").parse().map_err(|_| "pick a version")?;
-                let vid = app
-                    .store
-                    .versions(id)
-                    .ok()
-                    .and_then(|vs| vs.into_iter().find(|v| v.number == number))
-                    .map(|v| v.id)
-                    .ok_or("unknown version")?;
-                promote_preview(app, &p, id, name.clone(), vid, f.get("env").to_string(), mode);
-                Ok(())
+            let Some(st) = cv_store(app) else { return };
+            app.spawn("read environments".into(), true, async move {
+                let envs = env_names(&st, &p).await?;
+                let versions = st.versions(id).await?;
+                ap(move |app| {
+                    let form = Form::new(
+                        format!("{} {name}", if mode == Mode::Promote { "Promote" } else { "Roll back" }),
+                        vec![
+                            Field::new("version", "Version", FieldKind::Choice(published)),
+                            Field::new("env", "Environment", FieldKind::Choice(envs)),
+                        ],
+                    );
+                    app.form(form, move |app, f| {
+                        let number: i64 = f.get("version").parse().map_err(|_| "pick a version")?;
+                        let vid = versions.iter().find(|v| v.number == number).map(|v| v.id).ok_or("unknown version")?;
+                        promote_preview(app, id, name.clone(), vid, f.get("env").to_string(), mode);
+                        Ok(())
+                    });
+                })
             });
         }
         Act::CvDrift => app.job(format!("verify {name}"), move |ctx| async move {
-            let mut lines = vec![];
-            for e in ctx.store.environments(ctx.client.profile())? {
-                if let Some(b) = ctx.store.binding(e.id, id)? {
-                    let n = ctx.store.version(b.version_id)?.number;
-                    let issues = ctx.cv().verify(id, e.id).await?;
+            let (svc, mut lines) = (ctx.cv()?, vec![]);
+            for e in svc.store.environments(&svc.scope).await? {
+                if let Some(b) = svc.store.binding(e.id, id).await? {
+                    let n = svc.store.version(b.version_id).await?.number;
+                    let issues = svc.verify(id, e.id).await?;
                     lines.push(format!(
                         "{}: v{n} ({}) {}",
                         e.name,
@@ -258,7 +293,7 @@ fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
             ];
             app.confirm_danger(format!("Delete content view {name}"), lines, &name.clone(), move |app| {
                 app.job(format!("delete content view {name}"), move |ctx| async move {
-                    ctx.cv().delete_view(id, &ctx.log(), &ctx.on_task()).await?;
+                    ctx.cv()?.delete_view(id, &ctx.log(), &ctx.on_task()).await?;
                     ap(move |app| {
                         app.ok(format!("content view {name} deleted"));
                         app.reload();
@@ -271,22 +306,22 @@ fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
 }
 
 /// Show the exact distribution changes of a promotion/rollback, then run it.
-fn promote_preview(app: &mut App, profile: &str, cv: i64, name: String, vid: i64, env: String, mode: Mode) {
-    let Some(e) = app.store.environments(profile).ok().and_then(|es| es.into_iter().find(|e| e.name == env)) else {
-        app.error(format!("unknown environment {env}"));
-        return;
-    };
-    let prefix = app.cfg.settings.cv_base_path_prefix.clone();
+fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, mode: Mode) {
     app.job(format!("preview {name} -> {env}"), move |ctx| async move {
-        let st = &ctx.store;
-        let v = st.version(vid)?;
-        let current = st.binding(e.id, cv)?;
+        let svc = ctx.cv()?;
+        let st = &svc.store;
+        // What promote will use: the prefix this server already has, else the setting.
+        let prefix = st.stored_prefix(&svc.scope).await?.unwrap_or_else(|| svc.prefix.clone());
+        let envs = st.environments(&svc.scope).await?;
+        let e = envs.into_iter().find(|e| e.name == env).ok_or_else(|| anyhow!("unknown environment {env}"))?;
+        let v = st.version(vid).await?;
+        let current = st.binding(e.id, cv).await?;
         let cur_num = match &current {
-            Some(b) => format!("v{} ({})", st.version(b.version_id)?.number, b.state),
+            Some(b) => format!("v{} ({})", st.version(b.version_id).await?.number, b.state),
             None => "nothing".into(),
         };
         let mut lines = vec![format!("{name}: {env} now serves {cur_num}; will serve v{}", v.number), String::new()];
-        let vrs = st.version_repos(vid)?;
+        let vrs = st.version_repos(vid).await?;
         for vr in &vrs {
             let r = vr.repo();
             lines.push(format!(
@@ -297,7 +332,7 @@ fn promote_preview(app: &mut App, profile: &str, cv: i64, name: String, vid: i64
                 base_path(&prefix, &name, &env, &r.repo_name)
             ));
         }
-        for b in st.binding_repos(e.id, cv)? {
+        for b in st.binding_repos(e.id, cv).await? {
             if !vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) && b.publication.is_some() {
                 lines.push(format!("  {}: not part of v{} -> its distribution stops serving (kept for rollback)", b.repo_name, v.number));
             }
@@ -308,7 +343,7 @@ fn promote_preview(app: &mut App, profile: &str, cv: i64, name: String, vid: i64
             lines.push("Files of the replaced publications may stay downloadable for Pulp's".into());
             lines.push("DISTRIBUTED_PUBLICATION_RETENTION_PERIOD; repository metadata switches immediately.".into());
         } else if let Some(prior) = e.prior_id {
-            let ok = st.binding(prior, cv)?.is_some_and(|b| b.version_id == vid && b.state == "active");
+            let ok = st.binding(prior, cv).await?.is_some_and(|b| b.version_id == vid && b.state == "active");
             if !ok {
                 lines.push(String::new());
                 lines.push("BLOCKED: the version is not active in the prior environment.".into());
@@ -321,8 +356,9 @@ fn promote_preview(app: &mut App, profile: &str, cv: i64, name: String, vid: i64
                 app.job(
                     format!("{} {name} v{} -> {env}", if mode == Mode::Promote { "promote" } else { "rollback" }, v.number),
                     move |ctx| async move {
-                        let res = ctx.cv().promote(cv, vid, e.id, mode, &ctx.log(), &ctx.on_task()).await;
-                        let issues = ctx.cv().verify(cv, e.id).await.unwrap_or_else(|e| vec![e.to_string()]);
+                        let svc = ctx.cv()?;
+                        let res = svc.promote(cv, vid, e.id, mode, &ctx.log(), &ctx.on_task()).await;
+                        let issues = svc.verify(cv, e.id).await.unwrap_or_else(|e| vec![e.to_string()]);
                         ap(move |app| {
                             match (res, issues.is_empty()) {
                                 (Ok(()), true) => app.ok(format!("{name} v{} active in {env}; served content verified", v.number)),
@@ -347,7 +383,7 @@ fn promote_preview(app: &mut App, profile: &str, cv: i64, name: String, vid: i64
     });
 }
 
-fn version_action(app: &mut App, profile: &str, cv: i64, name: String, act: Act, item: Value) {
+fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, item: Value) {
     let vid = item["id"].as_i64().unwrap_or_default();
     let number = s(&item, "number");
     match act {
@@ -356,16 +392,21 @@ fn version_action(app: &mut App, profile: &str, cv: i64, name: String, act: Act,
                 app.error("only published versions can be bound to environments");
                 return;
             }
-            let envs = env_names(app, profile);
             let mode = if act == Act::Promote { Mode::Promote } else { Mode::Rollback };
-            let p = profile.to_string();
-            app.form(
-                Form::new(format!("v{number} -> environment"), vec![Field::new("env", "Environment", FieldKind::Choice(envs))]),
-                move |app, f| {
-                    promote_preview(app, &p, cv, name.clone(), vid, f.get("env").to_string(), mode);
-                    Ok(())
-                },
-            );
+            let Some(st) = cv_store(app) else { return };
+            let p = scope.to_string();
+            app.spawn("read environments".into(), true, async move {
+                let envs = env_names(&st, &p).await?;
+                ap(move |app| {
+                    app.form(
+                        Form::new(format!("v{number} -> environment"), vec![Field::new("env", "Environment", FieldKind::Choice(envs))]),
+                        move |app, f| {
+                            promote_preview(app, cv, name.clone(), vid, f.get("env").to_string(), mode);
+                            Ok(())
+                        },
+                    )
+                })
+            });
         }
         Act::Compare => {
             let marked: Vec<i64> = app.list.marked.iter().filter_map(|m| m.parse().ok()).filter(|m| *m != vid).collect();
@@ -375,7 +416,7 @@ fn version_action(app: &mut App, profile: &str, cv: i64, name: String, act: Act,
             };
             let (a, b) = if *other < vid { (*other, vid) } else { (vid, *other) };
             app.job("compare content view versions", move |ctx| async move {
-                let lines = ctx.cv().compare_versions(a, b).await?;
+                let lines = ctx.cv()?.compare_versions(a, b).await?;
                 ap(move |app| app.text(format!("{name}: version comparison"), lines))
             });
         }
@@ -385,7 +426,7 @@ fn version_action(app: &mut App, profile: &str, cv: i64, name: String, act: Act,
                 return;
             }
             app.job(format!("resume {name} v{number}"), move |ctx| async move {
-                let v = ctx.cv().resume(vid, &ctx.log(), &ctx.on_task()).await?;
+                let v = ctx.cv()?.resume(vid, &ctx.log(), &ctx.on_task()).await?;
                 ap(move |app| {
                     app.ok(format!("{name} v{} published", v.number));
                     app.reload();
@@ -400,7 +441,7 @@ fn version_action(app: &mut App, profile: &str, cv: i64, name: String, act: Act,
             ];
             app.confirm_danger(format!("Delete {name} v{number}"), lines, &format!("v{number}"), move |app| {
                 app.job(format!("delete {name} v{number}"), move |ctx| async move {
-                    ctx.cv().delete_version(vid, &ctx.log(), &ctx.on_task()).await?;
+                    ctx.cv()?.delete_version(vid, &ctx.log(), &ctx.on_task()).await?;
                     ap(move |app| {
                         app.ok("version deleted");
                         app.reload();
@@ -413,41 +454,47 @@ fn version_action(app: &mut App, profile: &str, cv: i64, name: String, act: Act,
     }
 }
 
-fn env_action(app: &mut App, profile: &str, act: Act, item: Value) {
+fn env_action(app: &mut App, scope: &str, act: Act, item: Value) {
     let id = item["id"].as_i64().unwrap_or_default();
     let name = s(&item, "name");
-    let p = profile.to_string();
+    let p = scope.to_string();
     match act {
         Act::Create => {
-            let envs = env_names(app, profile);
-            let form = Form::new(
-                "New lifecycle environment",
-                vec![
-                    Field::text("name", "Name").required(),
-                    Field::new("prior", "Comes after", FieldKind::Choice(envs)),
-                    Field::new("protected", "Protected (typed confirmation)", FieldKind::Bool),
-                ],
-            )
-            .note("Paths branch from Library, e.g. Library -> Dev -> Test -> Prod. Promotion follows the path.");
-            app.form(form, move |app, f| {
-                let (n, prior, prot, p) = (f.get("name").to_string(), f.get("prior").to_string(), f.bool("protected"), p.clone());
-                local(app, "create environment", move |st| {
-                    let pid = st
-                        .environments(&p)?
-                        .into_iter()
-                        .find(|e| e.name == prior)
-                        .map(|e| e.id)
-                        .ok_or_else(|| anyhow!("unknown prior {prior}"))?;
-                    st.create_env(&p, &n, pid, prot)?;
-                    Ok(format!("environment {n} created after {prior}"))
-                });
-                Ok(())
+            let Some(st) = cv_store(app) else { return };
+            app.spawn("read environments".into(), true, async move {
+                let envs = env_names(&st, &p).await?;
+                ap(move |app| {
+                    let form = Form::new(
+                        "New lifecycle environment",
+                        vec![
+                            Field::text("name", "Name").required(),
+                            Field::new("prior", "Comes after", FieldKind::Choice(envs)),
+                            Field::new("protected", "Protected (typed confirmation)", FieldKind::Bool),
+                        ],
+                    )
+                    .note("Paths branch from Library, e.g. Library -> Dev -> Test -> Prod. Promotion follows the path.");
+                    app.form(form, move |app, f| {
+                        let (n, prior, prot, p) = (f.get("name").to_string(), f.get("prior").to_string(), f.bool("protected"), p.clone());
+                        local(app, "create environment", async move |st| {
+                            let pid = st
+                                .environments(&p)
+                                .await?
+                                .into_iter()
+                                .find(|e| e.name == prior)
+                                .map(|e| e.id)
+                                .ok_or_else(|| anyhow!("unknown prior {prior}"))?;
+                            st.create_env(&p, &n, pid, prot).await?;
+                            Ok(format!("environment {n} created after {prior}"))
+                        });
+                        Ok(())
+                    });
+                })
             });
         }
         Act::ToggleProtected => {
             let prot = item["protected"] != true;
-            local(app, "toggle protected", move |st| {
-                st.set_env_protected(id, prot)?;
+            local(app, "toggle protected", async move |st| {
+                st.set_env_protected(id, prot).await?;
                 Ok(format!("{name} protected: {prot}"))
             });
         }
@@ -460,8 +507,8 @@ fn env_action(app: &mut App, profile: &str, act: Act, item: Value) {
                 format!("Delete environment {name}"),
                 vec!["Only allowed when no content view is bound and no environment follows it.".into()],
                 move |app| {
-                    local(app, "delete environment", move |st| {
-                        st.delete_env(id)?;
+                    local(app, "delete environment", async move |st| {
+                        st.delete_env(id).await?;
                         Ok(format!("environment {name} deleted"))
                     })
                 },

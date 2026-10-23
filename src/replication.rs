@@ -191,7 +191,7 @@ pub async fn run(
             Ok(m) => ("completed", m.clone()),
             Err(e) => ("failed", format!("{e:#}")),
         };
-        if let Err(e) = store.record_replication(dst.profile(), src_profile, &it.base_path, state, &detail) {
+        if let Err(e) = store.record_replication(dst.profile(), src_profile, &it.base_path, state, &detail).await {
             tracing::warn!("cannot record replication run: {e:#}");
         }
         lines.push(format!("{state:<9} {} {}: {detail}", it.t.label(), it.name));

@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(role_collection(&["core.view_taskgroup".to_string()]), None);
     }
 
-    fn ctx_for(server: &MockServer, caps: Capabilities) -> Ctx {
+    async fn ctx_for(server: &MockServer, caps: Capabilities) -> Ctx {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pw"), "s3cret").unwrap();
         let profile = Profile {
@@ -156,8 +156,9 @@ mod tests {
             ..Default::default()
         };
         let client = PulpClient::new("mock", &profile, &Settings::default()).unwrap();
-        let mut app = App::new(Config::default(), "/dev/null".into(), Arc::new(Store::open_in_memory().unwrap()));
-        app.conn = Some(Conn { client, caps: Arc::new(caps) });
+        let st = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(Config::default(), "/dev/null".into(), st.clone(), Ok(st));
+        app.conn = Some(Conn { client, caps: Arc::new(caps), scope: "mock".into() });
         app.ctx().unwrap()
     }
 
@@ -165,7 +166,7 @@ mod tests {
     async fn domains_need_domains_enabled_and_role_objects_need_a_role() {
         let server = MockServer::start().await;
         let mut caps = Capabilities::default();
-        let ctx = ctx_for(&server, caps.clone());
+        let ctx = ctx_for(&server, caps.clone()).await;
         let e = load_options(&ctx, &Source::Domains, "").await.unwrap_err();
         assert_eq!(e.to_string(), "domains are not enabled on this server");
         let e = load_options(&ctx, &Source::RoleObjects, "").await.unwrap_err();
@@ -179,7 +180,7 @@ mod tests {
             .mount(&server)
             .await;
         caps.status = Some(serde_json::from_value(json!({ "versions": [], "domain_enabled": true })).unwrap());
-        let ctx = ctx_for(&server, caps);
+        let ctx = ctx_for(&server, caps).await;
         let items = load_options(&ctx, &Source::Domains, "").await.unwrap();
         assert_eq!(items.iter().map(|i| (i.label.as_str(), i.value.as_str())).collect::<Vec<_>>(), [("d1", "/h/d1/")]);
     }
@@ -197,7 +198,7 @@ mod tests {
                 .mount(&server)
                 .await;
         }
-        let ctx = ctx_for(&server, Capabilities::default());
+        let ctx = ctx_for(&server, Capabilities::default()).await;
 
         let items = load_options(&ctx, &Source::Repos(None), "").await.unwrap();
         let got: Vec<_> = items.iter().map(|i| (i.label.as_str(), i.value.as_str(), i.note.as_str())).collect();

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use pulp_tui::config::{Config, default_config_path, default_data_dir};
 use pulp_tui::pulp::{Capabilities, PulpClient};
@@ -39,6 +39,19 @@ enum Cmd {
     ImportCv { file: PathBuf },
     /// Print an example configuration file.
     ConfigExample,
+    /// Manage the shared Content View database (`[database]`).
+    Db {
+        #[command(subcommand)]
+        cmd: DbCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCmd {
+    /// Create the schema, or upgrade it to this pulp-tui version (normal starts never change it).
+    Migrate,
+    /// Copy the Content View data of a profile from the local file into the shared database.
+    Copy,
 }
 
 #[tokio::main]
@@ -63,7 +76,7 @@ async fn run() -> Result<()> {
     let data_dir = cli.data_dir.clone().or_else(default_data_dir).context("cannot determine data dir; use --data-dir")?;
     std::fs::create_dir_all(&data_dir).with_context(|| format!("create {}", data_dir.display()))?;
     init_logging(&data_dir)?;
-    let store = Arc::new(Store::open(&data_dir.join("pulp-tui.db"))?);
+    let store = Arc::new(Store::open(&data_dir.join("pulp-tui.db")).await?);
     let profile = cfg.pick_profile(cli.profile.as_deref());
     if let (Some(req), None) = (&cli.profile, &profile) {
         bail!("profile {req} not found in {}", cfg_path.display());
@@ -80,9 +93,21 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
+        Some(Cmd::Db { cmd: DbCmd::Migrate }) => {
+            let d = cfg.database.as_ref().with_context(|| format!("no [database] in {}", cfg_path.display()))?;
+            let (from, to) = Store::migrate_external(&d.connect_url()?, &d.display_url()).await?;
+            if from == to {
+                println!("{}: schema {to} is current", d.display_url());
+            } else {
+                println!("{}: schema {from} -> {to}", d.display_url());
+            }
+            Ok(())
+        }
+        Some(Cmd::Db { cmd: DbCmd::Copy }) => bail!("not implemented yet"),
         Some(Cmd::ExportCv { output }) => {
             let name = profile.context("no profile configured")?;
-            let json = serde_json::to_string_pretty(&store.export(&name)?)?;
+            let cv = cv_store(&cfg, &store).await.map_err(|e| anyhow!("shared database unavailable: {e}"))?;
+            let json = serde_json::to_string_pretty(&cv.export(&cv.scope(&name, &cfg.profiles[&name])).await?)?;
             match output {
                 Some(p) => std::fs::write(&p, json).with_context(|| format!("write {}", p.display()))?,
                 None => println!("{json}"),
@@ -91,8 +116,10 @@ async fn run() -> Result<()> {
         }
         Some(Cmd::ImportCv { file }) => {
             let name = profile.context("no profile configured")?;
+            cfg.check_import_cv(&name)?;
             let ex = serde_json::from_slice(&std::fs::read(&file).with_context(|| format!("read {}", file.display()))?)?;
-            let (cvs, envs) = store.import(&name, &ex)?;
+            let cv = cv_store(&cfg, &store).await.map_err(|e| anyhow!("shared database unavailable: {e}"))?;
+            let (cvs, envs) = cv.import(&cv.scope(&name, &cfg.profiles[&name]), &ex).await?;
             println!("imported {cvs} content view(s) and {envs} environment(s) into profile {name}");
             Ok(())
         }
@@ -101,10 +128,19 @@ async fn run() -> Result<()> {
             if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
                 bail!("pulp-tui needs an interactive terminal (in containers use `docker run -it` / `podman run -it`)");
             }
-            let app = pulp_tui::tui::app::App::new(cfg, cfg_path, store);
+            let cv = cv_store(&cfg, &store).await;
+            let app = pulp_tui::tui::app::App::new(cfg, cfg_path, store, cv);
             pulp_tui::tui::run(app, profile).await
         }
     }
+}
+
+/// The Content View store: the `[database]` when configured (no fallback to the local file), else the local store.
+// shortcut: an unavailable shared database needs a restart to retry; upgrade to a lazy pool if operators hit this often.
+async fn cv_store(cfg: &Config, local: &Arc<Store>) -> Result<Arc<Store>, String> {
+    let Some(d) = &cfg.database else { return Ok(local.clone()) };
+    let url = d.connect_url().map_err(|e| format!("{e:#}"))?;
+    Store::open_external(&url, &d.display_url()).await.map(Arc::new).map_err(|e| format!("{e:#}"))
 }
 
 /// Logs go to a file (never the terminal the TUI draws on). Secrets are never logged:

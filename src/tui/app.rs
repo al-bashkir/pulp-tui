@@ -1,6 +1,7 @@
 //! Application state and event handling. Rendering never waits on I/O: every network or
 //! disk operation runs as a background job that sends back a closure applied here.
 
+use super::actions::ap;
 use super::form::{FieldKind, Form, FormEvent, PickItem, Source};
 use super::kinds::{self, Act, Kind};
 use super::tasks::TaskCenter;
@@ -45,7 +46,11 @@ pub enum Msg {
 pub struct Conn {
     pub client: PulpClient,
     pub caps: Arc<Capabilities>,
+    /// `Store::scope` of the profile the client was built from (a later config edit needs a reconnect).
+    pub scope: String,
 }
+
+pub const NO_PROFILE: &str = "select a server profile first (Content Views belong to a server)";
 
 pub struct Job {
     pub id: u64,
@@ -62,7 +67,14 @@ pub struct Job {
 pub struct Ctx {
     pub client: PulpClient,
     pub caps: Arc<Capabilities>,
+    /// The local file: task references and replication runs.
     pub store: Arc<Store>,
+    /// Content View / lifecycle store, or why the shared database is unavailable.
+    pub cv_store: Result<Arc<Store>, String>,
+    /// `Store::scope` of the connected server.
+    pub scope: String,
+    /// Operator name for locks and the audit log.
+    pub actor: String,
     pub settings: Settings,
     pub job: u64,
     tx: UnboundedSender<Msg>,
@@ -85,9 +97,20 @@ impl Ctx {
             let _ = tx.send(Msg::JobProgress { id, text: s });
         }
     }
-    pub fn cv(&self) -> CvService {
-        CvService { client: self.client.clone(), store: self.store.clone(), prefix: self.settings.cv_base_path_prefix.clone() }
+    pub fn cv(&self) -> anyhow::Result<CvService> {
+        Ok(CvService {
+            client: self.client.clone(),
+            store: self.cv_store.clone().map_err(unavailable)?,
+            prefix: self.settings.cv_base_path_prefix.clone(),
+            scope: self.scope.clone(),
+            actor: self.actor.clone(),
+        })
     }
+}
+
+/// What Content View screens and actions report while the shared database is unavailable.
+pub fn unavailable(e: String) -> anyhow::Error {
+    anyhow::anyhow!("shared database unavailable: {e}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +206,8 @@ pub struct App {
     pub cfg: Config,
     pub cfg_path: PathBuf,
     pub store: Arc<Store>,
+    /// `store` itself without a `[database]`; the error text when the shared database did not open.
+    pub cv_store: Result<Arc<Store>, String>,
     pub profile: Option<String>,
     pub conn: Option<Conn>,
     pub connecting: bool,
@@ -207,7 +232,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config, cfg_path: PathBuf, store: Arc<Store>) -> Self {
+    pub fn new(cfg: Config, cfg_path: PathBuf, store: Arc<Store>, cv_store: Result<Arc<Store>, String>) -> Self {
         let (tx, rx) = unbounded_channel();
         let s = &cfg.settings;
         let tasks = TaskCenter::new(Duration::from_millis(s.poll_min_ms.max(100)), Duration::from_millis(s.poll_max_ms.max(s.poll_min_ms)));
@@ -215,6 +240,7 @@ impl App {
             cfg,
             cfg_path,
             store,
+            cv_store,
             profile: None,
             conn: None,
             connecting: false,
@@ -267,10 +293,26 @@ impl App {
             client: c.client.clone(),
             caps: c.caps.clone(),
             store: self.store.clone(),
+            cv_store: self.cv_store.clone(),
+            scope: c.scope.clone(),
+            actor: crate::store::actor(c.caps.user.as_ref().map(|u| u.username.as_str())),
             settings: self.cfg.settings.clone(),
             job: 0,
             tx: self.tx.clone(),
         })
+    }
+
+    /// Content View store scope of a profile: the connection's when it is the connected one,
+    /// else from the config. An external store never falls back to the bare profile name.
+    pub fn scope(&self, name: &str) -> Result<String, String> {
+        if let (Some(c), Some(true)) = (&self.conn, self.profile.as_deref().map(|p| p == name)) {
+            return Ok(c.scope.clone());
+        }
+        match (&self.cv_store, self.cfg.profiles.get(name)) {
+            (Ok(st), Some(p)) => Ok(st.scope(name, p)),
+            (Ok(st), None) if st.external => Err(NO_PROFILE.into()),
+            _ => Ok(name.to_string()), // the local file, or no CV store at all (nothing is read or written)
+        }
     }
 
     /// Run `f` in the background against the active server.
@@ -367,10 +409,12 @@ impl App {
     /// Remember a submitted Pulp task (persisted so it is re-attached after a restart).
     pub fn track_task(&mut self, href: &str, label: &str) {
         self.tasks.track(href, label, "waiting");
-        if let Some(p) = &self.profile
-            && let Err(e) = self.store.track_task(p, href, label, "waiting")
-        {
-            self.error(format!("cannot persist task reference: {e:#}"));
+        if let Some(p) = self.profile.clone() {
+            let (st, href, label) = (self.store.clone(), href.to_string(), label.to_string());
+            self.spawn("persist task reference".into(), true, async move {
+                st.track_task(&p, &href, &label, "waiting").await?;
+                ap(|_| {})
+            });
         }
     }
 
@@ -380,8 +424,12 @@ impl App {
         let err = t.error_message();
         if self.tasks.update(t, driven) {
             let label = self.tasks.items.iter().find(|x| x.href == href).map(|x| x.label.clone()).unwrap_or_default();
-            if let Some(p) = &self.profile {
-                let _ = self.store.finish_task(p, &href, &state);
+            if let Some(p) = self.profile.clone() {
+                let (st, href, state) = (self.store.clone(), href.clone(), state.clone());
+                self.spawn("persist task state".into(), true, async move {
+                    st.finish_task(&p, &href, &state).await?;
+                    ap(|_| {})
+                });
             }
             match state.as_str() {
                 "completed" => self.ok(format!("task completed: {label}")),
@@ -434,6 +482,8 @@ impl App {
         self.dashboard.clear();
         self.history.clear();
         let (settings, name) = (self.cfg.settings.clone(), name.to_string());
+        // From the same Profile as the client. Without a CV store nothing uses it.
+        let scope = self.cv_store.as_ref().map(|st| st.scope(&name, &p)).unwrap_or_else(|_| name.clone());
         let fut = async move {
             let client = PulpClient::new(&name, &p, &settings)?;
             let caps = Capabilities::detect(&client).await?;
@@ -447,7 +497,7 @@ impl App {
                 if let Some(e) = &caps.openapi_error {
                     app.notify(Level::Warn, format!("OpenAPI schema unavailable ({e}); capability checks are limited"));
                 }
-                app.conn = Some(Conn { client, caps: Arc::new(caps) });
+                app.conn = Some(Conn { client, caps: Arc::new(caps), scope });
                 app.reattach_tasks();
                 app.open(Screen::Dashboard);
             });
@@ -472,19 +522,21 @@ impl App {
 
     fn reattach_tasks(&mut self) {
         let Some(p) = self.profile.clone() else { return };
-        match self.store.tasks(&p, 50) {
-            Ok(refs) => {
+        let st = self.store.clone();
+        // Not named "load ...": list reloads cancel those.
+        self.spawn("reattach tasks".into(), true, async move {
+            let refs = st.tasks(&p, 50).await?;
+            ap(move |app| {
                 let mut n = 0;
                 for r in refs.iter().rev() {
-                    self.tasks.track(&r.href, &r.label, &r.state);
+                    app.tasks.track(&r.href, &r.label, &r.state);
                     n += (!crate::pulp::models::TASK_FINAL_STATES.contains(&r.state.as_str())) as usize;
                 }
                 if n > 0 {
-                    self.notify(Level::Info, format!("re-attached to {n} unfinished task(s) from a previous session"));
+                    app.notify(Level::Info, format!("re-attached to {n} unfinished task(s) from a previous session"));
                 }
-            }
-            Err(e) => self.error(format!("cannot load task references: {e:#}")),
-        }
+            })
+        });
     }
 
     // ---- navigation ----------------------------------------------------------------
@@ -539,8 +591,8 @@ impl App {
                 self.list.error = None;
                 let generation = self.list.generation;
                 let (offset, filter) = (self.list.offset, self.list.filter.clone());
-                let store = self.store.clone();
                 let profile = self.profile.clone().unwrap_or_default();
+                let (cv, scope) = (self.cv_store.clone(), self.scope(&profile));
                 let cfg = self.cfg.clone();
                 let needs_conn = k.needs_connection();
                 let ctx = self.ctx();
@@ -558,8 +610,18 @@ impl App {
                     self.list.error = Some(f);
                     return;
                 }
+                let scope = match scope {
+                    Ok(s) => s,
+                    Err(e) if matches!(k, Kind::ContentViews | Kind::CvVersions { .. } | Kind::Environments) => {
+                        self.list.loading = false;
+                        self.list.error = Some(e);
+                        return;
+                    }
+                    Err(_) => String::new(), // other screens never read the CV store
+                };
                 let fut = async move {
-                    let (items, count) = kinds::load(&k, ctx.as_ref(), &store, &profile, &cfg, offset, &filter).await?;
+                    let cv = cv.as_deref().map_err(String::as_str);
+                    let (items, count) = kinds::load(&k, ctx.as_ref(), cv, &scope, &profile, &cfg, offset, &filter).await?;
                     let apply: Apply = Box::new(move |app: &mut App| {
                         if app.list.generation != generation {
                             return; // stale response
@@ -852,11 +914,12 @@ impl App {
 
     pub fn available_actions(&self, item: &Value) -> Vec<Act> {
         let ro = self.conn.as_ref().is_some_and(|c| c.client.read_only());
+        let shared = self.cfg.database.is_some();
         self.list
             .kind
             .actions()
             .into_iter()
-            .filter(|a| !(ro && a.mutates(&self.list.kind)))
+            .filter(|a| !(ro && a.mutates(&self.list.kind, shared)))
             .filter(|a| item.is_object() || !a.needs_item())
             .collect()
     }
@@ -1055,11 +1118,69 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AuthMethod, Profile};
     use crate::tui::form::Field;
 
-    #[test]
-    fn load_result_for_closed_form_is_dropped() {
-        let mut app = App::new(Config::default(), "/dev/null".into(), Arc::new(Store::open_in_memory().unwrap()));
+    /// A migrated external SQLite CV store (`Store::external` is true).
+    async fn external_store(dir: &tempfile::TempDir) -> Arc<Store> {
+        let url = format!("sqlite://{}", dir.path().join("cv.db").display());
+        Store::migrate_external(&url, "cv.db").await.unwrap();
+        Arc::new(Store::open_external(&url, "cv.db").await.unwrap())
+    }
+
+    fn lab(url: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.profiles.insert("lab".into(), Profile { url: url.into(), auth: AuthMethod::None, ..Default::default() });
+        cfg
+    }
+
+    #[tokio::test]
+    async fn external_scope_never_falls_back_to_the_profile_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = external_store(&dir).await;
+        let local = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(lab("https://pulp.example.com"), "/dev/null".into(), local.clone(), Ok(st.clone()));
+        app.profile = Some("lab".into());
+        assert_eq!(app.scope("lab"), Ok("https://pulp.example.com/pulp/#default".into()));
+        app.cfg.profiles.clear(); // the active profile was deleted in Servers
+        assert_eq!(app.scope("lab"), Err(NO_PROFILE.into()));
+        app.open(Screen::List(Kind::Environments));
+        assert_eq!(app.list.error.as_deref(), Some(NO_PROFILE));
+        assert!(st.environments("lab").await.unwrap().is_empty(), "no Library row under the bare profile name");
+        // The local file keeps scoping by profile name.
+        let mut app = App::new(Config::default(), "/dev/null".into(), local.clone(), Ok(local));
+        app.profile = Some("lab".into());
+        assert_eq!(app.scope("lab"), Ok("lab".into()));
+    }
+
+    #[tokio::test]
+    async fn connected_scope_is_fixed_at_connect_time() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let ok = ResponseTemplate::new(200).set_body_json(serde_json::json!({"versions": []}));
+        Mock::given(method("GET")).and(path("/pulp/api/v3/status/")).respond_with(ok).mount(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let st = external_store(&dir).await;
+        let mut app = App::new(lab(&server.uri()), "/dev/null".into(), st.clone(), Ok(st));
+        let mut rx = app.rx.take().unwrap();
+        app.connect("lab");
+        while app.conn.is_none() {
+            let m = rx.recv().await.unwrap();
+            app.handle_msg(m);
+        }
+        let key = format!("{}/pulp/#default", server.uri());
+        // Edit says "reconnect to apply": the client still talks to the old server, so the scope stays.
+        app.cfg.profiles.get_mut("lab").unwrap().url = "https://other.example.com".into();
+        assert_eq!(app.ctx().unwrap().scope, key);
+        assert_eq!(app.scope("lab"), Ok(key));
+        assert_eq!(app.ctx().unwrap().actor, crate::store::actor(None), "the mock server names no user");
+    }
+
+    #[tokio::test]
+    async fn load_result_for_closed_form_is_dropped() {
+        let st = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(Config::default(), "/dev/null".into(), st.clone(), Ok(st));
         let form = Form::new("t", vec![Field::pick("repo", "Repository", Source::Roles)]);
         let id = form.id;
         app.form(form, |_, _| Ok(()));
@@ -1074,8 +1195,9 @@ mod tests {
         assert!(form.fields[0].options.is_none());
     }
 
-    fn app_on(kind: Kind) -> App {
-        let mut app = App::new(Config::default(), "/dev/null".into(), Arc::new(Store::open_in_memory().unwrap()));
+    async fn app_on(kind: Kind) -> App {
+        let st = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(Config::default(), "/dev/null".into(), st.clone(), Ok(st));
         app.profile = Some("lab".into());
         app.screen = Screen::List(kind.clone());
         app.list = ListState::new(kind);
@@ -1093,9 +1215,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn notices_and_actions_are_logged_and_their_rows_open_as_text() {
-        let mut app = app_on(Kind::Profiles);
+    #[tokio::test]
+    async fn notices_and_actions_are_logged_and_their_rows_open_as_text() {
+        let mut app = app_on(Kind::Profiles).await;
         app.notify(Level::Warn, "notice-row-needle");
         let r = row_with("[warning] notice-row-needle");
         assert_eq!((r["kind"].as_str(), r["server"].as_str()), (Some("notice"), Some("lab")));
@@ -1107,7 +1229,7 @@ mod tests {
         assert_eq!(a["kind"], "action");
 
         // Logs: Enter opens the text view with no menu; empty detail shows the summary; the log is not extended.
-        let mut app = app_on(Kind::Logs { polls: false });
+        let mut app = app_on(Kind::Logs { polls: false }).await;
         app.profile = Some("logs-inspect-profile".into()); // only this App records under it
         app.list.items = vec![a.clone()];
         app.open_menu();
@@ -1125,10 +1247,10 @@ mod tests {
         assert_eq!(text_lines(&app), ["This entry is older than the last 1000 and was dropped."]);
     }
 
-    #[test]
-    fn reload_keeps_the_cursor_on_the_same_item() {
+    #[tokio::test]
+    async fn reload_keeps_the_cursor_on_the_same_item() {
         let row = |id: u64| serde_json::json!({"id": id});
-        let mut app = app_on(Kind::Logs { polls: false });
+        let mut app = app_on(Kind::Logs { polls: false }).await;
         app.list.items = vec![row(3), row(2), row(1)];
         app.list.selected = 1;
         // A new row on top pushes everything down: the cursor follows id 2.
@@ -1150,9 +1272,9 @@ mod tests {
         assert_eq!(app.list.selected, 1);
     }
 
-    #[test]
-    fn action_rows_name_a_target_only_for_actions_that_need_an_item() {
-        let mut app = app_on(Kind::Profiles);
+    #[tokio::test]
+    async fn action_rows_name_a_target_only_for_actions_that_need_an_item() {
+        let mut app = app_on(Kind::Profiles).await;
         app.profile = Some("action-rows-server".into());
         let item = serde_json::json!({"name": "target-needle"});
         // Create needs no item: a selected row is not its target.
@@ -1170,13 +1292,13 @@ mod tests {
     #[tokio::test]
     async fn logs_screen_reloads_on_new_rows_even_without_a_connection() {
         crate::session_log::record("notice", "lab", "tick-needle".into(), vec![]);
-        let mut app = app_on(Kind::Logs { polls: false });
+        let mut app = app_on(Kind::Logs { polls: false }).await;
         assert!(app.ctx().is_none());
         app.tick();
         assert!(app.list.loading, "a row newer than logs_seen starts a reload");
         assert!(app.logs_seen > 0);
         // Other screens do not reload.
-        let mut other = app_on(Kind::Profiles);
+        let mut other = app_on(Kind::Profiles).await;
         other.tick();
         assert!(!other.list.loading);
     }
