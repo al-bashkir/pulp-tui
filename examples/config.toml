@@ -1,0 +1,42 @@
+# pulp-tui configuration (TOML).
+# Location: --config, $PULP_TUI_CONFIG, or $XDG_CONFIG_HOME/pulp-tui/config.toml
+# Secrets are NEVER written here: `secret` is a reference resolved at connect time:
+#   env:VAR        environment variable (containers, CI)
+#   file:/path     file content, e.g. a mounted container secret (/run/secrets/...)
+#   keyring        system keyring (Secret Service / macOS Keychain), service "pulp-tui", user = profile name
+
+default_profile = "lab"
+
+[settings]
+max_concurrent_requests = 6   # per server
+poll_min_ms = 1000            # adaptive task polling bounds
+poll_max_ms = 10000
+max_response_mb = 64          # larger API responses are rejected
+upload_chunk_mb = 8           # chunked upload size
+cv_base_path_prefix = "cv"    # Content View distributions: <prefix>/<env>/<view>/<repo>
+
+[profiles.lab]
+url = "http://localhost:8080"
+username = "admin"
+secret = "env:PULP_PASSWORD"
+
+[profiles.prod]
+url = "https://pulp.example.com"
+api_root = "/pulp/"
+# domain = "rhel"             # only when Pulp domains are enabled
+auth = "basic"                # basic | bearer | none
+username = "pulp-operator"
+secret = "keyring"
+ca_cert = "/etc/pki/tls/certs/internal-ca.pem"
+# client_cert = "/etc/pulp-tui/client.crt"   # mTLS (together with client_key)
+# client_key = "/etc/pulp-tui/client.key"
+# proxy = "http://proxy.example.com:3128"
+timeout_secs = 30
+production = true             # red banner, typed confirmations
+read_only = false
+
+[profiles.upstream]
+url = "https://pulp-upstream.example.com"
+auth = "bearer"
+secret = "file:/run/secrets/pulp-upstream-token"
+read_only = true              # source for fallback replication only
