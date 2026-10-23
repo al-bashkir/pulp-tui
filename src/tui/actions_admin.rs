@@ -2,7 +2,7 @@
 
 use super::actions::{ap, submit};
 use super::app::{App, Level};
-use super::form::{Field, FieldKind, Form};
+use super::form::{Field, FieldKind, Form, Source};
 use super::kinds::{Act, Kind, s};
 use crate::pulp::{PulpClient, RepoType};
 use crate::replication::{self, PlanAction};
@@ -149,9 +149,9 @@ fn role_assignment(app: &mut App, act: Act, item: Value, owner: String, owner_na
             let form = Form::new(
                 format!("Assign role to {who}"),
                 vec![
-                    Field::text("role", "Role name").required().help("e.g. rpm.rpmrepository_viewer"),
-                    Field::text("content_object", "Object href").help("empty = model-level (all objects)"),
-                    Field::text("domain", "Domain href").help("optional domain scope"),
+                    Field::pick("role", "Role", Source::Roles).required(),
+                    Field::pick("content_object", "Object", Source::RoleObjects).help("empty = model-level (all objects)"),
+                    Field::pick("domain", "Domain", Source::Domains).help("optional domain scope"),
                 ],
             );
             app.form(form, move |app, f| {
@@ -217,13 +217,14 @@ fn group_action(app: &mut App, act: Act, item: Value) {
 
 fn member_action(app: &mut App, act: Act, item: Value, group: String, name: String) {
     match act {
-        Act::Create => {
-            app.form(Form::new(format!("Add member to {name}"), vec![Field::text("username", "Username").required()]), move |app, f| {
+        Act::Create => app.form(
+            Form::new(format!("Add member to {name}"), vec![Field::pick("username", "Username", Source::Users).required()]),
+            move |app, f| {
                 let (url, b) = (format!("{group}users/"), json!({ "username": f.get("username") }));
                 submit(app, format!("add {} to {name}", f.get("username")), move |c| async move { Ok(c.post(&url, &b).await?) });
                 Ok(())
-            })
-        }
+            },
+        ),
         Act::Delete => {
             let (href, user) = (s(&item, "pulp_href"), s(&item, "username"));
             let mut lines = vec![format!("Remove {user} from group {name}.")];

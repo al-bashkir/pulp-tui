@@ -2,7 +2,7 @@
 //! Content View and administration actions live in `actions_cv` / `actions_admin`.
 
 use super::app::{App, Apply, Ctx, Level, item_key};
-use super::form::{Field, FieldKind, Form, format_labels, parse_labels};
+use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, s, short};
 use crate::config::{AuthMethod, Profile};
 use crate::filters::{Selector, parse_rules};
@@ -327,7 +327,7 @@ fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>) -> 
     let mut fields = vec![
         Field::text("name", "Name").required().value(s(&v, "name")),
         Field::text("description", "Description").value(s(&v, "description")),
-        Field::text("remote", "Remote (name)").help("default remote for sync; empty = none").value(""),
+        Field::pick("remote", "Remote", Source::Remotes(t)).help("default remote for sync; empty = none").value(""),
         Field::new("retain_repo_versions", "Retain versions", FieldKind::Number)
             .value(s(&v, "retain_repo_versions"))
             .help("empty = keep all versions"),
@@ -349,8 +349,10 @@ fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>) -> 
             fields.push(Field::new("checksum_type", "Checksum type", FieldKind::Choice(c)).value(s(&v, "checksum_type")));
         }
         if has("metadata_signing_service") {
-            fields
-                .push(Field::text("metadata_signing_service", "Metadata signing service (href)").value(s(&v, "metadata_signing_service")));
+            fields.push(
+                Field::pick("metadata_signing_service", "Metadata signing service", Source::SigningServices)
+                    .value(s(&v, "metadata_signing_service")),
+            );
         }
     }
     if t == RepoType::File && has("manifest") {
@@ -474,14 +476,14 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             let form = Form::new(
                 format!("Sync {name}"),
                 vec![
-                    Field::text("remote", "Remote (name)").help("empty = the repository's default remote"),
+                    Field::pick("remote", "Remote", Source::Remotes(t)).help("empty = the repository's default remote"),
                     Field::new("policy", "Sync policy", FieldKind::Choice(policies)),
                 ],
             )
             .note(if item["remote"].is_string() {
                 "repository has a default remote"
             } else {
-                "repository has NO default remote: enter one"
+                "repository has NO default remote: pick one"
             });
             app.form(form, move |app, f| {
                 let (remote, policy) = (f.opt("remote").map(str::to_string), f.get("policy").to_string());
@@ -579,7 +581,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         Act::Distribute => distribute_form(app, t, name.clone(), item["latest_version_href"].as_str().map(str::to_string), Some(href)),
         Act::CopyContent => {
             let mut fields = vec![
-                Field::text("source", "Source repository (name)").required(),
+                Field::pick("source", "Source repository", Source::Repos(Some(t))).required(),
                 Field::text("filters", "Filter rules").help(if t == RepoType::Rpm {
                     "e.g. include name=kernel* arch=x86_64; exclude name=*-debuginfo (empty = all)"
                 } else {
@@ -830,9 +832,11 @@ fn version_action(app: &mut App, act: Act, item: Value) {
             distribute_form(app, t, name, Some(href), None);
         }
         Act::Rollback => {
-            let form =
-                Form::new(format!("Point a distribution to version {number}"), vec![Field::text("dist", "Distribution name").required()])
-                    .note("The distribution will serve this version's publication (created if missing). No version is deleted.");
+            let form = Form::new(
+                format!("Point a distribution to version {number}"),
+                vec![Field::pick("dist", "Distribution", Source::Distributions(t)).required()],
+            )
+            .note("The distribution will serve this version's publication (created if missing). No version is deleted.");
             app.form(form, move |app, f| {
                 rollback_preview(app, t, f.get("dist").to_string(), href.clone());
                 Ok(())
@@ -944,7 +948,7 @@ fn content_action(app: &mut App, version: String, act: Act) {
         Act::AddToRepo => {
             let form = Form::new(
                 format!("Add {} unit(s) to another {} repository", units.len(), t.label()),
-                vec![Field::text("target", "Target repository (name)").required()],
+                vec![Field::pick("target", "Target repository", Source::Repos(Some(t))).required()],
             );
             app.form(form, move |app, f| {
                 let (target, units) = (f.get("target").to_string(), units.clone());
@@ -969,7 +973,7 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             let form = Form::new(
                 format!("New {} publication", t.label()),
                 vec![
-                    Field::text("repo", "Repository (name)").required(),
+                    Field::pick("repo", "Repository", Source::Repos(Some(t))).required(),
                     Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
                 ],
             );
@@ -1050,7 +1054,7 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             let form = Form::new(
                 format!("Re-point {name}"),
                 vec![
-                    Field::text("repo", "Repository (name)").required(),
+                    Field::pick("repo", "Repository", Source::Repos(Some(t))).required(),
                     Field::new("number", "Version number", FieldKind::Number).required(),
                 ],
             );
@@ -1077,9 +1081,10 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                     } else {
                         "publication of a repository version"
                     }),
-                    Field::text("repo", "Repository (name)").help("required unless Serve = none; empty on edit = keep binding"),
+                    Field::pick("repo", "Repository", Source::Repos(Some(t)))
+                        .help("required unless Serve = none; empty on edit = keep binding"),
                     Field::new("number", "Version number", FieldKind::Number).help("empty = latest version"),
-                    Field::text("content_guard", "Content guard (href)").value(s(&v, "content_guard")),
+                    Field::pick("content_guard", "Content guard", Source::ContentGuards).value(s(&v, "content_guard")),
                     Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
                 ],
             )
@@ -1088,7 +1093,11 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 let mut b = json!({});
                 for k in ["name", "base_path", "content_guard"] {
                     if !edit || f.changed(k) {
-                        b[k] = f.opt(k).map(|x| Value::from(x.trim_matches('/'))).unwrap_or(Value::Null);
+                        // An href keeps its slashes; names and base paths do not.
+                        b[k] = f
+                            .opt(k)
+                            .map(|x| Value::from(if k == "content_guard" { x } else { x.trim_matches('/') }))
+                            .unwrap_or(Value::Null);
                     }
                 }
                 if !edit || f.changed("labels") {

@@ -2,7 +2,7 @@
 
 use super::actions::pretty;
 use super::app::{App, Focus, Level, Modal, Screen, item_key};
-use super::form::Form;
+use super::form::{FieldKind, Form, Picker};
 use super::kinds::{self, Kind, s};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -363,7 +363,7 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
         let focused = i == form.focus;
         let req = if fld.required { "*" } else { " " };
         let cursor =
-            if focused && !matches!(fld.kind, super::form::FieldKind::Bool | super::form::FieldKind::Choice(_)) { "▏" } else { "" };
+            if focused && !matches!(fld.kind, FieldKind::Bool | FieldKind::Choice(_) | FieldKind::Pick { .. }) { "▏" } else { "" };
         let label = format!("{}{req}{:<w$}", if focused { "▶" } else { " " }, fld.label, w = label_w);
         let value = format!("{}{cursor}", fld.display());
         lines.push(Line::from(vec![Span::raw(label), if focused { Span::styled(value, sel()) } else { Span::raw(value) }]));
@@ -381,8 +381,57 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
             Block::bordered()
                 .borders(Borders::ALL)
                 .title(format!(" {} ", form.title))
-                .title_bottom(" Tab/↑↓ move  Space toggle  ←→ choose  Enter next/submit  Ctrl-S submit  Esc cancel "),
+                .title_bottom(" Tab/↑↓ move  Space toggle/open  ←→ choose  Enter next/submit/pick  Ctrl-S submit  Esc cancel "),
         ),
+        r,
+    );
+    if let Some(p) = &form.picker {
+        draw_picker(f, form, p, r, area);
+    }
+}
+
+/// The option list of an open picker, over the form. Rows scroll so the highlighted one stays visible.
+fn draw_picker(f: &mut Frame, form: &Form, p: &Picker, form_area: Rect, area: Rect) {
+    let fld = &form.fields[p.field];
+    let multi = matches!(fld.kind, FieldKind::Pick { multi: true, .. });
+    // Taller than the form when the form is small, so a few rows are always visible.
+    let r = centered(area, form_area.width.saturating_sub(4), form_area.height.saturating_sub(2).max(12));
+    let rows = r.height.saturating_sub(2) as usize;
+    let lines: Vec<Line> = if let Some(e) = &p.error {
+        vec![Line::styled(format!("Could not load choices: {e}"), Style::default().fg(Color::Red)), Line::raw("Type the value instead.")]
+    } else if fld.options.is_none() {
+        vec![Line::raw("loading…")]
+    } else {
+        let vis = form.visible();
+        if vis.is_empty() {
+            vec![Line::styled("no match", Style::default().fg(Color::DarkGray))]
+        } else {
+            let pad = if vis.iter().any(|i| !i.note.is_empty()) { 5 } else { 0 };
+            let top = p.selected.saturating_sub(rows.saturating_sub(1));
+            vis.iter()
+                .enumerate()
+                .skip(top)
+                .take(rows)
+                .map(|(i, it)| {
+                    let mark = match (multi, p.marked.contains(&it.value)) {
+                        (false, _) => "",
+                        (true, true) => "[x] ",
+                        (true, false) => "[ ] ",
+                    };
+                    let text = format!("{mark}{:<pad$}{}", it.note, it.label);
+                    if i == p.selected { Line::styled(text, sel()) } else { Line::raw(text) }
+                })
+                .collect()
+        }
+    };
+    let hint = match (p.error.is_some(), multi) {
+        (true, _) => " Enter: use typed text  Esc: cancel ",
+        (false, true) => " Space: mark  Enter: done  Esc: cancel ",
+        (false, false) => " Enter: select  Esc: cancel ",
+    };
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(format!(" Pick {} ── filter: {} ", fld.label, p.filter)).title_bottom(hint)),
         r,
     );
 }
@@ -421,4 +470,36 @@ pub fn help_lines() -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::form::{Field, FormEvent, PickItem, Source};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn screen(form: &Form) -> String {
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| draw_form(f, form, f.area())).unwrap();
+        t.backend().to_string()
+    }
+
+    #[test]
+    fn picker_popup_shows_loading_scrolls_and_shows_errors() {
+        let mut form = Form::new("t", vec![Field::pick("repo", "Repository", Source::Roles).multi()]);
+        let ev = form.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(ev, FormEvent::Load(0)));
+        assert!(screen(&form).contains("loading…"));
+        let items = (0..40).map(|i| PickItem { label: format!("item{i:02}"), value: format!("v{i}"), note: "rpm".into() }).collect();
+        form.set_options(0, Ok(items));
+        form.picker.as_mut().unwrap().selected = 30;
+        let s = screen(&form);
+        assert!(s.contains("[ ] rpm  item30") && !s.contains("item00"), "{s}");
+        assert!(s.contains("Space: mark"));
+        form.picker.as_mut().unwrap().error = Some("boom".into());
+        let s = screen(&form);
+        assert!(s.contains("Could not load choices: boom") && s.contains("Enter: use typed text"), "{s}");
+    }
 }

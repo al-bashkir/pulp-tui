@@ -1,7 +1,7 @@
 //! Application state and event handling. Rendering never waits on I/O: every network or
 //! disk operation runs as a background job that sends back a closure applied here.
 
-use super::form::{Form, FormEvent};
+use super::form::{FieldKind, Form, FormEvent, PickItem, Source};
 use super::kinds::{self, Act, Kind};
 use super::tasks::TaskCenter;
 use crate::config::{Config, Settings};
@@ -598,6 +598,26 @@ impl App {
         self.modal = Some(Modal::Form { form, submit: Box::new(submit) });
     }
 
+    /// Load the options of a pick field in the background. The answer, also a load error, goes into the popup.
+    pub fn load_pick(&mut self, form_id: u64, field: usize, source: Source, role: String) {
+        if self.conn.is_none() {
+            return self.apply_pick(form_id, field, Err("not connected".into()));
+        }
+        self.job("load choices", move |ctx| async move {
+            let result = super::pick::load_options(&ctx, &source, &role).await.map_err(|e| format!("{e:#}"));
+            super::actions::ap(move |app| app.apply_pick(form_id, field, result))
+        });
+    }
+
+    /// Hand loaded options to the form, if that form is still the open one.
+    pub fn apply_pick(&mut self, form_id: u64, field: usize, result: Result<Vec<PickItem>, String>) {
+        if let Some(Modal::Form { form, .. }) = &mut self.modal
+            && form.id == form_id
+        {
+            form.set_options(field, result);
+        }
+    }
+
     pub fn confirm(&mut self, title: impl Into<String>, lines: Vec<String>, on_yes: impl FnOnce(&mut App) + 'static) {
         self.modal = Some(Modal::Confirm {
             title: title.into(),
@@ -844,6 +864,17 @@ impl App {
             Modal::Form { mut form, mut submit } => match form.handle_key(k) {
                 FormEvent::Cancel => {}
                 FormEvent::None => self.modal = Some(Modal::Form { form, submit }),
+                FormEvent::Load(i) => {
+                    let (id, role) = (form.id, form.get("role").to_string());
+                    let source = match &form.fields[i].kind {
+                        FieldKind::Pick { source, .. } => Some(source.clone()),
+                        _ => None,
+                    };
+                    self.modal = Some(Modal::Form { form, submit });
+                    if let Some(source) = source {
+                        self.load_pick(id, i, source, role);
+                    }
+                }
                 FormEvent::Submit => {
                     let res = form.validate().and_then(|_| submit(self, &form));
                     if let Err(e) = res {
@@ -980,5 +1011,28 @@ impl App {
 
     pub fn read_only(&self) -> bool {
         self.conn.as_ref().is_some_and(|c| c.client.read_only())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::form::Field;
+
+    #[test]
+    fn load_result_for_closed_form_is_dropped() {
+        let mut app = App::new(Config::default(), "/dev/null".into(), Arc::new(Store::open_in_memory().unwrap()));
+        let form = Form::new("t", vec![Field::pick("repo", "Repository", Source::Roles)]);
+        let id = form.id;
+        app.form(form, |_, _| Ok(()));
+        app.modal = None; // closed with Esc meanwhile
+        app.apply_pick(id, 0, Ok(vec![]));
+        assert!(app.modal.is_none());
+        // A different open form is not touched.
+        let other = Form::new("t", vec![Field::pick("repo", "Repository", Source::Roles)]);
+        app.form(other, |_, _| Ok(()));
+        app.apply_pick(id, 0, Ok(vec![PickItem { label: "x".into(), value: "x".into(), note: String::new() }]));
+        let Some(Modal::Form { form, .. }) = &app.modal else { panic!() };
+        assert!(form.fields[0].options.is_none());
     }
 }

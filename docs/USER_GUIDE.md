@@ -43,6 +43,16 @@ goes to the next field (submits on the last), `Ctrl-S` submits, `Ctrl-U` clears 
 `Esc` cancels. In confirmations: `y`/`Enter` confirms, `n`/`Esc` cancels; destructive
 operations require typing the shown name; `↑↓ PgUp PgDn` scroll long previews.
 
+**Pickers.** A field shown as `[ value ▾ ]` picks an existing object (repository, remote,
+distribution, role, user, ...) from the server. `Enter` or `Space` opens the list, and
+typing a letter opens it with that filter. In the list, type to filter, `↑↓ PgUp PgDn`
+move, and `Enter` selects and moves to the next field (submits on the last). In a
+multi-select list `Space` marks items and `Enter` takes all marked items (or the
+highlighted one if none is marked). `Esc` closes the list and keeps the old value.
+`Backspace` on the closed field clears it. If the list cannot be loaded, the popup shows
+the error and `Enter` takes the typed text as the value (with no text, it closes the list
+and keeps the old value).
+
 ### Three kinds of "cancel"
 
 1. **Esc on a loading list** cancels the HTTP request in the client.
@@ -124,7 +134,7 @@ environments with bound versions and states.
 | Key | Action |
 |---|---|
 | c / e / d | create / edit description / delete (removes the view's distributions and snapshot repositories, never source repositories) |
-| a | add repository: type, name, filter rules |
+| a | add repositories: a multi-select picker of RPM and File repositories (those already in the view are not listed) and filter rules; the rules apply to each selected repository, so mixed RPM and File selections need empty rules |
 | F | edit the filter rules of one repository |
 | x | remove a repository from the definition (published versions are unchanged) |
 | w | preview: exact content the draft selects compared with the latest published version |

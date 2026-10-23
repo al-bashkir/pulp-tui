@@ -2,7 +2,7 @@
 
 use super::actions::{ap, pretty};
 use super::app::{App, Level};
-use super::form::{Field, FieldKind, Form};
+use super::form::{Field, FieldKind, Form, PickItem, Source};
 use super::kinds::{Act, Kind, s};
 use crate::cv::{Mode, base_path, distribution_name};
 use crate::filters::{format_rules, parse_rules};
@@ -37,6 +37,30 @@ where
         })
     };
     app.spawn(label.into(), false, fut);
+}
+
+/// Definitions for the picked repositories. Filter rules are typed, so they need repositories of one type.
+fn new_cv_repos(picked: &[PickItem], rules: &str) -> Result<Vec<CvRepo>, String> {
+    if picked.is_empty() {
+        return Err("select at least one repository".into());
+    }
+    let mut repos = vec![];
+    for i in picked {
+        let repo_type = RepoType::from_href(&i.value).ok_or_else(|| format!("unknown repository type for {}", i.label))?;
+        repos.push(CvRepo { repo_href: i.value.clone(), repo_name: i.label.clone(), repo_type, filters: vec![] });
+    }
+    if rules.replace(';', "").trim().is_empty() {
+        return Ok(repos);
+    }
+    let t = repos[0].repo_type;
+    if repos.iter().any(|r| r.repo_type != t) {
+        return Err("filter rules need repositories of one type; add RPM and File repositories separately".into());
+    }
+    let filters = parse_rules(rules, t)?;
+    for r in &mut repos {
+        r.filters = filters.clone();
+    }
+    Ok(repos)
 }
 
 fn env_names(app: &App, profile: &str) -> Vec<String> {
@@ -80,27 +104,26 @@ fn cv_action(app: &mut App, profile: &str, act: Act, item: Value) {
             });
         }
         Act::CvAddRepo => {
+            // Repositories already in the view are not listed: adding them again would overwrite their filters.
+            let present = item["repos"].as_array().into_iter().flatten().map(|r| s(r, "href")).collect();
             let form = Form::new(
-                format!("Add repository to {name}"),
+                format!("Add repositories to {name}"),
                 vec![
-                    Field::new("type", "Type", FieldKind::Choice(vec!["rpm".into(), "file".into()])),
-                    Field::text("repo", "Repository (name)").required(),
+                    Field::pick("repos", "Repositories", Source::Repos(None)).multi().required().exclude(present),
                     Field::text("filters", "Filter rules")
                         .help("rpm: include name=x* arch=.. evr>=1.0; exclude name=*-debuginfo | file: exclude path=isos/*"),
                 ],
             )
-            .note("Each repository keeps its own type and distribution; formats are never merged.");
+            .note("Each repository keeps its own type and distribution; formats are never merged.")
+            .note("Filter rules apply to every selected repository, so they need repositories of one type.");
             app.form(form, move |app, f| {
-                let t = if f.get("type") == "file" { RepoType::File } else { RepoType::Rpm };
-                let filters = parse_rules(f.get("filters"), t)?;
-                let repo = f.get("repo").to_string();
-                app.job(format!("add {repo} to {}", f.get("repo")), move |ctx| async move {
-                    let href = super::actions::href_by_name(&ctx.client, t.repositories(), &repo).await?;
-                    ctx.store.set_cv_repo(id, &CvRepo { repo_href: href, repo_name: repo.clone(), repo_type: t, filters })?;
-                    ap(move |app| {
-                        app.ok(format!("{repo} added (takes effect on next publish)"));
-                        app.reload();
-                    })
+                let repos = new_cv_repos(&f.picked("repos"), f.get("filters"))?;
+                local(app, "add repositories", move |st| {
+                    for r in &repos {
+                        st.set_cv_repo(id, r)?;
+                    }
+                    let n = repos.len();
+                    Ok(format!("added {n} {} (takes effect on next publish)", if n == 1 { "repository" } else { "repositories" }))
                 });
                 Ok(())
             });
@@ -445,5 +468,51 @@ fn env_action(app: &mut App, profile: &str, act: Act, item: Value) {
             );
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(name: &str, t: &str) -> PickItem {
+        PickItem { label: name.into(), value: format!("/pulp/api/v3/repositories/{t}/{t}/{name}/"), note: t.into() }
+    }
+
+    #[test]
+    fn mixed_types_with_rules_rejected() {
+        let e = new_cv_repos(&[item("a", "rpm"), item("b", "file")], "exclude name=*-debuginfo").unwrap_err();
+        assert!(e.contains("one type"), "{e}");
+    }
+
+    #[test]
+    fn mixed_types_without_rules_ok() {
+        let r = new_cv_repos(&[item("a", "rpm"), item("b", "file")], "").unwrap();
+        assert_eq!((r[0].repo_type, r[1].repo_type), (RepoType::Rpm, RepoType::File));
+        assert!(r.iter().all(|x| x.filters.is_empty()));
+    }
+
+    #[test]
+    fn rules_apply_to_each_selected_repo() {
+        let r = new_cv_repos(&[item("a", "rpm"), item("b", "rpm")], "exclude name=*-debuginfo").unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(|x| x.filters.len() == 1));
+        assert_eq!(r[1].repo_name, "b");
+    }
+
+    #[test]
+    fn nothing_selected_rejected() {
+        assert!(new_cv_repos(&[], "").is_err());
+    }
+
+    #[test]
+    fn unknown_type_is_an_error() {
+        let odd = PickItem { label: "x".into(), value: "/pulp/api/v3/repositories/container/container/x/".into(), note: String::new() };
+        assert_eq!(new_cv_repos(&[odd], "").unwrap_err(), "unknown repository type for x");
+    }
+
+    #[test]
+    fn blank_rules_do_not_count_for_mixed_types() {
+        assert!(new_cv_repos(&[item("a", "rpm"), item("b", "file")], " ; ").is_ok());
     }
 }

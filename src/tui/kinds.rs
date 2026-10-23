@@ -234,7 +234,7 @@ impl Act {
             StoreSecret => "Store secret in system keyring",
             ExportCv => "Export Content View definitions",
             ImportCv => "Import Content View definitions",
-            CvAddRepo => "Add repository",
+            CvAddRepo => "Add repositories",
             CvFilters => "Edit repository filters",
             CvRemoveRepo => "Remove repository",
             CvPreview => "Preview draft vs latest version",

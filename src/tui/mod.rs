@@ -6,6 +6,7 @@ pub mod actions_cv;
 pub mod app;
 pub mod form;
 pub mod kinds;
+pub mod pick;
 pub mod tasks;
 pub mod view;
 
