@@ -161,7 +161,7 @@ fn inspect(app: &mut App, kind: &Kind, item: Value) {
     }
 }
 
-fn task_lines(item: &Value) -> Vec<String> {
+pub(super) fn task_lines(item: &Value) -> Vec<String> {
     let mut out = vec![
         format!("label: {}", s(item, "label")),
         format!("href:  {}", s(item, "pulp_href")),
@@ -1382,6 +1382,11 @@ fn task_action(app: &mut App, act: Act, item: Value) {
         Act::TrackTask => {
             app.track_task(&href, &s(&item, "name"));
             app.ok("tracking task");
+        }
+        Act::WatchTask => {
+            // Task Center rows have a label, server tasks a name.
+            let label = Some(s(&item, "label")).filter(|l| !l.is_empty()).unwrap_or_else(|| s(&item, "name"));
+            app.watch_task(&href, &label);
         }
         Act::CancelTask => {
             let lines = vec![

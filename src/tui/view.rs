@@ -243,6 +243,7 @@ fn modal_hint(m: &Modal) -> String {
         },
         Modal::Confirm { typed: Some(_), .. } => "-- EDIT --  Enter: confirm  Ctrl-D/U: scroll  Esc: cancel".into(),
         Modal::Confirm { .. } => "y/Enter: confirm  n/Esc: cancel  j/k g/G Ctrl-D/U: scroll".into(),
+        Modal::Text { watch: Some(_), .. } => "live: refreshes until the task ends  j/k g/G Ctrl-D/U: scroll  Esc: close".into(),
         Modal::Text { .. } => "j/k g/G Ctrl-D/U: scroll  Esc: close".into(),
         Modal::Input { .. } => "-- EDIT --  Enter: done  Ctrl-U: clear  Esc: cancel".into(),
         Modal::Palette { filtering: true, .. } => "-- FILTER --  Ctrl-J/K: move  Enter: run  Esc: stop filtering".into(),
@@ -318,7 +319,7 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
             f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), content);
             f.render_widget(Paragraph::new(prompt).style(Style::default().add_modifier(Modifier::BOLD)), p);
         }
-        Modal::Text { title, lines, scroll } => {
+        Modal::Text { title, lines, scroll, .. } => {
             let r = centered(area, area.width.saturating_sub(6), area.height.saturating_sub(4));
             let text: Vec<Line> = lines
                 .iter()
@@ -617,7 +618,7 @@ mod tests {
         let h = modal_hint(&pal(false));
         assert!(h.contains("/: filter") && !h.contains("-- FILTER --"), "{h}");
         assert!(modal_hint(&Modal::Input { title: String::new(), input: String::new(), on_done: None }).starts_with("-- EDIT --"));
-        assert!(modal_hint(&Modal::Text { title: String::new(), lines: vec![], scroll: 0 }).contains("Ctrl-D/U"));
+        assert!(modal_hint(&Modal::Text { title: String::new(), lines: vec![], scroll: 0, watch: None }).contains("Ctrl-D/U"));
         let mut form = Form::new("t", vec![Field::text("a", "A")]);
         form.editing = true;
         assert!(modal_hint(&Modal::Form { form, submit: Box::new(|_, _| Ok(())) }).starts_with("-- EDIT --"));

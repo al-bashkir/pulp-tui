@@ -185,11 +185,12 @@ pub fn item_key(v: &Value) -> String {
     v.get("pulp_href").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| v.get("id").map(|x| x.to_string()).unwrap_or_default())
 }
 
+/// `Text.watch`: href of a task whose lines follow the Task Center (rebuilt on each task message).
 pub enum Modal {
     Menu { title: String, items: Vec<Act>, selected: usize, item: Value },
     Form { form: Form, submit: Submit },
     Confirm { title: String, lines: Vec<String>, typed: Option<String>, input: String, on_yes: Option<OnYes>, danger: bool, scroll: usize },
-    Text { title: String, lines: Vec<String>, scroll: usize },
+    Text { title: String, lines: Vec<String>, scroll: usize, watch: Option<String> },
     Input { title: String, input: String, on_done: Option<OnInput> },
     Palette { input: String, selected: usize, filtering: bool },
 }
@@ -492,6 +493,12 @@ impl App {
             self.list.items = self.task_items();
             self.list.count = self.list.items.len() as u64;
         }
+        if let Some(Modal::Text { watch: Some(h), .. }) = &self.modal {
+            let new = self.watch_lines(h);
+            if let Some(Modal::Text { lines, .. }) = &mut self.modal {
+                *lines = new;
+            }
+        }
     }
 
     /// Task Center rows from the in-memory tracker (no I/O).
@@ -521,6 +528,19 @@ impl App {
                 ap(|_| {})
             });
         }
+    }
+
+    /// Track the task if needed and open a text view that follows its state until it ends.
+    pub fn watch_task(&mut self, href: &str, label: &str) {
+        if !self.tasks.items.iter().any(|t| t.href == href) {
+            self.track_task(href, label);
+        }
+        let lines = self.watch_lines(href);
+        self.modal = Some(Modal::Text { title: format!("Watch task {label}"), lines, scroll: 0, watch: Some(href.into()) });
+    }
+
+    fn watch_lines(&self, href: &str) -> Vec<String> {
+        self.task_items().iter().find(|r| r["pulp_href"] == href).map(super::actions::task_lines).unwrap_or_default()
     }
 
     fn task_update(&mut self, t: Task, driven: bool) {
@@ -865,7 +885,7 @@ impl App {
     }
 
     pub fn text(&mut self, title: impl Into<String>, lines: Vec<String>) {
-        self.modal = Some(Modal::Text { title: title.into(), lines, scroll: 0 });
+        self.modal = Some(Modal::Text { title: title.into(), lines, scroll: 0, watch: None });
     }
 
     pub fn input(&mut self, title: impl Into<String>, initial: &str, on_done: impl FnOnce(&mut App, String) + 'static) {
@@ -1147,7 +1167,7 @@ impl App {
                 }
                 self.modal = Some(Modal::Confirm { title, lines, typed, input, on_yes, danger, scroll });
             }
-            Modal::Text { title, lines, mut scroll } => {
+            Modal::Text { title, lines, mut scroll, watch } => {
                 let max = lines.len().saturating_sub(1);
                 match k.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return,
@@ -1161,7 +1181,7 @@ impl App {
                     KeyCode::End | KeyCode::Char('G') => scroll = max,
                     _ => {}
                 }
-                self.modal = Some(Modal::Text { title, lines, scroll });
+                self.modal = Some(Modal::Text { title, lines, scroll, watch });
             }
             Modal::Input { title, mut input, mut on_done } => match k.code {
                 KeyCode::Esc => {}
@@ -1714,6 +1734,24 @@ mod tests {
             Some(Modal::Text { lines, .. }) => lines.clone(),
             _ => panic!("no text modal"),
         }
+    }
+
+    #[tokio::test]
+    async fn watch_follows_task_updates() {
+        let mut app = app_on(Kind::Tasks).await;
+        app.watch_task("/t/1/", "copy");
+        app.watch_task("/t/1/", "copy");
+        assert_eq!(app.tasks.items.len(), 1);
+        assert!(matches!(&app.modal, Some(Modal::Text { watch: Some(h), .. }) if h == "/t/1/"));
+        let task = |state: &str| {
+            serde_json::from_value::<Task>(serde_json::json!({ "pulp_href": "/t/1/", "state": state, "name": "copy",
+                "progress_reports": [{ "message": "Associating Content", "code": "c", "state": state, "total": 9, "done": 3 }] }))
+            .unwrap()
+        };
+        app.handle_msg(Msg::TaskPolled { href: "/t/1/".into(), result: Ok(task("running")) });
+        assert!(text_lines(&app).contains(&"  [running] Associating Content 3/9".to_string()), "{:?}", text_lines(&app));
+        app.handle_msg(Msg::TaskPolled { href: "/t/1/".into(), result: Ok(task("completed")) });
+        assert!(text_lines(&app).contains(&"state: completed".to_string()), "{:?}", text_lines(&app));
     }
 
     #[tokio::test]

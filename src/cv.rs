@@ -63,7 +63,7 @@ pub struct CvLock {
     renew: tokio::task::AbortHandle,
 }
 
-fn unix_now() -> i64 {
+pub fn unix_now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 

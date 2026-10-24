@@ -149,6 +149,7 @@ pub enum Act {
     CancelTask,
     DismissTasks,
     TrackTask,
+    WatchTask,
     Connect,
     TestProfile,
     StoreSecret,
@@ -204,6 +205,7 @@ impl Act {
             Verify => 'V',
             CancelTask => 'X',
             DismissTasks => 'z',
+            WatchTask => 'W',
             TestProfile => 'T',
             StoreSecret => 'K',
             ExportCv => 'E',
@@ -243,6 +245,7 @@ impl Act {
             CancelTask => "Cancel task on server",
             DismissTasks => "Dismiss finished tasks",
             TrackTask => "Track in Task Center",
+            WatchTask => "Watch task (live)",
             Connect => "Connect (use this server)",
             TestProfile => "Test connection",
             StoreSecret => "Store secret in system keyring",
@@ -299,6 +302,7 @@ impl Act {
                     | Verify
                     | DismissTasks
                     | TrackTask
+                    | WatchTask
                     | Roles
                     | Members
                     | ReplicationHistory
@@ -532,7 +536,7 @@ impl Kind {
             ],
             Kind::CvVersions { .. } => vec![
                 col("version", 7, |v| s(v, "number")),
-                col("state", 10, |v| s(v, "state")),
+                col("state", 11, |v| s(v, "state")),
                 col("created", 19, |v| ts(v, "created_at")),
                 col("environments", 20, |v| s(v, "environments")),
                 col("notes", 30, |v| s(v, "notes")),
@@ -623,14 +627,14 @@ impl Kind {
                 Delete,
                 Inspect,
             ],
-            Kind::CvVersions { .. } => vec![Promote, Rollback, Compare, Resume, Delete, Inspect],
+            Kind::CvVersions { .. } => vec![Promote, Rollback, Compare, Resume, WatchTask, Delete, Inspect],
             Kind::Environments => vec![Create, Edit, ToggleProtected, Delete],
             Kind::UpstreamPulps => vec![Replicate, ReplicationHistory, FallbackReplicate, Create, Edit, Delete, Inspect],
             Kind::Users => vec![Roles, Create, Edit, Password, ToggleActive, Delete, Inspect],
             Kind::UserRoles { .. } | Kind::GroupRoles { .. } | Kind::GroupUsers { .. } => vec![Create, Delete],
             Kind::Groups => vec![Members, Roles, Create, Delete, Inspect],
-            Kind::Tasks => vec![Inspect, CancelTask, DismissTasks],
-            Kind::ServerTasks => vec![Inspect, TrackTask, CancelTask],
+            Kind::Tasks => vec![WatchTask, Inspect, CancelTask, DismissTasks],
+            Kind::ServerTasks => vec![WatchTask, Inspect, TrackTask, CancelTask],
             Kind::Logs { .. } => vec![Inspect],
         }
     }
@@ -760,8 +764,11 @@ pub async fn load(
             let store = store?;
             let envs = store.environments(scope).await?;
             let bindings = store.bindings_for_cv(*cv).await?;
+            // No live lock: the client that ran a `publishing` version ended; Resume continues it.
+            let running = store.lock_live(*cv, crate::cv::unix_now()).await?;
             let mut out = vec![];
             for v in store.versions(*cv).await? {
+                let state = if v.state == "publishing" && !running { "interrupted" } else { v.state.as_str() };
                 let in_envs: Vec<String> = bindings
                     .iter()
                     .filter(|b| b.version_id == v.id)
@@ -783,7 +790,7 @@ pub async fn load(
                 let components: Vec<String> =
                     store.version_components(v.id).await?.into_iter().map(|u| format!("{} v{}", u.name, u.number)).collect();
                 out.push(json!({
-                    "id": v.id, "cv_id": v.cv_id, "number": v.number, "state": v.state, "notes": v.notes,
+                    "id": v.id, "cv_id": v.cv_id, "number": v.number, "state": state, "notes": v.notes,
                     "created_at": v.created_at, "finished_at": v.finished_at, "error": v.error,
                     "environments": in_envs.join(", "), "repositories": repos, "components": components,
                 }));
@@ -913,6 +920,21 @@ mod tests {
         let k = Kind::CvVersions { cv: os, name: "os".into() };
         let (versions, _) = load(&k, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap();
         assert!(versions.iter().all(|v| v["components"] == json!([])));
+    }
+
+    #[tokio::test]
+    async fn a_publishing_version_without_a_live_lock_shows_interrupted() {
+        let (st, cfg) = (Store::open_in_memory().await.unwrap(), Config::default());
+        let cv = st.create_cv("lab", "os", "").await.unwrap();
+        st.begin_version(cv, "", &[]).await.unwrap();
+        let k = Kind::CvVersions { cv, name: "os".into() };
+        let state = async || load(&k, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap().0[0]["state"].clone();
+        assert_eq!(state().await, "interrupted", "no lock: the client that ran it ended");
+        let now = crate::cv::unix_now();
+        st.try_lock(cv, "a@h", "t1", "publish", now).await.unwrap().unwrap();
+        assert_eq!(state().await, "publishing");
+        st.renew_lock(cv, "t1", now - crate::store::LOCK_TTL_SECS - 1).await.unwrap();
+        assert_eq!(state().await, "interrupted", "lock expired");
     }
 
     #[test]

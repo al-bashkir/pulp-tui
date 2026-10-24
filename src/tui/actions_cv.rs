@@ -821,6 +821,18 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                 });
             });
         }
+        Act::WatchTask => {
+            let Some(st) = cv_store(app) else { return };
+            // Read again: the list is stale while another operator publishes.
+            app.spawn("read pending task".into(), true, async move {
+                // Repositories publish one at a time, so at most one row has a pending task.
+                let pending = st.version_repos(vid).await?.into_iter().find_map(|r| Some((r.repo().repo_name.clone(), r.pending_task?)));
+                ap(move |app| match pending {
+                    Some((repo, h)) => app.watch_task(&h, &format!("{name} v{number}: copy {repo}")),
+                    None => app.notify(Level::Info, format!("v{number} has no pending Pulp task now (only the copy step stores one)")),
+                })
+            });
+        }
         Act::Inspect => app.text(format!("{name} v{number}"), pretty(&item)),
         _ => {}
     }
@@ -1289,6 +1301,27 @@ mod tests {
         let rx = app.rx.take().unwrap();
         let st = app.cv_store.clone().unwrap();
         (app, rx, st)
+    }
+
+    #[tokio::test]
+    async fn watch_opens_the_pending_copy_task_of_a_version() {
+        let (mut app, mut rx, st) = composite_app().await;
+        let cv = st.create_cv("lab", "web", "").await.unwrap();
+        let v = st.begin_version(cv, "", &[cv_repo("os", "rpm", "1")]).await.unwrap();
+        let row = json!({ "id": v.id, "number": v.number });
+        version_action(&mut app, "lab", cv, "web".into(), Act::WatchTask, row.clone());
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none());
+        assert_eq!(last_notice(&app), (Level::Info, "v1 has no pending Pulp task now (only the copy step stores one)"));
+
+        let mut vr = st.version_repos(v.id).await.unwrap().remove(0);
+        vr.pending_task = Some(format!("{TASKS}7/"));
+        st.save_version_repo(&vr).await.unwrap();
+        version_action(&mut app, "lab", cv, "web".into(), Act::WatchTask, row);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Text { title, watch, .. }) = &app.modal else { panic!("no watch view") };
+        assert_eq!((title.as_str(), watch.clone()), ("Watch task web v1: copy os", Some(format!("{TASKS}7/"))));
+        assert_eq!(app.tasks.items[0].href, format!("{TASKS}7/"), "tracked, so the Task Center polls it");
     }
 
     /// Apply job results until no job runs.

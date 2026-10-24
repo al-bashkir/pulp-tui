@@ -1275,6 +1275,16 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// `true`: the lock of the view is held and was renewed within `LOCK_TTL_SECS`.
+    pub async fn lock_live(&self, cv_id: i64, now: i64) -> Result<bool> {
+        let r = sqlx::query("SELECT 1 FROM locks WHERE cv_id = $1 AND renewed_at >= $2")
+            .bind(cv_id)
+            .bind(now - LOCK_TTL_SECS)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(r.is_some())
+    }
+
     pub async fn lock_holder(&self, cv_id: i64) -> Result<Option<LockHolder>> {
         let r =
             sqlx::query("SELECT owner, operation, acquired_at FROM locks WHERE cv_id = $1").bind(cv_id).fetch_optional(&self.pool).await?;

@@ -273,9 +273,13 @@ extras.
 **M** promote, **b** roll back, **m** compare with the marked version, **R** resume a
 publish that failed or was interrupted (continues from checkpoints and re-attaches to a
 submitted task; with a shared database it can also continue a publish that another
-operator started), **d** delete (refused while bound, and while a composite uses it),
+operator started), **W** watch the pending copy task of a publishing version (see Tasks;
+only the copy step stores its task, so during other steps W says that no task is pending),
+**d** delete (refused while bound, and while a composite uses it),
 **i** details (source versions, snapshot versions, publications, unit counts; for a
-composite version, the component versions). Compare of two composite versions shows the
+composite version, the component versions). A `publishing` version shows as `interrupted`
+when nobody holds a live lock on the view: the client that ran it ended (quit, crash), so
+nothing continues it until you press **R**. Compare of two composite versions shows the
 component versions first (`rocky9-extras: v1 -> v2`), then the added and removed content of
 each repository.
 
@@ -322,9 +326,11 @@ edited (permissions as a comma list) and deleted.
 
 ### Tasks
 Tracked tasks with state, progress (only what Pulp reports; no invented percentages),
-start time and errors. The top box lists client operations still running. **i** details
-with all progress reports, **X** cancel on the server (confirmation), **z** dismiss
-finished tasks from the list. `t` switches to all server tasks (**a** tracks one).
+start time and errors. The top box lists client operations still running. **W** opens a
+live view of the task (state, progress reports, times, error, created resources) that
+refreshes until the task ends; **i** details with all progress reports, **X** cancel on
+the server (confirmation), **z** dismiss finished tasks from the list. `t` switches to all
+server tasks (**a** tracks one; **W** tracks it and opens the live view).
 
 ### Logs
 Everything that happened in this session, newest first, with the time in UTC. It works
