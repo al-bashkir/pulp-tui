@@ -13,6 +13,8 @@ Automated against real Pulp containers (`tests/run-live.sh`):
 | File: local repo, single and chunked upload, remove content, sync from manifest, publish, distribute, fetch served files, update, roll back, verify | `live_repos::file_lifecycle` |
 | Content Views: RPM + File snapshot with filters, preview, numbered versions, Library, Dev, Prod path rule, rollback, served-content verification, retention protection, advisory filtering, partial failure and retry, resume of an interrupted publish (re-attach to the submitted task), cleanup | `live_cv::content_view_lifecycle` |
 | Lifecycle environment relabel: a File view promoted to Dev serves at `<prefix>/dev/<view>/docs/`; Edit label `dev2` moves the distribution in place (PATCH `base_path`, task awaited), the new URL answers 200 and the old one 404, the stored row and the drift check follow, and a second promotion of the same version keeps the new path | `live_cv::environment_relabel_moves_served_paths` |
+| Composite Content View `rocky9`: the view `<id>-os` (File) pinned at v1 and `<id>-extras` (RPM) on latest; the composite publishes v1 without copying anything, Library serves its own paths (`docs/readme.txt`, `repomd.xml` answer 200) and verifies, and the component's own Library distribution verifies too (one publication, two distributions); after the extras are synced from `rpm2/` and published as v2, auto publish returns `<id> v2 published`, composite v2 uses extras v2 and os v1, compare shows `<id>-extras: v1 -> v2` and `+ fixture-gamma-0.5-1.noarch`; deleting extras v1 and the os view is refused (`used by <id> v1`, `is used by`); deleting composite v1 keeps the extras v1 publication (GET 200); deleting the composite removes its two distributions (GET 404), keeps the derived repositories of both components (GET 200) and both components still verify; cleanup | `live_cv::composite_content_view_rocky9` |
+| Composite Content Views on PostgreSQL: set_component refusals (not a composite, composite as component, unpublished or foreign pin), pins and auto publish (the flag as `BIGINT`), borrowed rows without the task reference, the database refuses `delete_cv` of a component (foreign key) and deleting works after the component and the composite version are gone, a component version that is no longer published is not borrowed, `db copy` of a composite from a SQLite store with a composite that sorts before its components | `live_shared_db::composite_store_methods_on_postgres` |
 | Native replication pulp2 → pulp1, rerun, upstream update; fallback conflicts with native objects | `live_replication::native_replication` |
 | Fallback replication: dry run, create, idempotent rerun, upstream update, loop and self guards | `live_replication::fallback_replication` |
 | RBAC: 401, 403, no self-escalation, creator role, group object role, revoke | `live_rbac` |
@@ -37,10 +39,10 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
 
 ## Test results (last run)
 
-* `cargo test --lib`: 188 passed
+* `cargo test --lib`: 214 passed
 * `cargo test --test mock_http`: 18 passed
-* Live (`tests/run-live.sh`, 2026-10-24): repos 2, cv 3, rbac 1, failures 2,
-  replication 2, shared_db 5 (PostgreSQL 16) — all passed
+* Live (`tests/run-live.sh`, 2026-10-24): repos 2, cv 4, rbac 1, failures 2,
+  replication 2, shared_db 6 (PostgreSQL 16) — all passed
 * `cargo fmt --check`, `cargo clippy --all-targets -D warnings` (default and
   `--no-default-features`): clean
 * `podman build -f Containerfile .`: built (29.5 MB image; no keyring; it contains the
@@ -84,7 +86,12 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
   covered by unit tests with a mock server and by `live_cv`; the key classification by a
   unit test.
 * Fallback replication synchronizes content only and never deletes.
-* Composite Content Views and reusable filter sets are not implemented.
+* The TUI flows of composite Content Views (the Composite flag of Create, Add components
+  with the pin form, Edit with pins and auto publish, the auto publish notice, the delete
+  confirmations) were not run by hand in a terminal. They are covered by unit tests with
+  mock servers and SQLite stores; the service behind them is covered by `live_cv`.
+* A composite has no filters of its own and cannot be a component of another composite.
+  Reusable filter sets are not implemented.
 * Plugins other than RPM and File, content guard creation, signing service creation,
   OIDC token refresh: not supported.
 * Not tested: Pulp domains, macOS at runtime (CI builds and runs unit tests), Windows.

@@ -1045,7 +1045,7 @@ impl App {
         let shared = self.shared();
         self.list
             .kind
-            .actions()
+            .item_actions(item)
             .into_iter()
             .filter(|a| !(ro && a.mutates(&self.list.kind, shared)))
             .filter(|a| item.is_object() || !a.needs_item())

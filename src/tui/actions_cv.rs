@@ -4,11 +4,11 @@ use super::actions::{ap, caps, confirm_mirror, pretty, sync_policies};
 use super::app::{App, Ctx, Level, NO_PROFILE, unavailable};
 use super::form::{Field, FieldKind, Form, PickItem, Source};
 use super::kinds::{Act, Kind, s};
-use crate::cv::{Mode, base_path, distribution_name};
+use crate::cv::{Mode, base_path, check_repo_clash, distribution_name};
 use crate::filters::{format_rules, parse_rules};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, PulpError, RepoType};
-use crate::store::{CvRepo, LIBRARY, Store};
+use crate::store::{Component, CvRepo, CvVersion, LIBRARY, Store};
 use anyhow::anyhow;
 use futures::future::join_all;
 use serde_json::Value;
@@ -91,6 +91,83 @@ fn new_cv_repos(picked: &[PickItem], rules: &str) -> Result<Vec<CvRepo>, String>
         r.filters = filters.clone();
     }
     Ok(repos)
+}
+
+/// Components with all versions of each (newest first), for the pin forms.
+type Parts = Vec<(Component, Vec<CvVersion>)>;
+
+async fn with_versions(st: &Store, components: Vec<Component>) -> anyhow::Result<Parts> {
+    let mut out = vec![];
+    for c in components {
+        let versions = st.versions(c.cv_id).await?;
+        out.push((c, versions));
+    }
+    Ok(out)
+}
+
+/// Choices of a pin: `latest`, then the published versions, newest first.
+fn pin_choices(versions: &[CvVersion]) -> Vec<String> {
+    let published = versions.iter().filter(|v| v.state == "published").map(|v| format!("v{}", v.number));
+    std::iter::once("latest".to_string()).chain(published).collect()
+}
+
+/// The version a choice pins; `None` is `latest`.
+fn pin_of(choice: &str, versions: &[CvVersion]) -> Option<i64> {
+    versions.iter().find(|v| v.state == "published" && format!("v{}", v.number) == choice).map(|v| v.id)
+}
+
+/// The choice that shows a pin (a version id; `None` is `latest`).
+fn pin_choice(pinned: Option<i64>, versions: &[CvVersion]) -> String {
+    versions.iter().find(|v| v.state == "published" && Some(v.id) == pinned).map_or("latest".into(), |v| format!("v{}", v.number))
+}
+
+/// One Choice per component, keyed by the component's view id, set to its current pin.
+fn pin_fields(parts: &Parts) -> Vec<Field> {
+    let field = |(c, vs): &(Component, Vec<CvVersion>)| {
+        Field::new(&c.cv_id.to_string(), &c.name, FieldKind::Choice(pin_choices(vs))).value(pin_choice(c.pinned, vs))
+    };
+    parts.iter().map(field).collect()
+}
+
+/// `(view id, pinned version)` of each component in a form made with `pin_fields`; `changed` keeps only the edited ones.
+fn chosen_pins(f: &Form, parts: &Parts, changed: bool) -> Vec<(i64, Option<i64>)> {
+    let key = |c: &Component| c.cv_id.to_string();
+    parts.iter().filter(|(c, _)| !changed || f.changed(&key(c))).map(|(c, vs)| (c.cv_id, pin_of(f.get(&key(c)), vs))).collect()
+}
+
+/// Second step of "Add components": pin each new component, check the repositories, then add them.
+fn pin_form(app: &mut App, composite: i64, name: String, parts: Parts) {
+    let form = Form::new(format!("Pin components of {name}"), pin_fields(&parts));
+    app.form(form, move |app, f| {
+        let pins = chosen_pins(f, &parts, false);
+        let new: Vec<(i64, String)> = parts.iter().map(|(c, _)| (c.cv_id, c.name.clone())).collect();
+        local(app, "add components", async move |st| {
+            // The definitions as they are now: the same repository twice, or one path segment twice, cannot be served.
+            let mut repos = vec![];
+            for c in st.components(composite).await? {
+                repos.push((c.name, st.cv_repos(c.cv_id).await?));
+            }
+            for (id, name) in new {
+                repos.push((name, st.cv_repos(id).await?));
+            }
+            check_repo_clash(&repos)?;
+            for (id, pin) in &pins {
+                st.set_component(composite, *id, *pin).await?;
+            }
+            Ok(format!("added {} component(s) (takes effect on next publish)", pins.len()))
+        });
+        Ok(())
+    });
+}
+
+/// The notice of a publish with the results of the auto publish that followed: a warning when one failed.
+fn auto_notice(msg: String, auto: Vec<Result<String, String>>) -> (Level, String) {
+    if auto.is_empty() {
+        return (Level::Ok, msg);
+    }
+    let level = if auto.iter().any(Result::is_err) { Level::Warn } else { Level::Ok };
+    let results: Vec<String> = auto.into_iter().map(|r| r.unwrap_or_else(|e| e)).collect();
+    (level, format!("{msg}; auto publish: {}", results.join("; ")))
 }
 
 /// What happened to one repository of a "Sync repositories" run.
@@ -226,16 +303,49 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                 vec![
                     Field::text("name", "Name").required().help("[A-Za-z0-9-_.], becomes part of base paths"),
                     Field::text("description", "Description"),
+                    Field::new("composite", "Composite (fixed after create)", FieldKind::Bool),
                 ],
             );
             app.form(form, move |app, f| {
-                let (n, d, p) = (f.get("name").to_string(), f.get("description").to_string(), p.clone());
+                let (n, d, p, composite) = (f.get("name").to_string(), f.get("description").to_string(), p.clone(), f.bool("composite"));
                 crate::store::validate_name(&n).map_err(|e| e.to_string())?;
                 local(app, "create content view", async move |st| {
-                    st.create_cv(&p, &n, &d).await?;
-                    Ok(format!("content view {n} created; add repositories with a"))
+                    if composite {
+                        st.create_composite(&p, &n, &d).await?;
+                        Ok(format!("composite content view {n} created; add components with a"))
+                    } else {
+                        st.create_cv(&p, &n, &d).await?;
+                        Ok(format!("content view {n} created; add repositories with a"))
+                    }
                 });
                 Ok(())
+            });
+        }
+        Act::Edit if item["composite"] == true => {
+            let Some(st) = cv_store(app) else { return };
+            app.spawn("read components".into(), true, async move {
+                let cv = st.content_view(id).await?;
+                let parts = with_versions(&st, st.components(id).await?).await?;
+                ap(move |app| {
+                    let mut fields = vec![
+                        Field::text("description", "Description").value(cv.description),
+                        Field::new("auto", "Auto publish when a latest component publishes", FieldKind::Bool)
+                            .value(cv.auto_publish.to_string()),
+                    ];
+                    fields.extend(pin_fields(&parts));
+                    app.form(Form::new(format!("Edit {name}"), fields), move |app, f| {
+                        let (d, auto, pins) = (f.get("description").to_string(), f.bool("auto"), chosen_pins(f, &parts, true));
+                        local(app, "update content view", async move |st| {
+                            st.update_cv(id, &d).await?;
+                            st.set_auto_publish(id, auto).await?;
+                            for (component, pin) in pins {
+                                st.set_component(id, component, pin).await?;
+                            }
+                            Ok("saved".into())
+                        });
+                        Ok(())
+                    });
+                })
             });
         }
         Act::Edit => {
@@ -316,6 +426,48 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                 })
             });
         }
+        Act::CvAddComponent => {
+            // Views already in the composite are not listed: adding one again would only change its pin (Edit).
+            let present = item["components"].as_array().into_iter().flatten().map(|c| s(c, "id")).collect();
+            let form = Form::new(
+                format!("Add components to {name}"),
+                vec![Field::pick("components", "Content Views", Source::ContentViews).multi().required().exclude(present)],
+            );
+            app.form(form, move |app, f| {
+                let picked = f
+                    .picked("components")
+                    .into_iter()
+                    .filter_map(|i| Some(Component { cv_id: i.value.parse().ok()?, name: i.label, pinned: None }))
+                    .collect();
+                let Some(st) = cv_store(app) else { return Ok(()) };
+                let name = name.clone();
+                app.spawn("read versions".into(), true, async move {
+                    let parts = with_versions(&st, picked).await?;
+                    ap(move |app| pin_form(app, id, name, parts))
+                });
+                Ok(())
+            });
+        }
+        Act::CvRemoveComponent => {
+            let components: Vec<(i64, String)> =
+                item["components"].as_array().into_iter().flatten().filter_map(|c| Some((c["id"].as_i64()?, s(c, "name")))).collect();
+            if components.is_empty() {
+                app.error("composite has no components");
+                return;
+            }
+            let names = components.iter().map(|(_, n)| n.clone()).collect();
+            let form =
+                Form::new(format!("Remove component from {name}"), vec![Field::new("component", "Component", FieldKind::Choice(names))]);
+            app.form(form, move |app, f| {
+                let (component, c) = components.iter().find(|(_, n)| n == f.get("component")).cloned().ok_or("unknown component")?;
+                let name = name.clone();
+                local(app, "remove component", async move |st| {
+                    st.remove_component(id, component).await?;
+                    Ok(format!("{c} removed from {name}; published versions are unchanged"))
+                });
+                Ok(())
+            });
+        }
         Act::CvPreview => app.job(format!("preview {name}"), move |ctx| async move {
             let svc = ctx.cv()?;
             let latest = svc.store.versions(id).await?.into_iter().find(|v| v.state == "published").map(|v| v.id);
@@ -338,8 +490,12 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                         app.confirm(format!("Publish {name}"), lines, move |app| {
                             app.job(format!("publish {name}"), move |ctx| async move {
                                 let v = ctx.cv()?.locked(id, "publish").await?.publish(id, &notes, &ctx.log(), &ctx.on_task()).await?;
+                                // After the lock of this view is released; composites take their own locks.
+                                let auto = ctx.cv()?.auto_publish(id, &ctx.log(), &ctx.on_task()).await;
                                 ap(move |app| {
-                                    app.ok(format!("{name} version {} published and active in Library", v.number));
+                                    let (level, text) =
+                                        auto_notice(format!("{name} version {} published and active in Library", v.number), auto);
+                                    app.notify(level, text);
                                     app.reload();
                                 })
                             });
@@ -448,12 +604,20 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             ap(move |app| app.text(format!("Verification of {name}"), lines))
         }),
         Act::Delete => {
-            let lines = vec![
-                format!("Delete content view {name} and everything pulp-tui created for it:"),
-                "  - its distributions in every environment (consumers lose these URLs)".into(),
-                "  - its snapshot repositories (with their versions and publications)".into(),
-                "Source repositories are NOT touched.".into(),
-            ];
+            // A composite owns distributions only: its versions borrow the components' objects.
+            let lines = if item["composite"] == true {
+                vec![
+                    format!("Delete composite content view {name}: its distributions in every environment (consumers lose these URLs)."),
+                    "Component views and their snapshots are NOT touched.".into(),
+                ]
+            } else {
+                vec![
+                    format!("Delete content view {name} and everything pulp-tui created for it:"),
+                    "  - its distributions in every environment (consumers lose these URLs)".into(),
+                    "  - its snapshot repositories (with their versions and publications)".into(),
+                    "Source repositories are NOT touched.".into(),
+                ]
+            };
             app.confirm_danger(format!("Delete content view {name}"), lines, &name.clone(), move |app| {
                 app.job(format!("delete content view {name}"), move |ctx| async move {
                     ctx.cv()?.locked(id, "delete").await?.delete_view(id, &ctx.log(), &ctx.on_task()).await?;
@@ -621,19 +785,34 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                 return;
             }
             app.job(format!("resume {name} v{number}"), move |ctx| async move {
-                let v = ctx.cv()?.locked(cv, &format!("resume v{number}")).await?.resume(vid, &ctx.log(), &ctx.on_task()).await?;
+                let svc = ctx.cv()?.locked(cv, &format!("resume v{number}")).await?;
+                // A stale list can show a published version as failed: resume returns at once, nothing new to auto publish.
+                let was_published = svc.store.version(vid).await?.state == "published";
+                let v = svc.resume(vid, &ctx.log(), &ctx.on_task()).await?;
+                drop(svc); // release the lock of this view; composites take their own
+                let auto = if was_published { vec![] } else { ctx.cv()?.auto_publish(cv, &ctx.log(), &ctx.on_task()).await };
                 ap(move |app| {
-                    app.ok(format!("{name} v{} published", v.number));
+                    let (level, text) = auto_notice(format!("{name} v{} published", v.number), auto);
+                    app.notify(level, text);
                     app.reload();
                 })
             });
         }
         Act::Delete => {
-            let lines = vec![
-                format!("Delete {name} version {number}: its snapshot version and publication are removed"),
-                "from Pulp unless shared with another version. Refused while bound to an environment.".into(),
-                "The version number is never reused.".into(),
-            ];
+            // Only a composite version has components; it borrows their snapshots and publications.
+            let mut lines = if item["components"].as_array().is_some_and(|c| !c.is_empty()) {
+                vec![
+                    format!("Delete {name} version {number}: only this composite version is removed."),
+                    "The snapshots and publications of its component versions are NOT touched. Refused while bound to an environment."
+                        .into(),
+                ]
+            } else {
+                vec![
+                    format!("Delete {name} version {number}: its snapshot version and publication are removed"),
+                    "from Pulp unless shared with another version. Refused while bound to an environment.".into(),
+                ]
+            };
+            lines.push("The version number is never reused.".into());
             app.confirm_danger(format!("Delete {name} v{number}"), lines, &format!("v{number}"), move |app| {
                 app.job(format!("delete {name} v{number}"), move |ctx| async move {
                     ctx.cv()?.locked(cv, &format!("delete v{number}")).await?.delete_version(vid, &ctx.log(), &ctx.on_task()).await?;
@@ -1101,5 +1280,281 @@ mod tests {
         let Some(Modal::Text { title, lines, .. }) = &app.modal else { panic!("no result") };
         assert_eq!((title.as_str(), lines[0].as_str()), ("Sync of web", "0 synced, 1 failed, 1 skipped"));
         assert!(app.jobs.is_empty() && app.tasks.items.is_empty());
+    }
+
+    // ---- composite views ----
+
+    /// An app on profile `lab` (scope `lab`, the local store) and the receiver of its job results.
+    async fn composite_app() -> (App, tokio::sync::mpsc::UnboundedReceiver<crate::tui::app::Msg>, Arc<Store>) {
+        let mut app = test_app().await;
+        app.profile = Some("lab".into());
+        let rx = app.rx.take().unwrap();
+        let st = app.cv_store.clone().unwrap();
+        (app, rx, st)
+    }
+
+    /// Apply job results until no job runs.
+    async fn drain(app: &mut App, rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::tui::app::Msg>) {
+        while !app.jobs.is_empty() {
+            let m = rx.recv().await.unwrap();
+            app.handle_msg(m);
+        }
+    }
+
+    async fn publish_empty(st: &Store, cv: i64) -> crate::store::CvVersion {
+        let v = st.begin_version(cv, "", &[]).await.unwrap();
+        st.finish_version(v.id, "published", None).await.unwrap();
+        st.version(v.id).await.unwrap()
+    }
+
+    fn open_form(app: &mut App) -> (Form, crate::tui::app::Submit) {
+        match app.modal.take() {
+            Some(Modal::Form { form, submit }) => (form, submit),
+            _ => panic!("no form"),
+        }
+    }
+
+    fn set(form: &mut Form, key: &str, value: &str) {
+        form.fields.iter_mut().find(|f| f.key == key).unwrap().value = value.into();
+    }
+
+    fn last_notice(app: &App) -> (Level, &str) {
+        let n = app.notices.back().expect("no notice");
+        (n.level, n.text.as_str())
+    }
+
+    #[test]
+    fn pin_choices_list_latest_then_published_versions_newest_first() {
+        let v = |number: i64, state: &str| crate::store::CvVersion {
+            id: number * 10,
+            cv_id: 1,
+            number,
+            notes: String::new(),
+            state: state.into(),
+            created_at: String::new(),
+            finished_at: None,
+            error: None,
+        };
+        let versions = [v(4, "failed"), v(3, "published"), v(2, "deleted"), v(1, "published")];
+        assert_eq!(pin_choices(&versions), ["latest", "v3", "v1"]);
+        assert_eq!(pin_choices(&[]), ["latest"]);
+        assert_eq!(pin_of("latest", &versions), None);
+        assert_eq!(pin_of("v1", &versions), Some(10));
+        assert_eq!(pin_of("v3", &versions), Some(30));
+        assert_eq!(pin_of("v4", &versions), None, "a version that is not published is not a pin");
+        assert_eq!(pin_choice(Some(30), &versions), "v3");
+        assert_eq!(pin_choice(None, &versions), "latest");
+    }
+
+    #[test]
+    fn auto_publish_results_extend_the_publish_notice() {
+        let ok = |s: &str| Ok(s.to_string());
+        assert_eq!(auto_notice("x published".into(), vec![]), (Level::Ok, "x published".into()));
+        assert_eq!(
+            auto_notice("x published".into(), vec![ok("a v2 published"), ok("b v1 published")]),
+            (Level::Ok, "x published; auto publish: a v2 published; b v1 published".into())
+        );
+        assert_eq!(
+            auto_notice("x published".into(), vec![ok("a v2 published"), Err("b: locked".into())]),
+            (Level::Warn, "x published; auto publish: a v2 published; b: locked".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_makes_a_composite_view_on_request() {
+        let (mut app, mut rx, st) = composite_app().await;
+        for (composite, msg) in [
+            (true, "composite content view rocky9 created; add components with a"),
+            (false, "content view plain created; add repositories with a"),
+        ] {
+            cv_action(&mut app, "lab", Act::Create, json!({}));
+            let (mut form, mut submit) = open_form(&mut app);
+            let last = form.fields.last().unwrap();
+            assert_eq!((last.key.as_str(), last.label.as_str()), ("composite", "Composite (fixed after create)"));
+            assert_eq!(last.kind, FieldKind::Bool);
+            set(&mut form, "name", if composite { "rocky9" } else { "plain" });
+            set(&mut form, "composite", &composite.to_string());
+            submit(&mut app, &form).unwrap();
+            drain(&mut app, &mut rx).await;
+            assert_eq!(last_notice(&app), (Level::Ok, msg));
+        }
+        let views: Vec<_> = st.content_views("lab").await.unwrap().into_iter().map(|v| (v.name, v.composite)).collect();
+        assert_eq!(views, [("plain".to_string(), false), ("rocky9".to_string(), true)]);
+    }
+
+    /// A composite `rocky9` (auto publish off) with `os` (v1, v2) pinned to v1 and `extras` (v1) on latest.
+    async fn rocky(st: &Store) -> (i64, i64, i64, Value) {
+        let (os, extras) = (st.create_cv("lab", "os", "").await.unwrap(), st.create_cv("lab", "extras", "").await.unwrap());
+        let v1 = publish_empty(st, os).await;
+        publish_empty(st, os).await;
+        publish_empty(st, extras).await;
+        let c = st.create_composite("lab", "rocky9", "old").await.unwrap();
+        st.set_component(c, os, Some(v1.id)).await.unwrap();
+        st.set_component(c, extras, None).await.unwrap();
+        let item = json!({
+            "id": c, "name": "rocky9", "description": "old", "composite": true, "auto_publish": false,
+            "components": [{ "id": extras, "name": "extras" }, { "id": os, "name": "os" }]
+        });
+        (c, os, extras, item)
+    }
+
+    #[tokio::test]
+    async fn edit_of_a_composite_sets_description_auto_publish_and_changed_pins() {
+        let (mut app, mut rx, st) = composite_app().await;
+        let (c, os, extras, item) = rocky(&st).await;
+        cv_action(&mut app, "lab", Act::Edit, item);
+        assert!(app.modal.is_none(), "the components are read first");
+        drain(&mut app, &mut rx).await;
+        let (mut form, mut submit) = open_form(&mut app);
+        let keys: Vec<_> = form.fields.iter().map(|f| f.key.clone()).collect();
+        assert_eq!(keys, ["description", "auto", &extras.to_string(), &os.to_string()]);
+        assert_eq!(form.fields[1].label, "Auto publish when a latest component publishes");
+        assert_eq!((form.fields[1].kind.clone(), form.fields[1].value.as_str()), (FieldKind::Bool, "false"));
+        let (e, o) = (&form.fields[2], &form.fields[3]);
+        assert_eq!(
+            (e.label.as_str(), e.value.as_str(), &e.kind),
+            ("extras", "latest", &FieldKind::Choice(vec!["latest".into(), "v1".into()]))
+        );
+        let want = FieldKind::Choice(vec!["latest".into(), "v2".into(), "v1".into()]);
+        assert_eq!((o.label.as_str(), o.value.as_str(), &o.kind), ("os", "v1", &want), "the current pin is preselected");
+
+        set(&mut form, "description", "new");
+        set(&mut form, "auto", "true");
+        set(&mut form, &os.to_string(), "latest");
+        set(&mut form, &extras.to_string(), "v1");
+        submit(&mut app, &form).unwrap();
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Ok, "saved"));
+        let cv = st.content_view(c).await.unwrap();
+        assert_eq!((cv.description.as_str(), cv.auto_publish), ("new", true));
+        let pins: Vec<_> = st.components(c).await.unwrap().into_iter().map(|k| (k.name, k.pinned.is_some())).collect();
+        assert_eq!(pins, [("extras".to_string(), true), ("os".to_string(), false)]);
+    }
+
+    #[tokio::test]
+    async fn edit_of_a_normal_view_keeps_the_description_form() {
+        let (mut app, _rx, _st) = composite_app().await;
+        cv_action(&mut app, "lab", Act::Edit, json!({ "id": 1, "name": "web", "description": "d", "composite": false }));
+        let (form, _) = open_form(&mut app);
+        assert_eq!(form.fields.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(), ["description"]);
+    }
+
+    #[tokio::test]
+    async fn add_components_pins_each_and_checks_repository_clashes() {
+        let (mut app, mut rx, st) = composite_app().await;
+        let (c, os, extras, item) = rocky(&st).await;
+        let base = cv_repo("baseos", "rpm", "1");
+        st.set_cv_repo(os, &base).await.unwrap();
+        let (tools, dup) = (st.create_cv("lab", "tools", "").await.unwrap(), st.create_cv("lab", "dup", "").await.unwrap());
+        publish_empty(&st, tools).await;
+        publish_empty(&st, tools).await;
+        publish_empty(&st, dup).await;
+        st.set_cv_repo(tools, &cv_repo("tools", "rpm", "2")).await.unwrap();
+        st.set_cv_repo(dup, &base).await.unwrap(); // the same repository as os
+
+        cv_action(&mut app, "lab", Act::CvAddComponent, item.clone());
+        let (mut form, mut submit) = open_form(&mut app);
+        assert_eq!(form.title, "Add components to rocky9");
+        let f = &form.fields[0];
+        assert_eq!((f.key.as_str(), f.label.as_str(), f.required), ("components", "Content Views", true));
+        assert_eq!(f.kind, FieldKind::Pick { source: Source::ContentViews, multi: true });
+        assert_eq!(f.exclude, [extras.to_string(), os.to_string()], "the current components are not listed");
+        let pick = |cv: i64, name: &str| PickItem { label: name.into(), value: cv.to_string(), note: String::new() };
+
+        // A clash: dup holds the repository of os. Nothing is added.
+        form.fields[0].options = Some(vec![pick(dup, "dup"), pick(tools, "tools")]);
+        set(&mut form, "components", &dup.to_string());
+        submit(&mut app, &form).unwrap();
+        drain(&mut app, &mut rx).await;
+        let (mut pins, mut pin_submit) = open_form(&mut app);
+        assert_eq!(pins.title, "Pin components of rocky9");
+        assert_eq!(pins.fields.iter().map(|f| (f.label.as_str(), f.value.as_str())).collect::<Vec<_>>(), [("dup", "latest")]);
+        pin_submit(&mut app, &pins).unwrap();
+        drain(&mut app, &mut rx).await;
+        let (level, text) = last_notice(&app);
+        assert_eq!(level, Level::Error);
+        assert!(text.contains("components os and dup both contain repository baseos"), "{text}");
+        assert_eq!(st.components(c).await.unwrap().len(), 2);
+
+        // A clean add, pinned to the older version.
+        set(&mut form, "components", &tools.to_string());
+        submit(&mut app, &form).unwrap();
+        drain(&mut app, &mut rx).await;
+        (pins, pin_submit) = open_form(&mut app);
+        assert_eq!(pins.fields[0].kind, FieldKind::Choice(vec!["latest".into(), "v2".into(), "v1".into()]));
+        set(&mut pins, &tools.to_string(), "v1");
+        pin_submit(&mut app, &pins).unwrap();
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Ok, "added 1 component(s) (takes effect on next publish)"));
+        let added = st.components(c).await.unwrap().into_iter().find(|k| k.cv_id == tools).unwrap();
+        let v1 = st.versions(tools).await.unwrap().into_iter().find(|v| v.number == 1).unwrap();
+        assert_eq!(added.pinned, Some(v1.id));
+    }
+
+    #[tokio::test]
+    async fn remove_component_keeps_the_others_and_says_so() {
+        let (mut app, mut rx, st) = composite_app().await;
+        let (c, os, extras, item) = rocky(&st).await;
+        cv_action(&mut app, "lab", Act::CvRemoveComponent, item);
+        let (mut form, mut submit) = open_form(&mut app);
+        assert_eq!(form.title, "Remove component from rocky9");
+        assert_eq!(form.fields[0].kind, FieldKind::Choice(vec!["extras".into(), "os".into()]));
+        set(&mut form, "component", "os");
+        submit(&mut app, &form).unwrap();
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Ok, "os removed from rocky9; published versions are unchanged"));
+        assert_eq!(st.components(c).await.unwrap().iter().map(|k| k.cv_id).collect::<Vec<_>>(), [extras]);
+        assert_eq!(st.versions(os).await.unwrap().len(), 2, "the component's versions are unchanged");
+        // No components: an error notice, no form.
+        cv_action(&mut app, "lab", Act::CvRemoveComponent, json!({ "id": c, "name": "rocky9", "composite": true, "components": [] }));
+        assert!(app.modal.is_none());
+        assert_eq!(last_notice(&app), (Level::Error, "composite has no components"));
+    }
+
+    #[tokio::test]
+    async fn resume_of_an_already_published_version_does_not_auto_publish() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let (c, _, extras, _) = rocky(&st).await;
+        st.set_auto_publish(c, true).await.unwrap();
+        let v = st.versions(extras).await.unwrap().remove(0);
+        // The list is stale: it shows `failed`, the database says `published`.
+        let item = json!({ "id": v.id, "number": v.number, "state": "failed" });
+        version_action(&mut app, "lab", extras, "extras".into(), Act::Resume, item);
+        drain(&mut app, &mut rx).await;
+        assert!(st.versions(c).await.unwrap().is_empty(), "no composite version for a version that was already published");
+    }
+
+    fn confirm_lines(app: &mut App) -> Vec<String> {
+        match app.modal.take() {
+            Some(Modal::Confirm { lines, .. }) => lines,
+            _ => panic!("no confirmation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_composite_does_not_promise_snapshot_removal() {
+        let mut app = test_app().await;
+        cv_action(&mut app, "lab", Act::Delete, json!({ "id": 1, "name": "rocky9", "composite": true }));
+        assert_eq!(
+            confirm_lines(&mut app),
+            [
+                "Delete composite content view rocky9: its distributions in every environment (consumers lose these URLs).",
+                "Component views and their snapshots are NOT touched."
+            ]
+        );
+        cv_action(&mut app, "lab", Act::Delete, json!({ "id": 1, "name": "web", "composite": false }));
+        assert!(confirm_lines(&mut app).iter().any(|l| l.contains("its snapshot repositories (with their versions and publications)")));
+
+        let version = |components: Value| json!({ "id": 5, "number": 2, "state": "published", "components": components });
+        version_action(&mut app, "lab", 1, "rocky9".into(), Act::Delete, version(json!(["os v1"])));
+        let lines = confirm_lines(&mut app);
+        assert!(
+            lines.iter().any(|l| l.contains("NOT touched")) && !lines.iter().any(|l| l.contains("snapshot version and publication")),
+            "{lines:?}"
+        );
+        version_action(&mut app, "lab", 1, "web".into(), Act::Delete, version(json!([])));
+        assert!(confirm_lines(&mut app).iter().any(|l| l.contains("its snapshot version and publication are removed")));
     }
 }

@@ -1,8 +1,8 @@
 //! Content View workflows against a live Pulp: multi-repository snapshots with filters,
 //! numbered versions, promotion through environments, rollback, served-content
 //! verification, retention protection, partial failure + recovery, and resuming a
-//! publish whose Pulp task was submitted before the client stopped, and objects owned by
-//! another database.
+//! publish whose Pulp task was submitted before the client stopped, objects owned by
+//! another database, and a composite view of two component views.
 
 mod common;
 
@@ -295,4 +295,115 @@ async fn content_view_owned_by_another_database() {
     b.delete_view(b_cv, &quiet, &no_progress).await.unwrap();
     assert!(c.get::<serde_json::Value>(&derived, &[]).await.unwrap_err().is_not_found());
     cleanup(&c, &[&repo, &remote]).await;
+}
+
+/// Composite `rocky9`: an OS view pinned at v1 and an extras view at latest. The composite borrows the
+/// components' Pulp objects, follows the extras with auto publish, and its deletes never remove them.
+#[tokio::test]
+async fn composite_content_view_rocky9() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvc");
+    let (os_name, extras_name) = (format!("{id}-os"), format!("{id}-extras"));
+    let (file_repo, file_remote) = synced_repo(&c, RepoType::File, &format!("{id}-src-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let (rpm_repo, rpm_remote) = synced_repo(&c, RepoType::Rpm, &format!("{id}-src-os"), "rpm/", "additive").await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService {
+        client: c.clone(),
+        store: store.clone(),
+        prefix: id.clone(),
+        scope: profile.clone(),
+        actor: "test@live".into(),
+        lock: None,
+    };
+    let os = store.create_cv(&profile, &os_name, "").await.unwrap();
+    let extras = store.create_cv(&profile, &extras_name, "").await.unwrap();
+    let repo = |href: &str, name: &str, t| CvRepo { repo_href: href.into(), repo_name: name.into(), repo_type: t, filters: vec![] };
+    store.set_cv_repo(os, &repo(&file_repo, "docs", RepoType::File)).await.unwrap();
+    store.set_cv_repo(extras, &repo(&rpm_repo, "os", RepoType::Rpm)).await.unwrap();
+    let os_v1 = svc.publish(os, "", &quiet, &no_progress).await.unwrap();
+    let extras_v1 = svc.publish(extras, "", &quiet, &no_progress).await.unwrap();
+
+    // v1: os pinned, extras latest; nothing is copied, and Library serves the composite's own paths.
+    let comp = store.create_composite(&profile, &id, "").await.unwrap();
+    store.set_component(comp, os, Some(os_v1.id)).await.unwrap();
+    store.set_component(comp, extras, None).await.unwrap();
+    store.set_auto_publish(comp, true).await.unwrap();
+    let c1 = svc.publish(comp, "first", &quiet, &no_progress).await.unwrap();
+    assert_eq!((c1.number, c1.state.as_str()), (1, "published"));
+    let lib = store.ensure_library(&profile).await.unwrap();
+    assert_eq!(svc.verify(comp, lib).await.unwrap(), Vec::<String>::new());
+    assert!(svc.verify(extras, lib).await.unwrap().is_empty(), "one publication, served by two distributions");
+    let url =
+        |label: &str, repo: &str, file: &str| format!("http://localhost:8080/pulp/content/{}/{file}", base_path(&id, &id, label, repo));
+    assert_eq!(c.fetch_content(&url("library", "docs", "docs/readme.txt"), 1 << 20).await.unwrap().0, 200);
+    assert_eq!(c.fetch_content(&url("library", "os", "repodata/repomd.xml"), 1 << 20).await.unwrap().0, 200);
+
+    // Promoting to another environment: the composite's own distributions under the label of Dev.
+    let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
+    svc.promote(comp, c1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    assert_eq!(svc.verify(comp, dev).await.unwrap(), Vec::<String>::new());
+    assert_eq!(c.fetch_content(&url("dev", "docs", "docs/readme.txt"), 1 << 20).await.unwrap().0, 200);
+    assert_eq!(c.fetch_content(&url("dev", "os", "repodata/repomd.xml"), 1 << 20).await.unwrap().0, 200);
+
+    // Upstream update: publishing the extras publishes the composite (auto publish), with os still at v1.
+    let m = c.patch(&rpm_remote, &json!({ "url": format!("{}/rpm2/", upstream()) })).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let m = ops::sync(&c, RepoType::Rpm, &rpm_repo, None, "additive").await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let extras_v2 = svc.publish(extras, "update", &quiet, &no_progress).await.unwrap();
+    assert_eq!(extras_v2.number, 2);
+    let auto = svc.auto_publish(extras, &quiet, &no_progress).await;
+    let want: Vec<Result<String, String>> = vec![Ok(format!("{id} v2 published"))];
+    assert_eq!(auto, want);
+    let c2 = store.versions(comp).await.unwrap().remove(0);
+    assert_eq!((c2.number, c2.state.as_str()), (2, "published"));
+    let used: Vec<_> = store.version_components(c2.id).await.unwrap().into_iter().map(|u| (u.name, u.number)).collect();
+    assert_eq!(used, [(extras_name.clone(), 2), (os_name.clone(), 1)]);
+    assert_eq!(svc.verify(comp, lib).await.unwrap(), Vec::<String>::new());
+    let cmp = svc.compare_versions(c1.id, c2.id).await.unwrap().join("\n");
+    assert!(cmp.contains(&format!("{extras_name}: v1 -> v2")) && cmp.contains("+ fixture-gamma-0.5-1.noarch"), "{cmp}");
+
+    // Auto publish never promotes: Dev still serves v1 until v2 is promoted there, then it serves the extras of v2.
+    assert_eq!(store.binding(dev, comp).await.unwrap().unwrap().version_id, c1.id);
+    svc.promote(comp, c2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    assert_eq!(svc.verify(comp, dev).await.unwrap(), Vec::<String>::new());
+    let extras_v2_pub = store.version_repos(extras_v2.id).await.unwrap().remove(0).publication;
+    let served = store.binding_repos(dev, comp).await.unwrap().into_iter().find(|b| b.repo_name == "os").unwrap().publication;
+    assert_eq!(served, extras_v2_pub);
+    assert_eq!(c.fetch_content(&url("dev", "os", "repodata/repomd.xml"), 1 << 20).await.unwrap().0, 200);
+    assert_eq!(c.fetch_content(&url("dev", "docs", "docs/readme.txt"), 1 << 20).await.unwrap().0, 200);
+
+    // Refusals name what uses the component; deleting the old composite version keeps the borrowed objects.
+    let e = svc.delete_version(extras_v1.id, &quiet, &no_progress).await.unwrap_err().to_string();
+    assert!(e.contains(&format!("used by {id} v1")), "{e}");
+    let e = svc.delete_view(os, &quiet, &no_progress).await.unwrap_err().to_string();
+    assert!(e.contains("is used by"), "{e}");
+    let extras_pub = store.version_repos(extras_v1.id).await.unwrap().remove(0).publication.unwrap();
+    svc.delete_version(c1.id, &quiet, &no_progress).await.unwrap();
+    assert_eq!(store.version(c1.id).await.unwrap().state, "deleted");
+    assert!(c.get::<serde_json::Value>(&extras_pub, &[]).await.is_ok(), "the borrowed publication stays");
+
+    // Deleting the composite removes its distributions only; both components still serve.
+    let mut derived = vec![];
+    for v in [os_v1.id, extras_v1.id] {
+        derived.push(store.version_repos(v).await.unwrap().remove(0).derived_repo.unwrap());
+    }
+    let dists: Vec<String> = store.all_binding_repos(comp).await.unwrap().into_iter().map(|b| b.distribution).collect();
+    assert_eq!(dists.len(), 4, "two repositories in Library and in Dev");
+    svc.delete_view(comp, &quiet, &no_progress).await.unwrap();
+    for d in &derived {
+        assert!(c.get::<serde_json::Value>(d, &[]).await.is_ok(), "{d}");
+    }
+    for d in &dists {
+        assert!(c.get::<serde_json::Value>(d, &[]).await.unwrap_err().is_not_found(), "{d}");
+    }
+    assert!(svc.verify(os, lib).await.unwrap().is_empty() && svc.verify(extras, lib).await.unwrap().is_empty());
+
+    svc.delete_view(os, &quiet, &no_progress).await.unwrap();
+    svc.delete_view(extras, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&file_repo, &rpm_repo, &file_remote, &rpm_remote]).await;
 }

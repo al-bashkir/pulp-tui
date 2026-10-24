@@ -60,7 +60,8 @@ idle group whose counts stay the same for three polls is also treated as final.
 ### Content View implementation
 
 * A **Content View** is a named list of RPM and File repositories. Each repository has
-  optional filter rules (`src/filters.rs`).
+  optional filter rules (`src/filters.rs`). A composite view lists other Content Views
+  instead (see "Composite Content Views" below).
 * **Publish** first records the latest version of every source repository, so the
   snapshot is consistent in time. Then for each repository:
   1. find or create the derived repository `pulp-tui-cv-<view>-<repo>`, labeled
@@ -113,7 +114,41 @@ idle group whose counts stay the same for three polls is also treated as final.
   bound version again (idempotent).
 * **Ownership**: pulp-tui never modifies a derived repository or CV distribution that does
   not carry its ownership labels. Deleting a CV version keeps Pulp objects that another
-  live version or a binding still uses.
+  live version of the view uses, and every publication (and with it its repository
+  version) that any binding row of the server scope still serves, also the binding of a
+  composite (`Store::served_publications`). Pulp deletes the publications of a repository
+  version with it, and deleting a publication silently stops the distributions that serve
+  it (COMPATIBILITY.md), so a served object is never removed. Deleting a view
+  (`CvService::delete_view`) is refused while a composite lists it as a component or a
+  non-deleted composite version used one of its versions, and when another view still
+  serves a publication of one of its derived repositories, because deleting the
+  repository would delete that publication. Deleting a version is refused while a
+  composite version uses it or a composite pins it.
+* **Composite Content Views**: a composite (`content_views.composite`) has components
+  (`cv_components`: the component view and a pinned version, or none for `latest`) instead
+  of repositories and filters. No nesting: `set_component` refuses a composite as a
+  component. Publish (`CvService::publish_composite`) resolves each component to its pin
+  or its newest published version, refuses one without a published version, and checks the
+  repositories of all resolved versions (`check_repo_clash`: one repository in two
+  components, or two names with one `slug` segment) before any write. Nothing is copied or
+  published in Pulp. `Store::begin_composite_version` takes the component versions
+  (`cv_version_components`) and copies their `cv_version_repos` rows as **borrowed** rows
+  (`borrowed = 1`, same derived repository, version and publication, without the task
+  reference) into the new version. It refuses a component version that is no longer
+  published. Then `resume` runs the normal path: `publish_repo` returns at once for a row
+  that has a publication, and `promote` binds Library with the composite's own
+  distributions `pulp-tui-cv-<composite>-<env>-<repo>`, labeled `pulp_tui_cv=<composite>`,
+  at `[<prefix>/]<label>/<composite>/<repo>`. One publication can be served by the
+  distribution of the component and the one of the composite (verified, COMPATIBILITY.md).
+  Delete never removes a borrowed object: `delete_version` skips borrowed rows, and
+  `delete_view` of a composite removes its distributions only. The composite takes its own
+  lock only; it reads the component versions and never changes them. `auto_publish`
+  (`CvService::auto_publish`) runs after a component publish or resume, outside the lock of
+  the component: for every composite with the flag that lists the component as `latest`
+  (`Store::auto_composites`) it takes the composite's lock and publishes, and returns one
+  result per composite, so a locked or failing composite does not undo the component's
+  publish. It never promotes beyond Library. The compare and preview of composites list
+  the component versions first (`cv::component_lines`).
 * **Database ID label**: derived repositories and CV distributions also carry
   `pulp_tui_db=<database id>` (`Store::db_id`). An object that carries the id of another
   database is refused: publish and promote stop with "... is owned by another pulp-tui
@@ -156,7 +191,7 @@ external database in use:
 | Store | Opened | Holds | Rows scoped by |
 |---|---|---|---|
 | Local file `<data_dir>/pulp-tui.db` (SQLite, WAL) | always, migrated on open | task references, replication runs; also the Content View data of every profile without an external database | profile name |
-| External database (PostgreSQL, or SQLite at a path): the `database` of a profile, else `[database]` | on Connect (a job), never migrated by an open | Content Views, repositories and filters, versions and checkpoints, environments, bindings, audit log, locks | server key |
+| External database (PostgreSQL, or SQLite at a path): the `database` of a profile, else `[database]` | on Connect (a job), never migrated by an open | Content Views (also composites and their components), repositories and filters, versions and checkpoints, environments, bindings, audit log, locks | server key |
 
 `Config::database_for(profile)` decides which database a profile uses: its own `database`,
 else `[database]`, else the local file (`None`). A profile with `url = "local"` also gets
@@ -214,9 +249,24 @@ scope; `validate_label`). The migration sets it to `lower(name)`, which is exact
 segment that served paths used before (so `Dev` and `dev` share `dev` and nothing moves),
 and seeds the prefix of every scope that has served rows but no stored prefix: the first
 segment of their `binding_repos.base_path` (usually `cv`). A new server stores an empty
-prefix (`Settings::new_server_prefix`). Export (format 1) and `db copy` carry the labels;
+prefix (`Settings::new_server_prefix`). Export (format 2) and `db copy` carry the labels;
 `db copy` refuses a label that another environment uses in the target scope. An external
 database at schema 2 needs `db migrate` after the upgrade.
+Schema 4 added composite Content Views: `content_views.composite` and `auto_publish`
+(flags, `BIGINT` on PostgreSQL), `cv_version_repos.borrowed`, `cv_components` (composite,
+component, optional pinned version; `component_id` and the pinned `version_id` have no
+cascade, so the database itself refuses to delete a view or version that a composite still
+uses) and `cv_version_components` (the component versions that a composite version used).
+Export format 2 carries composites, components by view name, the auto publish flag and a
+pin as a version number. Versions are not exported, so import turns every pin into `latest`
+and returns a warning that names it (the CLI prints it as `warning: ...`, the TUI shows one
+warning notice); a missing component, or a composite used as component, is skipped with a
+warning. Import still reads format 1; an older pulp-tui refuses format 2 (its check is
+`format != 1`). `db copy` copies composites, components with pins, the recorded component
+versions and the borrowed rows, with every id remapped. The links between composites,
+components and versions are written after all views and versions, so a composite that
+sorts before its components (`rocky9` < `rocky9-os`) is copied correctly. An external
+database at schema 3 needs `db migrate` after the upgrade.
 
 **Connection.** `Database::connect_url` (`src/config.rs`) builds the URL: it adds the
 password from the secret reference and forces `sslmode=verify-full` for every PostgreSQL
@@ -264,7 +314,11 @@ two pulp-tui processes on one host also exclude each other. Publish, resume, pro
 edits do not. The exception is an environment relabel: it takes the locks of every view
 bound in the environment, in `cv_id` order, and fails with the holder's name if one is taken,
 before it changes anything. `CvLock::acquire` never waits, so two relabels cannot block each
-other; the order only fixes which holder is named in the refusal.
+other; the order only fixes which holder is named in the refusal. A composite publish takes
+the lock of the composite only: it reads the component versions and does not lock the
+components, which are protected by the delete rules instead (a version that a composite uses
+cannot be deleted). Auto publish locks each composite separately, after the lock of the
+component is released.
 
 **Read-only mode.** When the store in use by the active profile is external (`App::shared()`;
 like `scope`, it follows `cv_store`, not the edited config, so an Edit applies at Connect),
@@ -306,8 +360,8 @@ database and offers copy, switch or cancel; the profile is saved only after the 
   checkpointed versions. That daemon does not exist.
 
 Export/import (`pulp-tui export-cv`, `import-cv`, or the Servers screen) moves Content
-View and environment definitions between databases. It contains no secrets and no Pulp
-state.
+View and environment definitions between databases (format 2, see "Schema and upgrades").
+It contains no secrets and no Pulp state.
 
 ## Security model
 

@@ -11,7 +11,7 @@ use futures::future::join_all;
 use pulp_tui::config::{AuthMethod, Config, DATABASE_KEYRING_USER, Database, Profile};
 use pulp_tui::cv::CvLock;
 use pulp_tui::pulp::RepoType;
-use pulp_tui::store::{BindingRepo, CvRepo, CvVersionRepo, NotMigrated, PG_MIGRATIONS, Store};
+use pulp_tui::store::{BindingRepo, CvRepo, CvVersion, CvVersionRepo, NotMigrated, PG_MIGRATIONS, Store};
 use pulp_tui::tui::app::{App, NO_PROFILE};
 use sqlx::{Connection, Executor};
 use std::sync::Arc;
@@ -249,6 +249,7 @@ async fn store_methods_on_postgres() {
         publication: Some("/pub/1/".into()),
         pending_task: Some("/t/9/".into()),
         content_count: Some(7),
+        borrowed: false,
     };
     st.save_version_repo(&vr).await.unwrap();
     assert_eq!(st.version_repos(v1.id).await.unwrap().iter().find(|r| r.repo().repo_name == "os"), Some(&vr));
@@ -311,8 +312,8 @@ async fn store_methods_on_postgres() {
 
     // Export and import between two servers' scopes of the same database.
     let ex = st.export(k).await.unwrap();
-    assert_eq!(st.import("https://copy/pulp/#default", &ex).await.unwrap(), (1, 2));
-    assert_eq!(st.import("https://copy/pulp/#default", &ex).await.unwrap(), (0, 0));
+    assert_eq!(st.import("https://copy/pulp/#default", &ex).await.unwrap(), (1, 2, vec![]));
+    assert_eq!(st.import("https://copy/pulp/#default", &ex).await.unwrap(), (0, 0, vec![]));
 
     // db copy from a local (SQLite) store: new ids, history kept, aliases recorded.
     let local = Store::open_in_memory().await.unwrap();
@@ -346,6 +347,137 @@ async fn store_methods_on_postgres() {
     assert!(st.cv_repos(cv).await.unwrap().is_empty());
     assert!(st.lock_holder(cv).await.unwrap().is_none());
     drop(lock);
+    s.drop_schema().await;
+}
+
+/// A published version of `cv` with one row that has a derived repository, version and publication
+/// (and a leftover task reference, which a borrowed row must not take).
+async fn published(st: &Store, cv: i64, name: &str) -> CvVersion {
+    let r = repo(name, RepoType::Rpm);
+    let v = st.begin_version(cv, "", std::slice::from_ref(&r)).await.unwrap();
+    let vr = CvVersionRepo {
+        version_id: v.id,
+        repo: Some(r),
+        derived_repo: Some(format!("/dr/{name}/")),
+        derived_version: Some(format!("/dr/{name}/versions/{}/", v.number)),
+        publication: Some(format!("/pub/{name}/{}/", v.number)),
+        pending_task: Some("/t/done/".into()),
+        ..Default::default()
+    };
+    st.save_version_repo(&vr).await.unwrap();
+    st.finish_version(v.id, "published", None).await.unwrap();
+    st.version(v.id).await.unwrap()
+}
+
+/// Composite Content Views (schema 4) on PostgreSQL: pins and refusals, borrowed rows, the foreign keys
+/// that keep a component, the flags as BIGINT, and `db copy` of a composite from a local store.
+#[tokio::test]
+async fn composite_store_methods_on_postgres() {
+    if !live_enabled() {
+        return;
+    }
+    let s = Schema::new().await;
+    s.migrate().await;
+    let st = s.open().await;
+    let k = "https://pulp.example.com/pulp/#composite";
+
+    // Components, pins and the refusals of set_component.
+    let (os, extras) = (st.create_cv(k, "os", "").await.unwrap(), st.create_cv(k, "extras", "").await.unwrap());
+    let c = st.create_composite(k, "rocky9", "").await.unwrap();
+    let v1 = published(&st, os, "baseos").await;
+    st.set_component(c, os, Some(v1.id)).await.unwrap();
+    st.set_component(c, extras, None).await.unwrap();
+    let got: Vec<_> = st.components(c).await.unwrap().into_iter().map(|x| (x.name, x.pinned)).collect();
+    assert_eq!(got, [("extras".to_string(), None), ("os".to_string(), Some(v1.id))]);
+    assert!(st.content_view(c).await.unwrap().composite && !st.content_view(os).await.unwrap().composite);
+    let err = |r: anyhow::Result<()>| r.unwrap_err().to_string();
+    assert_eq!(err(st.set_component(os, extras, None).await), "os is not a composite content view");
+    let other = st.create_composite(k, "other", "").await.unwrap();
+    assert_eq!(err(st.set_component(other, c, None).await), "rocky9 is a composite; a composite cannot be a component");
+    let failed = st.begin_version(extras, "", &[]).await.unwrap();
+    st.finish_version(failed.id, "failed", None).await.unwrap();
+    assert_eq!(err(st.set_component(c, extras, Some(failed.id)).await), "v1 is not a published version of extras");
+    assert_eq!(err(st.set_component(c, extras, Some(v1.id)).await), "v1 is not a published version of extras");
+    assert_eq!(st.components(c).await.unwrap()[0].pinned, None, "a refused pin changes nothing");
+
+    // Auto publish follows latest components only.
+    assert!(st.auto_composites(extras).await.unwrap().is_empty(), "off by default");
+    st.set_auto_publish(c, true).await.unwrap();
+    assert!(st.content_view(c).await.unwrap().auto_publish);
+    assert_eq!(st.auto_composites(extras).await.unwrap().iter().map(|v| v.id).collect::<Vec<_>>(), [c]);
+    assert!(st.auto_composites(os).await.unwrap().is_empty(), "a pinned component does not trigger it");
+    st.set_component(c, os, None).await.unwrap(); // upsert: latest now
+    assert_eq!(st.auto_composites(os).await.unwrap().len(), 1);
+    st.set_component(c, os, Some(v1.id)).await.unwrap();
+
+    // A composite version borrows the rows; the foreign keys keep the component and its pinned version.
+    let rows = st.version_repos(v1.id).await.unwrap();
+    assert!(!rows[0].borrowed && rows[0].pending_task.is_some());
+    let cv1 = st.begin_composite_version(c, "n", &[v1.id], &rows).await.unwrap();
+    assert_eq!((cv1.number, cv1.state.as_str()), (1, "publishing"));
+    let want: Vec<_> = rows.iter().map(|r| CvVersionRepo { version_id: cv1.id, borrowed: true, pending_task: None, ..r.clone() }).collect();
+    assert_eq!(st.version_repos(cv1.id).await.unwrap(), want);
+    assert_eq!(st.version_repos(v1.id).await.unwrap(), rows, "the component's rows are unchanged");
+    let used = st.version_components(cv1.id).await.unwrap();
+    assert_eq!(used.iter().map(|u| (u.name.as_str(), u.number)).collect::<Vec<_>>(), [("os", 1)]);
+    assert_eq!(st.composite_users(v1.id).await.unwrap(), ["rocky9 v1", "rocky9 (pinned)"]);
+    assert_eq!(st.composite_refs(os).await.unwrap(), ["rocky9 (component)", "rocky9 v1"]);
+    assert!(st.delete_cv(os).await.is_err(), "still a component");
+    assert_eq!(st.versions(os).await.unwrap().len(), 1, "a refused delete removes nothing");
+    st.remove_component(c, os).await.unwrap();
+    st.remove_component(c, extras).await.unwrap();
+    assert!(st.components(c).await.unwrap().is_empty());
+    st.finish_version(cv1.id, "deleted", None).await.unwrap();
+    assert!(st.composite_users(v1.id).await.unwrap().is_empty() && st.composite_refs(os).await.unwrap().is_empty());
+    st.delete_cv(os).await.unwrap();
+    assert!(st.version_components(cv1.id).await.unwrap().is_empty());
+
+    // A component version that is no longer published is not borrowed, and the version number is not taken.
+    let part = st.create_cv(k, "part", "").await.unwrap();
+    let pv = published(&st, part, "epel").await;
+    let rows = st.version_repos(pv.id).await.unwrap();
+    st.finish_version(pv.id, "deleted", None).await.unwrap();
+    let e = st.begin_composite_version(c, "", &[pv.id], &rows).await.unwrap_err();
+    assert_eq!(e.to_string(), "version v1 of part is no longer published");
+    assert_eq!(st.versions(c).await.unwrap().len(), 1, "nothing written");
+
+    // db copy from a local (SQLite) store: a composite whose name sorts before its components.
+    let local = Store::open_in_memory().await.unwrap();
+    let (lo, le) = (local.create_cv("lab", "rocky9-os", "").await.unwrap(), local.create_cv("lab", "rocky9-extras", "").await.unwrap());
+    let (vo, ve) = (published(&local, lo, "baseos").await, published(&local, le, "epel").await);
+    let lc = local.create_composite("lab", "rocky9", "").await.unwrap();
+    local.set_component(lc, lo, Some(vo.id)).await.unwrap();
+    local.set_component(lc, le, None).await.unwrap();
+    local.set_auto_publish(lc, true).await.unwrap();
+    let mut lrows = local.version_repos(vo.id).await.unwrap();
+    lrows.extend(local.version_repos(ve.id).await.unwrap());
+    let lv = local.begin_composite_version(lc, "", &[vo.id, ve.id], &lrows).await.unwrap();
+    local.finish_version(lv.id, "published", None).await.unwrap();
+    let r = st.copy_from(&local, "lab", "https://copied/pulp/#default").await.unwrap();
+    assert_eq!((r.views, r.versions), (3, 3));
+    let views = st.content_views("https://copied/pulp/#default").await.unwrap();
+    assert_eq!(views.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), ["rocky9", "rocky9-extras", "rocky9-os"]);
+    let (c2, ex2, os2) = (&views[0], &views[1], &views[2]);
+    assert!(c2.composite && c2.auto_publish && !os2.composite && !os2.auto_publish);
+    let vo2 = st.versions(os2.id).await.unwrap()[0].id;
+    let got: Vec<_> = st.components(c2.id).await.unwrap().into_iter().map(|x| (x.cv_id, x.pinned)).collect();
+    assert_eq!(got, [(ex2.id, None), (os2.id, Some(vo2))], "pins point at the new ids");
+    let n1 = st.versions(c2.id).await.unwrap().remove(0);
+    let used: Vec<_> = st.version_components(n1.id).await.unwrap().into_iter().map(|u| (u.name, u.number)).collect();
+    assert_eq!(used, [("rocky9-extras".to_string(), 1), ("rocky9-os".to_string(), 1)]);
+    assert!(st.version_repos(n1.id).await.unwrap().iter().all(|r| r.borrowed));
+    assert!(!st.version_repos(vo2).await.unwrap()[0].borrowed);
+
+    // Deleting the copied composite (a pin, a borrowed version, used versions) cascades through its own
+    // rows only; the components and their versions stay.
+    st.delete_cv(c2.id).await.unwrap();
+    assert!(st.content_view(c2.id).await.is_err());
+    assert!(st.versions(c2.id).await.unwrap().is_empty() && st.components(c2.id).await.unwrap().is_empty());
+    assert!(st.version_repos(n1.id).await.unwrap().is_empty() && st.version_components(n1.id).await.unwrap().is_empty());
+    assert_eq!(st.versions(os2.id).await.unwrap().len(), 1);
+    assert_eq!(st.versions(ex2.id).await.unwrap().len(), 1);
+    assert!(!st.version_repos(vo2).await.unwrap().is_empty());
+    assert!(st.composite_refs(os2.id).await.unwrap().is_empty() && st.composite_users(vo2).await.unwrap().is_empty());
     s.drop_schema().await;
 }
 

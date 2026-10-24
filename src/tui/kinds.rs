@@ -157,6 +157,8 @@ pub enum Act {
     CvAddRepo,
     CvFilters,
     CvRemoveRepo,
+    CvAddComponent,
+    CvRemoveComponent,
     CvPreview,
     CvPublish,
     CvVersions,
@@ -194,8 +196,8 @@ impl Act {
             Publish | CvPublish => 'P',
             Distribute | CvDrift => 'D',
             CopyContent => 'C',
-            RemoveContent | CvRemoveRepo => 'x',
-            AddToRepo | CvAddRepo | TrackTask => 'a',
+            RemoveContent | CvRemoveRepo | CvRemoveComponent => 'x',
+            AddToRepo | CvAddRepo | CvAddComponent | TrackTask => 'a',
             Compare => 'm',
             Rollback => 'b',
             CopyUrl => 'y',
@@ -249,6 +251,8 @@ impl Act {
             CvAddRepo => "Add repositories",
             CvFilters => "Edit repository filters",
             CvRemoveRepo => "Remove repository",
+            CvAddComponent => "Add components",
+            CvRemoveComponent => "Remove component",
             CvPreview => "Preview draft vs latest version",
             CvPublish => "Publish new version",
             CvVersions => "Versions",
@@ -281,7 +285,7 @@ impl Act {
             Kind::Environments => shared || matches!(self, Edit),
             Kind::ContentViews => {
                 matches!(self, Delete | CvPublish | CvSyncRepos | Promote | Rollback | BreakLock)
-                    || shared && matches!(self, Create | Edit | CvAddRepo | CvFilters | CvRemoveRepo)
+                    || shared && matches!(self, Create | Edit | CvAddRepo | CvFilters | CvRemoveRepo | CvAddComponent | CvRemoveComponent)
             }
             Kind::CvVersions { .. } => matches!(self, Delete | Promote | Rollback | Resume),
             _ => !matches!(
@@ -521,6 +525,7 @@ impl Kind {
             ],
             Kind::ContentViews => vec![
                 col("name", 20, |v| s(v, "name")),
+                col("composite", 9, |v| if v["composite"] == true { "yes".into() } else { String::new() }),
                 col("repos", 5, |v| v["repos"].as_array().map(|a| a.len().to_string()).unwrap_or_default()),
                 col("latest", 7, |v| s(v, "latest")),
                 col("environments", 40, |v| s(v, "bound")),
@@ -610,6 +615,8 @@ impl Kind {
                 CvAddRepo,
                 CvFilters,
                 CvRemoveRepo,
+                CvAddComponent,
+                CvRemoveComponent,
                 BreakLock,
                 Create,
                 Edit,
@@ -626,6 +633,21 @@ impl Kind {
             Kind::ServerTasks => vec![Inspect, TrackTask, CancelTask],
             Kind::Logs { .. } => vec![Inspect],
         }
+    }
+
+    /// The actions that fit `item`: a composite view has components instead of repositories, a normal view the opposite.
+    pub fn item_actions(&self, item: &Value) -> Vec<Act> {
+        use Act::*;
+        let mut actions = self.actions();
+        if *self == Kind::ContentViews {
+            let composite = item["composite"] == true;
+            actions.retain(|a| match a {
+                CvAddRepo | CvFilters | CvRemoveRepo | CvSyncRepos => !composite,
+                CvAddComponent | CvRemoveComponent => composite,
+                _ => true,
+            });
+        }
+        actions
     }
 }
 
@@ -708,8 +730,20 @@ pub async fn load(
                     .into_iter()
                     .map(|r| json!({ "name": r.repo_name, "type": r.repo_type, "href": r.repo_href, "filters": format_rules(&r.filters) }))
                     .collect();
+                let mut components = vec![];
+                for c in store.components(cv.id).await? {
+                    let pin = match c.pinned {
+                        Some(id) => format!("pinned v{}", store.version(id).await?.number),
+                        None => match store.versions(c.cv_id).await?.iter().find(|v| v.state == "published") {
+                            Some(v) => format!("latest (v{})", v.number),
+                            None => "latest (none published)".into(),
+                        },
+                    };
+                    components.push(json!({ "id": c.cv_id, "name": c.name, "pin": pin }));
+                }
                 out.push(json!({
                     "id": cv.id, "name": cv.name, "description": cv.description, "created_at": cv.created_at,
+                    "composite": cv.composite, "auto_publish": cv.auto_publish, "components": components,
                     "repos": repos, "bound": bound.join("  "),
                     "latest": versions.iter().find(|v| v.state == "published").map(|v| format!("v{}", v.number)),
                     "versions": versions.iter().filter(|v| v.state != "deleted").map(|v| json!({
@@ -746,10 +780,12 @@ pub async fn load(
                         })
                     })
                     .collect();
+                let components: Vec<String> =
+                    store.version_components(v.id).await?.into_iter().map(|u| format!("{} v{}", u.name, u.number)).collect();
                 out.push(json!({
                     "id": v.id, "cv_id": v.cv_id, "number": v.number, "state": v.state, "notes": v.notes,
                     "created_at": v.created_at, "finished_at": v.finished_at, "error": v.error,
-                    "environments": in_envs.join(", "), "repositories": repos,
+                    "environments": in_envs.join(", "), "repositories": repos, "components": components,
                 }));
             }
             out
@@ -802,14 +838,81 @@ mod tests {
             Kind::ServerTasks,
         ]);
         for k in kinds {
-            let keys: Vec<char> = k.actions().iter().map(|a| a.key()).collect();
-            let mut dedup = keys.clone();
-            dedup.sort();
-            dedup.dedup();
-            assert_eq!(keys.len(), dedup.len(), "duplicate action key in {k:?}: {keys:?}");
-            assert!(keys.iter().all(|c| !reserved.contains(*c)), "{k:?} uses a reserved key: {keys:?}");
+            // A Content View row is a normal or a composite view: the actions differ, so check both.
+            for item in [json!({}), json!({ "composite": true })] {
+                let keys: Vec<char> = k.item_actions(&item).iter().map(|a| a.key()).collect();
+                let mut dedup = keys.clone();
+                dedup.sort();
+                dedup.dedup();
+                assert_eq!(keys.len(), dedup.len(), "duplicate action key in {k:?} for {item}: {keys:?}");
+                assert!(keys.iter().all(|c| !reserved.contains(*c)), "{k:?} uses a reserved key: {keys:?}");
+            }
             assert!(!k.columns().is_empty());
         }
+    }
+
+    #[test]
+    fn composite_rows_offer_component_actions_only() {
+        let (normal, composite) =
+            (Kind::ContentViews.item_actions(&json!({})), Kind::ContentViews.item_actions(&json!({ "composite": true })));
+        for a in [Act::CvAddRepo, Act::CvFilters, Act::CvRemoveRepo, Act::CvSyncRepos] {
+            assert!(normal.contains(&a) && !composite.contains(&a), "{a:?}");
+        }
+        for a in [Act::CvAddComponent, Act::CvRemoveComponent] {
+            assert!(composite.contains(&a) && !normal.contains(&a), "{a:?}");
+        }
+        assert!(Act::CvAddComponent.mutates(&Kind::ContentViews, true) && !Act::CvAddComponent.mutates(&Kind::ContentViews, false));
+        assert!(Act::CvRemoveComponent.mutates(&Kind::ContentViews, true) && !Act::CvRemoveComponent.mutates(&Kind::ContentViews, false));
+        assert_eq!((Act::CvAddComponent.key(), Act::CvRemoveComponent.key()), ('a', 'x'));
+        assert_eq!(Kind::Repos(RepoType::Rpm).item_actions(&json!({ "composite": true })), Kind::Repos(RepoType::Rpm).actions());
+    }
+
+    #[tokio::test]
+    async fn content_view_rows_describe_composites_and_their_versions() {
+        let (st, cfg) = (Store::open_in_memory().await.unwrap(), Config::default());
+        let os = st.create_cv("lab", "os", "").await.unwrap();
+        let extras = st.create_cv("lab", "extras", "").await.unwrap();
+        let none = st.create_cv("lab", "none", "").await.unwrap();
+        let v1 = st.begin_version(os, "", &[]).await.unwrap();
+        st.finish_version(v1.id, "published", None).await.unwrap();
+        let v2 = st.begin_version(os, "", &[]).await.unwrap();
+        st.finish_version(v2.id, "published", None).await.unwrap();
+        let e1 = st.begin_version(extras, "", &[]).await.unwrap();
+        st.finish_version(e1.id, "published", None).await.unwrap();
+        let c = st.create_composite("lab", "rocky9", "").await.unwrap();
+        st.set_auto_publish(c, true).await.unwrap();
+        st.set_component(c, os, Some(v1.id)).await.unwrap();
+        st.set_component(c, extras, None).await.unwrap();
+        st.set_component(c, none, None).await.unwrap();
+        let cv1 = st.begin_composite_version(c, "", &[v1.id, e1.id], &[]).await.unwrap();
+
+        let (rows, _) = load(&Kind::ContentViews, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap();
+        let get = |name: &str| rows.iter().find(|r| r["name"] == name).unwrap().clone();
+        let cols = Kind::ContentViews.columns();
+        assert_eq!(cols[1].title, "composite");
+        let shown = |name: &str| (cols[1].get)(&get(name));
+        assert_eq!((shown("rocky9"), shown("os")), ("yes".to_string(), String::new()));
+        let rocky = get("rocky9");
+        assert_eq!((rocky["composite"].clone(), rocky["auto_publish"].clone()), (json!(true), json!(true)));
+        let pins: Vec<(i64, String, String)> =
+            rocky["components"].as_array().unwrap().iter().map(|c| (c["id"].as_i64().unwrap(), s(c, "name"), s(c, "pin"))).collect();
+        assert_eq!(
+            pins,
+            [
+                (extras, "extras".to_string(), "latest (v1)".to_string()),
+                (none, "none".to_string(), "latest (none published)".to_string()),
+                (os, "os".to_string(), "pinned v1".to_string()),
+            ]
+        );
+        assert_eq!(get("os")["components"], json!([]), "a normal view has no components");
+        assert_eq!(get("os")["composite"], json!(false));
+
+        let k = Kind::CvVersions { cv: c, name: "rocky9".into() };
+        let (versions, _) = load(&k, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap();
+        assert_eq!((versions[0]["id"].as_i64(), versions[0]["components"].clone()), (Some(cv1.id), json!(["extras v1", "os v1"])));
+        let k = Kind::CvVersions { cv: os, name: "os".into() };
+        let (versions, _) = load(&k, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap();
+        assert!(versions.iter().all(|v| v["components"] == json!([])));
     }
 
     #[test]

@@ -45,12 +45,13 @@ server gives the final answer; the dashboard shows a warning.
 | Distribution base path conflicts | refused with 409 |
 | Distribution `base_path` PATCH (environment relabel): runs as a task (`ageneral_update`), moves the distribution in place (same href, same publication), the new path answers 200 and the old path 404 as soon as the task ends (no content-cache delay seen); a promotion after the relabel serves at the new label | verified |
 | Content Views: multi-repo snapshot, RPM/File filters, advisory filtering, numbered versions, Library auto-binding, promotion path rules, rollback, served-content verification, retention protection, partial failure + retry, resume with re-attach to a submitted task, version and view deletion | verified |
+| Composite Content Views (`live_cv::composite_content_view_rocky9`): one publication served by two distributions at once (the component's Library distribution and the composite's own), auto publish after the extras view publishes, deleting a composite version or a composite keeps the publications and repositories of its components | verified |
 | Native replication: select by `q_select`, nodelete policy, rerun, upstream update | verified |
 | Fallback replication: dry run, create, idempotent rerun, upstream update, conflict with native-replicated objects, loop guard, self-replication guard | verified |
 | RBAC: 401 on wrong password, 403 without role, no self-escalation, model-level creator role, group object role, role removal | verified |
 | Task cancellation (waiting and running), 409 on completed task, TLS errors, unreadable CA bundle | verified |
 | Mock HTTP: pagination, foreign `next` links, 401/403/409, malformed JSON, read retries vs mutation non-retry, 429 Retry-After, timeouts, unreachable server, task polling, old-server capability negotiation, read-only blocking, size limits | verified |
-| Shared database on PostgreSQL 16 (`live_shared_db`): explicit schema creation (`db migrate`), refusal of an uninitialized, older and newer schema, two operators on one database, lock conflict and release, 8 simultaneous acquisitions of a free lock (exactly one wins), every store method, `db copy` from a local file, a profile with its own database next to a local profile, the migration of schema 2 rows to schema 3 (labels `library`/`dev`/`dev` for `Library`/`Dev`/`dev`, the prefix `acme` seeded from a served path, an existing prefix kept, a path without `/` seeds nothing, a used label refused) | verified |
+| Shared database on PostgreSQL 16 (`live_shared_db`): explicit schema creation (`db migrate`), refusal of an uninitialized, older and newer schema, two operators on one database, lock conflict and release, 8 simultaneous acquisitions of a free lock (exactly one wins), every store method, composite views (pins, borrowed rows, the foreign keys that refuse deleting a component, `db copy` of a composite), `db copy` from a local file, a profile with its own database next to a local profile, the migration of schema 2 rows to schema 3 (labels `library`/`dev`/`dev` for `Library`/`Dev`/`dev`, the prefix `acme` seeded from a served path, an existing prefix kept, a path without `/` seeds nothing, a used label refused) | verified |
 | Shared database with a role that has only `SELECT/INSERT/UPDATE/DELETE` (manual): import, export, `db migrate` on a current schema | verified |
 | Shared database TLS: `ca_cert` against a server with a private CA, connected through a non-loopback address (`verify-full`), see "Database TLS" | verified once (manual) |
 
@@ -62,6 +63,17 @@ server gives the final answer; the dashboard shows a warning.
   direct URLs of files that exist only in the newer publication can still answer 200
   during this period. pulp-tui verifies rollbacks through metadata and says so in the
   rollback preview.
+* **Deleting a served publication or repository version.** In pulpcore 3.123.0
+  (`pulpcore/app/models/publication.py`, read in the test container),
+  `Publication.repository_version` is `on_delete=CASCADE`: deleting a repository version
+  deletes its publications. `Distribution.publication` is `on_delete=SET_NULL`: deleting a
+  publication does not fail and does not warn, the distribution silently stops serving
+  (it is not refused when a distribution serves it). Because of this, pulp-tui does not
+  delete a served object. One publication may be served by several distributions: a
+  composite Content View serves the publication of its component under its own path while
+  the component serves it too. `delete_version` keeps a publication (and its repository
+  version) that any binding of the server still serves, and `delete_view` refuses to delete
+  the derived repository of a publication that another view still serves.
 * **mirror_complete** RPM syncs create their own publication with upstream package paths.
   Served-content checks therefore try the layout path and the original `location_href`.
 * **Native replication** pins distributions with `repository_version`, not a publication.
@@ -129,9 +141,10 @@ The live tests connect to `127.0.0.1` without TLS, so they do not exercise this 
 * Signing: repository fields for signing services are editable, but pulp-tui does not
   create signing services (that requires server-side scripts).
 * Content guards are only shown and set by href; they are not created or replicated.
-* Composite Content Views and reusable filter sets are not implemented yet. The data model
-  keeps filters per view repository, so a later "filter set" table can be referenced
-  without changing published versions.
+* Reusable filter sets are not implemented yet. The data model keeps filters per view
+  repository, so a later "filter set" table can be referenced without changing published
+  versions. A composite Content View has no filters of its own and cannot be a component
+  of another composite.
 * The fallback replication does not delete destination objects and does not copy Pulp
   metadata; use native replication for full metadata replication.
 * Pulp domains: the profile `domain` setting prefixes all API paths. It is implemented but

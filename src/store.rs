@@ -80,6 +80,20 @@ const MIGRATIONS: &[&str] = &[
         WHERE instr(b.base_path, '/') > 0
           AND NOT EXISTS (SELECT 1 FROM scope_settings s WHERE s.scope = c.profile AND s.key = 'cv_base_path_prefix')
         GROUP BY c.profile;",
+    // 4: composite Content Views, their components, the component versions a composite version used, borrowed rows.
+    // `component_id` has no cascade on purpose: the database also refuses to delete a view that is still a component.
+    "ALTER TABLE content_views ADD COLUMN composite INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE content_views ADD COLUMN auto_publish INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE cv_version_repos ADD COLUMN borrowed INTEGER NOT NULL DEFAULT 0;
+     CREATE TABLE cv_components(
+        composite_id INTEGER NOT NULL REFERENCES content_views(id) ON DELETE CASCADE,
+        component_id INTEGER NOT NULL REFERENCES content_views(id),
+        version_id INTEGER REFERENCES cv_versions(id),
+        PRIMARY KEY(composite_id, component_id));
+     CREATE TABLE cv_version_components(
+        version_id INTEGER NOT NULL REFERENCES cv_versions(id) ON DELETE CASCADE,
+        component_version_id INTEGER NOT NULL REFERENCES cv_versions(id) ON DELETE CASCADE,
+        PRIMARY KEY(version_id, component_version_id));",
 ];
 
 /// `MIGRATIONS` for PostgreSQL: every integer is BIGINT (sqlx `Any` reads SQLite integers as
@@ -143,6 +157,19 @@ pub const PG_MIGRATIONS: &[&str] = &[
         WHERE strpos(b.base_path, '/') > 0
           AND NOT EXISTS (SELECT 1 FROM scope_settings s WHERE s.scope = c.profile AND s.key = 'cv_base_path_prefix')
         GROUP BY c.profile;",
+    // 4: composite Content Views (see `MIGRATIONS`)
+    "ALTER TABLE content_views ADD COLUMN composite BIGINT NOT NULL DEFAULT 0;
+     ALTER TABLE content_views ADD COLUMN auto_publish BIGINT NOT NULL DEFAULT 0;
+     ALTER TABLE cv_version_repos ADD COLUMN borrowed BIGINT NOT NULL DEFAULT 0;
+     CREATE TABLE cv_components(
+        composite_id BIGINT NOT NULL REFERENCES content_views(id) ON DELETE CASCADE,
+        component_id BIGINT NOT NULL REFERENCES content_views(id),
+        version_id BIGINT REFERENCES cv_versions(id),
+        PRIMARY KEY(composite_id, component_id));
+     CREATE TABLE cv_version_components(
+        version_id BIGINT NOT NULL REFERENCES cv_versions(id) ON DELETE CASCADE,
+        component_version_id BIGINT NOT NULL REFERENCES cv_versions(id) ON DELETE CASCADE,
+        PRIMARY KEY(version_id, component_version_id));",
 ];
 
 /// A Content View lock not renewed for this long is expired; the next operator takes it over.
@@ -188,6 +215,27 @@ pub struct ContentView {
     pub name: String,
     pub description: String,
     pub created_at: String,
+    /// Has components instead of repositories.
+    pub composite: bool,
+    /// A composite: publish after a component it uses as latest publishes.
+    pub auto_publish: bool,
+}
+
+/// A component of a composite; `pinned` is a version id, `None` is the latest published version.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Component {
+    pub cv_id: i64,
+    pub name: String,
+    pub pinned: Option<i64>,
+}
+
+/// A component version that a composite version used.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsedVersion {
+    pub cv_id: i64,
+    pub name: String,
+    pub version_id: i64,
+    pub number: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -223,6 +271,8 @@ pub struct CvVersionRepo {
     pub publication: Option<String>,
     pub pending_task: Option<String>,
     pub content_count: Option<i64>,
+    /// A composite's row: the objects belong to a component version and are never deleted with it.
+    pub borrowed: bool,
 }
 
 impl CvVersionRepo {
@@ -598,17 +648,167 @@ impl Store {
     }
 
     pub async fn content_views(&self, profile: &str) -> Result<Vec<ContentView>> {
-        let rows = sqlx::query("SELECT id, name, description, created_at FROM content_views WHERE profile = $1 ORDER BY name")
-            .bind(profile)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(
+            "SELECT id, name, description, created_at, composite, auto_publish FROM content_views WHERE profile = $1 ORDER BY name",
+        )
+        .bind(profile)
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(content_view_row).collect()
     }
 
     pub async fn content_view(&self, id: i64) -> Result<ContentView> {
-        let r =
-            sqlx::query("SELECT id, name, description, created_at FROM content_views WHERE id = $1").bind(id).fetch_one(&self.pool).await?;
+        let r = sqlx::query("SELECT id, name, description, created_at, composite, auto_publish FROM content_views WHERE id = $1")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
         content_view_row(&r)
+    }
+
+    // ---- composite content views -------------------------------------------------
+
+    pub async fn create_composite(&self, profile: &str, name: &str, description: &str) -> Result<i64> {
+        validate_name(name)?;
+        let id = sqlx::query_scalar(
+            "INSERT INTO content_views(profile, name, description, created_at, composite) VALUES ($1, $2, $3, $4, 1) RETURNING id",
+        )
+        .bind(profile)
+        .bind(name)
+        .bind(description)
+        .bind(now())
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("content view {name} already exists?"))?;
+        Ok(id)
+    }
+
+    pub async fn set_auto_publish(&self, id: i64, on: bool) -> Result<()> {
+        sqlx::query("UPDATE content_views SET auto_publish = $2 WHERE id = $1").bind(id).bind(on as i64).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Components of a composite, by name.
+    pub async fn components(&self, composite_id: i64) -> Result<Vec<Component>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.name, k.version_id FROM cv_components k JOIN content_views c ON c.id = k.component_id
+             WHERE k.composite_id = $1 ORDER BY c.name",
+        )
+        .bind(composite_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|r| Ok(Component { cv_id: r.try_get(0)?, name: r.try_get(1)?, pinned: r.try_get(2)? })).collect()
+    }
+
+    /// Add a component, or change its pin (a version id; `None` is latest).
+    pub async fn set_component(&self, composite_id: i64, component_id: i64, pinned: Option<i64>) -> Result<()> {
+        let (composite, component) = (self.content_view(composite_id).await?, self.content_view(component_id).await?);
+        if !composite.composite {
+            bail!("{} is not a composite content view", composite.name);
+        }
+        if component.composite {
+            bail!("{} is a composite; a composite cannot be a component", component.name);
+        }
+        if let Some(id) = pinned {
+            let v = self.version(id).await?;
+            if v.cv_id != component_id || v.state != "published" {
+                bail!("v{} is not a published version of {}", v.number, component.name);
+            }
+        }
+        sqlx::query(
+            "INSERT INTO cv_components(composite_id, component_id, version_id) VALUES ($1, $2, $3)
+             ON CONFLICT(composite_id, component_id) DO UPDATE SET version_id = excluded.version_id",
+        )
+        .bind(composite_id)
+        .bind(component_id)
+        .bind(pinned)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_component(&self, composite_id: i64, component_id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM cv_components WHERE composite_id = $1 AND component_id = $2")
+            .bind(composite_id)
+            .bind(component_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The component versions a composite version used, by name.
+    pub async fn version_components(&self, version_id: i64) -> Result<Vec<UsedVersion>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.name, v.id, v.number FROM cv_version_components u JOIN cv_versions v ON v.id = u.component_version_id
+             JOIN content_views c ON c.id = v.cv_id WHERE u.version_id = $1 ORDER BY c.name",
+        )
+        .bind(version_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok(UsedVersion { cv_id: r.try_get(0)?, name: r.try_get(1)?, version_id: r.try_get(2)?, number: r.try_get(3)? }))
+            .collect()
+    }
+
+    /// What keeps a component version: `{composite} v{n}` for each non-deleted composite version that used it,
+    /// then `{composite} (pinned)` for each pin.
+    pub async fn composite_users(&self, version_id: i64) -> Result<Vec<String>> {
+        let used = sqlx::query(
+            "SELECT c.name, v.number FROM cv_version_components u JOIN cv_versions v ON v.id = u.version_id
+             JOIN content_views c ON c.id = v.cv_id WHERE u.component_version_id = $1 AND v.state != 'deleted'
+             ORDER BY c.name, v.number",
+        )
+        .bind(version_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let pins: Vec<String> = sqlx::query_scalar(
+            "SELECT c.name FROM cv_components k JOIN content_views c ON c.id = k.composite_id WHERE k.version_id = $1 ORDER BY c.name",
+        )
+        .bind(version_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = vec![];
+        for r in &used {
+            out.push(format!("{} v{}", r.try_get::<String, _>(0)?, r.try_get::<i64, _>(1)?));
+        }
+        out.extend(pins.into_iter().map(|c| format!("{c} (pinned)")));
+        Ok(out)
+    }
+
+    /// What keeps a view: `{composite} (component)` for each composite that lists it, then `{composite} v{n}`
+    /// for each non-deleted composite version that used one of its versions.
+    pub async fn composite_refs(&self, cv_id: i64) -> Result<Vec<String>> {
+        let lists: Vec<String> = sqlx::query_scalar(
+            "SELECT c.name FROM cv_components k JOIN content_views c ON c.id = k.composite_id WHERE k.component_id = $1 ORDER BY c.name",
+        )
+        .bind(cv_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let used = sqlx::query(
+            "SELECT DISTINCT c.name, v.number FROM cv_version_components u JOIN cv_versions v ON v.id = u.version_id
+             JOIN content_views c ON c.id = v.cv_id JOIN cv_versions w ON w.id = u.component_version_id
+             WHERE w.cv_id = $1 AND v.state != 'deleted' ORDER BY c.name, v.number",
+        )
+        .bind(cv_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: Vec<String> = lists.into_iter().map(|c| format!("{c} (component)")).collect();
+        for r in &used {
+            out.push(format!("{} v{}", r.try_get::<String, _>(0)?, r.try_get::<i64, _>(1)?));
+        }
+        Ok(out)
+    }
+
+    /// Composites with auto publish that list this view as latest (no pin).
+    pub async fn auto_composites(&self, component_id: i64) -> Result<Vec<ContentView>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.name, c.description, c.created_at, c.composite, c.auto_publish
+             FROM cv_components k JOIN content_views c ON c.id = k.composite_id
+             WHERE k.component_id = $1 AND k.version_id IS NULL AND c.auto_publish != 0 ORDER BY c.name",
+        )
+        .bind(component_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(content_view_row).collect()
     }
 
     pub async fn set_cv_repo(&self, cv_id: i64, repo: &CvRepo) -> Result<()> {
@@ -643,6 +843,16 @@ impl Store {
 
     /// Start a new numbered version with a frozen copy of the definition.
     pub async fn begin_version(&self, cv_id: i64, notes: &str, repos: &[CvRepo]) -> Result<CvVersion> {
+        self.begin(cv_id, notes, repos, &[], &[]).await
+    }
+
+    /// Start a composite version: the component versions it uses (`used`) and their rows (`rows`), stored
+    /// as borrowed with every checkpoint column except the task reference.
+    pub async fn begin_composite_version(&self, cv_id: i64, notes: &str, used: &[i64], rows: &[CvVersionRepo]) -> Result<CvVersion> {
+        self.begin(cv_id, notes, &[], used, rows).await
+    }
+
+    async fn begin(&self, cv_id: i64, notes: &str, repos: &[CvRepo], used: &[i64], rows: &[CvVersionRepo]) -> Result<CvVersion> {
         let at = now();
         let mut tx = self.pool.begin().await?;
         // Number and insert in one statement: the write lock is taken before the number is read.
@@ -656,6 +866,18 @@ impl Store {
         .fetch_one(&mut *tx)
         .await?;
         let (id, number): (i64, i64) = (r.try_get(0)?, r.try_get(1)?);
+        // After the insert (SQLite holds the write lock): a component version deleted since it was resolved is not borrowed.
+        for u in used {
+            let r =
+                sqlx::query("SELECT v.state, v.number, c.name FROM cv_versions v JOIN content_views c ON c.id = v.cv_id WHERE v.id = $1")
+                    .bind(u)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let (state, n, name): (String, i64, String) = (r.try_get(0)?, r.try_get(1)?, r.try_get(2)?);
+            if state != "published" {
+                bail!("version v{n} of {name} is no longer published");
+            }
+        }
         for r in repos {
             sqlx::query("INSERT INTO cv_version_repos(version_id, repo_href, repo_name, repo_type, filters) VALUES ($1, $2, $3, $4, $5)")
                 .bind(id)
@@ -665,6 +887,16 @@ impl Store {
                 .bind(serde_json::to_string(&r.filters)?)
                 .execute(&mut *tx)
                 .await?;
+        }
+        for u in used {
+            sqlx::query("INSERT INTO cv_version_components(version_id, component_version_id) VALUES ($1, $2)")
+                .bind(id)
+                .bind(u)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for r in rows {
+            insert_version_repo(&mut tx, &CvVersionRepo { version_id: id, pending_task: None, borrowed: true, ..r.clone() }).await?;
         }
         tx.commit().await?;
         Ok(CvVersion { id, cv_id, number, notes: notes.into(), state: "publishing".into(), created_at: at, finished_at: None, error: None })
@@ -714,13 +946,14 @@ impl Store {
     pub async fn version_repos(&self, version_id: i64) -> Result<Vec<CvVersionRepo>> {
         let rows = sqlx::query(
             "SELECT repo_href, repo_name, repo_type, filters, source_version, derived_repo, derived_version, publication,
-                    pending_task, content_count FROM cv_version_repos WHERE version_id = $1 ORDER BY repo_name",
+                    pending_task, content_count, borrowed FROM cv_version_repos WHERE version_id = $1 ORDER BY repo_name",
         )
         .bind(version_id)
         .fetch_all(&self.pool)
         .await?;
         rows.iter()
             .map(|r| {
+                let borrowed: i64 = r.try_get(10)?;
                 Ok(CvVersionRepo {
                     version_id,
                     repo: Some(cv_repo_row(r)?),
@@ -730,6 +963,7 @@ impl Store {
                     publication: r.try_get(7)?,
                     pending_task: r.try_get(8)?,
                     content_count: r.try_get(9)?,
+                    borrowed: borrowed != 0,
                 })
             })
             .collect()
@@ -964,6 +1198,18 @@ impl Store {
         rows.iter().map(binding_repo_row).collect()
     }
 
+    /// Every publication a binding row of the scope still records as served: `(publication, view, environment)`.
+    pub async fn served_publications(&self, profile: &str) -> Result<Vec<(String, String, String)>> {
+        let rows = sqlx::query(
+            "SELECT b.publication, c.name, e.name FROM binding_repos b JOIN content_views c ON c.id = b.cv_id
+             JOIN environments e ON e.id = b.env_id WHERE c.profile = $1 AND b.publication IS NOT NULL ORDER BY c.name, e.name",
+        )
+        .bind(profile)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|r| Ok((r.try_get(0)?, r.try_get(1)?, r.try_get(2)?))).collect()
+    }
+
     pub async fn save_binding_repo(&self, b: &BindingRepo) -> Result<()> {
         sqlx::query(
             "INSERT INTO binding_repos(env_id, cv_id, repo_href, repo_name, repo_type, distribution, base_path, publication)
@@ -1115,7 +1361,22 @@ impl Store {
     pub async fn export(&self, profile: &str) -> Result<Export> {
         let mut views = vec![];
         for cv in self.content_views(profile).await? {
-            views.push(ExportView { name: cv.name, description: cv.description, repos: self.cv_repos(cv.id).await? });
+            let mut components = vec![];
+            for c in self.components(cv.id).await? {
+                let pinned = match c.pinned {
+                    Some(id) => Some(self.version(id).await?.number),
+                    None => None,
+                };
+                components.push(ExportComponent { name: c.name, pinned });
+            }
+            views.push(ExportView {
+                name: cv.name,
+                description: cv.description,
+                composite: cv.composite,
+                auto_publish: cv.auto_publish,
+                components,
+                repos: self.cv_repos(cv.id).await?,
+            });
         }
         let envs = self.environments(profile).await?;
         let name_of = |id: Option<i64>| id.and_then(|i| envs.iter().find(|e| e.id == i)).map(|e| e.name.clone());
@@ -1129,12 +1390,15 @@ impl Store {
                 label: e.label.clone(),
             })
             .collect();
-        Ok(Export { format: 1, content_views: views, environments })
+        Ok(Export { format: 2, content_views: views, environments })
     }
 
-    /// Import definitions; existing objects with the same name are left unchanged.
-    pub async fn import(&self, profile: &str, ex: &Export) -> Result<(usize, usize)> {
-        if ex.format != 1 {
+    /// Import definitions (format 1 or 2); existing objects with the same name are left unchanged.
+    /// Returns the views and environments created and warnings. A component pin (a version number) becomes
+    /// latest: the versions of another database do not exist here. Components are added to the composites
+    /// this call created, after all views exist, so the order of the file does not matter.
+    pub async fn import(&self, profile: &str, ex: &Export) -> Result<(usize, usize, Vec<String>)> {
+        if !(1..=2).contains(&ex.format) {
             bail!("unsupported export format {}", ex.format);
         }
         self.ensure_library(profile).await?;
@@ -1165,17 +1429,40 @@ impl Store {
         }
         let mut cvs = 0;
         let existing = self.content_views(profile).await?;
+        let mut composites = vec![];
         for v in &ex.content_views {
             if existing.iter().any(|c| c.name == v.name) {
                 continue;
             }
-            let id = self.create_cv(profile, &v.name, &v.description).await?;
-            for r in &v.repos {
-                self.set_cv_repo(id, r).await?;
+            if v.composite {
+                let id = self.create_composite(profile, &v.name, &v.description).await?;
+                self.set_auto_publish(id, v.auto_publish).await?;
+                composites.push((id, v));
+            } else {
+                let id = self.create_cv(profile, &v.name, &v.description).await?;
+                for r in &v.repos {
+                    self.set_cv_repo(id, r).await?;
+                }
             }
             cvs += 1;
         }
-        Ok((cvs, envs))
+        let mut warnings = vec![];
+        let views = self.content_views(profile).await?;
+        for (id, v) in composites {
+            for c in &v.components {
+                match views.iter().find(|x| x.name == c.name) {
+                    None => warnings.push(format!("{}: component {} not found; skipped", v.name, c.name)),
+                    Some(x) if x.composite => warnings.push(format!("{}: component {} is a composite; skipped", v.name, c.name)),
+                    Some(x) => {
+                        self.set_component(id, x.id, None).await?;
+                        if let Some(k) = c.pinned {
+                            warnings.push(format!("{}: component {} was pinned to v{k}; imported as latest", v.name, c.name));
+                        }
+                    }
+                }
+            }
+        }
+        Ok((cvs, envs, warnings))
     }
 
     // ---- db copy ---------------------------------------------------------------------
@@ -1263,16 +1550,24 @@ impl Store {
             };
             env_ids.insert(e.id, id);
         }
+        // A composite can sort before its components: its components and used versions go in after all views.
+        let (mut cv_ids, mut version_ids) = (HashMap::new(), HashMap::new());
+        let (mut components, mut used) = (vec![], vec![]);
         for v in &views {
             let cv_id: i64 = sqlx::query_scalar(
-                "INSERT INTO content_views(profile, name, description, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+                "INSERT INTO content_views(profile, name, description, created_at, composite, auto_publish)
+                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
             )
             .bind(dst_scope)
             .bind(&v.name)
             .bind(&v.description)
             .bind(&v.created_at)
+            .bind(v.composite as i64)
+            .bind(v.auto_publish as i64)
             .fetch_one(&mut *tx)
             .await?;
+            cv_ids.insert(v.id, cv_id);
+            components.extend(src.components(v.id).await?.into_iter().map(|k| (cv_id, k)));
             for r in src.cv_repos(v.id).await? {
                 sqlx::query("INSERT INTO cv_repos(cv_id, repo_href, repo_name, repo_type, filters) VALUES ($1, $2, $3, $4, $5)")
                     .bind(cv_id)
@@ -1283,7 +1578,6 @@ impl Store {
                     .execute(&mut *tx)
                     .await?;
             }
-            let mut version_ids = HashMap::new();
             let mut versions = src.versions(v.id).await?;
             versions.reverse();
             report.versions += versions.len();
@@ -1303,32 +1597,19 @@ impl Store {
                 .await?;
                 version_ids.insert(ver.id, id);
                 for vr in src.version_repos(ver.id).await? {
-                    let r = vr.repo();
-                    sqlx::query(
-                        "INSERT INTO cv_version_repos(version_id, repo_href, repo_name, repo_type, filters, source_version, derived_repo,
-                                derived_version, publication, pending_task, content_count)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                    )
-                    .bind(id)
-                    .bind(&r.repo_href)
-                    .bind(&r.repo_name)
-                    .bind(type_str(r.repo_type))
-                    .bind(serde_json::to_string(&r.filters)?)
-                    .bind(&vr.source_version)
-                    .bind(&vr.derived_repo)
-                    .bind(&vr.derived_version)
-                    .bind(&vr.publication)
-                    .bind(&vr.pending_task)
-                    .bind(vr.content_count)
-                    .execute(&mut *tx)
-                    .await?;
+                    insert_version_repo(&mut tx, &CvVersionRepo { version_id: id, ..vr }).await?;
                 }
+                used.extend(src.version_components(ver.id).await?.into_iter().map(|u| (id, u.version_id)));
             }
             let bindings = src.bindings_for_cv(v.id).await?;
             report.bindings += bindings.len();
             for b in &bindings {
                 let env_id = env_ids.get(&b.env_id).copied().context("a binding points at an environment outside the path")?;
-                let version_id = version_ids.get(&b.version_id).copied().context("a binding points at a version of another view")?;
+                let version_id = versions
+                    .iter()
+                    .find(|x| x.id == b.version_id)
+                    .map(|x| version_ids[&x.id])
+                    .context("a binding points at a version of another view")?;
                 sqlx::query("INSERT INTO bindings(env_id, cv_id, version_id, state, updated_at) VALUES ($1, $2, $3, $4, $5)")
                     .bind(env_id)
                     .bind(cv_id)
@@ -1354,6 +1635,22 @@ impl Store {
                     .await?;
                 }
             }
+        }
+        let version = |id: i64| version_ids.get(&id).copied().context("a composite points at a version outside the copy");
+        for (composite, k) in &components {
+            sqlx::query("INSERT INTO cv_components(composite_id, component_id, version_id) VALUES ($1, $2, $3)")
+                .bind(composite)
+                .bind(cv_ids.get(&k.cv_id).copied().context("a composite points at a view outside the copy")?)
+                .bind(k.pinned.map(version).transpose()?)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for (id, u) in &used {
+            sqlx::query("INSERT INTO cv_version_components(version_id, component_version_id) VALUES ($1, $2)")
+                .bind(id)
+                .bind(version(*u)?)
+                .execute(&mut *tx)
+                .await?;
         }
         for a in &log {
             sqlx::query("INSERT INTO audit(profile, at, action, detail, actor) VALUES ($1, $2, $3, $4, $5)")
@@ -1407,7 +1704,22 @@ pub struct ExportView {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Format 2: has components instead of repositories.
+    #[serde(default)]
+    pub composite: bool,
+    #[serde(default)]
+    pub auto_publish: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<ExportComponent>,
     pub repos: Vec<CvRepo>,
+}
+
+/// A component by view name; `pinned` is a version number, which an import turns into latest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportComponent {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1425,8 +1737,42 @@ fn lock_row(r: &AnyRow) -> Result<LockHolder> {
     Ok(LockHolder { owner: r.try_get(0)?, operation: r.try_get(1)?, acquired_at: r.try_get(2)? })
 }
 
+/// Columns `id, name, description, created_at, composite, auto_publish`.
 fn content_view_row(r: &AnyRow) -> Result<ContentView> {
-    Ok(ContentView { id: r.try_get(0)?, name: r.try_get(1)?, description: r.try_get(2)?, created_at: r.try_get(3)? })
+    let (composite, auto_publish): (i64, i64) = (r.try_get(4)?, r.try_get(5)?);
+    Ok(ContentView {
+        id: r.try_get(0)?,
+        name: r.try_get(1)?,
+        description: r.try_get(2)?,
+        created_at: r.try_get(3)?,
+        composite: composite != 0,
+        auto_publish: auto_publish != 0,
+    })
+}
+
+/// A full `cv_version_repos` row, every checkpoint column as `vr` holds it.
+async fn insert_version_repo(c: &mut AnyConnection, vr: &CvVersionRepo) -> Result<()> {
+    let r = vr.repo();
+    sqlx::query(
+        "INSERT INTO cv_version_repos(version_id, repo_href, repo_name, repo_type, filters, source_version, derived_repo,
+                derived_version, publication, pending_task, content_count, borrowed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+    )
+    .bind(vr.version_id)
+    .bind(&r.repo_href)
+    .bind(&r.repo_name)
+    .bind(type_str(r.repo_type))
+    .bind(serde_json::to_string(&r.filters)?)
+    .bind(&vr.source_version)
+    .bind(&vr.derived_repo)
+    .bind(&vr.derived_version)
+    .bind(&vr.publication)
+    .bind(&vr.pending_task)
+    .bind(vr.content_count)
+    .bind(vr.borrowed as i64)
+    .execute(&mut *c)
+    .await?;
+    Ok(())
 }
 
 fn cv_repo_row(r: &AnyRow) -> Result<CvRepo> {
@@ -1630,8 +1976,8 @@ mod tests {
 
         let ex = s.export("lab").await.unwrap();
         let s2 = Store::open_in_memory().await.unwrap();
-        assert_eq!(s2.import("lab", &ex).await.unwrap(), (1, 2));
-        assert_eq!(s2.import("lab", &ex).await.unwrap(), (0, 0));
+        assert_eq!(s2.import("lab", &ex).await.unwrap(), (1, 2, vec![]));
+        assert_eq!(s2.import("lab", &ex).await.unwrap(), (0, 0, vec![]));
         assert_eq!(s2.export("lab").await.unwrap(), ex);
 
         s.delete_cv(cv).await.unwrap();
@@ -1665,6 +2011,35 @@ mod tests {
         assert_eq!(labels, ["Library=library", "Dev=dev", "dev=dev"]);
         assert_eq!(s.stored_prefix("old").await.unwrap().as_deref(), Some("acme"));
         assert_eq!(s.stored_prefix("new").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn migration_4_keeps_rows_of_normal_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pulp-tui.db");
+        {
+            // Rows as schema 3 wrote them, in raw SQL (the new store code writes columns schema 3 lacks).
+            let s = Store::open_at_version(&path, 3).await.unwrap();
+            sqlx::raw_sql(
+                "INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'old', 'web', 't');
+                 INSERT INTO cv_versions(id, cv_id, number, state, created_at) VALUES (1, 1, 1, 'published', 't');
+                 INSERT INTO cv_version_repos VALUES (1, '/r/1/', 'os', 'rpm', '[]', '/r/1/versions/3/', '/d/1/', '/d/1/versions/1/', '/p/1/', NULL, 7);",
+            )
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let s = Store::open(&path).await.unwrap();
+        let cv = s.content_view(1).await.unwrap();
+        assert_eq!((cv.name.as_str(), cv.composite, cv.auto_publish), ("web", false, false));
+        let rows = s.version_repos(1).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!((r.repo().repo_href.as_str(), r.repo().repo_name.as_str(), r.repo().repo_type), ("/r/1/", "os", RepoType::Rpm));
+        assert_eq!(r.source_version.as_deref(), Some("/r/1/versions/3/"));
+        assert_eq!((r.derived_repo.as_deref(), r.derived_version.as_deref()), (Some("/d/1/"), Some("/d/1/versions/1/")));
+        assert_eq!((r.publication.as_deref(), r.pending_task.as_deref(), r.content_count), (Some("/p/1/"), None, Some(7)));
+        assert!(!r.borrowed);
     }
 
     #[tokio::test]
@@ -2006,6 +2381,7 @@ mod tests {
             publication: Some("/pub/1/".into()),
             pending_task: Some("/t/9/".into()),
             content_count: Some(7),
+            borrowed: false,
         };
         src.save_version_repo(&vr).await.unwrap();
         for (env, ver) in [(dev, v1.id), (prod, v2.id)] {
@@ -2147,5 +2523,201 @@ mod tests {
         assert!(dst.content_views("k").await.unwrap().is_empty());
         assert!(dst.environments("k").await.unwrap().is_empty());
         assert!(dst.aliases().await.unwrap().is_empty());
+    }
+
+    /// A published version of `cv` with one row that has a derived repository, version and publication
+    /// (and a leftover task reference, which a borrowed row must not take).
+    async fn published(s: &Store, cv: i64, name: &str) -> CvVersion {
+        let r = repo(name, RepoType::Rpm);
+        let v = s.begin_version(cv, "", std::slice::from_ref(&r)).await.unwrap();
+        let vr = CvVersionRepo {
+            version_id: v.id,
+            repo: Some(r),
+            derived_repo: Some(format!("/dr/{name}/")),
+            derived_version: Some(format!("/dr/{name}/versions/{}/", v.number)),
+            publication: Some(format!("/pub/{name}/{}/", v.number)),
+            pending_task: Some("/t/done/".into()),
+            ..Default::default()
+        };
+        s.save_version_repo(&vr).await.unwrap();
+        s.finish_version(v.id, "published", None).await.unwrap();
+        s.version(v.id).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn components_pins_and_refusals() {
+        let s = Store::open_in_memory().await.unwrap();
+        let (os, extras) = (s.create_cv("k", "os", "").await.unwrap(), s.create_cv("k", "extras", "").await.unwrap());
+        let c = s.create_composite("k", "rocky9", "").await.unwrap();
+        let v1 = published(&s, os, "baseos").await;
+        s.set_component(c, os, Some(v1.id)).await.unwrap();
+        s.set_component(c, extras, None).await.unwrap();
+        let got: Vec<_> = s.components(c).await.unwrap().into_iter().map(|x| (x.name, x.pinned)).collect();
+        assert_eq!(got, [("extras".to_string(), None), ("os".to_string(), Some(v1.id))]);
+        assert!(s.content_view(c).await.unwrap().composite && !s.content_view(os).await.unwrap().composite);
+        let err = |r: Result<()>| r.unwrap_err().to_string();
+        assert_eq!(err(s.set_component(os, extras, None).await), "os is not a composite content view");
+        let other = s.create_composite("k", "other", "").await.unwrap();
+        assert_eq!(err(s.set_component(other, c, None).await), "rocky9 is a composite; a composite cannot be a component");
+        let failed = s.begin_version(extras, "", &[]).await.unwrap();
+        s.finish_version(failed.id, "failed", None).await.unwrap();
+        assert_eq!(err(s.set_component(c, extras, Some(failed.id)).await), "v1 is not a published version of extras");
+        assert_eq!(
+            err(s.set_component(c, extras, Some(v1.id)).await),
+            "v1 is not a published version of extras",
+            "a version of another view"
+        );
+        assert_eq!(s.components(c).await.unwrap()[0].pinned, None, "a refused pin changes nothing");
+        assert!(s.auto_composites(extras).await.unwrap().is_empty(), "auto publish is off by default");
+        s.set_auto_publish(c, true).await.unwrap();
+        assert_eq!(s.auto_composites(extras).await.unwrap().iter().map(|v| v.id).collect::<Vec<_>>(), [c]);
+        assert!(s.auto_composites(os).await.unwrap().is_empty(), "a pinned component does not trigger it");
+        s.set_component(c, os, None).await.unwrap(); // upsert: os is latest now
+        assert_eq!(s.auto_composites(os).await.unwrap().len(), 1);
+        s.remove_component(c, extras).await.unwrap();
+        assert_eq!(s.components(c).await.unwrap().iter().map(|x| x.cv_id).collect::<Vec<_>>(), [os]);
+    }
+
+    #[tokio::test]
+    async fn composite_versions_borrow_rows_and_block_deletes() {
+        let s = Store::open_in_memory().await.unwrap();
+        let os = s.create_cv("k", "os", "").await.unwrap();
+        let v1 = published(&s, os, "baseos").await;
+        let c = s.create_composite("k", "rocky9", "").await.unwrap();
+        s.set_component(c, os, Some(v1.id)).await.unwrap();
+        let rows = s.version_repos(v1.id).await.unwrap();
+        assert!(!rows[0].borrowed && rows[0].pending_task.is_some());
+        let cv1 = s.begin_composite_version(c, "n", &[v1.id], &rows).await.unwrap();
+        assert_eq!((cv1.number, cv1.state.as_str(), s.version(cv1.id).await.unwrap().state.as_str()), (1, "publishing", "publishing"));
+        let want: Vec<_> =
+            rows.iter().map(|r| CvVersionRepo { version_id: cv1.id, borrowed: true, pending_task: None, ..r.clone() }).collect();
+        assert_eq!(s.version_repos(cv1.id).await.unwrap(), want);
+        assert_eq!(s.version_repos(v1.id).await.unwrap(), rows, "the component's rows are unchanged");
+        assert_eq!(
+            s.version_components(cv1.id).await.unwrap(),
+            [UsedVersion { cv_id: os, name: "os".into(), version_id: v1.id, number: 1 }]
+        );
+        assert_eq!(s.composite_users(v1.id).await.unwrap(), ["rocky9 v1", "rocky9 (pinned)"]);
+        assert_eq!(s.composite_refs(os).await.unwrap(), ["rocky9 (component)", "rocky9 v1"]);
+        assert!(s.delete_cv(os).await.is_err(), "still a component");
+        assert_eq!(s.versions(os).await.unwrap().len(), 1, "a refused delete removes nothing");
+        s.remove_component(c, os).await.unwrap();
+        s.finish_version(cv1.id, "deleted", None).await.unwrap();
+        assert!(s.composite_users(v1.id).await.unwrap().is_empty());
+        assert!(s.composite_refs(os).await.unwrap().is_empty());
+        s.delete_cv(os).await.unwrap();
+        assert!(s.version_components(cv1.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn composite_version_refuses_a_component_version_no_longer_published() {
+        let s = Store::open_in_memory().await.unwrap();
+        let os = s.create_cv("k", "os", "").await.unwrap();
+        let v1 = published(&s, os, "baseos").await;
+        let c = s.create_composite("k", "rocky9", "").await.unwrap();
+        let rows = s.version_repos(v1.id).await.unwrap();
+        s.finish_version(v1.id, "deleted", None).await.unwrap(); // deleted after the composite resolved it
+        let e = s.begin_composite_version(c, "", &[v1.id], &rows).await.unwrap_err();
+        assert_eq!(e.to_string(), "version v1 of os is no longer published");
+        assert!(s.versions(c).await.unwrap().is_empty(), "nothing written");
+        assert!(s.composite_users(v1.id).await.unwrap().is_empty());
+        assert_eq!(s.begin_version(c, "", &[]).await.unwrap().number, 1, "the number was not taken");
+    }
+
+    #[tokio::test]
+    async fn export_v2_carries_composites_and_import_unpins() {
+        let src = Store::open_in_memory().await.unwrap();
+        let (os, extras) = (src.create_cv("lab", "os", "").await.unwrap(), src.create_cv("lab", "extras", "").await.unwrap());
+        let v1 = published(&src, os, "baseos").await;
+        let c = src.create_composite("lab", "rocky9", "").await.unwrap();
+        src.set_auto_publish(c, true).await.unwrap();
+        src.set_component(c, os, Some(v1.id)).await.unwrap();
+        src.set_component(c, extras, None).await.unwrap();
+
+        let ex = src.export("lab").await.unwrap();
+        assert_eq!(ex.format, 2);
+        let c = ex.content_views.iter().find(|v| v.name == "rocky9").unwrap();
+        assert!(c.composite && c.auto_publish && c.repos.is_empty());
+        assert_eq!(c.components.iter().map(|x| (x.name.as_str(), x.pinned)).collect::<Vec<_>>(), [("extras", None), ("os", Some(1))]);
+        assert!(ex.content_views.iter().filter(|v| v.name != "rocky9").all(|v| !v.composite && v.components.is_empty()));
+
+        let dst = Store::open_in_memory().await.unwrap();
+        assert_eq!(
+            dst.import("k", &ex).await.unwrap(),
+            (3, 0, vec!["rocky9: component os was pinned to v1; imported as latest".to_string()])
+        );
+        let imported = dst.content_views("k").await.unwrap().into_iter().find(|v| v.name == "rocky9").unwrap();
+        assert!(imported.composite && imported.auto_publish);
+        let got = dst.components(imported.id).await.unwrap();
+        assert_eq!(got.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["extras", "os"]);
+        assert!(got.iter().all(|x| x.pinned.is_none()));
+        assert_eq!(dst.import("k", &ex).await.unwrap(), (0, 0, vec![]));
+
+        // A component that is missing or is a composite is skipped with a named warning.
+        let comp = |name: &str| ExportComponent { name: name.into(), pinned: None };
+        let view = |name: &str, composite: bool, components| ExportView {
+            name: name.into(),
+            description: String::new(),
+            composite,
+            auto_publish: false,
+            components,
+            repos: vec![],
+        };
+        let odd = Export {
+            format: 2,
+            content_views: vec![view("odd", true, vec![comp("gone"), comp("rocky9"), comp("os")]), view("plain", false, vec![])],
+            environments: vec![],
+        };
+        assert_eq!(
+            dst.import("k", &odd).await.unwrap(),
+            (2, 0, vec!["odd: component gone not found; skipped".to_string(), "odd: component rocky9 is a composite; skipped".to_string()])
+        );
+        let odd_id = dst.content_views("k").await.unwrap().into_iter().find(|v| v.name == "odd").unwrap().id;
+        assert_eq!(dst.components(odd_id).await.unwrap().len(), 1);
+
+        // A file from before format 2 has none of the new fields.
+        let old: Export = serde_json::from_str(r#"{"format":1,"content_views":[{"name":"old","repos":[]}],"environments":[]}"#).unwrap();
+        assert_eq!(dst.import("k", &old).await.unwrap(), (1, 0, vec![]));
+        assert!(!dst.content_views("k").await.unwrap().iter().find(|v| v.name == "old").unwrap().composite);
+
+        let e = dst.import("k", &Export { format: 3, ..ex }).await.unwrap_err().to_string();
+        assert_eq!(e, "unsupported export format 3");
+    }
+
+    #[tokio::test]
+    async fn copy_keeps_composites() {
+        let src = Store::open_in_memory().await.unwrap();
+        let (os, extras) = (src.create_cv("lab", "rocky9-os", "").await.unwrap(), src.create_cv("lab", "rocky9-extras", "").await.unwrap());
+        let (vo, ve) = (published(&src, os, "baseos").await, published(&src, extras, "epel").await);
+        let c = src.create_composite("lab", "rocky9", "").await.unwrap(); // sorts before its components
+        src.set_component(c, os, Some(vo.id)).await.unwrap();
+        src.set_component(c, extras, None).await.unwrap();
+        src.set_auto_publish(c, true).await.unwrap();
+        let mut rows = src.version_repos(vo.id).await.unwrap();
+        rows.extend(src.version_repos(ve.id).await.unwrap());
+        let cv1 = src.begin_composite_version(c, "", &[vo.id, ve.id], &rows).await.unwrap();
+        src.finish_version(cv1.id, "published", None).await.unwrap();
+
+        let dst = Store::open_in_memory().await.unwrap();
+        // Rows in the target shift every id: a copy that kept source ids would point at the wrong rows.
+        let pad = dst.create_cv("x", "pad", "").await.unwrap();
+        dst.begin_version(pad, "", &[]).await.unwrap();
+        let r = dst.copy_from(&src, "lab", "k").await.unwrap();
+        assert_eq!((r.views, r.versions), (3, 3));
+        let views = dst.content_views("k").await.unwrap();
+        assert_eq!(views.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), ["rocky9", "rocky9-extras", "rocky9-os"]);
+        let (c2, ex2, os2) = (&views[0], &views[1], &views[2]);
+        assert!(c2.composite && c2.auto_publish && !os2.composite && !os2.auto_publish);
+        let (vo2, ve2) = (dst.versions(os2.id).await.unwrap()[0].id, dst.versions(ex2.id).await.unwrap()[0].id);
+        let got: Vec<_> = dst.components(c2.id).await.unwrap().into_iter().map(|x| (x.cv_id, x.name, x.pinned)).collect();
+        assert_eq!(got, [(ex2.id, "rocky9-extras".to_string(), None), (os2.id, "rocky9-os".to_string(), Some(vo2))]);
+        let n1 = dst.versions(c2.id).await.unwrap().remove(0);
+        let used: Vec<_> = dst.version_components(n1.id).await.unwrap().into_iter().map(|u| (u.name, u.number, u.version_id)).collect();
+        assert_eq!(used, [("rocky9-extras".to_string(), 1, ve2), ("rocky9-os".to_string(), 1, vo2)]);
+        let copied = dst.version_repos(n1.id).await.unwrap();
+        assert!(copied.len() == 2 && copied.iter().all(|r| r.borrowed));
+        let want: Vec<_> = src.version_repos(cv1.id).await.unwrap().into_iter().map(|r| CvVersionRepo { version_id: n1.id, ..r }).collect();
+        assert_eq!(copied, want, "publications equal the source rows");
+        assert!(!dst.version_repos(vo2).await.unwrap()[0].borrowed, "a component's own row is not borrowed");
     }
 }

@@ -518,6 +518,7 @@ pub fn help_lines() -> Vec<String> {
         "  Compare:    Versions -> Space on one version -> m on another",
         "  Content View: Content Views -> c create -> a add repos -> P publish (preview first)",
         "                -> M promote through Lifecycle Envs -> b roll back -> D verify/drift",
+        "  Composite:  Content Views -> c create with Composite -> a add components (x remove) -> P publish",
         "  Replication: Replication -> c add Upstream Pulp -> R replicate; F = fallback sync from a profile",
         "",
         "Safety",

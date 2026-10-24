@@ -151,8 +151,11 @@ async fn run() -> Result<()> {
             cfg.check_shared_write(&name)?;
             let ex = serde_json::from_slice(&std::fs::read(&file).with_context(|| format!("read {}", file.display()))?)?;
             let cv = cv_store(&cfg, &name, &store).await.map_err(|e| anyhow!("shared database unavailable: {e}"))?;
-            let (cvs, envs) = cv.import(&cv.scope(&name, &cfg.profiles[&name]), &ex).await?;
+            let (cvs, envs, warnings) = cv.import(&cv.scope(&name, &cfg.profiles[&name]), &ex).await?;
             println!("imported {cvs} content view(s) and {envs} environment(s) into profile {name}");
+            for w in warnings {
+                println!("warning: {w}");
+            }
             Ok(())
         }
         Some(Cmd::ConfigExample) => unreachable!(),

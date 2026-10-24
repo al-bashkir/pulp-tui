@@ -1,6 +1,6 @@
 //! Option loading for picker fields (the popup itself is drawn in `view.rs`).
 
-use super::app::Ctx;
+use super::app::{Ctx, unavailable};
 use super::form::{PickItem, Source};
 use super::kinds::short;
 use crate::pulp::RepoType;
@@ -38,6 +38,7 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
         }
         Source::Domains => vec![("domains/", NAME_HREF, "name", "pulp_href", "")],
         Source::RoleObjects => return role_objects(ctx, role).await,
+        Source::ContentViews => return content_views(ctx).await,
     };
     let mut out = vec![];
     for (path, fields, label, value, note) in specs {
@@ -46,6 +47,17 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
         out.extend(rows.iter().map(|r| PickItem { label: text(r, label), value: text(r, value), note: note.into() }));
     }
     Ok(out)
+}
+
+/// The views a composite can use as components: not composites themselves.
+async fn content_views(ctx: &Ctx) -> anyhow::Result<Vec<PickItem>> {
+    let st = ctx.cv_store.as_ref().map_err(|e| unavailable(e.clone()))?;
+    let views = st.content_views(&ctx.scope).await?;
+    Ok(views
+        .into_iter()
+        .filter(|v| !v.composite)
+        .map(|v| PickItem { label: v.name, value: v.id.to_string(), note: String::new() })
+        .collect())
 }
 
 /// Objects of the one type a role grants permissions on (for the object-level role forms).
@@ -183,6 +195,27 @@ mod tests {
         let ctx = ctx_for(&server, caps).await;
         let items = load_options(&ctx, &Source::Domains, "").await.unwrap();
         assert_eq!(items.iter().map(|i| (i.label.as_str(), i.value.as_str())).collect::<Vec<_>>(), [("d1", "/h/d1/")]);
+    }
+
+    #[tokio::test]
+    async fn content_view_picker_lists_non_composite_views() {
+        let server = MockServer::start().await;
+        let ctx = ctx_for(&server, Capabilities::default()).await;
+        let st = ctx.cv_store.clone().unwrap();
+        let os = st.create_cv(&ctx.scope, "os", "").await.unwrap();
+        st.create_composite(&ctx.scope, "rocky9", "").await.unwrap();
+        st.create_cv("other", "elsewhere", "").await.unwrap();
+        let items = load_options(&ctx, &Source::ContentViews, "").await.unwrap();
+        assert_eq!(items.iter().map(|i| (i.label.as_str(), i.value.clone())).collect::<Vec<_>>(), [("os", os.to_string())]);
+    }
+
+    #[tokio::test]
+    async fn content_view_picker_reports_an_unavailable_store() {
+        let server = MockServer::start().await;
+        let mut ctx = ctx_for(&server, Capabilities::default()).await;
+        ctx.cv_store = Err("timeout".into());
+        let e = load_options(&ctx, &Source::ContentViews, "").await.unwrap_err();
+        assert_eq!(e.to_string(), "shared database unavailable: timeout");
     }
 
     #[tokio::test]

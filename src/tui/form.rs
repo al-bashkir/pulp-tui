@@ -18,6 +18,8 @@ pub enum Source {
     Users,
     Domains,
     RoleObjects,
+    /// Normal (not composite) Content Views of the active server; the value is the view id.
+    ContentViews,
 }
 
 #[derive(Debug, Clone, PartialEq)]

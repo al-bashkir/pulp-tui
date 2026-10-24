@@ -534,8 +534,11 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
                     let ex: crate::store::Export =
                         serde_json::from_slice(&tokio::fs::read(&path).await.with_context(|| format!("read {path}"))?)?;
                     let (store, scope) = target.await?;
-                    let (cvs, envs) = store.import(&scope, &ex).await?;
-                    ap(move |app| app.ok(format!("imported {cvs} content view(s), {envs} environment(s); existing names were kept")))
+                    let (cvs, envs, warnings) = store.import(&scope, &ex).await?;
+                    ap(move |app| {
+                        let t = format!("imported {cvs} content view(s), {envs} environment(s); existing names were kept");
+                        if warnings.is_empty() { app.ok(t) } else { app.notify(Level::Warn, format!("{t}; {}", warnings.join("; "))) }
+                    })
                 };
                 app.spawn("import".into(), false, fut);
             });

@@ -160,16 +160,18 @@ repository version) or **FOLLOWS LATEST** (repository). **y** copies the content
 labels), **d** delete.
 
 ### Content Views
-Managed by pulp-tui (see `docs/ARCHITECTURE.md`). Columns: repositories, latest version,
-environments with bound versions and states.
+Managed by pulp-tui (see `docs/ARCHITECTURE.md`). Columns: composite (`yes` for a
+composite view), repositories, latest version, environments with bound versions and
+states. A composite view has components instead of repositories; see "Composite Content
+Views" below.
 
 | Key | Action |
 |---|---|
-| c / e / d | create / edit description / delete (removes the view's distributions and snapshot repositories, never source repositories) |
-| a | add repositories: a multi-select picker of RPM and File repositories (those already in the view are not listed) and filter rules; the rules apply to each selected repository, so mixed RPM and File selections need empty rules |
-| F | edit the filter rules of one repository |
-| x | remove a repository from the definition (published versions are unchanged) |
-| f | sync repositories: a multi-select picker of the view's repositories (all marked) and one sync policy (RPM values when the view has an RPM repository, else File values; File repositories treat any mirror policy as mirror). Each repository syncs from its own default remote; one without is skipped. Mirror policies show a warning first. The tasks show in Tasks; the result lists each repository: new version, no change, failed or skipped. Sync does not publish. |
+| c / e / d | create / edit description / delete (removes the view's distributions and snapshot repositories, never source repositories). On a composite, Edit also sets auto publish and the pin of each component, and Delete removes only its distributions. |
+| a | add repositories: a multi-select picker of RPM and File repositories (those already in the view are not listed) and filter rules; the rules apply to each selected repository, so mixed RPM and File selections need empty rules. On a composite: add components (see below). |
+| F | edit the filter rules of one repository (not offered on a composite) |
+| x | remove a repository from the definition (published versions are unchanged). On a composite: remove a component. |
+| f | sync repositories: a multi-select picker of the view's repositories (all marked) and one sync policy (RPM values when the view has an RPM repository, else File values; File repositories treat any mirror policy as mirror). Each repository syncs from its own default remote; one without is skipped. Mirror policies show a warning first. The tasks show in Tasks; the result lists each repository: new version, no change, failed or skipped. Sync does not publish. Not offered on a composite. |
 | w | preview: exact content the draft selects compared with the latest published version |
 | P | publish a new version: notes → preview → confirm; the version becomes active in Library |
 | v | versions of the view |
@@ -205,12 +207,75 @@ matches. All criteria of one rule must match. `evr` supports `= < <= > >=` with 
 version comparison; `epoch:` is optional; without a release only epoch and version are
 compared.
 
+#### Composite Content Views
+
+A composite view joins other Content Views (its **components**), as a Katello composite
+does. Example: the view `rocky9-os` holds BaseOS and AppStream, and you keep it at a
+version that you tested. The view `rocky9-extras` holds docker, postgres and other
+repositories that you want to follow. The composite `rocky9` has both as components:
+`rocky9-os` pinned to a version, `rocky9-extras` on `latest`. When you publish
+`rocky9-extras` and then `rocky9`, clients of `rocky9` keep the OS packages and get the new
+extras.
+
+* **Create.** `c` has the flag *Composite (fixed after create)*. A view is composite or
+  normal for its whole life. A composite has no repositories and no filters of its own, and
+  a composite cannot be a component of another composite (no nesting).
+* **Components.** `a` opens a multi-select picker of the normal Content Views that are not
+  yet components, then asks for the pin of each: `latest` (the newest published version at
+  the time the composite publishes) or one published version (`v3`). `x` removes a
+  component. `e` sets the description, **auto publish** and the pin of each component.
+  Changes take effect at the next publish. The repository actions `a` (add repository), `F`,
+  `x` (remove repository) and `f` are not offered on a composite.
+* **Repository rule.** Two components must not contain the same repository, and two
+  repositories must not have names with the same path segment (`os/x` and `os x` both
+  become `os-x`). pulp-tui checks this when you add a component and again at every
+  publish, over the versions that the publish would use, and names both views or both
+  repositories. Nothing is written when it refuses.
+* **Publish** (`P`) resolves each `latest` to the newest published version of the
+  component. It is refused, before anything is written, for a composite with no
+  components, a `latest` component that has no published version, a pinned version that
+  is no longer published, and a repository clash (see above). It copies nothing in Pulp:
+  the composite version only records which component versions it uses and points at their
+  snapshot repositories and publications. Like every publish, it becomes active in
+  Library. The preview lists every component version (`rocky9-os: v1 (unchanged)`,
+  `rocky9-extras: v1 -> v2`), then the content that changes in each repository.
+* **Served paths.** A composite has its own distributions
+  `pulp-tui-cv-<composite>-<env>-<repo>` at
+  `[<prefix>/]<lc label>/<composite>/<repo>`. Promote, roll back and the drift check work as
+  for a normal view. One publication can be served by the distribution of its component and
+  by the distribution of the composite at the same time.
+* **Auto publish.** Off by default, set per composite with `e`. When a component publishes
+  (Publish, or *Resume* that finishes), every composite with auto publish that lists this
+  component on `latest` publishes too, each under its own lock. A component that is pinned
+  does not trigger it. The result is part of the notice, for example `rocky9-extras version
+  2 published and active in Library; auto publish: rocky9 v2 published`. If a composite
+  fails (for example, it is locked), the component stays published and the notice is a
+  warning that names the composite and the reason. Auto publish never promotes: the new
+  composite version is active in Library only; promote it yourself.
+* **Delete.** The delete actions never remove an object that a component owns.
+  * A component version that a composite version uses (or a composite pins) cannot be
+    deleted: `version 1 is used by rocky9 v1, rocky9 (pinned)`.
+  * A Content View that is a component, or that a composite version uses, cannot be
+    deleted: `content view rocky9-os is used by rocky9 (component), rocky9 v1; remove it
+    from the composite and delete those composite versions first`.
+  * Deleting a composite version, or a composite, removes only the composite's own
+    records and distributions. The component snapshots and publications stay.
+  * Deleting a version keeps every publication (with its repository version) that any
+    environment of the server still serves. Deleting a view stops with `... is still
+    served by <view> in <environment>` when another view serves one of its publications.
+    Pulp deletes the publications of a repository version with it, and a deleted
+    publication silently stops its distributions (COMPATIBILITY.md). These rules also apply
+    to normal views.
+
 ### Content View versions
 **M** promote, **b** roll back, **m** compare with the marked version, **R** resume a
 publish that failed or was interrupted (continues from checkpoints and re-attaches to a
 submitted task; with a shared database it can also continue a publish that another
-operator started), **d** delete (refused while bound), **i** details (source versions,
-snapshot versions, publications, unit counts).
+operator started), **d** delete (refused while bound, and while a composite uses it),
+**i** details (source versions, snapshot versions, publications, unit counts; for a
+composite version, the component versions). Compare of two composite versions shows the
+component versions first (`rocky9-extras: v1 -> v2`), then the added and removed content of
+each repository.
 
 ### Lifecycle Environments
 Library exists automatically. **c** creates an environment after an existing one
@@ -370,11 +435,11 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreS
   (open Servers, Connect again to migrate, or run pulp-tui db migrate --profile prod)`, and
   Connect offers the migration (see below). The command-line Content View commands
   (`export-cv`, `import-cv`, `db copy`) stop with, for example, `... database schema 1 is
-  older than this pulp-tui (3); run pulp-tui db migrate --profile prod` or `...: database is
+  older than this pulp-tui (4); run pulp-tui db migrate --profile prod` or `...: database is
   not initialized; run pulp-tui db migrate --profile prod`.
 * **Migrate from the TUI.** When Connect finds a database with no schema, or an older one,
   it asks `Migrate database of <profile>?`. The dialog shows the database, the schema
-  change (for example `empty -> 3`) and a warning that other operators then need this
+  change (for example `empty -> 4`) and a warning that other operators then need this
   pulp-tui version or newer. Enter migrates (with the role of the connection, which must
   create tables, as for `db migrate`). Esc does not migrate; the Content View screens then
   show the message above. When you save a profile with a new database, pulp-tui opens it at
@@ -405,7 +470,9 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreS
    pulp-tui version with lifecycle environment labels, migrate an external database that is
    at schema 2 once (the TUI offers it on Connect, or run `pulp-tui db migrate --profile
    <name>`). Schema 3 gives each environment the label of its lower-case name and stores the
-   base path prefix of servers that already serve, so no served path moves.
+   base path prefix of servers that already serve, so no served path moves. An external
+   database at schema 3 needs the same migration (the TUI offer, or `db migrate`) before
+   composite Content Views work: schema 4 adds their tables and columns.
 3. Give the operators' role only `SELECT`, `INSERT`, `UPDATE` and `DELETE`. After a migration
    that adds tables, grant again (or use `ALTER DEFAULT PRIVILEGES`).
 
@@ -420,8 +487,10 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreS
 ### Move the data of one operator
 
 `pulp-tui --profile lab db copy` copies the Content View data of the profile `lab` from the
-local file into the database of `lab`: Content Views with repositories and filters, versions
-and their checkpoints, environments, bindings and the audit log. The rows get new IDs. The
+local file into the database of `lab`: Content Views with repositories and filters (and
+composites with their components, pins and auto publish flag), versions and their
+checkpoints (and the component versions that a composite version used), environments,
+bindings and the audit log. The rows get new IDs. The
 local profile name becomes the server key (see below). The copy runs in one transaction. It
 **never merges**: if the target database already has a Content View, or an environment
 other than Library, with the same name for this server, it stops and writes nothing. Task
@@ -479,9 +548,9 @@ database of a profile and choose "copy and switch" (see above).
   labels keeps its prefix: the migration to schema 3 stores the first path segment of its
   served paths (for example `cv`).
 * **Read-only profiles.** When the database of the profile is external (its own, or
-  `[database]`), creating or editing a Content View, adding or removing repositories and
-  filters, and creating, deleting or protecting an environment change state that other
-  operators publish from. A read-only profile does not show these actions. `import-cv` and
+  `[database]`), creating or editing a Content View, adding or removing repositories,
+  filters and components, and creating, deleting or protecting an environment change state
+  that other operators publish from. A read-only profile does not show these actions. `import-cv` and
   `db copy` refuse a read-only profile, and the TUI neither migrates its database nor
   offers "copy and switch" for it. When the profile uses the local file, these actions stay
   available, because they change only the local file. The exception is the label edit on
@@ -495,12 +564,15 @@ database of a profile and choose "copy and switch" (see above).
   `Content View web is locked by alice@ws12 (promote to Prod) since 14:02 UTC` before
   anything is sent to Pulp. The lock is also taken when two pulp-tui processes use one
   local file.
+* Publishing a composite locks the composite only; it reads the component versions and
+  never changes them. Auto publish takes the lock of each composite after the lock of the
+  component is released.
 * Changing the label of an environment (Edit on Lifecycle Environments) takes the locks of
   **all** views that are bound in it, in the order of their IDs. If another operator holds
   one of them, the relabel stops before it changes anything, with that operator's name.
 * Preview, compare and the drift check do not lock. Edits (create, add or remove
-  repositories, filters, create, protect or delete an environment) do not lock either: the
-  last write wins.
+  repositories, filters or components, create, protect or delete an environment) do not
+  lock either: the last write wins.
 * The holder renews the lock every 30 seconds. A lock that is not renewed for 2 minutes is
   expired, and the next operator takes it over. Times come from the client clocks.
 * The lock is released when the workflow ends (also with an error), and when you press Esc
@@ -562,6 +634,15 @@ pulp-tui config-example              print an example config
 profile (`--profile`, `$PULP_TUI_PROFILE`, `default_profile`): its own `database`, else
 `[database]`, else the local file. `db migrate` on a profile that uses the local file stops
 with `profile <name> uses the local file; db migrate is only for an external database`.
+
+The export file has `"format": 2`. It carries composite views, their components (by view
+name) and the auto publish flag. A pin is written as a version number, but versions are not
+exported, so `import-cv` (and **I** on Servers) imports every pin as `latest` and prints a
+line for each: `warning: rocky9: component os was pinned to v1; imported as latest` (the TUI
+shows one warning notice). Pin the component again with **e**. A component that the import
+does not find, or that is itself a composite, is skipped with a `warning:` line that names
+it. A format 1 file still imports. A pulp-tui from before composites refuses a format 2
+file. The database needs schema 4 (`pulp-tui db migrate`) for composites.
 
 Logs: `<data-dir>/pulp-tui.log`; level with `PULP_TUI_LOG` (for example
 `PULP_TUI_LOG=pulp_tui=debug`). Secrets are never logged.
