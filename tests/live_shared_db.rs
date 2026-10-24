@@ -1,5 +1,6 @@
 //! The shared Content View database on a real PostgreSQL (tests/env/pulp-env.sh pg-up):
-//! explicit schema creation, two operators sharing state and locks, and the store methods.
+//! explicit schema creation, two operators sharing state and locks, the store methods, and a
+//! profile with its own database next to a local profile.
 //! Each test works in its own PostgreSQL schema (`options=-csearch_path=...`), so reruns
 //! against the same container never meet old rows. No Pulp server is needed.
 
@@ -7,10 +8,11 @@ mod common;
 
 use common::*;
 use futures::future::join_all;
-use pulp_tui::config::Database;
+use pulp_tui::config::{AuthMethod, Config, DATABASE_KEYRING_USER, Database, Profile};
 use pulp_tui::cv::CvLock;
 use pulp_tui::pulp::RepoType;
-use pulp_tui::store::{BindingRepo, CvRepo, CvVersionRepo, PG_MIGRATIONS, Store};
+use pulp_tui::store::{BindingRepo, CvRepo, CvVersionRepo, NotMigrated, PG_MIGRATIONS, Store};
+use pulp_tui::tui::app::{App, NO_PROFILE};
 use sqlx::{Connection, Executor};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,7 +37,7 @@ impl Schema {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, password()).unwrap();
         let secret = Some(format!("file:{}", file.display()));
-        let admin = Database { url: base.clone(), secret: secret.clone(), ca_cert: None }.connect_url().unwrap();
+        let admin = Database { url: base.clone(), secret: secret.clone(), ca_cert: None }.connect_url(DATABASE_KEYRING_USER).unwrap();
         let name = unique("ptui").replace('-', "_");
         sqlx::any::install_default_drivers();
         let mut c = sqlx::AnyConnection::connect(&admin).await.expect("PostgreSQL is not reachable; run tests/env/pulp-env.sh pg-up");
@@ -45,7 +47,7 @@ impl Schema {
     }
 
     fn connect(&self) -> String {
-        self.db.connect_url().unwrap()
+        self.db.connect_url(DATABASE_KEYRING_USER).unwrap()
     }
 
     fn display(&self) -> String {
@@ -299,5 +301,53 @@ async fn store_methods_on_postgres() {
     assert!(st.cv_repos(cv).await.unwrap().is_empty());
     assert!(st.lock_holder(cv).await.unwrap().is_none());
     drop(lock);
+    s.drop_schema().await;
+}
+
+#[tokio::test]
+async fn profile_database_next_to_a_local_profile() {
+    if !live_enabled() {
+        return;
+    }
+    let s = Schema::new().await;
+    let database = |url: &str| Database { url: url.into(), secret: None, ca_cert: None };
+    let profile = |database| Profile { url: "https://pulp.example.com".into(), auth: AuthMethod::None, database, ..Default::default() };
+    // The top-level [database] is a file that must never be opened: `prod` has its own database, `lab` says `local`.
+    let mut cfg = Config { database: Some(database("sqlite:///nonexistent/never-opened.db")), ..Default::default() };
+    cfg.profiles.insert("prod".into(), profile(Some(s.db.clone())));
+    cfg.profiles.insert("lab".into(), profile(Some(database("local"))));
+    let key = cfg.profiles["prod"].server_key();
+    let local = Arc::new(Store::open_in_memory().await.unwrap());
+    let app = App::new(cfg, "/dev/null".into(), local.clone(), Err(NO_PROFILE.into()));
+    assert_eq!(app.cfg.database_for("prod").unwrap().1, "[database]:prod");
+
+    // A fresh schema is not opened, and not migrated by opening it.
+    let e = app.open_store(app.cfg.database_for("prod")).await.unwrap_err();
+    assert_eq!(e.downcast_ref::<NotMigrated>().map(|n| n.from), Some(0), "{e:#}");
+    assert!(!format!("{e:#}").contains(&password()), "the password must not appear in errors: {e:#}");
+    s.migrate().await;
+
+    // One external store per database; `lab` stays in the local file; the [database] file is never touched.
+    let prod = app.open_store(app.cfg.database_for("prod")).await.unwrap();
+    assert!(prod.external && Arc::ptr_eq(&prod, &app.open_store(app.cfg.database_for("prod")).await.unwrap()));
+    assert!(Arc::ptr_eq(&app.open_store(app.cfg.database_for("lab")).await.unwrap(), &local));
+    assert_eq!(app.stores.lock().unwrap().len(), 1);
+    assert!(!std::path::Path::new("/nonexistent").exists());
+    assert_eq!((app.scope("prod"), app.scope("lab")), (Ok(key.clone()), Ok("lab".into())));
+
+    // Rows under the server key are only in prod's database.
+    prod.create_cv(&key, "api", "").await.unwrap();
+    assert!(local.content_views(&key).await.unwrap().is_empty());
+    assert!(local.content_views("prod").await.unwrap().is_empty());
+
+    // Move lab's data from the local file into prod's database under prod's server key.
+    local.create_cv("lab", "web", "from the file").await.unwrap();
+    let r = prod.copy_from(&local, "lab", &key).await.unwrap();
+    assert_eq!((r.views, r.versions, r.environments), (1, 0, 0));
+    let names: Vec<_> = prod.content_views(&key).await.unwrap().into_iter().map(|v| v.name).collect();
+    assert_eq!(names, ["api", "web"]);
+    assert_eq!(prod.aliases().await.unwrap(), vec![local.db_id().to_string()]);
+    assert!(local.aliases().await.unwrap().is_empty());
+    assert_eq!(local.content_views("lab").await.unwrap().len(), 1, "the source is only read");
     s.drop_schema().await;
 }

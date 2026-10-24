@@ -5,14 +5,14 @@ use super::actions::ap;
 use super::form::{FieldKind, Form, FormEvent, PickItem, Source};
 use super::kinds::{self, Act, Kind};
 use super::tasks::TaskCenter;
-use crate::config::{Config, Settings};
+use crate::config::{Config, Database, Settings};
 use crate::cv::CvService;
 use crate::pulp::models::Task;
 use crate::pulp::{Capabilities, PulpClient};
-use crate::store::Store;
+use crate::store::{NotMigrated, Store};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -207,8 +207,12 @@ pub struct App {
     pub cfg: Config,
     pub cfg_path: PathBuf,
     pub store: Arc<Store>,
-    /// `store` itself without a `[database]`; the error text when the shared database did not open.
+    /// The CV store of the active profile: `store` without a database, else its external one, or why that is not open.
     pub cv_store: Result<Arc<Store>, String>,
+    /// Open external stores by connect URL. A key holds the password: never show or log it.
+    pub stores: Arc<std::sync::Mutex<HashMap<String, Arc<Store>>>>,
+    /// The local file `<data_dir>/pulp-tui.db` (set by main; empty in tests).
+    pub local_db: PathBuf,
     pub profile: Option<String>,
     pub conn: Option<Conn>,
     pub connecting: bool,
@@ -242,6 +246,8 @@ impl App {
             cfg_path,
             store,
             cv_store,
+            stores: Default::default(),
+            local_db: PathBuf::new(),
             profile: None,
             conn: None,
             connecting: false,
@@ -306,14 +312,113 @@ impl App {
     /// Content View store scope of a profile: the connection's when it is the connected one,
     /// else from the config. An external store never falls back to the bare profile name.
     pub fn scope(&self, name: &str) -> Result<String, String> {
-        if let (Some(c), Some(true)) = (&self.conn, self.profile.as_deref().map(|p| p == name)) {
+        let active = self.profile.as_deref() == Some(name);
+        if let (Some(c), true) = (&self.conn, active) {
             return Ok(c.scope.clone());
         }
-        match (&self.cv_store, self.cfg.profiles.get(name)) {
-            (Ok(st), Some(p)) => Ok(st.scope(name, p)),
-            (Ok(st), None) if st.external => Err(NO_PROFILE.into()),
-            _ => Ok(name.to_string()), // the local file, or no CV store at all (nothing is read or written)
+        let external = match &self.cv_store {
+            Ok(st) if active => st.external,
+            _ => self.cfg.database_for(name).is_some(),
+        };
+        match self.cfg.profiles.get(name) {
+            Some(p) if external => Ok(p.server_key()),
+            None if external => Err(NO_PROFILE.into()),
+            _ => Ok(name.to_string()), // the local file
         }
+    }
+
+    /// The active profile uses an external database (other operators may share it): the store in use, as in
+    /// `scope`, not the edited config (an Edit applies at the next Connect).
+    pub fn shared(&self) -> bool {
+        match (&self.cv_store, self.profile.as_deref()) {
+            (Ok(st), Some(_)) => st.external,
+            (_, Some(p)) => self.cfg.database_for(p).is_some(),
+            _ => false,
+        }
+    }
+
+    /// The CV store of a database (`None`: the local file). Profiles with one connect URL share one store;
+    /// a failed open is not cached.
+    pub fn open_store(&self, db: Option<(Database, String)>) -> impl Future<Output = anyhow::Result<Arc<Store>>> + Send + 'static {
+        let (local, stores) = (self.store.clone(), self.stores.clone());
+        async move {
+            let Some((d, user)) = db else { return Ok(local) };
+            let url = d.connect_url(&user)?;
+            let hit = stores.lock().unwrap().get(&url).cloned();
+            if let Some(st) = hit {
+                return Ok(st);
+            }
+            let st = Arc::new(Store::open_external(&url, &d.display_url()).await?);
+            Ok(stores.lock().unwrap().entry(url).or_insert(st).clone())
+        }
+    }
+
+    /// The CV store and scope of any profile, also one that is not connected.
+    pub fn profile_store(&self, name: &str) -> impl Future<Output = anyhow::Result<(Arc<Store>, String)>> + Send + 'static {
+        let active = self.cv_store.as_ref().ok().filter(|_| self.profile.as_deref() == Some(name)).cloned();
+        let (open, scope) = (self.open_store(self.cfg.database_for(name)), self.scope(name));
+        async move {
+            let scope = scope.map_err(anyhow::Error::msg)?;
+            let st = match active {
+                Some(st) => st,
+                None => open.await?,
+            };
+            Ok((st, scope))
+        }
+    }
+
+    /// Open the store of `db` in a job, then call `done`. A database that is not migrated gives `done(Err)`,
+    /// then the offer to migrate it (not for a read-only profile, not over an open modal).
+    pub fn with_store(
+        &mut self,
+        name: &str,
+        read_only: bool,
+        db: Option<(Database, String)>,
+        done: impl Fn(&mut App, Result<Arc<Store>, String>) + Send + Sync + 'static,
+    ) {
+        let done = Arc::new(done);
+        let Some((d, user)) = db else {
+            let local = self.store.clone();
+            return done(self, Ok(local));
+        };
+        let (name, display, open) = (name.to_string(), d.display_url(), self.open_store(Some((d.clone(), user.clone()))));
+        self.spawn(format!("open database {display}"), true, async move {
+            let r = open.await;
+            ap(move |app| {
+                let e = match r {
+                    Ok(st) => return done(app, Ok(st)),
+                    Err(e) => e,
+                };
+                let Some(nm) = e.downcast_ref::<NotMigrated>() else { return done(app, Err(format!("{e:#}"))) };
+                let how = format!("run pulp-tui db migrate --profile {name}");
+                done(app, Err(format!("{display}: database not migrated (open Servers, Connect again to migrate, or {how})")));
+                if read_only && Act::MigrateDb.mutates(&Kind::Profiles, true) {
+                    app.notify(Level::Warn, format!("profile {name} is read-only, so {display} is not migrated ({how})"));
+                    return;
+                }
+                if app.modal.is_some() {
+                    return; // the CV screens say how to migrate
+                }
+                let from = if nm.from == 0 { "empty".to_string() } else { nm.from.to_string() };
+                let lines = vec![
+                    format!("Database: {display}"),
+                    format!("Schema: {from} -> {}", nm.to),
+                    format!("Other operators using this database need pulp-tui {} or newer after this.", env!("CARGO_PKG_VERSION")),
+                    "Esc: do not migrate now.".into(),
+                ];
+                app.confirm(format!("Migrate database of {name}?"), lines, move |app| {
+                    let open = app.open_store(Some((d.clone(), user.clone())));
+                    app.spawn(format!("migrate {display}"), false, async move {
+                        let (a, b) = Store::migrate_external(&d.connect_url(&user)?, &display).await?;
+                        let st = open.await?;
+                        ap(move |app| {
+                            app.ok(format!("{display}: schema {a} -> {b}"));
+                            done(app, Ok(st));
+                        })
+                    });
+                });
+            })
+        });
     }
 
     /// Run `f` in the background against the active server.
@@ -482,9 +587,24 @@ impl App {
         );
         self.dashboard.clear();
         self.history.clear();
+        let db = self.cfg.database_for(name);
+        if let Some((d, _)) = &db {
+            self.cv_store = Err(format!("{}: opening", d.display_url())); // never the previous profile's store
+        }
+        let n = name.to_string();
+        self.with_store(name, p.read_only, db, move |app, r| {
+            if app.profile.as_deref() != Some(n.as_str()) {
+                return; // switched again meanwhile
+            }
+            app.cv_store = r;
+            // Also on an error: the screen then shows it instead of "opening".
+            if matches!(app.screen, Screen::Dashboard | Screen::List(Kind::ContentViews | Kind::CvVersions { .. } | Kind::Environments)) {
+                app.reload();
+            }
+        });
+        // After the store is set: `scope` reads it. Always Ok, the profile exists.
+        let scope = self.scope(name).unwrap_or_default();
         let (settings, name) = (self.cfg.settings.clone(), name.to_string());
-        // From the same Profile as the client. Without a CV store nothing uses it.
-        let scope = self.cv_store.as_ref().map(|st| st.scope(&name, &p)).unwrap_or_else(|_| name.clone());
         let fut = async move {
             let client = PulpClient::new(&name, &p, &settings)?;
             let caps = Capabilities::detect(&client).await?;
@@ -915,7 +1035,7 @@ impl App {
 
     pub fn available_actions(&self, item: &Value) -> Vec<Act> {
         let ro = self.conn.as_ref().is_some_and(|c| c.client.read_only());
-        let shared = self.cfg.database.is_some();
+        let shared = self.shared();
         self.list
             .kind
             .actions()
@@ -1119,7 +1239,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AuthMethod, Profile};
+    use crate::config::{AuthMethod, Database, Profile};
+    use crate::store::{NotMigrated, PG_MIGRATIONS};
     use crate::tui::form::Field;
 
     /// A migrated external SQLite CV store (`Store::external` is true).
@@ -1176,6 +1297,367 @@ mod tests {
         assert_eq!(app.ctx().unwrap().scope, key);
         assert_eq!(app.scope("lab"), Ok(key));
         assert_eq!(app.ctx().unwrap().actor, crate::store::actor(None), "the mock server names no user");
+    }
+
+    fn db(url: &str) -> Option<Database> {
+        Some(Database { url: url.into(), secret: None, ca_cert: None })
+    }
+
+    async fn pulp() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let ok = ResponseTemplate::new(200).set_body_json(serde_json::json!({"versions": []}));
+        Mock::given(method("GET")).and(path("/pulp/api/v3/status/")).respond_with(ok).mount(&server).await;
+        server
+    }
+
+    async fn settle(app: &mut App, rx: &mut UnboundedReceiver<Msg>) {
+        while !app.jobs.is_empty() {
+            let m = rx.recv().await.unwrap();
+            app.handle_msg(m);
+        }
+    }
+
+    #[tokio::test]
+    async fn profiles_with_one_database_share_one_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("cv.db").display());
+        Store::migrate_external(&url, "cv.db").await.unwrap();
+        let new_url = format!("sqlite://{}", dir.path().join("new.db").display());
+        let mut cfg = Config::default();
+        for (name, database) in [("lab", db(&url)), ("prod", db(&url)), ("new", db(&new_url)), ("file", None)] {
+            let p = Profile { url: "https://pulp.example.com".into(), auth: AuthMethod::None, database, ..Default::default() };
+            cfg.profiles.insert(name.into(), p);
+        }
+        let local = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(cfg, "/dev/null".into(), local.clone(), Err(NO_PROFILE.into()));
+        let a = app.open_store(app.cfg.database_for("lab")).await.unwrap();
+        let b = app.open_store(app.cfg.database_for("prod")).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b) && a.external);
+        assert!(Arc::ptr_eq(&app.open_store(app.cfg.database_for("file")).await.unwrap(), &local));
+        assert!(app.open_store(app.cfg.database_for("new")).await.unwrap_err().downcast_ref::<NotMigrated>().is_some());
+        Store::migrate_external(&new_url, "new.db").await.unwrap();
+        assert!(app.open_store(app.cfg.database_for("new")).await.is_ok(), "a failed open is not cached");
+        app.profile = Some("lab".into());
+        assert!(app.shared());
+        app.profile = Some("file".into());
+        assert!(!app.shared());
+    }
+
+    #[tokio::test]
+    async fn migrate_offer_for_an_empty_sqlite_file() {
+        let server = pulp().await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(Store::open_in_memory().await.unwrap());
+        // lab on the mock server, its database a 0-byte SQLite file.
+        let new_app = |file: &str, read_only: bool| {
+            let f = dir.path().join(file);
+            std::fs::write(&f, b"").unwrap();
+            let mut cfg = lab(&server.uri());
+            let p = cfg.profiles.get_mut("lab").unwrap();
+            p.database = db(&format!("sqlite://{}", f.display()));
+            p.read_only = read_only;
+            let mut app = App::new(cfg, "/dev/null".into(), local.clone(), Err(NO_PROFILE.into()));
+            let rx = app.rx.take().unwrap();
+            (app, rx)
+        };
+        let (mut app, mut rx) = new_app("cv.db", false);
+        app.connect("lab");
+        settle(&mut app, &mut rx).await;
+        let not = "database not migrated (open Servers, Connect again to migrate, or run pulp-tui db migrate --profile lab)";
+        assert!(app.cv_store.as_ref().unwrap_err().contains(not));
+        let Some(Modal::Confirm { title, lines, on_yes, .. }) = app.modal.take() else { panic!("no migrate offer") };
+        assert_eq!(title, "Migrate database of lab?");
+        assert!(lines.contains(&format!("Schema: empty -> {}", PG_MIGRATIONS.len())));
+        assert!(lines.iter().any(|l| l.contains(env!("CARGO_PKG_VERSION"))));
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        let st = app.cv_store.clone().unwrap();
+        assert!(st.external);
+        assert_eq!(st.schema_version().await.unwrap(), PG_MIGRATIONS.len() as i64);
+
+        let (mut ro, mut rx) = new_app("ro.db", true);
+        ro.connect("lab");
+        settle(&mut ro, &mut rx).await;
+        assert!(ro.modal.is_none());
+        assert!(ro.notices.iter().any(|n| n.text.contains("is read-only, so")));
+        assert!(ro.cv_store.as_ref().unwrap_err().contains(not));
+
+        let (mut busy, mut rx) = new_app("busy.db", false);
+        busy.connect("lab");
+        busy.form(Form::new("t", vec![]), |_, _| Ok(()));
+        settle(&mut busy, &mut rx).await;
+        assert!(matches!(busy.modal, Some(Modal::Form { .. })), "the offer never replaces an open modal");
+    }
+
+    #[tokio::test]
+    async fn switching_profiles_never_shows_the_old_store() {
+        let server = pulp().await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("cv.db").display());
+        Store::migrate_external(&url, "cv.db").await.unwrap();
+        let mut cfg = lab(&server.uri());
+        cfg.profiles.get_mut("lab").unwrap().database = db(&url);
+        cfg.profiles.insert("prod".into(), Profile { url: server.uri(), auth: AuthMethod::None, ..Default::default() });
+        let local = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(cfg, "/dev/null".into(), local.clone(), Ok(local.clone()));
+        let mut rx = app.rx.take().unwrap();
+        app.connect("lab");
+        assert!(app.cv_store.as_ref().is_err_and(|e| e.ends_with(": opening")), "never the previous store");
+        app.connect("prod");
+        assert!(Arc::ptr_eq(app.cv_store.as_ref().unwrap(), &local));
+        settle(&mut app, &mut rx).await;
+        assert!(Arc::ptr_eq(app.cv_store.as_ref().unwrap(), &local), "lab's late result is dropped");
+        app.connect("lab");
+        settle(&mut app, &mut rx).await;
+        assert!(app.cv_store.as_ref().unwrap().external);
+        assert_eq!(app.ctx().unwrap().scope, format!("{}/pulp/#default", server.uri()));
+    }
+
+    #[tokio::test]
+    async fn store_errors_hide_the_database_password() {
+        unsafe { std::env::set_var("PTUI_TEST_PROFILE_DBPW", "hunter2-profile") };
+        let mut cfg = lab("https://pulp.example.com");
+        cfg.profiles.get_mut("lab").unwrap().database =
+            Some(Database { url: "postgres://u@127.0.0.1:1/x".into(), secret: Some("env:PTUI_TEST_PROFILE_DBPW".into()), ca_cert: None });
+        let local = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(cfg, "/dev/null".into(), local.clone(), Ok(local));
+        let mut rx = app.rx.take().unwrap();
+        app.profile = Some("lab".into());
+        app.with_store("lab", false, app.cfg.database_for("lab"), |app, r| app.cv_store = r);
+        settle(&mut app, &mut rx).await;
+        let e = app.cv_store.clone().unwrap_err();
+        assert!(e.starts_with("postgres://u@127.0.0.1:1/x: ") && !e.contains("hunter2"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn shared_follows_the_store_in_use_not_the_edited_config() {
+        let server = pulp().await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("cv.db").display());
+        Store::migrate_external(&url, "cv.db").await.unwrap();
+        let mut cfg = lab(&server.uri());
+        let p = cfg.profiles.get_mut("lab").unwrap();
+        (p.database, p.read_only) = (db(&url), true);
+        let local = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(cfg, "/dev/null".into(), local, Err(NO_PROFILE.into()));
+        let mut rx = app.rx.take().unwrap();
+        app.connect("lab");
+        settle(&mut app, &mut rx).await;
+        // Edit to the local file saves at once, but this session keeps writing to the shared store until Connect.
+        app.cfg.profiles.get_mut("lab").unwrap().database = db(crate::config::LOCAL_DATABASE);
+        app.list = ListState::new(Kind::ContentViews);
+        assert!(app.read_only() && app.shared());
+        assert!(!app.available_actions(&Value::Null).contains(&Act::Create));
+        super::super::actions::run(&mut app, Act::Create, Value::Null);
+        assert!(app.modal.is_none() && app.notices.iter().any(|n| n.text.contains("read-only mode")));
+        // A profile edited to a database while it uses the local file does not write to it either.
+        app.cv_store = Ok(app.store.clone());
+        app.cfg.profiles.get_mut("lab").unwrap().database = db(&url);
+        assert!(!app.shared());
+    }
+
+    #[tokio::test]
+    async fn saving_a_new_database_offers_the_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cv.db"), b"").unwrap();
+        let mut app = app_on(Kind::Profiles).await;
+        app.cfg_path = dir.path().join("config.toml");
+        let mut rx = app.rx.take().unwrap();
+        super::super::actions::run(&mut app, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no create form") };
+        let file = dir.path().join("cv.db").display().to_string();
+        for (key, value) in [("name", "web"), ("url", "https://pulp.example.com"), ("auth", "none"), ("database", &file)] {
+            form.fields.iter_mut().find(|f| f.key == key).unwrap().value = value.into();
+        }
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(matches!(&app.modal, Some(Modal::Confirm { title, .. }) if title == "Migrate database of web?"));
+        let saved = Config::load(&app.cfg_path).unwrap().profiles["web"].database.clone().unwrap();
+        assert_eq!(saved.url, format!("sqlite://{file}"));
+
+        // The same database again (an edit that leaves the field alone) is not offered a second time.
+        app.modal = None;
+        super::super::actions::run(&mut app, Act::Edit, serde_json::json!({"name": "web"}));
+        let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no edit form") };
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none());
+    }
+
+    fn set(form: &mut Form, key: &str, value: &str) {
+        form.fields.iter_mut().find(|f| f.key == key).unwrap().value = value.into();
+    }
+
+    /// Edit `lab` on the Servers screen: its database becomes `value`.
+    fn edit(app: &mut App, value: &str) {
+        super::super::actions::run(app, Act::Edit, serde_json::json!({"name": "lab"}));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
+        set(&mut form, "database", value);
+        submit(app, &form).unwrap();
+    }
+
+    /// `lab` on the local file with a Content View "web"; `<dir>/cv.db` is a migrated external SQLite file.
+    async fn lab_with_data(dir: &tempfile::TempDir) -> (App, UnboundedReceiver<Msg>, Arc<Store>, String) {
+        let new = external_store(dir).await;
+        let mut app = app_on(Kind::Profiles).await;
+        app.cfg = lab("https://pulp.example.com");
+        app.cfg_path = dir.path().join("config.toml");
+        app.store.create_cv("lab", "web", "").await.unwrap();
+        let rx = app.rx.take().unwrap();
+        (app, rx, new, dir.path().join("cv.db").display().to_string())
+    }
+
+    #[tokio::test]
+    async fn database_change_with_data_offers_copy_and_keeps_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut rx, _new, file) = lab_with_data(&dir).await;
+        edit(&mut app, &file);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no copy offer") };
+        assert_eq!(form.title, "Database of lab changes");
+        assert!(form.notes.contains(&"1 Content View(s), 0 version(s), 0 environment(s) of this server in the old database.".to_string()));
+        assert_eq!(app.cfg.profiles["lab"].database, None, "nothing is saved before the choice");
+        set(&mut form, "choice", "copy and switch");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let saved = Config::load(&app.cfg_path).unwrap().profiles["lab"].database.clone().unwrap();
+        assert_eq!(saved.url, format!("sqlite://{file}"));
+        let new = app.open_store(app.cfg.database_for("lab")).await.unwrap();
+        assert_eq!(new.content_views(&app.cfg.profiles["lab"].server_key()).await.unwrap()[0].name, "web");
+        assert!(new.aliases().await.unwrap().contains(&app.store.db_id().to_string()), "copies keep ownership of the old Pulp objects");
+        assert_eq!(app.store.content_views("lab").await.unwrap().len(), 1, "the old database is only read");
+    }
+
+    #[tokio::test]
+    async fn copy_refusal_leaves_the_profile_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut rx, new, file) = lab_with_data(&dir).await;
+        new.create_cv(&app.cfg.profiles["lab"].server_key(), "web", "").await.unwrap();
+        edit(&mut app, &file);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no copy offer") };
+        set(&mut form, "choice", "copy and switch");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.cfg.profiles["lab"].database, None);
+        assert_eq!(Config::load(&app.cfg_path).unwrap_or_default().profiles.get("lab").and_then(|p| p.database.clone()), None);
+        assert!(app.notices.iter().any(|n| n.text.contains("never merges")));
+        // Read-only: only "switch without copy"; it saves, and the old data stays.
+        app.cfg.profiles.get_mut("lab").unwrap().read_only = true;
+        edit(&mut app, &file);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no choice form") };
+        assert!(matches!(&form.fields[0].kind, FieldKind::Choice(c) if c == &["switch without copy"]));
+        assert!(form.notes.contains(&"Read-only profile: copy is not offered.".to_string()));
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.cfg.profiles["lab"].database.is_some());
+        assert_eq!(app.store.content_views("lab").await.unwrap().len(), 1);
+    }
+
+    /// Edit `lab` to the database `path`, choose "copy and switch" and submit.
+    async fn copy_to(app: &mut App, rx: &mut UnboundedReceiver<Msg>, path: &str) {
+        edit(app, path);
+        settle(app, rx).await;
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no copy offer") };
+        set(&mut form, "choice", "copy and switch");
+        submit(app, &form).unwrap();
+        settle(app, rx).await;
+    }
+
+    #[tokio::test]
+    async fn copy_into_a_missing_database_asks_to_migrate_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut rx, _new, _file) = lab_with_data(&dir).await;
+        let missing = dir.path().join("new.db");
+        let path = missing.display().to_string();
+        // Esc on the migrate question: the profile is not saved, in memory or in the file.
+        copy_to(&mut app, &mut rx, &path).await;
+        assert!(matches!(&app.modal, Some(Modal::Confirm { title, lines, .. })
+            if title == "Migrate database of lab?" && lines.last().unwrap() == "Esc: do not migrate now."));
+        let note = app.notices.iter().find(|n| n.text.contains("not changed")).expect("no notice").text.clone();
+        assert!(note.contains("database not migrated") && !note.contains("db migrate"), "{note}");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none() && !missing.exists());
+        assert_eq!(app.cfg.profiles["lab"].database, None);
+        assert_eq!(Config::load(&app.cfg_path).unwrap_or_default().profiles.get("lab").and_then(|p| p.database.clone()), None);
+        // Yes: migrate, copy, then save.
+        copy_to(&mut app, &mut rx, &path).await;
+        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no migrate offer") };
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(Config::load(&app.cfg_path).unwrap().profiles["lab"].database.as_ref().unwrap().url, format!("sqlite://{path}"));
+        let new = app.open_store(app.cfg.database_for("lab")).await.unwrap();
+        assert_eq!(new.content_views(&app.cfg.profiles["lab"].server_key()).await.unwrap()[0].name, "web");
+        assert!(app.notices.iter().any(|n| n.text.starts_with("copied 1 content view(s), 0 version(s), 0 environment(s) into ")));
+    }
+
+    #[tokio::test]
+    async fn copy_then_a_failed_save_says_the_rows_were_copied_and_the_profile_was_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut rx, _new, file) = lab_with_data(&dir).await;
+        app.cfg_path = dir.path().join("cv.db").join("config.toml"); // its parent is a file: the save fails
+        copy_to(&mut app, &mut rx, &file).await;
+        let e = app.notices.iter().find(|n| n.level == Level::Error).expect("no error").text.clone();
+        assert!(e.starts_with("copied 1 content view(s)") && e.contains("but profile lab was not saved: cannot save "), "{e}");
+        assert_eq!(app.cfg.profiles["lab"].database, None, "memory still agrees with the file");
+    }
+
+    #[tokio::test]
+    async fn changing_only_the_database_secret_saves_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut rx, new, file) = lab_with_data(&dir).await;
+        app.cfg.profiles.get_mut("lab").unwrap().database = db(&format!("sqlite://{file}"));
+        new.create_cv(&app.cfg.profiles["lab"].server_key(), "web", "").await.unwrap();
+        super::super::actions::run(&mut app, Act::Edit, serde_json::json!({"name": "lab"}));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
+        set(&mut form, "db_secret", "env:PTUI_TEST_OTHER_SECRET");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "the same database is not copied onto itself");
+        let saved = Config::load(&app.cfg_path).unwrap().profiles["lab"].database.clone().unwrap();
+        assert_eq!((saved.url, saved.secret), (format!("sqlite://{file}"), Some("env:PTUI_TEST_OTHER_SECRET".into())));
+    }
+
+    #[tokio::test]
+    async fn database_change_without_data_saves_at_once_and_an_unreadable_old_one_offers_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut rx, _new, file) = lab_with_data(&dir).await;
+        app.store.delete_cv(app.store.content_views("lab").await.unwrap()[0].id).await.unwrap();
+        edit(&mut app, &file);
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no data, no question");
+        assert_eq!(Config::load(&app.cfg_path).unwrap().profiles["lab"].database.as_ref().unwrap().url, format!("sqlite://{file}"));
+        // The old database is an empty file: nothing can be counted or copied.
+        let empty = dir.path().join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        app.cfg.profiles.get_mut("lab").unwrap().database = db(&format!("sqlite://{}", empty.display()));
+        edit(&mut app, &file);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no choice form") };
+        assert!(matches!(&form.fields[0].kind, FieldKind::Choice(c) if c == &["switch without copy"]));
+        assert!(form.notes.iter().any(|n| n.starts_with("The old database is unavailable (")));
+    }
+
+    #[tokio::test]
+    async fn store_secret_asks_which_secret_for_an_own_database() {
+        let mut app = app_on(Kind::Profiles).await;
+        let local = Database { url: crate::config::LOCAL_DATABASE.into(), secret: None, ca_cert: None };
+        for (name, database) in [("prod", db("postgres://u@h/x")), ("lab", None), ("file", Some(local))] {
+            let p = Profile { url: "https://pulp.example.com".into(), auth: AuthMethod::None, database, ..Default::default() };
+            app.cfg.profiles.insert(name.into(), p);
+        }
+        for (name, asks) in [("prod", true), ("lab", false), ("file", false)] {
+            super::super::actions::run(&mut app, Act::StoreSecret, serde_json::json!({ "name": name }));
+            let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form for {name}") };
+            assert_eq!(form.fields.iter().any(|f| f.key == "target"), asks, "{name}");
+            if asks {
+                assert_eq!(form.fields[0].key, "target", "the question comes first");
+            }
+        }
     }
 
     #[tokio::test]

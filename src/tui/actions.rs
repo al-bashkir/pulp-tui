@@ -4,15 +4,18 @@
 use super::app::{App, Apply, Ctx, Level, item_key};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, s, short};
-use crate::config::{AuthMethod, Profile};
+use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile, database_keyring_user};
 use crate::filters::{Selector, parse_rules};
 use crate::pulp::client::Page;
 use crate::pulp::models::Task;
 use crate::pulp::ops;
 use crate::pulp::{Capabilities, Mutation, PulpClient, RepoType};
+use crate::store::Store;
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
 use std::future::Future;
+use std::path::Path;
+use std::sync::Arc;
 
 pub fn ap(f: impl FnOnce(&mut App) + Send + 'static) -> anyhow::Result<Apply> {
     Ok(Box::new(f))
@@ -77,7 +80,7 @@ pub fn copy_to_clipboard(s: &str) {
 
 pub fn run(app: &mut App, act: Act, item: Value) {
     let kind = app.list.kind.clone();
-    if act.mutates(&kind, app.cfg.database.is_some()) && app.read_only() {
+    if act.mutates(&kind, app.shared()) && app.read_only() {
         app.error("read-only mode: this action changes the server");
         return;
     }
@@ -156,13 +159,17 @@ fn task_lines(item: &Value) -> Vec<String> {
 
 // ---- profiles ----------------------------------------------------------------------
 
-fn profile_form(name: Option<&str>, p: &Profile) -> Form {
+/// `inherited` is the top-level `[database]`; `local_db` is the local file, shown for "no external database".
+fn profile_form(name: Option<&str>, p: &Profile, inherited: Option<&Database>, local_db: &Path) -> Form {
     let auth = ["basic", "bearer", "none"].map(String::from).to_vec();
     let mut fields = vec![];
     if name.is_none() {
         fields.push(Field::text("name", "Profile name").required());
     }
     let opt = |o: &Option<std::path::PathBuf>| o.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+    // The stored text, unchanged: an untouched form must store no `database` block.
+    let db = p.database.as_ref().or(inherited).filter(|d| !d.is_local());
+    let db_url = db.map_or_else(|| local_db.display().to_string(), |d| d.url.clone());
     fields.extend([
         Field::text("url", "Server URL").required().value(&p.url).help("scheme://host[:port], e.g. https://pulp.example.com"),
         Field::text("api_root", "API root").value(&p.api_root).help("usually /pulp/"),
@@ -180,6 +187,13 @@ fn profile_form(name: Option<&str>, p: &Profile) -> Form {
         Field::text("client_cert", "mTLS client cert (PEM path)").value(opt(&p.client_cert)),
         Field::text("client_key", "mTLS client key (PEM path)").value(opt(&p.client_key)),
         Field::text("proxy", "HTTP(S) proxy URL").value(p.proxy.clone().unwrap_or_default()),
+        Field::text("database", "Database")
+            .value(db_url)
+            .help("local, a file path, postgres://user@host:5432/db or sqlite:///path; never a password"),
+        Field::text("db_secret", "Database secret")
+            .value(db.and_then(|d| d.secret.clone()).unwrap_or_default())
+            .help("env:VAR, file:/path or keyring (keyring user [database]:<profile>)"),
+        Field::text("db_ca_cert", "Database CA (PEM path)").value(opt(&db.and_then(|d| d.ca_cert.clone()))),
         Field::new("timeout_secs", "Timeout (s)", FieldKind::Number).value(p.timeout_secs.to_string()),
         Field::new("read_only", "Read-only", FieldKind::Bool).value(p.read_only.to_string()),
         Field::new("production", "Production (red banner)", FieldKind::Bool).value(p.production.to_string()),
@@ -188,7 +202,20 @@ fn profile_form(name: Option<&str>, p: &Profile) -> Form {
         .note("TLS certificates are always verified. Secrets are referenced, never stored in the config file.")
 }
 
-fn profile_from_form(f: &Form) -> Result<Profile, String> {
+/// The `database` field as a block. `None`: the same database the profile would get without a block.
+fn database_from_form(f: &Form, inherited: Option<&Database>, local_db: &Path) -> Option<Database> {
+    let (v, local) = (f.get("database"), local_db.display().to_string());
+    let marker = Database { url: LOCAL_DATABASE.into(), secret: None, ca_cert: None };
+    let db = if v.is_empty() || v == LOCAL_DATABASE || v == local || v.strip_prefix("sqlite://") == Some(local.as_str()) {
+        marker.clone()
+    } else {
+        let url = if v.starts_with('/') { format!("sqlite://{v}") } else { v.to_string() };
+        Database { url, secret: f.opt("db_secret").map(Into::into), ca_cert: f.opt("db_ca_cert").map(Into::into) }
+    };
+    (db != *inherited.unwrap_or(&marker)).then_some(db)
+}
+
+fn profile_from_form(f: &Form, inherited: Option<&Database>, local_db: &Path) -> Result<Profile, String> {
     let path = |k: &str| f.opt(k).map(std::path::PathBuf::from);
     let p = Profile {
         url: f.get("url").trim_end_matches('/').to_string(),
@@ -208,13 +235,143 @@ fn profile_from_form(f: &Form) -> Result<Profile, String> {
         timeout_secs: f.number("timeout_secs").unwrap_or(30).max(1) as u64,
         read_only: f.bool("read_only"),
         production: f.bool("production"),
+        database: database_from_form(f, inherited, local_db),
     };
     p.validate().map_err(|e| format!("{e:#}"))?;
     Ok(p)
 }
 
-fn save_config(app: &mut App) -> Result<(), String> {
-    app.cfg.save(&app.cfg_path).map_err(|e| format!("cannot save {}: {e:#}", app.cfg_path.display()))
+fn save_config(app: &App, cfg: &crate::config::Config) -> Result<(), String> {
+    cfg.save(&app.cfg_path).map_err(|e| format!("cannot save {}: {e:#}", app.cfg_path.display()))
+}
+
+/// After a save that changed the database of `name`: open it now, so a wrong URL or secret shows up here
+/// and a database without the schema gets the offer to migrate it.
+fn check_database(app: &mut App, name: &str) {
+    let read_only = app.cfg.profiles.get(name).is_some_and(|p| p.read_only);
+    let n = name.to_string();
+    app.with_store(name, read_only, app.cfg.database_for(name), move |app, r| {
+        if let Err(e) = r {
+            app.notify(Level::Warn, format!("profile {n}: {e}"));
+        }
+    });
+}
+
+/// Save the config file with the profile, then use it and reload. A failed save leaves the config in memory as it was.
+fn put_profile(app: &mut App, name: &str, p: Profile) -> Result<(), String> {
+    let mut next = app.cfg.clone();
+    next.profiles.insert(name.to_string(), p);
+    save_config(app, &next)?;
+    app.cfg = next;
+    app.reload();
+    Ok(())
+}
+
+fn location(db: &Option<(Database, String)>, local_db: &Path) -> String {
+    db.as_ref().map_or_else(|| format!("the local file {}", local_db.display()), |(d, _)| d.display_url())
+}
+
+/// Save a profile whose database changed, and open the new one.
+fn switch_database(app: &mut App, name: &str, p: Profile) -> Result<(), String> {
+    put_profile(app, name, p)?;
+    app.ok(format!("profile {name} saved (reconnect to apply)"));
+    check_database(app, name);
+    Ok(())
+}
+
+/// Edit changed the database of `name`. Count what the old one holds for this server: nothing, and the profile
+/// is saved; else offer to copy it first. Nothing is written to the old database, and the profile stays as it
+/// was until the copy succeeds.
+fn change_database(app: &mut App, name: String, p: Profile, old: Option<(Database, String)>, new: Option<(Database, String)>) {
+    let cur = app.cfg.profiles.get(&name).cloned().unwrap_or_else(|| p.clone());
+    let (open, label) = (app.open_store(old.clone()), format!("database impact of {name}"));
+    app.spawn(label, false, async move {
+        let counted = async {
+            let st = open.await?;
+            let scope = st.scope(&name, &cur);
+            let views = st.content_views(&scope).await?;
+            let mut versions = 0;
+            for v in &views {
+                versions += st.versions(v.id).await?.iter().filter(|x| x.state != "deleted").count();
+            }
+            let envs = st.environments(&scope).await?.iter().filter(|e| e.prior_id.is_some()).count();
+            anyhow::Ok((st, scope, [views.len(), versions, envs]))
+        }
+        .await;
+        ap(move |app| match counted {
+            Ok((_, _, [0, _, 0])) => {
+                if let Err(e) = switch_database(app, &name, p) {
+                    app.error(e);
+                }
+            }
+            Ok((st, scope, counts)) => offer_copy(app, name, p, (old, new), Some((st, scope)), Ok(counts)),
+            Err(e) => offer_copy(app, name, p, (old, new), None, Err(format!("{e:#}"))),
+        })
+    });
+}
+
+type Databases = (Option<(Database, String)>, Option<(Database, String)>);
+
+/// The choice form of `change_database`. `old_store` is `None` when the old database cannot be read.
+fn offer_copy(
+    app: &mut App,
+    name: String,
+    p: Profile,
+    (old, new): Databases,
+    old_store: Option<(Arc<Store>, String)>,
+    counts: Result<[usize; 3], String>,
+) {
+    let read_only = p.read_only && Act::CopyDb.mutates(&Kind::Profiles, true);
+    let copy = old_store.is_some() && !read_only;
+    let (from, to) = (location(&old, &app.local_db), location(&new, &app.local_db));
+    let mut choices = vec!["switch without copy".to_string()];
+    if copy {
+        choices.insert(0, "copy and switch".into());
+    }
+    let mut form = Form::new(format!("Database of {name} changes"), vec![Field::new("choice", "On save", FieldKind::Choice(choices))])
+        .note(format!("Old: {from}"))
+        .note(format!("New: {to}"));
+    form = match counts {
+        Ok([v, n, e]) => form.note(format!("{v} Content View(s), {n} version(s), {e} environment(s) of this server in the old database.")),
+        Err(e) => form.note(format!("The old database is unavailable ({e}); nothing can be counted or copied.")),
+    };
+    if copy {
+        form = form.note(
+            "copy and switch: copy them, then save. The copies keep ownership of the existing Pulp objects. The old database is only read.",
+        );
+    }
+    form = form.note("switch without copy: save only. The old data stays in the old database; the new one refuses its Pulp objects, so publish and promote of these views fail there.");
+    if read_only {
+        form = form.note("Read-only profile: copy is not offered.");
+    }
+    app.form(form.note("Esc: cancel; the profile is not changed."), move |app, f| {
+        let (Some((old_st, old_scope)), "copy and switch") = (&old_store, f.get("choice")) else {
+            return switch_database(app, &name, p.clone());
+        };
+        let (n, p, to, old_st, old_scope) = (name.clone(), p.clone(), to.clone(), old_st.clone(), old_scope.clone());
+        app.with_store(&name, p.read_only, new.clone(), move |app, r| {
+            let st = match r {
+                Ok(st) => st,
+                // Cut the CLI hint of `with_store`: it names the saved database, and this profile is not saved.
+                Err(e) => return app.error(format!("profile {n} not changed: {}", e.split(" (open Servers").next().unwrap_or(&e))),
+            };
+            let (n, p, to, old_st, old_scope) = (n.clone(), p.clone(), to.clone(), old_st.clone(), old_scope.clone());
+            app.spawn(format!("copy {n} data"), false, async move {
+                let r = st.copy_from(&old_st, &old_scope, &st.scope(&n, &p)).await?;
+                ap(move |app| {
+                    let copied = format!(
+                        "copied {} content view(s), {} version(s), {} environment(s) into {to}",
+                        r.views, r.versions, r.environments
+                    );
+                    match put_profile(app, &n, p) {
+                        Ok(()) => app.ok(format!("{copied}; profile {n} saved (reconnect to apply)")),
+                        Err(e) => app.error(format!("{copied}, but profile {n} was not saved: {e}")),
+                    }
+                })
+            });
+        });
+        Ok(())
+    });
 }
 
 fn profile_action(app: &mut App, act: Act, item: Value) {
@@ -239,36 +396,55 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
             };
             app.spawn("test connection".into(), false, fut);
         }
-        Act::Create => app.form(profile_form(None, &Profile::default()), |app, f| {
-            let name = f.get("name").to_string();
-            crate::store::validate_name(&name).map_err(|e| e.to_string())?;
-            if app.cfg.profiles.contains_key(&name) {
-                return Err(format!("profile {name} exists"));
-            }
-            app.cfg.profiles.insert(name.clone(), profile_from_form(f)?);
-            if app.cfg.default_profile.is_none() {
-                app.cfg.default_profile = Some(name.clone());
-            }
-            save_config(app)?;
-            app.ok(format!("profile {name} saved"));
-            app.reload();
-            Ok(())
-        }),
-        Act::Edit => {
-            let Some(p) = app.cfg.profiles.get(&name).cloned() else { return };
-            app.form(profile_form(Some(&name), &p), move |app, f| {
-                app.cfg.profiles.insert(name.clone(), profile_from_form(f)?);
-                save_config(app)?;
-                app.ok(format!("profile {name} saved (reconnect to apply)"));
+        Act::Create => {
+            let form = profile_form(None, &Profile::default(), app.cfg.database.as_ref(), &app.local_db);
+            app.form(form, |app, f| {
+                let name = f.get("name").to_string();
+                crate::store::validate_name(&name).map_err(|e| e.to_string())?;
+                if app.cfg.profiles.contains_key(&name) {
+                    return Err(format!("profile {name} exists"));
+                }
+                let before = app.cfg.database_for(&name);
+                app.cfg.profiles.insert(name.clone(), profile_from_form(f, app.cfg.database.as_ref(), &app.local_db)?);
+                if app.cfg.default_profile.is_none() {
+                    app.cfg.default_profile = Some(name.clone());
+                }
+                save_config(app, &app.cfg)?;
+                app.ok(format!("profile {name} saved"));
+                if app.cfg.database_for(&name) != before {
+                    check_database(app, &name);
+                }
                 app.reload();
                 Ok(())
             });
         }
+        Act::Edit => {
+            let Some(p) = app.cfg.profiles.get(&name).cloned() else { return };
+            let form = profile_form(Some(&name), &p, app.cfg.database.as_ref(), &app.local_db);
+            app.form(form, move |app, f| {
+                let edited = profile_from_form(f, app.cfg.database.as_ref(), &app.local_db)?;
+                let old = app.cfg.database_for(&name);
+                let mut next = app.cfg.clone();
+                next.profiles.insert(name.clone(), edited.clone());
+                let new = next.database_for(&name);
+                // The place decides the copy offer; another secret or CA for the same URL is a plain save.
+                let place = |d: &Option<(Database, String)>| d.as_ref().map(|(d, _)| d.url.clone());
+                if place(&old) != place(&new) {
+                    change_database(app, name.clone(), edited, old, new);
+                } else {
+                    put_profile(app, &name, edited)?;
+                    app.ok(format!("profile {name} saved (reconnect to apply)"));
+                    if old != new {
+                        check_database(app, &name);
+                    }
+                }
+                Ok(())
+            });
+        }
         Act::Delete => {
-            let kept = if app.cfg.database.is_some() {
-                "stay in the shared database (they belong to the server, not to the profile name)"
-            } else {
-                "stay in the local database file"
+            let kept = match app.cfg.database_for(&name) {
+                Some((d, _)) => format!("stay in the database {} (they belong to the server, not to the profile name)", d.display_url()),
+                None => "stay in the local database file".into(),
             };
             let lines = vec![
                 format!("Remove profile {name} from the config file."),
@@ -280,20 +456,23 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
                 if app.cfg.default_profile.as_deref() == Some(n.as_str()) {
                     app.cfg.default_profile = None;
                 }
-                if let Err(e) = save_config(app) {
+                if let Err(e) = save_config(app, &app.cfg) {
                     app.error(e);
                 }
                 app.reload();
             });
         }
         Act::StoreSecret => {
-            let form = Form::new(
-                format!("Store secret for {name} in the system keyring"),
-                vec![Field::new("secret", "Password / token", FieldKind::Secret).required()],
-            )
-            .note("The profile's secret reference must be `keyring` to use it.");
+            let mut fields = vec![Field::new("secret", "Password / token", FieldKind::Secret).required()];
+            if app.cfg.profiles.get(&name).and_then(|p| p.database.as_ref()).is_some_and(|d| !d.is_local()) {
+                let target = ["Pulp server", "database"].map(String::from).to_vec();
+                fields.insert(0, Field::new("target", "Secret of", FieldKind::Choice(target)));
+            }
+            let form = Form::new(format!("Store secret for {name} in the system keyring"), fields)
+                .note("The matching secret reference (profile secret or database secret) must be keyring.");
             app.form(form, move |app, f| {
-                let (n, secret) = (name.clone(), f.get("secret").to_string());
+                let user = if f.get("target") == "database" { database_keyring_user(&name) } else { name.clone() };
+                let (n, secret) = (user, f.get("secret").to_string());
                 let fut = async move {
                     tokio::task::spawn_blocking(move || crate::config::keyring_set(&n, &secret)).await??;
                     ap(|app| app.ok("secret stored in keyring"))
@@ -304,12 +483,13 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
         }
         Act::ExportCv => {
             let profile = if name.is_empty() { app.profile.clone().unwrap_or_default() } else { name };
-            let Some((store, scope)) = super::actions_cv::cv_target(app, &profile) else { return };
             app.input(
                 format!("Export Content View definitions of {profile} to file"),
                 &format!("pulp-tui-{profile}-cv.json"),
                 move |app, path| {
+                    let target = app.profile_store(&profile);
                     let fut = async move {
+                        let (store, scope) = target.await?;
                         let ex = store.export(&scope).await?;
                         tokio::fs::write(&path, serde_json::to_vec_pretty(&ex)?).await.with_context(|| format!("write {path}"))?;
                         ap(move |app| {
@@ -322,11 +502,12 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
         }
         Act::ImportCv => {
             let profile = app.profile.clone().unwrap_or_default();
-            let Some((store, scope)) = super::actions_cv::cv_target(app, &profile) else { return };
             app.input(format!("Import Content View definitions into {profile} from file"), "", move |app, path| {
+                let target = app.profile_store(&profile);
                 let fut = async move {
                     let ex: crate::store::Export =
                         serde_json::from_slice(&tokio::fs::read(&path).await.with_context(|| format!("read {path}"))?)?;
+                    let (store, scope) = target.await?;
                     let (cvs, envs) = store.import(&scope, &ex).await?;
                     ap(move |app| app.ok(format!("imported {cvs} content view(s), {envs} environment(s); existing names were kept")))
                 };
@@ -1354,6 +1535,86 @@ mod tests {
         let b = repo_body(&new, false).unwrap();
         assert_eq!(b["name"], "x");
         assert!(b.get("description").is_none() && b["retain_repo_versions"].is_null());
+    }
+
+    #[test]
+    fn profile_form_database_round_trip() {
+        let local = std::path::Path::new("/data/pulp-tui.db");
+        let p = Profile { url: "https://h".into(), auth: AuthMethod::None, ..Default::default() };
+        let top = Database { url: "postgres://u@db/x".into(), secret: Some("env:PW".into()), ca_cert: None };
+        let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+        for inherited in [None, Some(&top)] {
+            let f = profile_form(Some("lab"), &p, inherited, local);
+            assert_eq!(f.get("database"), inherited.map_or("/data/pulp-tui.db", |d| d.url.as_str()));
+            assert_eq!(profile_from_form(&f, inherited, local).unwrap().database, None, "untouched: no block");
+        }
+        let mut f = profile_form(Some("lab"), &p, Some(&top), local);
+        assert_eq!((f.get("db_secret"), f.get("db_ca_cert")), ("env:PW", ""), "the secret starts with the inherited one");
+        set(&mut f, "db_secret", "");
+        set(&mut f, "database", "/srv/cv.db");
+        assert_eq!(profile_from_form(&f, Some(&top), local).unwrap().database.unwrap().url, "sqlite:///srv/cv.db");
+        for same in ["", "local", "/data/pulp-tui.db", "sqlite:///data/pulp-tui.db"] {
+            set(&mut f, "database", same);
+            assert!(profile_from_form(&f, Some(&top), local).unwrap().database.unwrap().is_local(), "{same:?} is the local file");
+        }
+        set(&mut f, "database", "postgres://u:pw@db/x");
+        let e = profile_from_form(&f, Some(&top), local).unwrap_err();
+        assert!(e.contains("put the database password in secret") && !e.contains("u:pw"), "{e}");
+    }
+
+    #[test]
+    fn profile_form_shows_the_own_database_not_the_inherited_one() {
+        let local = std::path::Path::new("/data/pulp-tui.db");
+        let own = Database { url: "postgres://o@own/y".into(), secret: Some("keyring".into()), ca_cert: Some("/ca.pem".into()) };
+        let top = Database { url: "postgres://u@db/x".into(), secret: Some("env:PW".into()), ca_cert: None };
+        let mut p = Profile { url: "https://h".into(), auth: AuthMethod::None, database: Some(own.clone()), ..Default::default() };
+        let f = profile_form(Some("lab"), &p, Some(&top), local);
+        assert_eq!((f.get("database"), f.get("db_secret"), f.get("db_ca_cert")), (own.url.as_str(), "keyring", "/ca.pem"));
+        assert_eq!(profile_from_form(&f, Some(&top), local).unwrap().database, Some(own));
+        // The local marker hides the inherited database and its secret.
+        p.database = Some(Database { url: LOCAL_DATABASE.into(), secret: None, ca_cert: None });
+        let f = profile_form(Some("lab"), &p, Some(&top), local);
+        assert_eq!((f.get("database"), f.get("db_secret")), ("/data/pulp-tui.db", ""));
+        assert!(profile_from_form(&f, Some(&top), local).unwrap().database.unwrap().is_local());
+    }
+
+    #[tokio::test]
+    async fn editing_a_profile_keeps_its_database() {
+        use crate::store::Store;
+        use crate::tui::app::Modal;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database { url: "postgres://u@db.example.com/x".into(), secret: Some("keyring".into()), ca_cert: Some("/ca.pem".into()) };
+        let mut cfg = crate::config::Config::default();
+        cfg.profiles.insert(
+            "lab".into(),
+            Profile { url: "http://h".into(), auth: AuthMethod::None, database: Some(db.clone()), ..Default::default() },
+        );
+        let st = std::sync::Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(cfg, dir.path().join("config.toml"), st.clone(), Ok(st));
+        profile_action(&mut app, Act::Edit, json!({ "name": "lab" }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
+        form.fields.iter_mut().find(|f| f.key == "timeout_secs").unwrap().value = "45".into();
+        submit(&mut app, &form).unwrap();
+        let p = &app.cfg.profiles["lab"];
+        assert_eq!((p.timeout_secs, p.database.as_ref()), (45, Some(&db)), "an untouched database field keeps the block");
+        let saved = crate::config::Config::load(&dir.path().join("config.toml")).unwrap();
+        assert_eq!(saved.profiles["lab"].database, Some(db), "and the file keeps the [profiles.lab.database] block");
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_leaves_the_profile_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        let old = Profile { url: "http://h".into(), auth: AuthMethod::None, ..Default::default() };
+        cfg.profiles.insert("lab".into(), old.clone());
+        let st = std::sync::Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(cfg, dir.path().join("config.toml"), st.clone(), Ok(st));
+        std::fs::write(dir.path().join("file"), b"").unwrap();
+        app.cfg_path = dir.path().join("file").join("config.toml"); // its parent is a file: the save fails
+        let new = Profile { database: Some(Database { url: "postgres://u@db/x".into(), secret: None, ca_cert: None }), ..old.clone() };
+        let e = put_profile(&mut app, "lab", new).unwrap_err();
+        assert!(e.starts_with("cannot save "), "{e}");
+        assert_eq!(app.cfg.profiles["lab"], old, "memory and file still agree");
     }
 
     #[test]

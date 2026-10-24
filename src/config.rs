@@ -14,6 +14,13 @@ pub const KEYRING_SERVICE: &str = "pulp-tui";
 /// Keyring user of `[database].secret = "keyring"`. Profiles use their name as the user; a
 /// profile name cannot hold brackets, so the two never share an entry.
 pub const DATABASE_KEYRING_USER: &str = "[database]";
+/// `url` of a profile's `database` that keeps the profile in the local file, whatever `[database]` says.
+pub const LOCAL_DATABASE: &str = "local";
+
+/// Keyring user of `keyring` in `[profiles.<profile>.database].secret`.
+pub fn database_keyring_user(profile: &str) -> String {
+    format!("{DATABASE_KEYRING_USER}:{profile}")
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -22,7 +29,8 @@ pub struct Config {
     pub default_profile: Option<String>,
     #[serde(default)]
     pub settings: Settings,
-    /// External Content View / lifecycle database; without it they stay in the local file.
+    /// External Content View / lifecycle database; the default for profiles without their own `database`.
+    /// Without either, Content Views stay in the local file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<Database>,
     #[serde(default)]
@@ -34,7 +42,7 @@ pub struct Config {
 pub struct Database {
     /// `postgres://user@host:5432/db` or `sqlite:///path/cv.db`; never with a password.
     pub url: String,
-    /// `env:VAR`, `file:/path` or `keyring` (keyring user `[database]`, see `DATABASE_KEYRING_USER`).
+    /// `env:VAR`, `file:/path` or `keyring` (keyring user `[database]`, or `[database]:<profile>` for a profile's own).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,6 +50,11 @@ pub struct Database {
 }
 
 impl Database {
+    /// The marker `url = "local"`: the profile uses the local file, not an external database.
+    pub fn is_local(&self) -> bool {
+        self.url == LOCAL_DATABASE
+    }
+
     /// Errors never repeat the URL: it could hold a password.
     fn parsed(&self) -> Result<url::Url> {
         let u = url::Url::parse(&self.url).map_err(|e| anyhow::anyhow!("invalid database url: {e}"))?;
@@ -57,6 +70,9 @@ impl Database {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.is_local() {
+            return Ok(());
+        }
         self.parsed()?;
         if let Some(s) = &self.secret {
             parse_secret_ref(s)?;
@@ -65,13 +81,14 @@ impl Database {
     }
 
     /// The URL for sqlx, with the password and the TLS settings. Never show or log it.
-    pub fn connect_url(&self) -> Result<String> {
+    /// A `keyring` secret is read from `keyring_user`.
+    pub fn connect_url(&self, keyring_user: &str) -> Result<String> {
         let mut u = self.parsed()?;
         if u.scheme() == "sqlite" {
             return Ok(self.url.clone());
         }
         if let Some(s) = &self.secret {
-            let pw = resolve_secret(DATABASE_KEYRING_USER, &parse_secret_ref(s)?)?;
+            let pw = resolve_secret(keyring_user, &parse_secret_ref(s)?)?;
             // `set_password` leaves `%` as is and sqlx percent-decodes: encode every byte but ASCII alphanumerics.
             let pw: String =
                 pw.bytes().map(|b| if b.is_ascii_alphanumeric() { char::from(b).to_string() } else { format!("%{b:02X}") }).collect();
@@ -183,6 +200,9 @@ pub struct Profile {
     /// Marks the server as production: the UI shows a red banner.
     #[serde(default)]
     pub production: bool,
+    /// Own Content View database; overrides `[database]`. `url = "local"` keeps the profile in the local file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<Database>,
 }
 
 fn default_api_root() -> String {
@@ -208,6 +228,7 @@ impl Default for Profile {
             timeout_secs: default_timeout(),
             read_only: false,
             production: false,
+            database: None,
         }
     }
 }
@@ -240,6 +261,9 @@ impl Profile {
         }
         if self.client_cert.is_some() != self.client_key.is_some() {
             bail!("client_cert and client_key must be set together");
+        }
+        if let Some(d) = &self.database {
+            d.validate().context("database")?;
         }
         Ok(())
     }
@@ -373,10 +397,28 @@ impl Config {
         self.default_profile.clone().filter(|d| self.profiles.contains_key(d)).or_else(|| self.profiles.keys().next().cloned())
     }
 
-    /// `import-cv` and `db copy` create objects in the `[database]`: a read-only profile must not do that.
-    pub fn check_shared_write(&self, profile: &str, command: &str) -> Result<()> {
-        if self.database.is_some() && self.profiles.get(profile).is_some_and(|p| p.read_only) {
-            bail!("profile {profile} is read-only; {command} writes to the shared database");
+    /// The external database of a profile and the keyring user of its secret: the profile's own `database`,
+    /// else `[database]`. `None`: the local file (nothing set, or the `local` marker). An unknown name gets `[database]`.
+    pub fn database_for(&self, profile: &str) -> Option<(Database, String)> {
+        let (d, user) = match self.profiles.get(profile).and_then(|p| p.database.as_ref()) {
+            Some(d) => (d, database_keyring_user(profile)),
+            None => (self.database.as_ref()?, DATABASE_KEYRING_USER.to_string()),
+        };
+        (!d.is_local()).then(|| (d.clone(), user))
+    }
+
+    /// `import-cv` creates objects in an external database: a read-only profile must not do that.
+    pub fn check_shared_write(&self, profile: &str) -> Result<()> {
+        if self.database_for(profile).is_some() && self.profiles.get(profile).is_some_and(|p| p.read_only) {
+            bail!("profile {profile} is read-only; import-cv writes to the shared database");
+        }
+        Ok(())
+    }
+
+    /// `db copy` writes to the target database, also the local file (as the TUI): a read-only profile must not run it.
+    pub fn check_copy_write(&self, profile: &str) -> Result<()> {
+        if self.profiles.get(profile).is_some_and(|p| p.read_only) {
+            bail!("profile {profile} is read-only; db copy writes to the database");
         }
         Ok(())
     }
@@ -455,17 +497,22 @@ read_only = true
     #[test]
     fn shared_database_writes_need_a_writable_profile() {
         let mut cfg: Config = toml::from_str(EXAMPLE).unwrap();
-        assert!(cfg.check_shared_write("prod", "import-cv").is_ok(), "the local file: nothing changes");
+        assert!(cfg.check_shared_write("prod").is_ok(), "the local file: nothing changes");
         cfg.database = Some(Database { url: "postgres://u@h/x".into(), secret: None, ca_cert: None });
-        assert!(cfg.check_shared_write("lab", "db copy").is_ok());
+        assert!(cfg.check_shared_write("lab").is_ok() && cfg.check_copy_write("lab").is_ok());
         assert_eq!(
-            cfg.check_shared_write("prod", "import-cv").unwrap_err().to_string(),
+            cfg.check_shared_write("prod").unwrap_err().to_string(),
             "profile prod is read-only; import-cv writes to the shared database"
         );
-        assert_eq!(
-            cfg.check_shared_write("prod", "db copy").unwrap_err().to_string(),
-            "profile prod is read-only; db copy writes to the shared database"
-        );
+        assert_eq!(cfg.check_copy_write("prod").unwrap_err().to_string(), "profile prod is read-only; db copy writes to the database");
+        // A profile's own database counts too, and `local` leaves the shared one.
+        cfg.database = None;
+        cfg.profiles.get_mut("prod").unwrap().database = Some(Database { url: "postgres://u@h/x".into(), secret: None, ca_cert: None });
+        assert!(cfg.check_shared_write("prod").is_err());
+        cfg.database = Some(Database { url: "postgres://u@h/x".into(), secret: None, ca_cert: None });
+        cfg.profiles.get_mut("prod").unwrap().database = Some(Database { url: LOCAL_DATABASE.into(), secret: None, ca_cert: None });
+        assert!(cfg.check_shared_write("prod").is_ok(), "import-cv into the local file is allowed");
+        assert!(cfg.check_copy_write("prod").is_err(), "db copy refuses a read-only profile, also on the local file");
     }
 
     #[test]
@@ -489,7 +536,7 @@ read_only = true
         let d = Database { url: "postgres://u@127.0.0.1/x".into(), secret: Some(format!("file:{}", f.display())), ca_cert: None };
         for pw in ["a%41b", "p@ss:w/rd", "p@ss word+"] {
             std::fs::write(&f, pw).unwrap();
-            let u = url::Url::parse(&d.connect_url().unwrap()).unwrap();
+            let u = url::Url::parse(&d.connect_url(DATABASE_KEYRING_USER).unwrap()).unwrap();
             // sqlx percent-decodes the password (the encoded form has no `+`, `&` or `=`, so this decodes the same).
             let got = url::form_urlencoded::parse(u.password().unwrap().as_bytes()).next().unwrap().0;
             assert_eq!(got, pw);
@@ -515,21 +562,55 @@ read_only = true
     fn connect_url_tls_rules() {
         unsafe { std::env::set_var("PTUI_TEST_DBPW", "p@ss word") };
         let d = |u: &str| Database { url: u.into(), secret: Some("env:PTUI_TEST_DBPW".into()), ca_cert: Some("/ca.pem".into()) };
-        let remote = d("postgres://u@db.example.com:5432/x?sslmode=disable").connect_url().unwrap();
+        let remote = d("postgres://u@db.example.com:5432/x?sslmode=disable").connect_url(DATABASE_KEYRING_USER).unwrap();
         assert!(remote.contains("sslmode=verify-full") && !remote.contains("sslmode=disable"));
         assert!(remote.contains("sslrootcert=%2Fca.pem") || remote.contains("sslrootcert=/ca.pem"));
         assert!(remote.contains("p%40ss%20word"));
-        assert!(!d("postgres://u@127.0.0.1/x").connect_url().unwrap().contains("verify-full"));
+        assert!(!d("postgres://u@127.0.0.1/x").connect_url(DATABASE_KEYRING_USER).unwrap().contains("verify-full"));
         assert!(!d("postgres://u@db.example.com/x").display_url().contains("p%40ss"));
         // sqlx connects to the `host` parameter, not the URL host; a socket path stays on the machine.
-        assert!(d("postgres://u@127.0.0.1/x?host=db.example.com").connect_url().unwrap().contains("verify-full"));
-        assert!(!d("postgres://u@%2Frun%2Fpostgresql/x").connect_url().unwrap().contains("verify-full"));
-        assert!(!d("postgres://u@db.example.com/x?host=/run/postgresql").connect_url().unwrap().contains("verify-full"));
+        assert!(d("postgres://u@127.0.0.1/x?host=db.example.com").connect_url(DATABASE_KEYRING_USER).unwrap().contains("verify-full"));
+        assert!(!d("postgres://u@%2Frun%2Fpostgresql/x").connect_url(DATABASE_KEYRING_USER).unwrap().contains("verify-full"));
+        assert!(
+            !d("postgres://u@db.example.com/x?host=/run/postgresql").connect_url(DATABASE_KEYRING_USER).unwrap().contains("verify-full")
+        );
+    }
+
+    #[test]
+    fn database_for_resolution_order() {
+        let mut cfg: Config = toml::from_str(EXAMPLE).unwrap();
+        assert_eq!(cfg.database_for("lab"), None, "nothing set: the local file");
+        let top = Database { url: "postgres://u@db.example.com/x".into(), secret: Some("keyring".into()), ca_cert: None };
+        cfg.database = Some(top.clone());
+        assert_eq!(cfg.database_for("lab"), Some((top.clone(), "[database]".into())));
+        assert_eq!(cfg.database_for("gone"), Some((top.clone(), "[database]".into())), "unknown profile: the default");
+        let own = Database { url: "sqlite:///srv/cv.db".into(), secret: None, ca_cert: None };
+        cfg.profiles.get_mut("prod").unwrap().database = Some(own.clone());
+        assert_eq!(cfg.database_for("prod"), Some((own, "[database]:prod".into())));
+        cfg.profiles.get_mut("lab").unwrap().database = Some(Database { url: LOCAL_DATABASE.into(), secret: None, ca_cert: None });
+        assert_eq!(cfg.database_for("lab"), None, "local wins over [database]");
+    }
+
+    #[test]
+    fn profile_database_roundtrip_and_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let head = "[profiles.x]\nurl = \"http://h\"\nauth = \"none\"\n[profiles.x.database]\n";
+        std::fs::write(&path, format!("{head}url = \"local\"\n")).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.profiles["x"].database.as_ref().unwrap().is_local());
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), cfg);
+        std::fs::write(&path, format!("{head}url = \"postgres://u:hunter2@h/x\"\n")).unwrap();
+        let e = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(e.contains("profile x") && e.contains("put the database password in secret") && !e.contains("hunter2"), "{e}");
     }
 
     #[test]
     fn database_keyring_user_cannot_be_a_profile_name() {
         assert_eq!(DATABASE_KEYRING_USER, "[database]");
+        assert_eq!(database_keyring_user("prod"), "[database]:prod");
+        assert!(crate::store::validate_name(&database_keyring_user("prod")).is_err());
         // Profiles created in the TUI pass validate_name, so they never share this keyring entry.
         assert!(crate::store::validate_name(DATABASE_KEYRING_USER).is_err());
         assert!(crate::store::validate_name("database").is_ok(), "the old user was a valid profile name");

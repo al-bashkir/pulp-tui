@@ -248,7 +248,7 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    let mutates = a.mutates(&app.list.kind, app.cfg.database.is_some());
+                    let mutates = a.mutates(&app.list.kind, app.shared());
                     let t = format!(
                         "{} [{}] {}{}",
                         if i == *selected { "▶" } else { " " },

@@ -50,10 +50,10 @@ podman run --rm -it --read-only \
 * The image (about 30 MB) runs as UID 10001 with a read-only root filesystem.
   `/config/config.toml` is mounted read-only; `/data` holds the SQLite database and the
   log (Content Views, task references). Without a volume, that state is lost at exit.
-  With a `[database]` section the Content Views live in that database instead, and `/data`
-  keeps only the task references and the log. Add `--hostname <name>` then: locks and audit
-  rows name the operator as `user@host`, and without it the host is a new container ID
-  each run.
+  With a `[database]` section (or a `database` in the profile) the Content Views live in
+  that database instead, and `/data` keeps only the task references and the log. Add
+  `--hostname <name>` then: locks and audit rows name the operator as `user@host`, and
+  without it the host is a new container ID each run.
 * Secrets: a container secret readable by UID 10001 (above), or `-e PULP_PASSWORD` with
   `secret = "env:PULP_PASSWORD"`. A plain bind-mounted file with mode 0600 is not readable
   by the container user under rootless Podman. The container build has no keyring.

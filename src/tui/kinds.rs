@@ -172,6 +172,9 @@ pub enum Act {
     Roles,
     Members,
     BreakLock,
+    /// In no `actions()` list: offered on Connect and save; here so that `mutates` classifies them.
+    MigrateDb,
+    CopyDb,
 }
 
 impl Act {
@@ -204,7 +207,8 @@ impl Act {
             ImportCv => 'I',
             CvFilters | FallbackReplicate => 'F',
             CvPreview | Password => 'w',
-            Promote => 'M',
+            Promote | MigrateDb => 'M',
+            CopyDb => 'Y',
             Resume | Replicate | Roles => 'R',
             ToggleProtected => 'L',
             ToggleActive => 'A',
@@ -259,6 +263,8 @@ impl Act {
             Roles => "Roles",
             Members => "Members",
             BreakLock => "Break lock",
+            MigrateDb => "Migrate database",
+            CopyDb => "Copy Content View data",
         }
     }
 
@@ -267,8 +273,8 @@ impl Act {
     pub fn mutates(self, k: &Kind, shared: bool) -> bool {
         use Act::*;
         match k {
-            // Import creates Content Views and environments in the shared database.
-            Kind::Profiles => shared && matches!(self, ImportCv),
+            // Migrate and copy change a database; import creates Content Views and environments in the shared one.
+            Kind::Profiles => matches!(self, MigrateDb | CopyDb) || shared && matches!(self, ImportCv),
             Kind::Environments => shared,
             Kind::ContentViews => {
                 matches!(self, Delete | CvPublish | Promote | Rollback | BreakLock)
@@ -847,6 +853,8 @@ mod tests {
         assert!(!Act::Delete.mutates(&Kind::Profiles, true));
         assert!(Act::ImportCv.mutates(&Kind::Profiles, true), "bulk create in the shared database");
         assert!(!Act::ImportCv.mutates(&Kind::Profiles, false));
+        assert!(Act::MigrateDb.mutates(&Kind::Profiles, false) && Act::CopyDb.mutates(&Kind::Profiles, false));
+        assert!(!Kind::Profiles.actions().iter().any(|a| matches!(a, Act::MigrateDb | Act::CopyDb)), "offered on Connect and save only");
     }
 
     #[test]

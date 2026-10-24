@@ -19,6 +19,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
 use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -259,6 +260,18 @@ pub struct LockHolder {
     pub acquired_at: String,
 }
 
+/// An external database with no schema (`from` 0) or an older one: `pulp-tui db migrate` (or the TUI offer) fixes it.
+#[derive(Debug, thiserror::Error)]
+#[error("{display}: {}; run pulp-tui db migrate", match .from {
+    0 => "database is not initialized".to_string(),
+    v => format!("database schema {v} is older than this pulp-tui ({})", .to),
+})]
+pub struct NotMigrated {
+    pub display: String,
+    pub from: i64,
+    pub to: i64,
+}
+
 pub const LIBRARY: &str = "Library";
 
 fn repo_type(s: &str) -> Result<RepoType> {
@@ -305,12 +318,13 @@ async fn migrate_on(c: &mut AnyConnection, b: Backend, upto: usize) -> Result<i6
     }
     for (i, m) in list.iter().enumerate().take(upto).skip(v as usize) {
         let mut tx = c.begin().await?;
-        sqlx::raw_sql(m).execute(&mut *tx).await.with_context(|| format!("migration {}", i + 1))?;
+        // `Executor::execute`, not `RawSql::execute`: rustc cannot prove the latter `Send` in a spawned job.
+        tx.execute(sqlx::raw_sql(m)).await.with_context(|| format!("migration {}", i + 1))?;
         let set = match b {
             Backend::Sqlite => format!("PRAGMA user_version = {}", i + 1),
             Backend::Postgres => format!("DELETE FROM schema_version; INSERT INTO schema_version(version) VALUES ({})", i + 1),
         };
-        sqlx::raw_sql(&set).execute(&mut *tx).await?;
+        tx.execute(sqlx::raw_sql(&set)).await?;
         tx.commit().await?;
     }
     Ok(v)
@@ -352,12 +366,19 @@ impl Store {
     /// The configured `[database]`. A normal start never changes its schema; `db migrate` does.
     /// Errors name `display`, never `connect` (it holds the password).
     pub async fn open_external(connect: &str, display: &str) -> Result<Self> {
+        let not_migrated = |from, to| anyhow::Error::new(NotMigrated { display: display.into(), from, to });
+        // sqlx would fail on a missing file; only `db migrate` creates it.
+        if connect.starts_with("sqlite:") && !connect.contains("mode=") {
+            let opts = SqliteConnectOptions::from_str(connect).map_err(|e| anyhow!("{display}: {e}"))?;
+            if !opts.get_filename().exists() {
+                return Err(not_migrated(0, MIGRATIONS.len() as i64));
+            }
+        }
         let s = Self::external(connect, display).await?;
         let v = s.schema_version().await.map_err(|e| anyhow!("{display}: {e:#}"))?;
         let m = migrations(s.backend).len() as i64;
         match v {
-            0 => bail!("{display}: database is not initialized; run pulp-tui db migrate"),
-            v if v < m => bail!("{display}: database schema {v} is older than this pulp-tui ({m}); run pulp-tui db migrate"),
+            v if v < m => Err(not_migrated(v, m)),
             v if v > m => bail!("{display}: database schema {v} is newer than this pulp-tui ({m}); upgrade pulp-tui"),
             _ => s.with_db_id().await.map_err(|e| anyhow!("{display}: {e:#}")),
         }
@@ -372,7 +393,7 @@ impl Store {
         let res = async {
             let mut c = s.pool.acquire().await?;
             if s.backend == Backend::Sqlite {
-                sqlx::raw_sql("PRAGMA journal_mode=WAL").execute(&mut *c).await?;
+                c.execute(sqlx::raw_sql("PRAGMA journal_mode=WAL")).await?;
                 // A second `db migrate` fails on its batch transaction (table exists) and rolls back.
                 return migrate_on(&mut c, s.backend, usize::MAX).await;
             }
@@ -1073,10 +1094,27 @@ impl Store {
 
     // ---- db copy ---------------------------------------------------------------------
 
-    /// `pulp-tui db copy`, on the target: copy the Content View data of `src_scope` in `src` (the local file)
+    /// `pulp-tui db copy`, on the target: copy the Content View data of `src_scope` in `src` (any store)
     /// into `dst_scope` here, in one transaction with new ids. It never merges: a name that exists is refused.
-    /// Task references, replication runs and locks stay behind. `src` is only read.
+    /// It also refuses the same database, and a view whose lock was renewed within `LOCK_TTL_SECS` (an operation
+    /// is running). Task references, replication runs and locks stay behind. `src` is only read.
     pub async fn copy_from(&self, src: &Store, src_scope: &str, dst_scope: &str) -> Result<CopyReport> {
+        if src.db_id() == self.db_id() {
+            bail!("source and target are the same database");
+        }
+        let live = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) - LOCK_TTL_SECS;
+        let locked = sqlx::query(
+            "SELECT c.name, l.owner, l.operation FROM locks l JOIN content_views c ON c.id = l.cv_id
+             WHERE c.profile = $1 AND l.renewed_at >= $2 ORDER BY c.name LIMIT 1",
+        )
+        .bind(src_scope)
+        .bind(live)
+        .fetch_optional(&src.pool)
+        .await?;
+        if let Some(r) = locked {
+            let (name, owner, op): (String, String, String) = (r.try_get(0)?, r.try_get(1)?, r.try_get(2)?);
+            bail!("Content View {name} is locked by {owner} ({op}); copy after it ends");
+        }
         let (views, envs) = (src.content_views(src_scope).await?, src.environments(src_scope).await?);
         let have = self.content_views(dst_scope).await?;
         if let Some(v) = views.iter().find(|v| have.iter().any(|h| h.name == v.name)) {
@@ -1615,6 +1653,11 @@ mod tests {
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("cv.db").display());
         let e = Store::open_external(&url, "cv.db").await.unwrap_err().to_string();
         assert!(e.contains("not initialized; run pulp-tui db migrate"), "{e}");
+        let err = Store::open_external(&url, "cv.db").await.unwrap_err();
+        let nm = err.downcast_ref::<NotMigrated>().unwrap();
+        assert_eq!((nm.from, nm.to), (0, MIGRATIONS.len() as i64));
+        let older = NotMigrated { display: "cv.db".into(), from: 1, to: 2 }.to_string();
+        assert_eq!(older, "cv.db: database schema 1 is older than this pulp-tui (2); run pulp-tui db migrate");
         assert_eq!(Store::migrate_external(&url, "cv.db").await.unwrap(), (0, MIGRATIONS.len() as i64));
         assert_eq!(Store::migrate_external(&url, "cv.db").await.unwrap(), (MIGRATIONS.len() as i64, MIGRATIONS.len() as i64));
         let s = Store::open_external(&url, "cv.db").await.unwrap();
@@ -1629,6 +1672,15 @@ mod tests {
         // `db migrate` creates a new SQLite file without `mode=rwc` in the URL.
         let fresh = format!("sqlite://{}", dir.path().join("new.db").display());
         Store::migrate_external(&fresh, "new.db").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_sqlite_file_is_not_migrated_and_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("new.db");
+        let e = Store::open_external(&format!("sqlite://{}", f.display()), "new.db").await.unwrap_err();
+        assert_eq!(e.downcast_ref::<NotMigrated>().map(|n| n.from), Some(0));
+        assert!(!f.exists(), "a normal open never creates the file");
     }
 
     #[tokio::test]
@@ -1807,6 +1859,23 @@ mod tests {
         e.create_cv("k", "api", "").await.unwrap();
         let msg = e.copy_from(&src, "lab", "k").await.unwrap_err().to_string();
         assert_eq!(msg, "target already has content view api for this server; db copy never merges");
+    }
+
+    #[tokio::test]
+    async fn copy_refuses_the_same_database_and_live_locks() {
+        let src = Store::open_in_memory().await.unwrap();
+        let cv = src.create_cv("lab", "web", "").await.unwrap();
+        assert!(src.copy_from(&src, "lab", "k").await.unwrap_err().to_string().contains("source and target are the same database"));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        src.try_lock(cv, "alice@ws1", "t1", "publish", now).await.unwrap().unwrap();
+        let dst = Store::open_in_memory().await.unwrap();
+        let e = dst.copy_from(&src, "lab", "k").await.unwrap_err().to_string();
+        assert_eq!(e, "Content View web is locked by alice@ws1 (publish); copy after it ends");
+        assert!(dst.content_views("k").await.unwrap().is_empty());
+        // A crashed session's lock (not renewed for LOCK_TTL_SECS) does not block.
+        src.release_lock(cv, "t1").await.unwrap();
+        src.try_lock(cv, "bob@ws2", "t2", "publish", now - LOCK_TTL_SECS - 1).await.unwrap().unwrap();
+        assert_eq!(dst.copy_from(&src, "lab", "k").await.unwrap().views, 1);
     }
 
     #[tokio::test]

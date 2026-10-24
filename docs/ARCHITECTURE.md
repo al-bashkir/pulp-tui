@@ -55,7 +55,7 @@ idle group whose counts stay the same for three polls is also treated as final.
 | Concept | Owner | Notes |
 |---|---|---|
 | Repository, Remote, Repository Version, Publication, Distribution, Task, Task Group, User, Group, Role, Upstream Pulp | **Pulp** | Used as documented. The Repository and the Remote are separate objects. |
-| Content View, Content View Version, Lifecycle Environment, Promotion, Binding | **pulp-tui** | Not a Pulp API and not Katello. Stored in the local SQLite file, or in the shared `[database]` when one is configured (see "Storage"), and built from the Pulp objects above. |
+| Content View, Content View Version, Lifecycle Environment, Promotion, Binding | **pulp-tui** | Not a Pulp API and not Katello. Stored in the local SQLite file, or in the external database of the profile (its own `database`, else `[database]`; see "Storage"), and built from the Pulp objects above. |
 
 ### Content View implementation
 
@@ -135,18 +135,40 @@ failed publish keeps its checkpoints; *Resume* continues from them.
 
 `Store` (`src/store.rs`) uses sqlx with its `Any` driver, so one implementation of each
 method serves SQLite and PostgreSQL. All store calls are `async`; the UI thread never
-calls them (they run in jobs). pulp-tui holds up to two stores:
+calls them (they run in jobs). pulp-tui holds the local file and one store for each
+external database in use:
 
 | Store | Opened | Holds | Rows scoped by |
 |---|---|---|---|
-| Local file `<data_dir>/pulp-tui.db` (SQLite, WAL) | always, migrated on open | task references, replication runs; also the Content View data when no `[database]` is set | profile name |
-| External `[database]` (PostgreSQL, or SQLite at a path) | at start, never migrated | Content Views, repositories and filters, versions and checkpoints, environments, bindings, audit log, locks | server key |
+| Local file `<data_dir>/pulp-tui.db` (SQLite, WAL) | always, migrated on open | task references, replication runs; also the Content View data of every profile without an external database | profile name |
+| External database (PostgreSQL, or SQLite at a path): the `database` of a profile, else `[database]` | on Connect (a job), never migrated by an open | Content Views, repositories and filters, versions and checkpoints, environments, bindings, audit log, locks | server key |
 
-`App.store` is the local file. `App.cv_store` is the store of Content View data: the same
-local store without `[database]`, else the external one. If the external database cannot
-be opened, `cv_store` holds the error, Content View screens and actions report
+`Config::database_for(profile)` decides which database a profile uses: its own `database`,
+else `[database]`, else the local file (`None`). A profile with `url = "local"` also gets
+`None`, even when `[database]` is set. It returns the keyring user of the secret too:
+`[database]`, or `[database]:<profile>` for a profile's own database (`validate_name`
+rejects such a profile name). The store of a database is cached in `App.stores`, keyed by
+the connect URL (which holds the password: the key is never shown or logged), so profiles
+that use one database share one `Arc<Store>`. `App::open_store(db)` returns the cached
+store, or opens and caches it; `None` gives the local store, and a failed open is not cached.
+
+`App.store` is the local file. `App.cv_store` is the store of Content View data of the
+connected profile. `App::connect` opens it in a job (`App::with_store`) and sets it when the
+job ends; a result for a profile that is no longer the active one is dropped, and while the
+job runs `cv_store` holds an `opening` error, never the store of the previous profile. For
+a profile without an external database it is the local store. If the external database
+cannot be opened, `cv_store` holds the error, Content View screens and actions report
 `shared database unavailable: ...`, and nothing falls back to the local file (the state
-would split).
+would split). The next Connect opens it again.
+
+`Store::open_external` fails with `store::NotMigrated` (`from` 0 for an empty database or a
+SQLite file that does not exist, else the older version) instead of changing anything.
+`with_store` turns it into the message `<display>: database not migrated (open Servers,
+Connect again to migrate, or run pulp-tui db migrate --profile <name>)` for `cv_store`. It
+also shows the confirm `Migrate database of <name>?`; after Enter it runs
+`Store::migrate_external` in a job and opens the store. A read-only profile gets a warning
+instead of the confirm, because migrate is a mutating action (`Act::MigrateDb`). The
+profile form does the same check after a save that changed the database.
 
 **Server key scope.** In the external database the scope value is the server key
 `<origin><api_root>#<domain>` (`Profile::server_key`, applied by `Store::scope`), so two
@@ -163,10 +185,11 @@ writes under the key of the profile that runs it. The Dashboard shows the key
 (a unit test checks this). PostgreSQL uses `BIGINT` for every integer and identity
 columns, because sqlx `Any` reads integers as `i64`. A batch and its version number are
 applied in one transaction. The local file migrates on open. The external database changes
-only with `pulp-tui db migrate` (`Store::migrate_external`), which also creates the schema
-and, on PostgreSQL, holds a `pg_advisory_lock` so two administrators cannot migrate at the
-same time. A normal start (`Store::open_external`) compares versions and refuses an
-uninitialized, older or newer schema with a message. Operators need only
+only with `pulp-tui db migrate` or the confirm in the TUI. Both call
+`Store::migrate_external`, which also creates the schema and, on PostgreSQL, holds a
+`pg_advisory_lock` so two administrators cannot migrate at the same time. A normal open
+(`Store::open_external`) compares versions and refuses an uninitialized, older or newer
+schema with a message. Operators need only
 `SELECT/INSERT/UPDATE/DELETE`; the database ID is created with an `INSERT`.
 Schema 2 added the `meta` table (database ID `db_id` and aliases `alias:<id>`),
 `scope_settings` (the base path prefix per server, first value wins), `locks` and
@@ -217,14 +240,24 @@ two pulp-tui processes on one host also exclude each other. Publish, resume, pro
 (rollback, reconcile), delete view and delete version lock; preview, compare, verify and
 edits do not.
 
-**Read-only mode.** With a `[database]`, edits of Content Views and environments and
-`import-cv` change shared state, so `Act::mutates(kind, shared)` counts them as mutating.
-Without it they are not (they touch only the local file).
+**Read-only mode.** When the store in use by the active profile is external (`App::shared()`;
+like `scope`, it follows `cv_store`, not the edited config, so an Edit applies at Connect),
+edits of Content Views and environments and `import-cv` change shared state, so
+`Act::mutates(kind, shared)` counts them as mutating. Otherwise they are not (they touch
+only the local file). `MigrateDb` and `CopyDb` always mutate, so a read-only profile cannot
+migrate or copy.
 
-**Moving data.** `pulp-tui db copy` (`Store::copy_from`) copies one profile's Content View
-data from the local file into the external database in one target transaction, with new
-ids and remapped references. It refuses name clashes and never merges. The local file's
-database ID becomes an alias in the target `meta`.
+**Moving data.** `pulp-tui db copy [--from <profile|local>]` and the "copy and switch"
+choice of the TUI use `Store::copy_from(src, src_scope, dst_scope)`. The source can be any
+store: the local file (`--from local`, the default) or the database of another profile. The
+copy runs in one target transaction, with new ids and remapped references. It refuses name
+clashes and never merges. It refuses `source and target are the same database` (equal
+`db_id`, so two URLs of one database are caught) and a Content View whose lock was renewed
+within `LOCK_TTL_SECS` (`Content View <name> is locked by <owner> (<operation>); copy after
+it ends`); the lock of a crashed session has expired and does not block. The database ID of
+the source becomes an alias in the target `meta`. The source is only read. When Edit
+changes the database of a profile that has data, the TUI counts the data in the old
+database and offers copy, switch or cancel; the profile is saved only after the copy worked.
 
 **Limits.**
 
@@ -259,7 +292,8 @@ state.
   contain a password, and errors show the URL without it.
 * Secrets are references in the config (`env:VAR`, `file:/path`, `keyring`). The config
   parser rejects unknown keys such as `password`. Secret files that are readable by group
-  or others cause a warning in the log. The `[database]` secret uses the same references.
+  or others cause a warning in the log. The `[database]` secret and the secret of a
+  profile's own `database` use the same references.
 * The `Authorization` header is marked sensitive. The log file (never the terminal)
   records method, path and status only. Write-only fields (remote passwords, keys) are
   never pre-filled in forms and are displayed masked.

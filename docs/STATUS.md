@@ -19,6 +19,7 @@ Automated against real Pulp containers (`tests/run-live.sh`):
 | Shared database on PostgreSQL 16: `db migrate` creates the schema (and again changes nothing), an uninitialized, older or newer schema is refused with the right message, the database ID is created once | `live_shared_db::postgres_schema_lifecycle` |
 | Two operators on one PostgreSQL database: B sees A's Content View and audit actor, lock conflict names A, B gets the lock after A releases, `break_lock` removes only the holder shown (a second call removes nothing), 8 simultaneous lock attempts give exactly one winner | `live_shared_db::two_operators_share_state_and_locks` |
 | Every store method on PostgreSQL (definitions, versions, checkpoints, conditional writes after a lost lock, environments, bindings, audit, replication runs, tasks, prefix, export/import, delete cascade) and `db copy` from a local SQLite store | `live_shared_db::store_methods_on_postgres` |
+| A database per profile: `prod` with its own PostgreSQL schema next to `lab` with `url = "local"` and a top-level `[database]` that is never opened; `database_for` gives the keyring user `[database]:prod`; a fresh schema is `NotMigrated` and an open does not migrate it; after `migrate` the store is external and cached (the same `Arc`), `lab` gets the local `Arc`; rows of the server key are not in the local store; `copy_from` another store copies a view under that key and records the source database ID as an alias | `live_shared_db::profile_database_next_to_a_local_profile` |
 
 Manually in the TUI (tmux, real servers): dashboard, repository create/search/upload,
 remote create, mirror sync with warning, Task Center progress, distribute, versions,
@@ -34,11 +35,10 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
 
 ## Test results (last run)
 
-* `cargo test --lib`: 117 passed
+* `cargo test --lib`: 135 passed
 * `cargo test --test mock_http`: 17 passed
-* Live (`tests/run-live.sh`): repos 2, cv 2, rbac 1, failures 2, replication 2,
-  shared_db 3 (PostgreSQL 16) — all passed; cv and shared_db run again on 2026-10-24
-  after the lock and config fixes — passed
+* Live (`tests/run-live.sh`, 2026-10-24): repos 2, cv 2, rbac 1, failures 2,
+  replication 2, shared_db 4 (PostgreSQL 16) — all passed
 * `cargo fmt --check`, `cargo clippy --all-targets -D warnings` (default and
   `--no-default-features`): clean
 * `podman build -f Containerfile .`: built (29.5 MB image; no keyring; it contains the
@@ -54,9 +54,9 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
 ## Limitations
 
 * Content Views, environments and their history live in the local SQLite file of one
-  operator, or, with `[database]`, in a database that several operators share (PostgreSQL,
-  or SQLite on one host). There is no pulp-tui server: each pulp-tui connects directly.
-  Other operators' changes show after a refresh.
+  operator, or, with `[database]` or the `database` of a profile, in a database that
+  several operators share (PostgreSQL, or SQLite on one host). There is no pulp-tui
+  server: each pulp-tui connects directly. Other operators' changes show after a refresh.
 * Client-orchestrated steps (publish/promote) continue only while pulp-tui runs; Pulp
   tasks always continue. Interrupted publishes resume with *Resume*, also by another
   operator when the database is shared. No daemon resumes them unattended.
@@ -64,14 +64,19 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
   the clients' clocks). Operations on the same repository from other tools, and from two
   databases that manage one Pulp server, are only serialized by Pulp's task resource locks
   (the later task waits; visible in Tasks).
-* The `[database]` password cannot be stored in the keyring from the TUI (the **K** key
-  stores profile secrets only); use `env:` or `file:`, or create the keyring entry
-  (service `pulp-tui`, user `[database]`) with the system tool.
+* The **K** key stores the Pulp secret of a profile, and the database password of a profile
+  that has its own `database` (keyring user `[database]:<profile>`). The password of the
+  top-level `[database]` still cannot be stored with **K**; use `env:` or `file:`, or
+  create the keyring entry (service `pulp-tui`, user `[database]`) with the system tool.
 * The shared-database TLS path (private CA, non-loopback host) is checked by hand, not by
   `tests/run-live.sh`. `ca_cert` adds to the built-in Mozilla roots; the OS trust store is
   not used (COMPATIBILITY.md).
 * Two live TUI sessions on a shared database were not run by hand; the lock logic is
   covered by the unit and live tests.
+* The TUI flows of the database per profile (open on Connect, migrate confirm, copy and
+  switch on Edit) are covered by unit tests with mock servers and SQLite files, and the
+  store and config parts by the live PostgreSQL test. They were not run by hand in a
+  terminal.
 * Fallback replication synchronizes content only and never deletes.
 * Composite Content Views and reusable filter sets are not implemented.
 * Plugins other than RPM and File, content guard creation, signing service creation,

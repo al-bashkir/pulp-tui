@@ -73,10 +73,26 @@ says if they are in the local file or in the shared database). `r` refreshes.
 Named profiles from the config file. Actions: **o** connect, **T** test connection (shows
 user, content origin, plugin versions), **c**/**e** create/edit, **d** remove from the
 config (after typing the name; Pulp is not changed, and the Content View definitions of the
-server stay in the local file, or in the shared database when `[database]` is set),
-**K** store a password/token in the system keyring, **E**/**I** export/import Content
-View definitions (with a shared database, import writes to it, so a read-only profile
-cannot import). See "Server profiles" and "Shared database" below.
+server stay where they are: the dialog names the database of the profile, or says the local
+file), **K** store a password/token in the system keyring (when the profile has its own
+database, it first asks if the secret is for the "Pulp server" or the "database"),
+**E**/**I** export/import Content View definitions (with an external database, import
+writes to it, so a read-only profile cannot import). See "Server profiles" and "Shared
+database" below.
+
+The create/edit form has three database fields: **Database**, **Database secret** and
+**Database CA**. **Database** shows the database that the profile uses now: the path of the
+local file, or the `[database]` that it follows. Type `local` (or the local file path) for
+the local file, a file path such as `/srv/cv.db` for SQLite (it is saved as
+`sqlite:///srv/cv.db`), or a `postgres://` or `sqlite://` URL. Never type a password in the
+URL. If you do not change the field, the form adds no database block to the profile (a
+block that the profile already has is kept).
+
+**Connect** opens the Content View database of the profile in the background. If the
+schema is not there yet, pulp-tui asks `Migrate database of <profile>?`. Saving a profile
+with a new database asks the same. When you change the database location of a profile
+that has Content View data, pulp-tui asks `Database of <profile> changes`: copy and
+switch, switch without copy, or Esc. See "Shared database" for both.
 
 ### RPM Repositories / File Repositories
 Columns: name, latest version, default remote, retention, description. Details explain
@@ -241,14 +257,39 @@ Auth methods: `basic` (username + secret), `bearer` (secret is the token), `none
 (PEM bundle added to the system roots), `client_cert` + `client_key` (mTLS). `proxy`,
 `timeout_secs`, `read_only`, `production`.
 
+A profile can have its own Content View database. It takes the same fields as the
+top-level `[database]` (see "Shared database"):
+
+```toml
+[profiles.prod.database]
+url = "postgres://pulp_tui@db.example.com:5432/pulp_tui_prod"
+secret = "keyring"            # keyring user [database]:prod
+# ca_cert = "/etc/pki/tls/certs/internal-ca.pem"
+```
+
+The database of a profile is the first of these (the TUI and the command line use the same
+rule):
+
+1. the `[profiles.<name>.database]` of the profile;
+2. else the top-level `[database]`;
+3. else the local file `<data-dir>/pulp-tui.db`.
+
+`url = "local"` in `[profiles.<name>.database]` keeps that profile in the local file even
+when a top-level `[database]` is set. The form accepts `local` or the path of the local
+file for this, and a bare absolute path such as `/srv/cv.db` for an SQLite database. A
+form value that is the same as what the profile would use without a block (the inherited
+`[database]`, or the local file) stores nothing, so an untouched form never adds a
+`database` block. The keyring user of the `keyring` secret of a profile database is
+`[database]:<profile>`; the top-level `[database]` uses the user `[database]`.
+
 ## Shared database
 
-Without a `[database]` section, Content Views, versions, environments, promotions and
-their history live in a SQLite file in the data directory. Only one operator uses it.
-With a `[database]` section, several operators use one database and see the same Content
-Views, versions, environments, promotions and history. There is no pulp-tui server: each
-pulp-tui connects to the database directly. A change of another operator shows after a
-refresh (`r`); nothing is pushed.
+A profile without a database (neither its own `database` nor a top-level `[database]`)
+keeps Content Views, versions, environments, promotions and their history in a SQLite file
+in the data directory. Only one operator uses it. With a database, several operators use one
+database and see the same Content Views, versions, environments, promotions and history.
+There is no pulp-tui server: each pulp-tui connects to the database directly. A change of
+another operator shows after a refresh (`r`); nothing is pushed.
 
 ```toml
 [database]
@@ -257,12 +298,17 @@ secret = "env:PULP_TUI_DB_PASSWORD"                         # env:VAR, file:/pat
 ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreSQL only
 ```
 
-* There is one `[database]` for the whole config file, not one per profile.
+* `[database]` is the default for all profiles. A profile with its own
+  `[profiles.<name>.database]` uses that instead, and `url = "local"` there keeps the
+  profile in the local file (see "Server profiles"). Profiles in one config file can
+  therefore use different databases. Profiles with the same connect URL share one open
+  store in a running pulp-tui.
 * The password is never in the URL. A URL with a password is rejected. `secret` is a
   reference, as for profiles. For `keyring` the entry has the service `pulp-tui` and the
   user `[database]`; the **K** key of the Servers screen cannot store it, so use `env:` or
-  `file:` unless you create the entry with the system keyring tool. Error messages show the
-  URL without the password.
+  `file:` unless you create the entry with the system keyring tool. The database of a
+  profile uses the keyring user `[database]:<profile>`, and **K** can store that one (it asks
+  "Pulp server" or "database"). Error messages show the URL without the password.
 * PostgreSQL traffic is always encrypted and verified (certificate chain and host name),
   except through a Unix socket or to `localhost`, `127.0.0.1` or `::1`, where it does not
   leave the machine. For other hosts pulp-tui overrides any `sslmode` in the URL with
@@ -273,24 +319,48 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreS
   used for the database.** An internal CA therefore needs `ca_cert`, also when the host
   already trusts it. (This differs from the `ca_cert` of a profile, which adds to the
   system roots.)
-* If the database cannot be opened, the Pulp screens still work. The Content View screens
-  and actions show `shared database unavailable: <reason>` and do nothing. pulp-tui does not
-  use the local file instead, because the state would split. Fix the cause and restart.
-  This is also true for a schema that `db migrate` did not create or upgrade. The TUI
-  starts and the Content View screens show, for example, `shared database unavailable:
-  postgres://pulp_tui@db.example.com:5432/pulp_tui: database schema 1 is older than this
-  pulp-tui (2); run pulp-tui db migrate`, or `...: database is not initialized; run
-  pulp-tui db migrate`. The command-line Content View commands (`export-cv`, `import-cv`,
-  `db copy`) stop with the same message.
+* The database of a profile opens in the background when you connect to the profile. If it
+  cannot be opened, the Pulp screens still work. The Content View screens and actions show
+  `shared database unavailable: <reason>` and do nothing. pulp-tui does not use the local
+  file instead, because the state would split. Fix the cause and Connect again (a failed
+  open is not kept, so the next Connect tries again). This is also true for a schema that
+  `db migrate` did not create or upgrade: the Content View screens show `shared database
+  unavailable: postgres://pulp_tui@db.example.com:5432/pulp_tui: database not migrated
+  (open Servers, Connect again to migrate, or run pulp-tui db migrate --profile prod)`, and
+  Connect offers the migration (see below). The command-line Content View commands
+  (`export-cv`, `import-cv`, `db copy`) stop with, for example, `... database schema 1 is
+  older than this pulp-tui (2); run pulp-tui db migrate --profile prod` or `...: database is
+  not initialized; run pulp-tui db migrate --profile prod`.
+* **Migrate from the TUI.** When Connect finds a database with no schema, or an older one,
+  it asks `Migrate database of <profile>?`. The dialog shows the database, the schema
+  change (for example `empty -> 2`) and a warning that other operators then need this
+  pulp-tui version or newer. Enter migrates (with the role of the connection, which must
+  create tables, as for `db migrate`). Esc does not migrate; the Content View screens then
+  show the message above. When you save a profile with a new database, pulp-tui opens it at
+  once and asks the same question. A SQLite file that does not exist yet counts as not
+  migrated: only the migration creates it, a normal open never does. A read-only profile
+  gets a warning instead of the question: run `pulp-tui db migrate --profile <name>`.
+* **Change the database of a profile.** When you edit a profile and change the location
+  (the URL) of its database, pulp-tui reads the old database (it only reads it) and counts
+  the Content Views, versions and environments of this server. If there are none, it saves
+  the profile. Otherwise it shows `Database of <profile> changes`:
+  **copy and switch** copies the data into the new database like `db copy` (new IDs, never
+  merges), and saves the profile only after the copy worked; **switch without copy** only
+  saves, and the old data stays in the old database; Esc cancels and the profile is not
+  changed. Objects that the old database published in Pulp carry its database ID, so the new
+  database can change them only after a copy, which records the old ID (see "Database ID").
+  Nothing is deleted from the old database. A read-only profile, and an old database that
+  cannot be read, get only **switch without copy**. A change of only the secret or the CA is
+  saved at once. The change takes effect at the next Connect.
 
 ### Set up (administrator)
 
 1. Create the PostgreSQL database and a role for the operators.
-2. Run `pulp-tui db migrate` with a role that can create tables. It creates the schema the
-   first time and upgrades it after you upgrade pulp-tui. A normal start never changes the
-   schema. If the schema is older, the Content View screens show `... database schema 1 is
-   older than this pulp-tui (2); run pulp-tui db migrate` (see above). If it is newer,
-   upgrade pulp-tui. When two administrators migrate at the same time, the second one waits.
+2. Run `pulp-tui db migrate --profile <name>` with a role that can create tables. It creates
+   the schema the first time and upgrades it after you upgrade pulp-tui. A normal start
+   never changes the schema. If the schema is older, the Content View screens show
+   `... database not migrated (...)` (see above). If it is newer, upgrade pulp-tui. When two
+   administrators migrate at the same time, the second one waits.
 3. Give the operators' role only `SELECT`, `INSERT`, `UPDATE` and `DELETE`. After a migration
    that adds tables, grant again (or use `ALTER DEFAULT PRIVILEGES`).
 
@@ -299,26 +369,41 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreS
    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pulp_tui_op;
    ```
 
-4. Each operator puts the same `[database]` in the config and starts pulp-tui.
+4. Each operator puts the same `[database]` in the config (or the same `database` in the
+   profile) and starts pulp-tui.
 
 ### Move the data of one operator
 
 `pulp-tui --profile lab db copy` copies the Content View data of the profile `lab` from the
-local file into the shared database: Content Views with repositories and filters, versions
+local file into the database of `lab`: Content Views with repositories and filters, versions
 and their checkpoints, environments, bindings and the audit log. The rows get new IDs. The
 local profile name becomes the server key (see below). The copy runs in one transaction. It
-**never merges**: if the shared database already has a Content View, or an environment
+**never merges**: if the target database already has a Content View, or an environment
 other than Library, with the same name for this server, it stops and writes nothing. Task
-references, replication history and locks are not copied. The local file stays as it is. A
+references, replication history and locks are not copied. The source stays as it is. A
 read-only profile cannot run `db copy`. Run it once for each server.
 
-After the copy, objects that the local file published get the database ID label of the
-shared database on the next publish or promotion (see "Database ID" below). After that, the
-old local file cannot change them any more.
+`--from <profile|local>` chooses the source. The default is `local`: the local file, also
+when a profile has that name. With a profile name, `db copy` reads the database of that
+profile (an external one with its server key, the local file with the profile name).
+For example, `pulp-tui --profile prod db copy --from lab` copies the data of `lab` into the
+database of `prod`, under the server key of `prod`. The command refuses two cases and
+writes nothing:
+
+* The source and the target are the same database, also when two URLs reach it:
+  `source and target are the same database`.
+* A Content View of the source has a live lock (renewed within the last 2 minutes): `Content
+  View web is locked by alice@ws12 (publish); copy after it ends`. The lock of a crashed
+  session expires after 2 minutes and does not block the copy.
+
+After the copy, objects that the source published get the database ID label of the
+target database on the next publish or promotion (see "Database ID" below). After that, the
+old source cannot change them any more. The TUI does the same copy when you change the
+database of a profile and choose "copy and switch" (see above).
 
 ### What is shared
 
-| Shared (in `[database]`) | Always local (`<data-dir>/pulp-tui.db`) |
+| Shared (in the external database) | Always local (`<data-dir>/pulp-tui.db`) |
 |---|---|
 | Content Views, repositories and filters, versions and checkpoints, environments, bindings, audit log (with the operator), locks | Task Center references, replication history |
 
@@ -342,11 +427,13 @@ old local file cannot change them any more.
 * **Base path prefix.** `cv_base_path_prefix` is stored per server the first time a
   promotion uses it. Later promotions use the stored value. If your setting is different,
   the workflow log says so and pulp-tui uses the stored value, so served URLs do not move.
-* **Read-only profiles.** With a shared database, creating or editing a Content View,
-  adding or removing repositories and filters, and creating, deleting or protecting an
-  environment change state that other operators publish from. A read-only profile does not
-  show these actions. `import-cv` and `db copy` refuse a read-only profile. Without a
-  shared database these actions stay available, because they change only the local file.
+* **Read-only profiles.** When the database of the profile is external (its own, or
+  `[database]`), creating or editing a Content View, adding or removing repositories and
+  filters, and creating, deleting or protecting an environment change state that other
+  operators publish from. A read-only profile does not show these actions. `import-cv` and
+  `db copy` refuse a read-only profile, and the TUI neither migrates its database nor
+  offers "copy and switch" for it. When the profile uses the local file, these actions stay
+  available, because they change only the local file.
 
 ### Locks
 
@@ -406,11 +493,18 @@ pulp-tui [--config FILE] [--profile NAME] [--data-dir DIR]     start the TUI
 pulp-tui check                       test a profile non-interactively
 pulp-tui export-cv [-o FILE]         export Content View definitions (JSON, no secrets)
 pulp-tui import-cv FILE              import them (existing names are kept)
-pulp-tui db migrate                  create or upgrade the schema of the [database]
-pulp-tui --profile NAME db copy      copy that profile's Content View data from the local file
-                                     into the [database] (never merges)
+pulp-tui db migrate                  create or upgrade the schema of the profile's database
+pulp-tui --profile NAME db copy [--from PROFILE|local]
+                                     copy Content View data into the database of NAME, from
+                                     the local file (default) or the database of another
+                                     profile (never merges)
 pulp-tui config-example              print an example config
 ```
+
+`export-cv`, `import-cv`, `db migrate` and `db copy` use the database of the selected
+profile (`--profile`, `$PULP_TUI_PROFILE`, `default_profile`): its own `database`, else
+`[database]`, else the local file. `db migrate` on a profile that uses the local file stops
+with `profile <name> uses the local file; db migrate is only for an external database`.
 
 Logs: `<data-dir>/pulp-tui.log`; level with `PULP_TUI_LOG` (for example
 `PULP_TUI_LOG=pulp_tui=debug`). Secrets are never logged.

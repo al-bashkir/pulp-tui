@@ -15,10 +15,10 @@ max_response_mb = 64          # larger API responses are rejected
 upload_chunk_mb = 8           # chunked upload size
 cv_base_path_prefix = "cv"    # Content View distributions: <prefix>/<env>/<view>/<repo>
 
-# Shared Content View / lifecycle database (optional, one for all profiles). Without it they
-# stay in the local file. `pulp-tui db migrate` creates or upgrades the schema; a normal start
-# never changes it. When it cannot be opened, Pulp screens still work and Content View screens
-# show "shared database unavailable: ...".
+# Shared Content View / lifecycle database (optional): the default for profiles without their own
+# `database` (see [profiles.prod.database] below). Without either, they stay in the local file.
+# `pulp-tui db migrate` creates or upgrades the schema; a normal start never changes it. When it
+# cannot be opened, Pulp screens still work and Content View screens show "shared database unavailable: ...".
 # [database]
 # url = "postgres://pulp_tui@db.example.com:5432/pulp_tui"   # never a password in the URL
 # secret = "env:PULP_TUI_DB_PASSWORD"   # env:VAR, file:/path or keyring (user "[database]")
@@ -49,6 +49,11 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"
 timeout_secs = 30
 production = true             # red banner, typed confirmations
 read_only = false
+# Own Content View database for this profile (same fields as [database]; it wins over [database]).
+# [profiles.prod.database]
+# url = "postgres://pulp_tui@db.example.com:5432/pulp_tui_prod"
+# secret = "keyring"            # keyring user "[database]:prod"
+# url = "local" keeps this profile in the local file even when [database] is set.
 
 [profiles.upstream]
 url = "https://pulp-upstream.example.com"
