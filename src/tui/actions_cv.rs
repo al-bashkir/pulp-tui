@@ -4,7 +4,7 @@ use super::actions::{ap, caps, confirm_mirror, pretty, sync_policies};
 use super::app::{App, Ctx, Level, NO_PROFILE, unavailable};
 use super::form::{Field, FieldKind, Form, PickItem, Source};
 use super::kinds::{Act, Kind, s};
-use crate::cv::{Mode, base_path, check_repo_clash, distribution_name};
+use crate::cv::{Mode, check_repo_clash, distribution_name};
 use crate::filters::{format_rules, parse_rules};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, PulpError, RepoType};
@@ -673,8 +673,6 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
     app.job(format!("preview {name} -> {env}"), move |ctx| async move {
         let svc = ctx.cv()?;
         let st = &svc.store;
-        // What promote will use: the prefix this server already has, else the setting.
-        let prefix = st.stored_prefix(&svc.scope).await?.unwrap_or_else(|| svc.prefix.clone());
         let envs = st.environments(&svc.scope).await?;
         let e = envs.into_iter().find(|e| e.name == env).ok_or_else(|| anyhow!("unknown environment {env}"))?;
         let v = st.version(vid).await?;
@@ -692,7 +690,7 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
                 r.repo_name,
                 r.repo_type.label(),
                 distribution_name(&name, &env, &r.repo_name),
-                base_path(&prefix, &name, &e.label, &r.repo_name)
+                svc.served_path(&name, &e, r).await?
             ));
         }
         for b in st.binding_repos(e.id, cv).await? {

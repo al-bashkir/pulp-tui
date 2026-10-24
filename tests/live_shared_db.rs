@@ -134,17 +134,12 @@ async fn postgres_migration_3_keeps_served_paths() {
         for m in &PG_MIGRATIONS[..2] {
             c.execute(sqlx::raw_sql(m)).await.unwrap();
         }
-        // k: "Dev" and "dev" share the segment `dev`, prefix acme. kept: has a stored prefix already.
-        // plain: a path without a prefix. The new store code writes columns schema 2 lacks, so this is raw SQL.
+        // "Dev" and "dev" share the segment `dev`. The new store code writes columns schema 2 lacks, so this is raw SQL.
         c.execute(sqlx::raw_sql(
             "INSERT INTO schema_version(version) VALUES (2);
-             INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'k', 'web', 't'), (2, 'kept', 'web', 't'), (3, 'plain', 'web', 't');
+             INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'k', 'web', 't');
              INSERT INTO environments(id, profile, name, prior_id) VALUES (1, 'k', 'Library', NULL), (2, 'k', 'Dev', 1), (3, 'k', 'dev', 1);
-             INSERT INTO scope_settings(scope, key, value) VALUES ('kept', 'cv_base_path_prefix', 'custom');
-             INSERT INTO binding_repos VALUES
-                (2, 1, '/r/1/', 'os', 'rpm', '/d/1/', 'acme/dev/web/os', '/p/1/'),
-                (2, 2, '/r/2/', 'os', 'rpm', '/d/2/', 'other/dev/web/os', '/p/2/'),
-                (2, 3, '/r/3/', 'os', 'rpm', '/d/3/', 'os', '/p/3/');",
+             INSERT INTO binding_repos VALUES (2, 1, '/r/1/', 'os', 'rpm', '/d/1/', 'acme/dev/web/os', '/p/1/');",
         ))
         .await
         .unwrap();
@@ -154,9 +149,6 @@ async fn postgres_migration_3_keeps_served_paths() {
     let labels: Vec<String> = st.environments("k").await.unwrap().iter().map(|e| format!("{}={}", e.name, e.label)).collect();
     assert_eq!(labels, ["Library=library", "Dev=dev", "dev=dev"]);
     assert_eq!(st.binding_repos(2, 1).await.unwrap()[0].base_path, "acme/dev/web/os");
-    assert_eq!(st.stored_prefix("k").await.unwrap().as_deref(), Some("acme"));
-    assert_eq!(st.stored_prefix("kept").await.unwrap().as_deref(), Some("custom"), "a stored prefix is not replaced");
-    assert_eq!(st.stored_prefix("plain").await.unwrap(), None, "a path without `/` seeds nothing");
 
     // Labels stay unique per scope on PostgreSQL too.
     let e = st.set_env_label(2, "library").await.unwrap_err().to_string();
@@ -294,7 +286,7 @@ async fn store_methods_on_postgres() {
     assert!(st.delete_env(dev).await.is_err(), "bound and has a successor");
     st.delete_env(qa).await.unwrap();
 
-    // Audit trail, replication runs, task references, the first base path prefix.
+    // Audit trail, replication runs, task references.
     st.audit(k, "ann@ws1", "cv.promote", "base v1 -> Dev").await.unwrap();
     st.audit(k, "bob@ws2", "cv.publish", "base v2").await.unwrap();
     let log = st.audit_log(k, 5).await.unwrap();
@@ -307,8 +299,6 @@ async fn store_methods_on_postgres() {
     st.track_task(k, "/t/1/", "sync os", "running").await.unwrap();
     st.finish_task(k, "/t/1/", "completed").await.unwrap();
     assert_eq!(st.tasks(k, 5).await.unwrap()[0].state, "completed");
-    assert_eq!(st.cv_prefix(k, "cv").await.unwrap(), "cv");
-    assert_eq!(st.cv_prefix(k, "other").await.unwrap(), "cv", "the first prefix of a server wins");
 
     // Export and import between two servers' scopes of the same database.
     let ex = st.export(k).await.unwrap();

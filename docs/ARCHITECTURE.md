@@ -86,8 +86,9 @@ idle group whose counts stay the same for three polls is also treated as final.
   `Library -> Dev -> Test -> Prod`. Publishing makes the new version active in Library.
 * **Promote** binds a version to an environment. The version must be active in the prior
   environment. Each (view, environment, repository) has a stable distribution
-  `pulp-tui-cv-<view>-<env>-<repo>` at `[<prefix>/]<env label>/<view>/<repo>`
-  (`cv::base_path`; an empty prefix leaves out its segment). The distribution name and the
+  `pulp-tui-cv-<view>-<env>-<repo>` at `<env label>/<view>/<repo>` (`cv::base_path`). An
+  existing distribution keeps its path (`CvService::served_path`): older servers serve at
+  `cv/...`, and an operator may move a distribution by hand. The distribution name and the
   ownership label `pulp_tui_env` keep the environment **name**; only the served path uses
   the environment **label**. Promotion re-points the distribution to the version's
   publication. Repositories that are bound but not part of the version stop serving
@@ -98,7 +99,7 @@ idle group whose counts stay the same for three polls is also treated as final.
   the old path stops serving). Steps: load the impact (`relabel_impact`: served rows whose
   path changes); `confirm_danger` typed with the environment name; take the locks of every
   view with a binding or served rows in the environment, in `cv_id` order; store the new
-  label (the checkpoint) and the server prefix; then for each row check the ownership
+  label (the checkpoint); then for each row check the ownership
   labels and the database ID, `PATCH`, wait, and save the row. A row that fails keeps its old
   path and is reported; a rerun with the same label continues with the rows that are left
   (a row whose `PATCH` finished before the crash is saved without a second `PATCH`). A row
@@ -138,7 +139,7 @@ idle group whose counts stay the same for three polls is also treated as final.
   published. Then `resume` runs the normal path: `publish_repo` returns at once for a row
   that has a publication, and `promote` binds Library with the composite's own
   distributions `pulp-tui-cv-<composite>-<env>-<repo>`, labeled `pulp_tui_cv=<composite>`,
-  at `[<prefix>/]<label>/<composite>/<repo>`. One publication can be served by the
+  at `<label>/<composite>/<repo>`. One publication can be served by the
   distribution of the component and the one of the composite (verified, COMPATIBILITY.md).
   Delete never removes a borrowed object: `delete_version` skips borrowed rows, and
   `delete_view` of a composite removes its distributions only. The composite takes its own
@@ -242,14 +243,13 @@ only with `pulp-tui db migrate` or the confirm in the TUI. Both call
 schema with a message. Operators need only
 `SELECT/INSERT/UPDATE/DELETE`; the database ID is created with an `INSERT`.
 Schema 2 added the `meta` table (database ID `db_id` and aliases `alias:<id>`),
-`scope_settings` (the base path prefix per server, first value wins), `locks` and
+`scope_settings` (the base path prefix per server; no longer read), `locks` and
 `audit.actor`.
 Schema 3 added `environments.label`, the path segment of an environment (unique per
 scope; `validate_label`). The migration sets it to `lower(name)`, which is exactly the
 segment that served paths used before (so `Dev` and `dev` share `dev` and nothing moves),
-and seeds the prefix of every scope that has served rows but no stored prefix: the first
-segment of their `binding_repos.base_path` (usually `cv`). A new server stores an empty
-prefix (`Settings::new_server_prefix`). Export (format 2) and `db copy` carry the labels;
+and seeds `scope_settings` with the first segment of `binding_repos.base_path` (usually
+`cv`; no longer read). Export (format 2) and `db copy` carry the labels;
 `db copy` refuses a label that another environment uses in the target scope. An external
 database at schema 2 needs `db migrate` after the upgrade.
 Schema 4 added composite Content Views: `content_views.composite` and `auto_publish`

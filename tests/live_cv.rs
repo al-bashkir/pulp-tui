@@ -30,14 +30,7 @@ async fn content_view_lifecycle() {
 
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let profile = c.profile().to_string();
-    let svc = CvService {
-        client: c.clone(),
-        store: store.clone(),
-        prefix: id.clone(),
-        scope: profile.clone(),
-        actor: "test@live".into(),
-        lock: None,
-    };
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
     let cv = store.create_cv(&profile, &id, "test view").await.unwrap();
     // Every workflow below runs under the view's lock (renewed every 30 s), as the TUI does.
     let svc = svc.locked(cv, "live test").await.unwrap();
@@ -83,7 +76,7 @@ async fn content_view_lifecycle() {
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
     assert_eq!(svc.verify(cv, dev).await.unwrap(), Vec::<String>::new());
     let dev_docs = c
-        .fetch_content(&format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, &id, "dev", "docs")), 1 << 20)
+        .fetch_content(&format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, "dev", "docs")), 1 << 20)
         .await
         .unwrap();
     assert_eq!(dev_docs.0, 200);
@@ -126,7 +119,7 @@ async fn content_view_lifecycle() {
     let blocker = create(
         &c,
         RepoType::File.distributions(),
-        json!({ "name": format!("{id}-blocker"), "base_path": base_path(&id, &id, "qa", "docs") }),
+        json!({ "name": format!("{id}-blocker"), "base_path": base_path(&id, "qa", "docs") }),
         "/distributions/",
     )
     .await;
@@ -197,14 +190,7 @@ async fn environment_relabel_moves_served_paths() {
     let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let profile = c.profile().to_string();
-    let svc = CvService {
-        client: c.clone(),
-        store: store.clone(),
-        prefix: id.clone(),
-        scope: profile.clone(),
-        actor: "test@live".into(),
-        lock: None,
-    };
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
     let cv = store.create_cv(&profile, &id, "").await.unwrap();
     store
         .set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] })
@@ -214,24 +200,24 @@ async fn environment_relabel_moves_served_paths() {
     let lib = store.ensure_library(&profile).await.unwrap();
     let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
-    let readme = |label: &str| format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, &id, label, "docs"));
+    let readme = |label: &str| format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, label, "docs"));
     assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 200);
 
     // The impact names the move; the relabel moves the one served row and the view still verifies.
     let dist = store.binding_repos(dev, cv).await.unwrap()[0].distribution.clone();
     let impact = svc.relabel_impact(dev, "dev2").await.unwrap();
-    assert_eq!((impact.len(), impact[0].1.as_str()), (1, base_path(&id, &id, "dev2", "docs").as_str()));
+    assert_eq!((impact.len(), impact[0].1.as_str()), (1, base_path(&id, "dev2", "docs").as_str()));
     let (lines, failed) = svc.relabel_env(dev, "dev2", &quiet, &no_progress).await.unwrap();
     assert_eq!(failed, 0, "{lines:?}");
     assert!(svc.verify(cv, dev).await.unwrap().is_empty());
     assert_eq!(c.fetch_content(&readme("dev2"), 1 << 20).await.unwrap().0, 200);
     assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 404, "the old path is gone");
-    assert_eq!(store.binding_repos(dev, cv).await.unwrap()[0].base_path, base_path(&id, &id, "dev2", "docs"));
+    assert_eq!(store.binding_repos(dev, cv).await.unwrap()[0].base_path, base_path(&id, "dev2", "docs"));
 
     // The distribution moved in place (same object), and a second promotion serves at the new label.
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
     let row = store.binding_repos(dev, cv).await.unwrap().remove(0);
-    assert_eq!((row.distribution, row.base_path), (dist, base_path(&id, &id, "dev2", "docs")));
+    assert_eq!((row.distribution, row.base_path), (dist, base_path(&id, "dev2", "docs")));
     assert!(svc.verify(cv, dev).await.unwrap().is_empty());
     assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 404);
 
@@ -255,7 +241,7 @@ async fn content_view_owned_by_another_database() {
         let store = Arc::new(Store::open_in_memory().await.unwrap());
         let cv = store.create_cv(&profile, &id, "").await.unwrap();
         store.set_cv_repo(cv, &docs).await.unwrap();
-        let svc = CvService { client: c.clone(), store, prefix: id.clone(), scope: profile.clone(), actor: actor.into(), lock: None };
+        let svc = CvService { client: c.clone(), store, scope: profile.clone(), actor: actor.into(), lock: None };
         services.push((svc, cv));
     }
     let ((a, a_cv), (b, b_cv)) = (services.remove(0), services.remove(0));
@@ -311,14 +297,7 @@ async fn composite_content_view_rocky9() {
     let (rpm_repo, rpm_remote) = synced_repo(&c, RepoType::Rpm, &format!("{id}-src-os"), "rpm/", "additive").await;
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let profile = c.profile().to_string();
-    let svc = CvService {
-        client: c.clone(),
-        store: store.clone(),
-        prefix: id.clone(),
-        scope: profile.clone(),
-        actor: "test@live".into(),
-        lock: None,
-    };
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
     let os = store.create_cv(&profile, &os_name, "").await.unwrap();
     let extras = store.create_cv(&profile, &extras_name, "").await.unwrap();
     let repo = |href: &str, name: &str, t| CvRepo { repo_href: href.into(), repo_name: name.into(), repo_type: t, filters: vec![] };
@@ -337,8 +316,7 @@ async fn composite_content_view_rocky9() {
     let lib = store.ensure_library(&profile).await.unwrap();
     assert_eq!(svc.verify(comp, lib).await.unwrap(), Vec::<String>::new());
     assert!(svc.verify(extras, lib).await.unwrap().is_empty(), "one publication, served by two distributions");
-    let url =
-        |label: &str, repo: &str, file: &str| format!("http://localhost:8080/pulp/content/{}/{file}", base_path(&id, &id, label, repo));
+    let url = |label: &str, repo: &str, file: &str| format!("http://localhost:8080/pulp/content/{}/{file}", base_path(&id, label, repo));
     assert_eq!(c.fetch_content(&url("library", "docs", "docs/readme.txt"), 1 << 20).await.unwrap().0, 200);
     assert_eq!(c.fetch_content(&url("library", "os", "repodata/repomd.xml"), 1 << 20).await.unwrap().0, 200);
 

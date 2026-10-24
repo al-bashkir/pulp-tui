@@ -179,8 +179,6 @@ pub const LOCK_RENEW_SECS: u64 = 30;
 
 /// `pg_advisory_lock` key held while `db migrate` runs.
 const MIGRATE_LOCK: i64 = 7_301_955;
-/// `scope_settings` key of the base path prefix a server's distributions use.
-const PREFIX_KEY: &str = "cv_base_path_prefix";
 /// Limit for reaching an external database (a dropped packet otherwise waits for the OS TCP timeout).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -540,26 +538,6 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
-    }
-
-    /// The `cv_base_path_prefix` this server has used so far, if any.
-    pub async fn stored_prefix(&self, scope: &str) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar("SELECT value FROM scope_settings WHERE scope = $1 AND key = $2")
-            .bind(scope)
-            .bind(PREFIX_KEY)
-            .fetch_optional(&self.pool)
-            .await?)
-    }
-
-    /// The first prefix used for this server wins: later config changes must not move served paths.
-    pub async fn cv_prefix(&self, scope: &str, local: &str) -> Result<String> {
-        sqlx::query("INSERT INTO scope_settings(scope, key, value) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-            .bind(scope)
-            .bind(PREFIX_KEY)
-            .bind(local)
-            .execute(&self.pool)
-            .await?;
-        Ok(self.stored_prefix(scope).await?.unwrap_or_else(|| local.to_string()))
     }
 
     async fn migrate(&self, upto: usize) -> Result<()> {
@@ -1662,15 +1640,6 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
-        // The base path prefix stays with the server: promotions after the copy keep the same paths.
-        if let Some(prefix) = src.stored_prefix(src_scope).await? {
-            sqlx::query("INSERT INTO scope_settings(scope, key, value) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-                .bind(dst_scope)
-                .bind(PREFIX_KEY)
-                .bind(prefix)
-                .execute(&mut *tx)
-                .await?;
-        }
         // Pulp objects the local file labeled with its id are now this database's.
         sqlx::query("INSERT INTO meta(key, value) VALUES ($1, $2) ON CONFLICT DO NOTHING")
             .bind(format!("alias:{}", src.db_id()))
@@ -1995,10 +1964,10 @@ mod tests {
         let path = dir.path().join("pulp-tui.db");
         {
             // Rows as schema 2 wrote them, in raw SQL (the new store code writes columns schema 2 lacks).
-            // "dev" next to "Dev" shares today's segment; scope "new" has a view but no served rows.
+            // "dev" next to "Dev" shares today's segment.
             let s = Store::open_at_version(&path, 2).await.unwrap();
             sqlx::raw_sql(
-                "INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'old', 'web', 't'), (2, 'new', 'api', 't');
+                "INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'old', 'web', 't');
                  INSERT INTO environments(id, profile, name, prior_id) VALUES (1, 'old', 'Library', NULL), (2, 'old', 'Dev', 1), (3, 'old', 'dev', 1);
                  INSERT INTO binding_repos VALUES (2, 1, '/r/1/', 'os', 'rpm', '/d/1/', 'acme/dev/web/os', '/p/1/');",
             )
@@ -2009,8 +1978,6 @@ mod tests {
         let s = Store::open(&path).await.unwrap();
         let labels: Vec<String> = s.environments("old").await.unwrap().iter().map(|e| format!("{}={}", e.name, e.label)).collect();
         assert_eq!(labels, ["Library=library", "Dev=dev", "dev=dev"]);
-        assert_eq!(s.stored_prefix("old").await.unwrap().as_deref(), Some("acme"));
-        assert_eq!(s.stored_prefix("new").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -2070,7 +2037,7 @@ mod tests {
         sqlx::query("INSERT INTO environments(profile, name, prior_id) VALUES ('k', 'QA', $1)").bind(lib).execute(&s.pool).await.unwrap();
         let envs = s.environments("k").await.unwrap();
         assert_eq!(envs[1].label, "qa");
-        assert_eq!(crate::cv::base_path("", "web", &envs[1].label, "os"), "qa/web/os");
+        assert_eq!(crate::cv::base_path("web", &envs[1].label, "os"), "qa/web/os");
         assert_eq!(s.create_env("k", "qa", lib, false).await.unwrap_err().to_string(), "label qa is already used by environment QA");
         let dev = s.create_env("k", "Dev", lib, false).await.unwrap();
         assert_eq!(s.set_env_label(dev, "qa").await.unwrap_err().to_string(), "label qa is already used by environment QA");
@@ -2174,16 +2141,6 @@ mod tests {
         assert_eq!(id.len(), 16);
         Store::migrate_external(&url, "cv.db").await.unwrap();
         assert_eq!(Store::open_external(&url, "cv.db").await.unwrap().db_id(), id);
-    }
-
-    #[tokio::test]
-    async fn first_prefix_wins() {
-        let s = Store::open_in_memory().await.unwrap();
-        assert_eq!(s.stored_prefix("k").await.unwrap(), None);
-        assert_eq!(s.cv_prefix("k", "cv").await.unwrap(), "cv");
-        assert_eq!(s.cv_prefix("k", "other").await.unwrap(), "cv");
-        assert_eq!(s.stored_prefix("k").await.unwrap().as_deref(), Some("cv"));
-        assert_eq!(s.cv_prefix("k2", "other").await.unwrap(), "other"); // per server
     }
 
     #[tokio::test]
@@ -2398,7 +2355,6 @@ mod tests {
             };
             src.save_binding_repo(&b).await.unwrap();
         }
-        src.cv_prefix("lab", "acme").await.unwrap();
         src.audit("lab", "ann@h", "cv.create", "web").await.unwrap();
         src.audit("lab", "", "cv.publish", "web v1").await.unwrap();
 
@@ -2442,7 +2398,6 @@ mod tests {
         assert_eq!(dst.binding(envs[1].id, cv2.id).await.unwrap().unwrap().version_id, n1.id);
         let brs = dst.binding_repos(envs[2].id, cv2.id).await.unwrap();
         assert_eq!((brs.len(), brs[0].cv_id, brs[0].base_path.as_str()), (1, cv2.id, format!("cv/{prod}/os").as_str()));
-        assert_eq!(dst.stored_prefix("k").await.unwrap().as_deref(), Some("acme"));
         let log = dst.audit_log("k", 5).await.unwrap();
         assert_eq!(
             log.iter().map(|a| (a.action.as_str(), a.actor.as_str())).collect::<Vec<_>>(),

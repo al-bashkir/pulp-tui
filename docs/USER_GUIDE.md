@@ -189,10 +189,12 @@ submitted, with how many were submitted, failed or skipped (the per-repository r
 finished tasks is shown in the result view, not in the entry).
 
 Each promoted repository is served at
-`https://<pulp>/pulp/content/[<prefix>/]<lc label>/<view>/<repo>/`, where `<lc label>` is
-the label of the lifecycle environment (see "Lifecycle Environments"). Servers that served
-Content Views with an earlier pulp-tui keep their prefix (`cv/` unless you set another one);
-new servers have no prefix. See "Base path prefix" under "Shared database".
+`https://<pulp>/pulp/content/<lc label>/<view>/<repo>/`, where `<lc label>` is
+the label of the lifecycle environment (see "Lifecycle Environments"). A promotion keeps the
+path of a distribution that exists: distributions of an earlier pulp-tui stay at `cv/...`.
+For a custom path, change the `base_path` of the distribution in Pulp (Distributions,
+Edit); later promotions keep it. A relabel moves all paths of the environment to
+`<lc label>/<view>/<repo>`, also the paths that you changed.
 
 Filter syntax (rules separated by `;`):
 
@@ -241,7 +243,7 @@ extras.
   `rocky9-extras: v1 -> v2`), then the content that changes in each repository.
 * **Served paths.** A composite has its own distributions
   `pulp-tui-cv-<composite>-<env>-<repo>` at
-  `[<prefix>/]<lc label>/<composite>/<repo>`. Promote, roll back and the drift check work as
+  `<lc label>/<composite>/<repo>`. Promote, roll back and the drift check work as
   for a normal view. One publication can be served by the distribution of its component and
   by the distribution of the composite at the same time.
 * **Auto publish.** Off by default, set per composite with `e`. When a component publishes
@@ -293,8 +295,7 @@ moved, and the drift check of each bound view. The distribution names do not cha
 and is named in the result; run Edit again with the same label to move the rest. A relabel
 locks every view that is bound in the environment (see "Locks"), and stops with the
 holder's name if another operator holds one of them. A view bound in the environment during
-the relabel is not moved; run Edit again. When the server has no path prefix, a label must
-not overlap the base path of another distribution (for example a repository distributed at
+the relabel is not moved; run Edit again. A label must not overlap the base path of another distribution (for example a repository distributed at
 `dev`, or at `dev/tools`): Pulp refuses a path that is equal to, a parent of, or a child of
 another path, and the rows that fail stay as described above.
 
@@ -469,8 +470,8 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreS
    administrators migrate at the same time, the second one waits. After you upgrade to the
    pulp-tui version with lifecycle environment labels, migrate an external database that is
    at schema 2 once (the TUI offers it on Connect, or run `pulp-tui db migrate --profile
-   <name>`). Schema 3 gives each environment the label of its lower-case name and stores the
-   base path prefix of servers that already serve, so no served path moves. An external
+   <name>`). Schema 3 gives each environment the label of its lower-case name, so no served
+   path moves. An external
    database at schema 3 needs the same migration (the TUI offer, or `db migrate`) before
    composite Content Views work: schema 4 adds their tables and columns.
 3. Give the operators' role only `SELECT`, `INSERT`, `UPDATE` and `DELETE`. After a migration
@@ -538,15 +539,6 @@ database of a profile and choose "copy and switch" (see above).
   upgrade) shows no `by`; `db copy` marks such rows `by copied`. In a container the host
   name is a random container ID: start the container with `--hostname` (for example
   `--hostname ws12`), so that the lock owner and the audit actor stay the same.
-* **Base path prefix.** `cv_base_path_prefix` in `[settings]` is optional. Without it a new
-  server has no prefix and its paths start with the environment label. The prefix is stored
-  per server the first time a promotion uses it; the first value wins. Later promotions use
-  the stored value. If your setting is different, the workflow log says so and pulp-tui
-  uses the stored value, so served URLs do not move. The value `"cv"` is read as unset (an
-  older pulp-tui wrote it into every config), so a new server cannot get a `cv/` prefix with
-  this value; use another value. A server that served Content Views before environment
-  labels keeps its prefix: the migration to schema 3 stores the first path segment of its
-  served paths (for example `cv`).
 * **Read-only profiles.** When the database of the profile is external (its own, or
   `[database]`), creating or editing a Content View, adding or removing repositories,
   filters and components, and creating, deleting or protecting an environment change state

@@ -142,17 +142,9 @@ pub struct Settings {
     pub max_response_mb: u64,
     /// Upload chunk size for the Pulp chunked upload API.
     pub upload_chunk_mb: u64,
-    /// Optional first path segment of Content View base paths, for servers without a stored prefix.
-    /// `"cv"` is the old default and counts as unset.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Removed setting, ignored: read so that configs of older versions still load, never saved.
+    #[serde(skip_serializing)]
     pub cv_base_path_prefix: Option<String>,
-}
-
-impl Settings {
-    /// The prefix a server with no stored prefix starts with.
-    pub fn new_server_prefix(&self) -> &str {
-        self.cv_base_path_prefix.as_deref().filter(|p| *p != "cv").unwrap_or("")
-    }
 }
 
 impl Default for Settings {
@@ -469,15 +461,12 @@ read_only = true
     }
 
     #[test]
-    fn cv_prefix_setting_is_optional() {
+    fn removed_cv_prefix_setting_still_loads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        Config::default().save(&path).unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("cv_base_path_prefix"));
-        let s = |v: Option<&str>| Settings { cv_base_path_prefix: v.map(String::from), ..Default::default() };
-        assert_eq!((s(None).new_server_prefix(), s(Some("cv")).new_server_prefix(), s(Some("acme")).new_server_prefix()), ("", "", "acme"));
         let old: Config = toml::from_str("[settings]\ncv_base_path_prefix = \"cv\"\n").unwrap();
-        assert_eq!(old.settings.new_server_prefix(), "");
+        old.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("cv_base_path_prefix"));
         toml::from_str::<Config>(include_str!("../examples/config.toml")).unwrap();
     }
 
