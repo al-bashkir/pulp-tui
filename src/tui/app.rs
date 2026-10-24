@@ -2,9 +2,10 @@
 //! disk operation runs as a background job that sends back a closure applied here.
 
 use super::actions::ap;
-use super::form::{FieldKind, Form, FormEvent, PickItem, Source};
+use super::form::{FieldKind, Form, FormEvent, PickItem, Source, move_key};
 use super::kinds::{self, Act, Kind};
 use super::tasks::TaskCenter;
+use super::view::help_lines;
 use crate::config::{Config, Database, Settings};
 use crate::cv::CvService;
 use crate::pulp::models::Task;
@@ -143,7 +144,6 @@ pub struct Notice {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Screen {
     Dashboard,
-    Help,
     List(Kind),
 }
 
@@ -192,7 +192,7 @@ pub enum Modal {
     Confirm { title: String, lines: Vec<String>, typed: Option<String>, input: String, on_yes: Option<OnYes>, danger: bool, scroll: usize },
     Text { title: String, lines: Vec<String>, scroll: usize },
     Input { title: String, input: String, on_done: Option<OnInput> },
-    Palette { input: String, selected: usize },
+    Palette { input: String, selected: usize, filtering: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -694,7 +694,6 @@ impl App {
     pub fn reload(&mut self) {
         match self.screen.clone() {
             Screen::Dashboard => super::actions::load_dashboard(self),
-            Screen::Help => {}
             Screen::List(Kind::Tasks) => {
                 self.list.items = self.task_items();
                 self.list.count = self.list.items.len() as u64;
@@ -903,10 +902,10 @@ impl App {
                     self.quit = true;
                 }
             }
-            KeyCode::Char('?') => self.open(Screen::Help),
-            KeyCode::Char(':') => self.modal = Some(Modal::Palette { input: String::new(), selected: 0 }),
+            KeyCode::Char('?') => self.text("Help", help_lines()),
+            KeyCode::Char(':') => self.modal = Some(Modal::Palette { input: String::new(), selected: 0, filtering: true }),
             KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.modal = Some(Modal::Palette { input: String::new(), selected: 0 })
+                self.modal = Some(Modal::Palette { input: String::new(), selected: 0, filtering: true })
             }
             KeyCode::Char('N') => {
                 let lines = self.notices.iter().rev().map(|n| format!("{:?}: {}", n.level, n.text)).collect();
@@ -916,7 +915,7 @@ impl App {
             _ if self.focus == Focus::Nav => self.nav_key(k),
             _ => match self.screen.clone() {
                 Screen::List(_) => self.list_key(k),
-                Screen::Dashboard | Screen::Help => match k.code {
+                Screen::Dashboard => match k.code {
                     KeyCode::Char('r') => self.reload(),
                     KeyCode::Esc => self.back(),
                     KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
@@ -934,11 +933,13 @@ impl App {
         match k.code {
             KeyCode::Up | KeyCode::Char('k') => self.nav = (self.nav + n - 1) % n,
             KeyCode::Down | KeyCode::Char('j') => self.nav = (self.nav + 1) % n,
+            KeyCode::Char('g') => self.nav = 0,
+            KeyCode::Char('G') => self.nav = n - 1,
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let s = match self.nav {
                     0 => Screen::Dashboard,
                     i if i <= kinds::NAV.len() => Screen::List(kinds::NAV[i - 1].1.clone()),
-                    _ => Screen::Help,
+                    _ => return self.text("Help", help_lines()),
                 };
                 self.history.clear();
                 self.open(s);
@@ -952,7 +953,13 @@ impl App {
     fn list_key(&mut self, k: KeyEvent) {
         let len = self.list.items.len();
         let page = 15;
-        match k.code {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let code = match k.code {
+            KeyCode::Char('d') if ctrl => KeyCode::PageDown,
+            KeyCode::Char('u') if ctrl => KeyCode::PageUp,
+            c => c,
+        };
+        match code {
             KeyCode::Down | KeyCode::Char('j') => self.list.selected = (self.list.selected + 1).min(len.saturating_sub(1)),
             KeyCode::Up | KeyCode::Char('k') => self.list.selected = self.list.selected.saturating_sub(1),
             KeyCode::PageDown => self.list.selected = (self.list.selected + page).min(len.saturating_sub(1)),
@@ -1023,7 +1030,7 @@ impl App {
                 }
             }
             KeyCode::Enter => self.open_menu(),
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !ctrl => {
                 let item = self.list.current().cloned().unwrap_or(Value::Null);
                 if let Some(a) = self.available_actions(&item).into_iter().find(|a| a.key() == c) {
                     super::actions::run(self, a, item);
@@ -1065,6 +1072,7 @@ impl App {
 
     fn modal_key(&mut self, k: KeyEvent) {
         let Some(modal) = self.modal.take() else { return };
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match modal {
             Modal::Menu { title, items, mut selected, item } => match k.code {
                 KeyCode::Esc => {}
@@ -1076,8 +1084,12 @@ impl App {
                     selected = (selected + 1) % items.len();
                     self.modal = Some(Modal::Menu { title, items, selected, item });
                 }
+                KeyCode::Home | KeyCode::Char('g') | KeyCode::End | KeyCode::Char('G') => {
+                    selected = if matches!(k.code, KeyCode::End | KeyCode::Char('G')) { items.len() - 1 } else { 0 };
+                    self.modal = Some(Modal::Menu { title, items, selected, item });
+                }
                 KeyCode::Enter => super::actions::run(self, items[selected], item),
-                KeyCode::Char(c) => match items.iter().find(|a| a.key() == c) {
+                KeyCode::Char(c) if !ctrl => match items.iter().find(|a| a.key() == c) {
                     Some(a) => super::actions::run(self, *a, item),
                     None => self.modal = Some(Modal::Menu { title, items, selected, item }),
                 },
@@ -1108,7 +1120,7 @@ impl App {
             Modal::Confirm { title, lines, typed, mut input, mut on_yes, danger, mut scroll } => {
                 let ok = match &typed {
                     Some(t) => k.code == KeyCode::Enter && input.trim() == t,
-                    None => matches!(k.code, KeyCode::Char('y') | KeyCode::Enter),
+                    None => k.code == KeyCode::Enter || (k.code == KeyCode::Char('y') && !ctrl),
                 };
                 if ok {
                     if let Some(f) = on_yes.take() {
@@ -1118,15 +1130,20 @@ impl App {
                 }
                 let max = lines.len().saturating_sub(1);
                 match (k.code, &typed) {
-                    (KeyCode::Esc, _) | (KeyCode::Char('n'), None) => return,
+                    (KeyCode::Esc, _) => return,
+                    (KeyCode::Char('n'), None) if !ctrl => return,
                     (KeyCode::Backspace, Some(_)) => {
                         input.pop();
                     }
                     (KeyCode::Down, _) | (KeyCode::Char('j'), None) => scroll = (scroll + 1).min(max),
                     (KeyCode::Up, _) | (KeyCode::Char('k'), None) => scroll = scroll.saturating_sub(1),
                     (KeyCode::PageDown, _) => scroll = (scroll + 20).min(max),
+                    (KeyCode::Char('d'), _) if ctrl => scroll = (scroll + 20).min(max),
                     (KeyCode::PageUp, _) => scroll = scroll.saturating_sub(20),
-                    (KeyCode::Char(c), Some(_)) => input.push(c),
+                    (KeyCode::Char('u'), _) if ctrl => scroll = scroll.saturating_sub(20),
+                    (KeyCode::Home, _) | (KeyCode::Char('g'), None) => scroll = 0,
+                    (KeyCode::End, _) | (KeyCode::Char('G'), None) => scroll = max,
+                    (KeyCode::Char(c), Some(_)) if !ctrl => input.push(c),
                     _ => {}
                 }
                 self.modal = Some(Modal::Confirm { title, lines, typed, input, on_yes, danger, scroll });
@@ -1138,7 +1155,9 @@ impl App {
                     KeyCode::Down | KeyCode::Char('j') => scroll = (scroll + 1).min(max),
                     KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
                     KeyCode::PageDown | KeyCode::Char(' ') => scroll = (scroll + 20).min(max),
+                    KeyCode::Char('d') if ctrl => scroll = (scroll + 20).min(max),
                     KeyCode::PageUp => scroll = scroll.saturating_sub(20),
+                    KeyCode::Char('u') if ctrl => scroll = scroll.saturating_sub(20),
                     KeyCode::Home | KeyCode::Char('g') => scroll = 0,
                     KeyCode::End | KeyCode::Char('G') => scroll = max,
                     _ => {}
@@ -1156,42 +1175,42 @@ impl App {
                     input.pop();
                     self.modal = Some(Modal::Input { title, input, on_done });
                 }
-                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('u') if ctrl => {
                     self.modal = Some(Modal::Input { title, input: String::new(), on_done });
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !ctrl => {
                     input.push(c);
                     self.modal = Some(Modal::Input { title, input, on_done });
                 }
                 _ => self.modal = Some(Modal::Input { title, input, on_done }),
             },
-            Modal::Palette { mut input, mut selected } => {
+            Modal::Palette { mut input, mut selected, mut filtering } => {
                 let entries = self.palette_entries(&input);
-                match k.code {
-                    KeyCode::Esc => {}
-                    KeyCode::Enter => {
-                        if let Some((_, f)) = entries.into_iter().nth(selected) {
-                            f(self);
+                if let Some(to) = move_key(k, filtering, selected, entries.len()) {
+                    selected = to;
+                } else {
+                    match k.code {
+                        KeyCode::Esc if !filtering => return,
+                        KeyCode::Esc => filtering = false, // the filter text and the selection stay
+                        KeyCode::Enter => {
+                            if let Some((_, f)) = entries.into_iter().nth(selected) {
+                                f(self);
+                            }
+                            return;
                         }
+                        KeyCode::Backspace => {
+                            input.pop();
+                            selected = 0;
+                        }
+                        KeyCode::Char('/') if !filtering && !ctrl => filtering = true,
+                        KeyCode::Char(c) if filtering && !ctrl => {
+                            input.push(c);
+                            selected = 0;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Down => {
-                        selected = (selected + 1).min(entries.len().saturating_sub(1));
-                        self.modal = Some(Modal::Palette { input, selected });
-                    }
-                    KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
-                        self.modal = Some(Modal::Palette { input, selected });
-                    }
-                    KeyCode::Backspace => {
-                        input.pop();
-                        self.modal = Some(Modal::Palette { input, selected: 0 });
-                    }
-                    KeyCode::Char(c) => {
-                        input.push(c);
-                        self.modal = Some(Modal::Palette { input, selected: 0 });
-                    }
-                    _ => self.modal = Some(Modal::Palette { input, selected }),
                 }
+                self.modal = Some(Modal::Palette { input, selected, filtering });
             }
         }
     }
@@ -1210,7 +1229,7 @@ impl App {
                 }),
             ));
         }
-        out.push(("Go: Help".into(), Box::new(|a: &mut App| a.open(Screen::Help))));
+        out.push(("Go: Help".into(), Box::new(|a: &mut App| a.text("Help", help_lines()))));
         for name in self.cfg.profiles.keys() {
             let n = name.clone();
             out.push((format!("Connect: {name}"), Box::new(move |a: &mut App| a.connect(&n))));
@@ -1784,5 +1803,180 @@ mod tests {
         let mut other = app_on(Kind::Profiles).await;
         other.tick();
         assert!(!other.list.loading);
+    }
+
+    fn key(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    /// A character key like crossterm delivers it: uppercase letters come with SHIFT.
+    fn ch(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), if c.is_uppercase() { KeyModifiers::SHIFT } else { KeyModifiers::NONE })
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn palette(app: &App) -> (String, usize, bool) {
+        match &app.modal {
+            Some(Modal::Palette { input, selected, filtering }) => (input.clone(), *selected, *filtering),
+            _ => panic!("no palette"),
+        }
+    }
+
+    #[tokio::test]
+    async fn palette_opens_in_filter_mode_and_moves_without_arrows() {
+        let mut app = app_on(Kind::Profiles).await;
+        ":go".chars().for_each(|c| app.handle_key(ch(c)));
+        assert_eq!(palette(&app), ("go".into(), 0, true));
+        let keys = [ctrl('j'), ctrl('n'), ctrl('k'), ctrl('p'), key(KeyCode::Down), key(KeyCode::Up)];
+        let seen: Vec<usize> = keys
+            .into_iter()
+            .map(|k| {
+                app.handle_key(k);
+                palette(&app).1
+            })
+            .collect();
+        assert_eq!(seen, [1, 2, 1, 0, 1, 0]);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(palette(&app), ("go".into(), 0, false));
+        app.handle_key(ch('j'));
+        assert_eq!(palette(&app).1, 1);
+        app.handle_key(ch('G'));
+        assert_eq!(palette(&app).1, app.palette_entries("go").len() - 1);
+        app.handle_key(ch('g'));
+        assert_eq!(palette(&app).1, 0);
+        "/x".chars().for_each(|c| app.handle_key(ch(c)));
+        assert_eq!(palette(&app), ("gox".into(), 0, true));
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        app.handle_key(ctrl('p'));
+        assert!(palette(&app).2, "Ctrl-P opens in filter mode too");
+    }
+
+    #[tokio::test]
+    async fn list_pages_with_ctrl_d_ctrl_u_and_ctrl_letters_never_run_actions() {
+        let mut app = app_on(Kind::Profiles).await;
+        app.cfg.profiles.insert("p0".into(), Profile::default());
+        app.list.items = (0..40).map(|i| serde_json::json!({ "name": format!("p{i}") })).collect();
+        app.handle_key(ctrl('d'));
+        assert_eq!((app.list.selected, app.modal.is_none()), (15, true), "Ctrl-D pages, it is not Delete");
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.list.selected, 0);
+        app.handle_key(ctrl('e'));
+        assert!(app.modal.is_none(), "Ctrl-E is not Edit");
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.list.selected, 15);
+        app.handle_key(ch('g'));
+        app.handle_key(ch('e'));
+        assert!(matches!(app.modal, Some(Modal::Form { .. })), "plain e still edits");
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn menu_moves_with_g_and_G_and_ignores_ctrl_letters() {
+        let mut app = app_on(Kind::Profiles).await;
+        app.list.items = vec![serde_json::json!({ "name": "p0" })];
+        app.handle_key(key(KeyCode::Enter));
+        let menu = |app: &App| match &app.modal {
+            Some(Modal::Menu { selected, items, .. }) => (*selected, items.len()),
+            _ => panic!("no menu"),
+        };
+        app.handle_key(ch('G'));
+        assert_eq!(menu(&app).0, menu(&app).1 - 1);
+        app.handle_key(ch('g'));
+        app.handle_key(ctrl('d'));
+        assert_eq!(menu(&app).0, 0, "Ctrl-D is not Delete");
+    }
+
+    #[tokio::test]
+    async fn text_and_confirm_scroll_with_ctrl_d_ctrl_u() {
+        let mut app = app_on(Kind::Profiles).await;
+        let lines: Vec<String> = (0..50).map(|i| format!("line {i}")).collect();
+        let scroll = |app: &App| match &app.modal {
+            Some(Modal::Text { scroll, .. }) | Some(Modal::Confirm { scroll, .. }) => *scroll,
+            _ => panic!("no scrolling modal"),
+        };
+        app.text("t", lines.clone());
+        for (k, want) in [(ctrl('d'), 20), (ctrl('u'), 0), (ch('j'), 1), (key(KeyCode::Down), 2)] {
+            app.handle_key(k);
+            assert_eq!(scroll(&app), want);
+        }
+        // Typed name: letters type (also j), Ctrl keys scroll and type nothing.
+        app.confirm_danger("t", lines, "repo-j", |app| app.quit = true);
+        "repo-j".chars().for_each(|c| app.handle_key(ch(c)));
+        app.handle_key(ctrl('d'));
+        let Some(Modal::Confirm { input, .. }) = &app.modal else { panic!() };
+        assert_eq!((input.as_str(), scroll(&app)), ("repo-j", 20));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.quit);
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn confirm_goes_to_top_and_bottom_with_g_G_home_end_but_a_typed_name_keeps_the_letters() {
+        let mut app = app_on(Kind::Profiles).await;
+        let lines: Vec<String> = (0..50).map(|i| format!("line {i}")).collect();
+        let scroll = |app: &App| match &app.modal {
+            Some(Modal::Confirm { scroll, .. }) => *scroll,
+            _ => panic!("no confirm"),
+        };
+        app.confirm("t", lines.clone(), |_| {});
+        for (k, want) in [(ch('G'), 49), (ch('g'), 0), (key(KeyCode::End), 49), (key(KeyCode::Home), 0)] {
+            app.handle_key(k);
+            assert_eq!(scroll(&app), want);
+        }
+        app.confirm_danger("t", lines, "gG", |_| {});
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(scroll(&app), 49);
+        app.handle_key(ch('g'));
+        app.handle_key(ch('G'));
+        let Some(Modal::Confirm { input, .. }) = &app.modal else { panic!() };
+        assert_eq!((input.as_str(), scroll(&app)), ("gG", 49), "letters type, they do not scroll");
+    }
+
+    #[tokio::test]
+    async fn help_is_a_scrollable_text_view_that_reaches_its_last_line() {
+        let last = help_lines().last().unwrap().trim().to_string();
+        for (w, h) in [(80, 24), (100, 30)] {
+            let mut app = app_on(Kind::Profiles).await;
+            app.handle_key(ch('?'));
+            assert!(matches!(&app.modal, Some(Modal::Text { title, .. }) if title == "Help"));
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            t.draw(|f| super::super::view::draw(f, &app)).unwrap();
+            let s = t.backend().to_string();
+            assert!(!s.contains(&last), "{w}x{h}: the last line is below the fold at first");
+            assert!(s.contains("shown)"), "{w}x{h}: long lines wrap, they are not cut\n{s}");
+            app.handle_key(ch('G'));
+            t.draw(|f| super::super::view::draw(f, &app)).unwrap();
+            let s = t.backend().to_string();
+            assert!(s.contains(&last), "{w}x{h}\n{s}");
+            app.handle_key(key(KeyCode::Esc));
+            assert!(app.modal.is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn nav_jumps_with_g_and_G() {
+        let mut app = app_on(Kind::Profiles).await;
+        app.focus = Focus::Nav;
+        app.handle_key(ch('G'));
+        assert_eq!(app.nav, kinds::NAV.len() + 1);
+        app.handle_key(ch('g'));
+        assert_eq!(app.nav, 0);
+    }
+
+    #[tokio::test]
+    async fn input_modal_ignores_ctrl_letters() {
+        let mut app = app_on(Kind::Profiles).await;
+        app.input("t", "ab", |_, _| {});
+        app.handle_key(ctrl('j'));
+        app.handle_key(ctrl('d'));
+        app.handle_key(ch('c'));
+        let Some(Modal::Input { input, .. }) = &app.modal else { panic!() };
+        assert_eq!(input, "abc", "Ctrl letters type nothing");
     }
 }

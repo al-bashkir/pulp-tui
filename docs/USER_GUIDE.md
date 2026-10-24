@@ -24,11 +24,12 @@
 | Key | Action |
 |---|---|
 | `Tab` | switch focus between the screen list and the main area |
-| `:` or `Ctrl-P` | command palette: go to a screen, connect to a server, dismiss finished tasks |
-| `?` | help |
+| `:` or `Ctrl-P` | command palette: go to a screen, connect to a server, dismiss finished tasks. It opens in filter mode (`-- FILTER --`): type to filter, `Ctrl-J/K` or `Ctrl-N/P` move. `Esc` goes to move mode (`j k g G`), `/` filters again, a second `Esc` closes |
+| `?` | help (a text view: `j k g G Ctrl-D Ctrl-U` scroll, `Esc` closes) |
 | `N` | notification log |
 | `q` / `Ctrl-C` | quit (q asks first when client operations still run) |
-| `↑ ↓ j k PgUp PgDn g G` | move |
+| `↑ ↓ j k PgUp PgDn Ctrl-D Ctrl-U g G` | move (in the screen list: `j k g G` choose a screen) |
+| `h` / `l` | from the list to the screen list / from the screen list open the screen |
 | `Enter` | action menu of the selected item (shows the shortcut letter of each action; `*` marks actions that change the server) |
 | `/` | server-side search (empty clears) |
 | `s` / `S` | sort by next column / reverse (current page) |
@@ -38,20 +39,31 @@
 | `r` | refresh |
 | `Esc` | cancel a loading request, clear marks, or go back |
 
-In forms: `Tab`/`↑↓` move, `Space` toggles a checkbox, `←→` change a choice, `Enter`
-goes to the next field (submits on the last), `Ctrl-S` submits, `Ctrl-U` clears a field,
-`Esc` cancels. In confirmations: `y`/`Enter` confirms, `n`/`Esc` cancels; destructive
-operations require typing the shown name; `↑↓ PgUp PgDn` scroll long previews.
+In forms (they open in move mode): `j k`/`Tab`/`↑↓` change the field, `i` or `Enter` edits
+a text field (the box shows `-- EDIT --`), `Enter` then goes to the next field (submits on
+the last), and `Esc` stops editing. `h l`/`←→`/`Space` change a choice, `Space` toggles a
+checkbox. `Ctrl-S` submits from either mode (also from an open picker, after it takes the
+selection), `Ctrl-U` clears the field while editing, and `Esc` in move mode cancels. A form
+with a single text, secret or number field opens in edit mode. In confirmations:
+`y`/`Enter` confirms, `n`/`Esc` cancels; destructive operations require typing the shown
+name; `j k g G Ctrl-D Ctrl-U ↑↓ PgUp PgDn Home End` scroll long previews. With a typed name
+letters type, so only `Ctrl-D`/`Ctrl-U`, `PgUp`/`PgDn`, `Home`/`End` and the arrows scroll
+(`Ctrl-J`/`Ctrl-K` do not).
 
 **Pickers.** A field shown as `[ value ▾ ]` picks an existing object (repository, remote,
-distribution, role, user, ...) from the server. `Enter` or `Space` opens the list, and
-typing a letter opens it with that filter. In the list, type to filter, `↑↓ PgUp PgDn`
-move, and `Enter` selects and moves to the next field (submits on the last). In a
+distribution, role, user, ...) from the server. `Enter` or `Space` opens the list in move
+mode: `j k` or `↑↓` move one row, `g G` go to the first or last row, `Ctrl-D`/`Ctrl-U` or
+`PgDn PgUp` move 10 rows. Typing a letter other than `j` or `k` on the closed field opens
+the list in filter mode with that letter as the filter (`j` and `k` move to another field).
+`/` enters filter mode (the popup shows `-- FILTER --`):
+type to filter, `Ctrl-J/K` or `Ctrl-N/P` (and the arrow keys) move, and `Esc` keeps the
+filter and returns to move mode. A second `Esc` closes the list and keeps the old value;
+in move mode a single `Esc` closes it.
+`Enter` selects and moves to the next field; it does not submit (use `Ctrl-S`). In a
 multi-select list `Space` marks items and `Enter` takes all marked items (or the
-highlighted one if none is marked). `Esc` closes the list and keeps the old value.
-`Backspace` on the closed field clears it. If the list cannot be loaded, the popup shows
-the error and `Enter` takes the typed text as the value (with no text, it closes the list
-and keeps the old value).
+highlighted one if none is marked). `Backspace` on the closed field clears it. If the
+list cannot be loaded, the popup is in filter mode, shows the error, and `Enter` takes
+the typed text as the value (with no text, it closes the list and keeps the old value).
 
 ### Three kinds of "cancel"
 

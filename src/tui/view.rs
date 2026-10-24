@@ -2,7 +2,7 @@
 
 use super::actions::{log_lines, pretty};
 use super::app::{App, Focus, Level, Modal, Screen, item_key};
-use super::form::{FieldKind, Form, Picker};
+use super::form::{Field, FieldKind, Form, Picker};
 use super::kinds::{self, Kind, s};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -36,7 +36,6 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     match &app.screen {
         Screen::Dashboard => draw_text_screen(f, "Dashboard  [r: refresh]", &app.dashboard, main),
-        Screen::Help => draw_text_screen(f, "Help", &help_lines(), main),
         Screen::List(_) => draw_list(f, app, main),
     }
     draw_footer(f, app, footer);
@@ -209,9 +208,9 @@ fn detail_lines(kind: &Kind, v: &serde_json::Value) -> Vec<String> {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match (&app.modal, &app.screen, app.focus) {
-        (Some(_), _, _) => "Esc: close".to_string(),
-        (_, _, Focus::Nav) => "↑↓: choose screen  Enter: open  Tab: list  :: palette  ?: help  q: quit".into(),
-        (_, Screen::List(_), _) => "↑↓/PgUp/PgDn  Enter: actions  /: search  s/S: sort  n/p: page  Space: mark  t: type  r: refresh  Esc: back  Tab: screens  :: palette  q: quit".into(),
+        (Some(m), _, _) => modal_hint(m),
+        (_, _, Focus::Nav) => "j/k g/G: choose screen  l/Enter: open  Tab: list  :: palette  ?: help  q: quit".into(),
+        (_, Screen::List(_), _) => "j/k g/G Ctrl-D/U  h: screens  Enter: actions  /: search  s/S: sort  n/p: page  Space: mark  t: type  r: refresh  Esc: back  Tab: screens  :: palette  q: quit".into(),
         _ => "Tab: screens  r: refresh  :: palette  ?: help  N: notifications  q: quit".into(),
     };
     let [h, n] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
@@ -232,6 +231,23 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         _ => Line::raw(""),
     };
     f.render_widget(Paragraph::new(line), n);
+}
+
+/// Footer keys of the open modal, by kind and mode: they name the mode the operator is in.
+fn modal_hint(m: &Modal) -> String {
+    match m {
+        Modal::Menu { .. } => "j/k g/G: move  Enter: run  letter: shortcut  Esc: close".into(),
+        Modal::Form { form, .. } => match &form.picker {
+            Some(p) => picker_hint(&form.fields[p.field], p),
+            None => form_hint(form),
+        },
+        Modal::Confirm { typed: Some(_), .. } => "-- EDIT --  Enter: confirm  Ctrl-D/U: scroll  Esc: cancel".into(),
+        Modal::Confirm { .. } => "y/Enter: confirm  n/Esc: cancel  j/k g/G Ctrl-D/U: scroll".into(),
+        Modal::Text { .. } => "j/k g/G Ctrl-D/U: scroll  Esc: close".into(),
+        Modal::Input { .. } => "-- EDIT --  Enter: done  Ctrl-U: clear  Esc: cancel".into(),
+        Modal::Palette { filtering: true, .. } => "-- FILTER --  Ctrl-J/K: move  Enter: run  Esc: stop filtering".into(),
+        Modal::Palette { .. } => "j/k g/G: move  /: filter  Enter: run  Esc: close".into(),
+    }
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -290,7 +306,7 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
             };
             let border = if *danger { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Yellow) };
             let block = Block::bordered().border_style(border).title(format!(" {title} ")).title_bottom(format!(
-                " {}/{} ↑↓ PgUp/PgDn scroll ",
+                " {}/{} ↑↓ Ctrl-D/U scroll ",
                 scroll + 1,
                 lines.len().max(1)
             ));
@@ -320,8 +336,8 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
                 .collect();
             f.render_widget(Clear, r);
             f.render_widget(
-                Paragraph::new(text).block(Block::bordered().title(format!(
-                    " {title}  [{}/{}]  j/k PgUp/PgDn  Esc: close ",
+                Paragraph::new(text).wrap(Wrap { trim: false }).block(Block::bordered().title(format!(
+                    " {title}  [{}/{}]  j/k g/G Ctrl-D/U  Esc: close ",
                     scroll + 1,
                     lines.len().max(1)
                 ))),
@@ -333,15 +349,20 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
             f.render_widget(Clear, r);
             f.render_widget(Paragraph::new(format!("{input}▏")).block(Block::bordered().title(format!(" {title} "))), r);
         }
-        Modal::Palette { input, selected } => {
+        Modal::Palette { input, selected, filtering } => {
             let entries = app.palette_entries(input);
             let r = centered(area, 60, (entries.len() as u16 + 3).min(20));
-            let mut text = vec![Line::styled(format!("> {input}▏"), Style::default().add_modifier(Modifier::BOLD))];
-            for (i, (l, _)) in entries.iter().enumerate().take(r.height.saturating_sub(3) as usize) {
+            let cursor = if *filtering { "▏" } else { "" };
+            let mut text = vec![Line::styled(format!("> {input}{cursor}"), Style::default().add_modifier(Modifier::BOLD))];
+            // Rows scroll so the highlighted one stays visible, as in the picker.
+            let rows = r.height.saturating_sub(3) as usize;
+            let top = selected.saturating_sub(rows.saturating_sub(1));
+            for (i, (l, _)) in entries.iter().enumerate().skip(top).take(rows) {
                 text.push(if i == *selected { Line::styled(format!("▶ {l}"), sel()) } else { Line::raw(format!("  {l}")) });
             }
             f.render_widget(Clear, r);
-            f.render_widget(Paragraph::new(text).block(Block::bordered().title(" Command palette ")), r);
+            let title = if *filtering { " Command palette -- FILTER -- " } else { " Command palette " };
+            f.render_widget(Paragraph::new(text).block(Block::bordered().title(title)), r);
         }
     }
 }
@@ -357,8 +378,7 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
     for (i, fld) in form.fields.iter().enumerate() {
         let focused = i == form.focus;
         let req = if fld.required { "*" } else { " " };
-        let cursor =
-            if focused && !matches!(fld.kind, FieldKind::Bool | FieldKind::Choice(_) | FieldKind::Pick { .. }) { "▏" } else { "" };
+        let cursor = if focused && form.editing { "▏" } else { "" };
         let label = format!("{}{req}{:<w$}", if focused { "▶" } else { " " }, fld.label, w = label_w);
         let value = format!("{}{cursor}", fld.display());
         lines.push(Line::from(vec![Span::raw(label), if focused { Span::styled(value, sel()) } else { Span::raw(value) }]));
@@ -373,16 +393,28 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
     f.render_widget(Clear, r);
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::bordered()
-                .borders(Borders::ALL)
-                .title(format!(" {} ", form.title))
-                .title_bottom(" Tab/↑↓ move  Space toggle/open  ←→ choose  Enter next/submit/pick  Ctrl-S submit  Esc cancel "),
+            Block::bordered().borders(Borders::ALL).title(format!(" {} ", form.title)).title_bottom(format!(" {} ", form_hint(form))),
         ),
         r,
     );
     if let Some(p) = &form.picker {
         draw_picker(f, form, p, r, area);
     }
+}
+
+/// Keys of the form itself (the picker has its own hint). At most 90 characters: the box is 98 wide.
+fn form_hint(form: &Form) -> String {
+    if form.editing {
+        let enter = if form.focus + 1 == form.fields.len() { "submit" } else { "next" };
+        return format!("-- EDIT --  Enter: {enter}  Esc: done  Ctrl-S: submit");
+    }
+    let act = match form.fields.get(form.focus).map(|f| &f.kind) {
+        Some(FieldKind::Choice(_)) => "h/l Space: choose",
+        Some(FieldKind::Bool) => "Space: toggle",
+        Some(FieldKind::Pick { .. }) => "Enter: pick  /: filter",
+        _ => "i/Enter: edit",
+    };
+    format!("{act}  j/k: field  Ctrl-S: submit  Esc: cancel")
 }
 
 /// The option list of an open picker, over the form. Rows scroll so the highlighted one stays visible.
@@ -419,16 +451,27 @@ fn draw_picker(f: &mut Frame, form: &Form, p: &Picker, form_area: Rect, area: Re
                 .collect()
         }
     };
-    let hint = match (p.error.is_some(), multi) {
-        (true, _) => " Enter: use typed text  Esc: cancel ",
-        (false, true) => " Space: mark  Enter: done  Esc: cancel ",
-        (false, false) => " Enter: select  Esc: cancel ",
-    };
     f.render_widget(Clear, r);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(format!(" Pick {} ── filter: {} ", fld.label, p.filter)).title_bottom(hint)),
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(format!(" Pick {} ── filter: {} ", fld.label, p.filter))
+                .title_bottom(format!(" {} ", picker_hint(fld, p))),
+        ),
         r,
     );
+}
+
+/// Keys of the open picker, by mode. At most 90 characters: the popup is narrower than the 98-wide form box.
+fn picker_hint(fld: &Field, p: &Picker) -> String {
+    let multi = matches!(fld.kind, FieldKind::Pick { multi: true, .. });
+    let take = if multi { "Space: mark  Enter: done" } else { "Enter: select" };
+    match (p.error.is_some(), p.filtering) {
+        (true, true) => "-- FILTER --  Enter: use typed text  Esc: stop filtering".into(),
+        (true, false) => "Enter: use typed text  /: filter  Esc: close".into(),
+        (false, true) => format!("-- FILTER --  Ctrl-J/K: move  {take}  Esc: stop filtering"),
+        (false, false) => format!("j/k: move  /: filter  {take}  Esc: close"),
+    }
 }
 
 pub fn help_lines() -> Vec<String> {
@@ -438,14 +481,33 @@ pub fn help_lines() -> Vec<String> {
         "Global",
         "  Tab            switch focus between screen list and main area",
         "  :  or Ctrl-P   command palette (screens, connect to server, commands)",
-        "  ?              this help        N  notifications log        q  quit (Ctrl-C: immediate)",
+        "  ?              this help (a text view: j k g G Ctrl-D/U scroll, Esc closes)",
+        "  N              notifications log        q  quit (Ctrl-C: immediate)",
+        "  j k g G        in the screen list: choose a screen; l or Enter opens it",
         "",
         "Lists",
-        "  ↑↓ j k PgUp PgDn g G   move        Enter  action menu (shortcut letters shown)",
+        "  ↑↓ j k  PgUp PgDn Ctrl-D Ctrl-U  g G  move   h  screen list     Enter  action menu (shortcut letters shown)",
         "  /   server-side search  s/S sort column / reverse   n/p next/previous page",
         "  Space  mark item (multi-select: compare, remove/add content)",
         "  t   toggle RPM/File, content type, tracked/server tasks, or task polling in Logs",
         "  r   refresh   Esc  cancel loading request / clear marks / go back",
+        "",
+        "Forms",
+        "  j k Tab ↑↓   move between fields      i/Enter  edit a text field (-- EDIT --)",
+        "  h l ←→ Space change a choice / toggle  Ctrl-S  submit (both modes)    Esc  cancel (move mode)",
+        "  In -- EDIT --: Enter goes to the next field (submits on the last), Esc stops editing, Ctrl-U clears",
+        "  A form with one text field opens in -- EDIT --.",
+        "",
+        "Pickers and palette",
+        "  j k g G ↑↓ PgUp PgDn Ctrl-D/U  move       /  filter (-- FILTER --)       Ctrl-S  take the selection and submit",
+        "  On a closed pick field a letter other than j k opens the list in -- FILTER -- with that letter typed",
+        "  In -- FILTER --: type to filter, Ctrl-J/K or Ctrl-N/P move, Esc keeps the filter; the next Esc closes",
+        "  In move mode one Esc closes the list.",
+        "  The palette (: or Ctrl-P) opens in -- FILTER --; Esc leaves it for j k g G, / filters again, Enter runs",
+        "",
+        "Text views and confirmations",
+        "  j k g G Ctrl-D Ctrl-U ↑↓ PgUp PgDn Home End  scroll",
+        "  A confirmation with a typed name takes every letter: only Ctrl-D/U, PgUp PgDn, Home End and ↑↓ scroll",
         "",
         "Cancelling: Esc cancels only the client-side request. Pulp tasks keep running on the",
         "server; cancel them explicitly in Tasks (X). Quitting never cancels server work.",
@@ -479,6 +541,116 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
         t.draw(|f| draw_form(f, form, f.area())).unwrap();
         t.backend().to_string()
+    }
+
+    #[test]
+    fn form_shows_edit_mode_and_cursor_only_while_editing() {
+        let mut form = Form::new("t", vec![Field::text("name", "Name"), Field::text("other", "Other")]);
+        let s = screen(&form);
+        assert!(s.contains("i/Enter: edit") && s.contains("Ctrl-S: submit") && !s.contains("-- EDIT --") && !s.contains('▏'), "{s}");
+        form.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        let s = screen(&form);
+        assert!(s.contains("-- EDIT --") && s.contains('▏') && s.contains("Enter: next"), "{s}");
+    }
+
+    #[test]
+    fn form_hint_enter_submits_on_the_last_field_and_move_hint_follows_the_field_kind() {
+        let choice = FieldKind::Choice(vec!["a".into()]);
+        let mut form = Form::new(
+            "t",
+            vec![
+                Field::text("a", "A"),
+                Field::new("b", "B", choice),
+                Field::new("c", "C", FieldKind::Bool),
+                Field::pick("d", "D", Source::Roles),
+                Field::text("e", "E"),
+            ],
+        );
+        for (focus, want) in
+            [(0, "i/Enter: edit"), (1, "h/l Space: choose"), (2, "Space: toggle"), (3, "Enter: pick  /: filter"), (4, "i/Enter: edit")]
+        {
+            form.focus = focus;
+            let h = form_hint(&form);
+            assert!(h.contains(want) && h.contains("j/k: field  Ctrl-S: submit  Esc: cancel") && h.chars().count() <= 90, "{h}");
+        }
+        form.editing = true;
+        form.focus = 3;
+        assert!(form_hint(&form).contains("Enter: next"));
+        form.focus = 4;
+        assert!(form_hint(&form).contains("Enter: submit"));
+    }
+
+    #[tokio::test]
+    async fn palette_scrolls_so_the_selected_entry_stays_visible() {
+        let st = std::sync::Arc::new(crate::store::Store::open_in_memory().await.unwrap());
+        let app = App::new(crate::config::Config::default(), "/dev/null".into(), st.clone(), Ok(st));
+        let entries = app.palette_entries("");
+        assert!(entries.len() > 17, "the box shows 17 rows");
+        let draw = |selected| {
+            let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            let m = Modal::Palette { input: String::new(), selected, filtering: false };
+            t.draw(|f| draw_modal(f, &m, &app, f.area())).unwrap();
+            t.backend().to_string()
+        };
+        assert!(draw(0).contains(&format!("▶ {}", entries[0].0)));
+        let last = entries.len() - 1;
+        let s = draw(last);
+        assert!(s.contains(&format!("▶ {}", entries[last].0)) && !s.contains(&entries[0].0), "{s}");
+    }
+
+    #[test]
+    fn picker_shows_filter_mode() {
+        let mut form = Form::new("t", vec![Field::pick("repo", "Repository", Source::Roles)]);
+        form.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        form.set_options(0, Ok(vec![PickItem { label: "a".into(), value: "a".into(), note: String::new() }]));
+        let s = screen(&form);
+        assert!(s.contains("/: filter") && !s.contains("-- FILTER --"), "{s}");
+        form.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(screen(&form).contains("-- FILTER --"));
+    }
+
+    #[test]
+    fn modal_hint_names_mode_and_keys() {
+        let pal = |filtering| Modal::Palette { input: String::new(), selected: 0, filtering };
+        assert!(modal_hint(&pal(true)).starts_with("-- FILTER --"));
+        let h = modal_hint(&pal(false));
+        assert!(h.contains("/: filter") && !h.contains("-- FILTER --"), "{h}");
+        assert!(modal_hint(&Modal::Input { title: String::new(), input: String::new(), on_done: None }).starts_with("-- EDIT --"));
+        assert!(modal_hint(&Modal::Text { title: String::new(), lines: vec![], scroll: 0 }).contains("Ctrl-D/U"));
+        let mut form = Form::new("t", vec![Field::text("a", "A")]);
+        form.editing = true;
+        assert!(modal_hint(&Modal::Form { form, submit: Box::new(|_, _| Ok(())) }).starts_with("-- EDIT --"));
+    }
+
+    #[test]
+    fn modal_hint_follows_picker_and_confirm_kinds() {
+        let mut form = Form::new("t", vec![Field::pick("repo", "Repository", Source::Roles)]);
+        form.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let h = modal_hint(&Modal::Form { form, submit: Box::new(|_, _| Ok(())) });
+        assert!(h.contains("/: filter") && h.contains("Esc: close"), "{h}");
+        let confirm = |typed: Option<&str>| Modal::Confirm {
+            title: String::new(),
+            lines: vec![],
+            typed: typed.map(Into::into),
+            input: String::new(),
+            on_yes: None,
+            danger: false,
+            scroll: 0,
+        };
+        let h = modal_hint(&confirm(Some("x")));
+        assert!(h.starts_with("-- EDIT --") && h.contains("Enter: confirm") && h.contains("Ctrl-D/U: scroll"), "{h}");
+        let h = modal_hint(&confirm(None));
+        assert!(h.contains("y/Enter") && h.contains("n/Esc") && !h.contains("-- EDIT --"), "{h}");
+        let menu = Modal::Menu { title: String::new(), items: vec![], selected: 0, item: serde_json::Value::Null };
+        assert!(modal_hint(&menu).contains("j/k g/G") && modal_hint(&menu).contains("Esc: close"));
+    }
+
+    #[test]
+    fn help_lists_vim_keys() {
+        let h = help_lines().join("\n");
+        for t in ["Ctrl-D", "Ctrl-J", "i/Enter", "-- FILTER --", "-- EDIT --"] {
+            assert!(h.contains(t), "help misses {t}");
+        }
     }
 
     #[test]
