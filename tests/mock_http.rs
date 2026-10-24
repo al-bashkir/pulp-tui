@@ -390,3 +390,26 @@ async fn distribution_without_database_label_is_adopted_even_when_the_publicatio
     ops::ensure_distribution(&c, RepoType::Rpm, "d", "bp", Some(&pubn), &labels, db, &no_progress).await.unwrap();
     server.verify().await;
 }
+
+#[tokio::test]
+async fn file_sync_maps_any_mirror_policy_to_mirror() {
+    let server = MockServer::start().await;
+    let task = json!({ "task": format!("{API}tasks/1/") });
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(202).set_body_json(task)).expect(4).mount(&server).await;
+    let c = client(&server, |_, _| {});
+    for (t, policy) in [
+        (RepoType::File, "additive"),
+        (RepoType::File, "mirror"),
+        (RepoType::File, "mirror_content_only"),
+        (RepoType::Rpm, "mirror_complete"),
+    ] {
+        let repo = format!("{API}repositories/{}/r/", if t == RepoType::File { "file/file" } else { "rpm/rpm" });
+        ops::sync(&c, t, &repo, None, policy).await.unwrap();
+    }
+    let bodies: Vec<Value> = server.received_requests().await.unwrap().iter().map(|r| r.body_json().unwrap()).collect();
+    assert_eq!(
+        bodies,
+        [json!({"mirror": false}), json!({"mirror": true}), json!({"mirror": true}), json!({"sync_policy": "mirror_complete"})]
+    );
+    server.verify().await;
+}

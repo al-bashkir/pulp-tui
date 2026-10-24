@@ -96,6 +96,7 @@ pub async fn find_by_name<T: serde::de::DeserializeOwned>(c: &PulpClient, collec
     Ok(p.results.into_iter().next())
 }
 
+/// File has only `mirror: bool`: any `mirror*` policy (the RPM values, from a mixed Content View) means mirror.
 pub async fn sync(c: &PulpClient, t: RepoType, repo: &str, remote: Option<&str>, policy: &str) -> Result<Mutation> {
     let mut body = json!({});
     if let Some(r) = remote {
@@ -103,7 +104,7 @@ pub async fn sync(c: &PulpClient, t: RepoType, repo: &str, remote: Option<&str>,
     }
     match t {
         RepoType::Rpm => body["sync_policy"] = policy.into(),
-        RepoType::File => body["mirror"] = (policy == "mirror").into(),
+        RepoType::File => body["mirror"] = policy.starts_with("mirror").into(),
     }
     c.post(&format!("{repo}sync/"), &body).await
 }

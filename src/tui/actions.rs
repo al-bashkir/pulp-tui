@@ -62,8 +62,34 @@ fn version_of(repo: &str, number: i64) -> String {
     format!("{repo}versions/{number}/")
 }
 
-fn caps(app: &App) -> Option<std::sync::Arc<Capabilities>> {
+pub(super) fn caps(app: &App) -> Option<std::sync::Arc<Capabilities>> {
     app.conn.as_ref().map(|c| c.caps.clone())
+}
+
+/// The sync policies of a repository type: the server's `SyncPolicyEnum` for RPM, if it has one.
+pub fn sync_policies(caps: Option<&Capabilities>, t: RepoType) -> Vec<String> {
+    match t {
+        RepoType::Rpm => caps
+            .and_then(|c| c.enum_values("SyncPolicyEnum").map(|e| e.to_vec()))
+            .unwrap_or_else(|| vec!["additive".into(), "mirror_complete".into(), "mirror_content_only".into()]),
+        RepoType::File => vec!["additive".into(), "mirror".into()],
+    }
+}
+
+/// Runs `go` at once, or after the operator confirms the mirror warning when `policy` is a mirror policy.
+pub fn confirm_mirror(app: &mut App, policy: &str, go: impl FnOnce(&mut App) + 'static) {
+    if !policy.contains("mirror") {
+        return go(app);
+    }
+    let mut lines = vec![
+        "Mirror sync makes the NEW repository version match the upstream exactly:".into(),
+        "content that is not upstream is removed from the new version.".into(),
+        "Older versions are not changed and can still be published (rollback).".into(),
+    ];
+    if policy == "mirror_complete" {
+        lines.push("mirror_complete also publishes the upstream metadata unchanged (a publication is created).".into());
+    }
+    app.confirm("Confirm mirror sync", lines, go);
 }
 
 pub fn pretty(v: &Value) -> Vec<String> {
@@ -671,12 +697,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             });
         }
         Act::Sync => {
-            let policies: Vec<String> = match t {
-                RepoType::Rpm => caps(app)
-                    .and_then(|c| c.enum_values("SyncPolicyEnum").map(|e| e.to_vec()))
-                    .unwrap_or_else(|| vec!["additive".into(), "mirror_complete".into(), "mirror_content_only".into()]),
-                RepoType::File => vec!["additive".into(), "mirror".into()],
-            };
+            let policies = sync_policies(caps(app).as_deref(), t);
             let form = Form::new(
                 format!("Sync {name}"),
                 vec![
@@ -701,19 +722,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         Ok(ops::sync(&c, t, &href, r.as_deref(), &policy).await?)
                     })
                 };
-                if f.get("policy").contains("mirror") {
-                    let mut lines = vec![
-                        "Mirror sync makes the NEW repository version match the upstream exactly:".into(),
-                        "content that is not upstream is removed from the new version.".into(),
-                        "Older versions are not changed and can still be published (rollback).".into(),
-                    ];
-                    if f.get("policy") == "mirror_complete" {
-                        lines.push("mirror_complete also publishes the upstream metadata unchanged (a publication is created).".into());
-                    }
-                    app.confirm("Confirm mirror sync", lines, go);
-                } else {
-                    go(app);
-                }
+                confirm_mirror(app, f.get("policy"), go);
                 Ok(())
             });
         }
@@ -1615,6 +1624,32 @@ mod tests {
         let e = put_profile(&mut app, "lab", new).unwrap_err();
         assert!(e.starts_with("cannot save "), "{e}");
         assert_eq!(app.cfg.profiles["lab"], old, "memory and file still agree");
+    }
+
+    #[test]
+    fn sync_policies_without_schema() {
+        assert_eq!(sync_policies(None, RepoType::Rpm), ["additive", "mirror_complete", "mirror_content_only"]);
+        assert_eq!(sync_policies(None, RepoType::File), ["additive", "mirror"]);
+    }
+
+    #[tokio::test]
+    async fn mirror_policies_ask_first() {
+        use crate::tui::app::Modal;
+        use std::{cell::Cell, rc::Rc};
+        let st = std::sync::Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(crate::config::Config::default(), "/dev/null".into(), st.clone(), Ok(st));
+        let ran = Rc::new(Cell::new(false));
+        confirm_mirror(&mut app, "additive", {
+            let r = ran.clone();
+            move |_| r.set(true)
+        });
+        assert!(ran.get() && app.modal.is_none());
+        confirm_mirror(&mut app, "mirror_complete", |_| panic!("ran before the confirm"));
+        let Some(Modal::Confirm { title, lines, .. }) = &app.modal else { panic!("no confirm") };
+        assert_eq!((title.as_str(), lines.len()), ("Confirm mirror sync", 4));
+        confirm_mirror(&mut app, "mirror", |_| {});
+        let Some(Modal::Confirm { lines, .. }) = &app.modal else { panic!("no confirm") };
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]

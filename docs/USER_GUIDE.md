@@ -169,6 +169,7 @@ environments with bound versions and states.
 | a | add repositories: a multi-select picker of RPM and File repositories (those already in the view are not listed) and filter rules; the rules apply to each selected repository, so mixed RPM and File selections need empty rules |
 | F | edit the filter rules of one repository |
 | x | remove a repository from the definition (published versions are unchanged) |
+| f | sync repositories: a multi-select picker of the view's repositories (all marked) and one sync policy (RPM values when the view has an RPM repository, else File values; File repositories treat any mirror policy as mirror). Each repository syncs from its own default remote; one without is skipped. Mirror policies show a warning first. The tasks show in Tasks; the result lists each repository: new version, no change, failed or skipped. Sync does not publish. |
 | w | preview: exact content the draft selects compared with the latest published version |
 | P | publish a new version: notes → preview → confirm; the version becomes active in Library |
 | v | versions of the view |
@@ -180,7 +181,10 @@ environments with bound versions and states.
 Publish, promote, roll back, delete (the view or a version) and *Resume* take a lock on
 the view while they run; a second operator (or a second pulp-tui on this host) gets
 `Content View web is locked by alice@ws12 (promote to Prod) since 14:02 UTC` before
-anything is sent to Pulp. Preview, compare and the drift check do not lock.
+anything is sent to Pulp. Preview, compare and the drift check do not lock. Sync
+repositories does not lock the view; it writes one audit entry (`cv.sync`) when the syncs are
+submitted, with how many were submitted, failed or skipped (the per-repository result of the
+finished tasks is shown in the result view, not in the entry).
 
 Filter syntax (rules separated by `;`):
 

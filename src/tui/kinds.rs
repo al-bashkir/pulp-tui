@@ -160,6 +160,7 @@ pub enum Act {
     CvPreview,
     CvPublish,
     CvVersions,
+    CvSyncRepos,
     Promote,
     CvDrift,
     Resume,
@@ -185,7 +186,7 @@ impl Act {
             Edit => 'e',
             Delete => 'd',
             Inspect => 'i',
-            Sync => 'f',
+            Sync | CvSyncRepos => 'f',
             SyncHistory | ReplicationHistory => 'H',
             Versions | CvVersions => 'v',
             Content | Connect | Members => 'o',
@@ -251,6 +252,7 @@ impl Act {
             CvPreview => "Preview draft vs latest version",
             CvPublish => "Publish new version",
             CvVersions => "Versions",
+            CvSyncRepos => "Sync repositories",
             Promote => "Promote version to environment",
             CvDrift => "Verify / drift check (all environments)",
             Resume => "Resume / retry publish",
@@ -277,7 +279,7 @@ impl Act {
             Kind::Profiles => matches!(self, MigrateDb | CopyDb) || shared && matches!(self, ImportCv),
             Kind::Environments => shared,
             Kind::ContentViews => {
-                matches!(self, Delete | CvPublish | Promote | Rollback | BreakLock)
+                matches!(self, Delete | CvPublish | CvSyncRepos | Promote | Rollback | BreakLock)
                     || shared && matches!(self, Create | Edit | CvAddRepo | CvFilters | CvRemoveRepo)
             }
             Kind::CvVersions { .. } => matches!(self, Delete | Promote | Rollback | Resume),
@@ -597,6 +599,7 @@ impl Kind {
             Kind::Distributions(_) => vec![CopyUrl, Verify, Rollback, Create, Edit, Delete, Inspect],
             Kind::ContentViews => vec![
                 CvVersions,
+                CvSyncRepos,
                 CvPreview,
                 CvPublish,
                 Promote,
@@ -850,6 +853,8 @@ mod tests {
         assert!(Act::CvPublish.mutates(&Kind::ContentViews, false));
         assert!(Act::BreakLock.mutates(&Kind::ContentViews, false), "removes another operator's lock");
         assert!(Kind::ContentViews.actions().contains(&Act::BreakLock) && Act::BreakLock.needs_item());
+        assert!(Act::CvSyncRepos.mutates(&Kind::ContentViews, false), "changes Pulp, whatever the database");
+        assert!(Kind::ContentViews.actions().contains(&Act::CvSyncRepos) && Act::CvSyncRepos.key() == 'f');
         assert!(!Act::Delete.mutates(&Kind::Profiles, true));
         assert!(Act::ImportCv.mutates(&Kind::Profiles, true), "bulk create in the shared database");
         assert!(!Act::ImportCv.mutates(&Kind::Profiles, false));
