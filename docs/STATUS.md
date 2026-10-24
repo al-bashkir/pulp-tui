@@ -12,6 +12,7 @@ Automated against real Pulp containers (`tests/run-live.sh`):
 | RPM: local repo, upload, remote, sync, inspect version, publish, distribute, fetch served metadata and package, update, publish, roll back, verify | `live_repos::rpm_lifecycle` |
 | File: local repo, single and chunked upload, remove content, sync from manifest, publish, distribute, fetch served files, update, roll back, verify | `live_repos::file_lifecycle` |
 | Content Views: RPM + File snapshot with filters, preview, numbered versions, Library, Dev, Prod path rule, rollback, served-content verification, retention protection, advisory filtering, partial failure and retry, resume of an interrupted publish (re-attach to the submitted task), cleanup | `live_cv::content_view_lifecycle` |
+| Lifecycle environment relabel: a File view promoted to Dev serves at `<prefix>/dev/<view>/docs/`; Edit label `dev2` moves the distribution in place (PATCH `base_path`, task awaited), the new URL answers 200 and the old one 404, the stored row and the drift check follow, and a second promotion of the same version keeps the new path | `live_cv::environment_relabel_moves_served_paths` |
 | Native replication pulp2 → pulp1, rerun, upstream update; fallback conflicts with native objects | `live_replication::native_replication` |
 | Fallback replication: dry run, create, idempotent rerun, upstream update, loop and self guards | `live_replication::fallback_replication` |
 | RBAC: 401, 403, no self-escalation, creator role, group object role, revoke | `live_rbac` |
@@ -20,6 +21,7 @@ Automated against real Pulp containers (`tests/run-live.sh`):
 | Two operators on one PostgreSQL database: B sees A's Content View and audit actor, lock conflict names A, B gets the lock after A releases, `break_lock` removes only the holder shown (a second call removes nothing), 8 simultaneous lock attempts give exactly one winner | `live_shared_db::two_operators_share_state_and_locks` |
 | Every store method on PostgreSQL (definitions, versions, checkpoints, conditional writes after a lost lock, environments, bindings, audit, replication runs, tasks, prefix, export/import, delete cascade) and `db copy` from a local SQLite store | `live_shared_db::store_methods_on_postgres` |
 | A database per profile: `prod` with its own PostgreSQL schema next to `lab` with `url = "local"` and a top-level `[database]` that is never opened; `database_for` gives the keyring user `[database]:prod`; a fresh schema is `NotMigrated` and an open does not migrate it; after `migrate` the store is external and cached (the same `Arc`), `lab` gets the local `Arc`; rows of the server key are not in the local store; `copy_from` another store copies a view under that key and records the source database ID as an alias | `live_shared_db::profile_database_next_to_a_local_profile` |
+| Schema 2 → 3 on PostgreSQL with rows as the previous version wrote them: `Library`, `Dev` and `dev` get the labels `library`, `dev`, `dev`; the served path `acme/dev/web/os` stays and `acme` is seeded as the prefix; a scope with a stored prefix keeps it; a path without `/` seeds nothing; a used label is refused | `live_shared_db::postgres_migration_3_keeps_served_paths` |
 
 Manually in the TUI (tmux, real servers): dashboard, repository create/search/upload,
 remote create, mirror sync with warning, Task Center progress, distribute, versions,
@@ -35,10 +37,10 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
 
 ## Test results (last run)
 
-* `cargo test --lib`: 135 passed
-* `cargo test --test mock_http`: 17 passed
-* Live (`tests/run-live.sh`, 2026-10-24): repos 2, cv 2, rbac 1, failures 2,
-  replication 2, shared_db 4 (PostgreSQL 16) — all passed
+* `cargo test --lib`: 188 passed
+* `cargo test --test mock_http`: 18 passed
+* Live (`tests/run-live.sh`, 2026-10-24): repos 2, cv 3, rbac 1, failures 2,
+  replication 2, shared_db 5 (PostgreSQL 16) — all passed
 * `cargo fmt --check`, `cargo clippy --all-targets -D warnings` (default and
   `--no-default-features`): clean
 * `podman build -f Containerfile .`: built (29.5 MB image; no keyring; it contains the
@@ -77,6 +79,10 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
   switch on Edit) are covered by unit tests with mock servers and SQLite files, and the
   store and config parts by the live PostgreSQL test. They were not run by hand in a
   terminal.
+* The TUI flow of the environment relabel (Edit form, impact list with typed confirmation,
+  result view) was not run by hand in a terminal. The service behind it (`relabel_env`) is
+  covered by unit tests with a mock server and by `live_cv`; the key classification by a
+  unit test.
 * Fallback replication synchronizes content only and never deletes.
 * Composite Content Views and reusable filter sets are not implemented.
 * Plugins other than RPM and File, content guard creation, signing service creation,

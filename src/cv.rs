@@ -5,7 +5,7 @@
 //!   new immutable repository version, which is then published. The derived repository
 //!   has no retention limit, so source-side pruning cannot remove CV snapshots.
 //! * Promote/rollback: per environment and repository a distribution with a stable base
-//!   path (`<prefix>/<env>/<cv>/<repo>`) is re-pointed to the version's publication.
+//!   path (`[<prefix>/]<env label>/<cv>/<repo>`) is re-pointed to the version's publication.
 //!   History is never deleted to roll back.
 //!
 //! Pulp has no cross-resource transactions. Each step is idempotent (find-or-create by
@@ -18,7 +18,7 @@ use crate::pulp::models::{Distribution, Package, RepoVersion, Repository, Task};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, RepoType};
 use crate::store::{
-    BindingRepo, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, LOCK_RENEW_SECS, LOCK_TTL_SECS, LockHolder, Store,
+    BindingRepo, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, LOCK_RENEW_SECS, LOCK_TTL_SECS, LockHolder, Store, validate_label,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -155,8 +155,16 @@ pub fn distribution_name(cv: &str, env: &str, repo: &str) -> String {
     format!("pulp-tui-cv-{}-{}-{}", slug(cv), slug(env), slug(repo))
 }
 
-pub fn base_path(prefix: &str, cv: &str, env: &str, repo: &str) -> String {
-    format!("{}/{}/{}/{}", slug(prefix), slug(env).to_lowercase(), slug(cv), slug(repo))
+pub fn base_path(prefix: &str, cv: &str, env_label: &str, repo: &str) -> String {
+    let path = format!("{}/{}/{}", slug(env_label), slug(cv), slug(repo));
+    if prefix.is_empty() { path } else { format!("{}/{path}", slug(prefix)) }
+}
+
+/// Warning for a configured prefix that the server's stored prefix overrides; none when unset or equal.
+fn prefix_warning(local: &str, stored: &str) -> Option<String> {
+    let shown = if stored.is_empty() { "no prefix" } else { stored }; // new servers store ""
+    (!local.is_empty() && local != stored)
+        .then(|| format!("cv_base_path_prefix {local} differs from the stored {shown} for this server; using {shown}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,8 +487,7 @@ impl CvService {
         }
         // The first prefix used for this server stays: a changed setting must not move served paths.
         let prefix = self.store.cv_prefix(&self.scope, &self.prefix).await?;
-        if prefix != self.prefix {
-            let msg = format!("cv_base_path_prefix {} differs from the stored {prefix} for this server; using {prefix}", self.prefix);
+        if let Some(msg) = prefix_warning(&self.prefix, &prefix) {
             tracing::warn!("{msg}");
             log(msg);
         }
@@ -546,7 +553,7 @@ impl CvService {
         let repo = vr.repo();
         let publication = vr.publication.as_deref().ok_or_else(|| anyhow!("version has no publication"))?;
         let name = distribution_name(cv, &env.name, &repo.repo_name);
-        let bp = base_path(prefix, cv, &env.name, &repo.repo_name);
+        let bp = base_path(prefix, cv, &env.label, &repo.repo_name);
         let labels = json!({ LABEL_CV: slug(cv), LABEL_ENV: slug(&env.name) });
         let aliases = self.store.aliases().await?;
         self.alive()?;
@@ -567,6 +574,100 @@ impl CvService {
             })
             .await?;
         Ok(())
+    }
+
+    // ---- lifecycle environment labels -----------------------------------------------
+
+    /// The served paths that the label `label` of environment `env_id` moves: each served row whose
+    /// path differs, with its new path. Reads only.
+    pub async fn relabel_impact(&self, env_id: i64, label: &str) -> Result<Vec<(BindingRepo, String)>> {
+        validate_label(label)?;
+        if let Some(e) = self.store.environments(&self.scope).await?.into_iter().find(|e| e.id != env_id && e.label == label) {
+            bail!("label {label} is already used by environment {}", e.name);
+        }
+        let prefix = self.store.stored_prefix(&self.scope).await?.unwrap_or_else(|| self.prefix.clone());
+        let mut out = vec![];
+        for cv_id in self.store.env_cv_ids(env_id).await? {
+            let cv = self.store.content_view(cv_id).await?.name;
+            for b in self.store.binding_repos(env_id, cv_id).await? {
+                let new = base_path(&prefix, &cv, label, &b.repo_name);
+                if b.base_path != new {
+                    out.push((b, new));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Change the label of environment `env_id` and move its served paths in place. The stored label is
+    /// the checkpoint: a rerun with the same label moves what is left. Returns result lines and the
+    /// number of rows not moved (they keep their old path).
+    pub async fn relabel_env(&self, env_id: i64, label: &str, log: Log<'_>, on: OnTask<'_>) -> Result<(Vec<String>, usize)> {
+        let envs = self.store.environments(&self.scope).await?;
+        let env = envs.into_iter().find(|e| e.id == env_id).ok_or_else(|| anyhow!("unknown environment"))?;
+        let mut locks = vec![];
+        for cv_id in self.store.env_cv_ids(env_id).await? {
+            let name = self.store.content_view(cv_id).await?.name;
+            let lock = CvLock::acquire(self.store.clone(), cv_id, &name, &self.actor, &format!("relabel {}", env.name)).await?;
+            locks.push((cv_id, name, lock));
+        }
+        let alive = || locks.iter().try_for_each(|(_, _, l)| l.check());
+        alive()?;
+        // Store the prefix now, so promotions after the relabel serve at the same paths.
+        self.store.cv_prefix(&self.scope, &self.prefix).await?;
+        let aliases = self.store.aliases().await?;
+        let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice()));
+        self.store.set_env_label(env_id, label).await?; // after the calls that can fail: then the audit entry below is always written
+        let (mut lines, mut moved, mut failed) = (vec![], 0, 0);
+        let res = async {
+            for (b, new) in self.relabel_impact(env_id, label).await? {
+                let (repo, old) = (b.repo_name.clone(), b.base_path.clone());
+                // A view bound after the locks were taken is not ours to change now.
+                let Some((_, cv, _)) = locks.iter().find(|l| l.0 == b.cv_id) else {
+                    failed += 1;
+                    let line = format!(
+                        "FAILED {repo} of {}: its view was bound during the relabel (still at /{old})",
+                        self.store.content_view(b.cv_id).await?.name
+                    );
+                    log(line.clone());
+                    lines.push(line);
+                    continue;
+                };
+                let labels = json!({ LABEL_CV: slug(cv), LABEL_ENV: slug(&env.name) });
+                alive()?;
+                let res = ops::move_distribution(&self.client, &b.distribution, &new, &labels, db, on).await;
+                alive()?;
+                let line = match res {
+                    Ok(_) => {
+                        self.store.save_binding_repo(&BindingRepo { base_path: new.clone(), ..b }).await?;
+                        moved += 1;
+                        format!("moved {repo} of {cv}: /{old} -> /{new}")
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        format!("FAILED {repo} of {cv}: {e:#} (still at /{old})")
+                    }
+                };
+                log(line.clone());
+                lines.push(line);
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        // Written also when a lost lock stopped the workflow: the label is already changed.
+        if env.label != label || moved > 0 {
+            self.audit("env.relabel", &format!("{}: {} -> {label}: {moved} moved, {failed} failed", env.name, env.label)).await;
+        }
+        res?;
+        if moved + failed == 0 {
+            lines.push("no served path changes".into());
+        }
+        for (cv_id, cv, _) in &locks {
+            let issues = self.verify(*cv_id, env_id).await.unwrap_or_else(|e| vec![format!("{e:#}")]);
+            lines.push(format!("{cv}: {}", if issues.is_empty() { "OK" } else { "DRIFT" }));
+            lines.extend(issues.into_iter().map(|i| format!("    {i}")));
+        }
+        Ok((lines, failed))
     }
 
     // ---- verification / drift --------------------------------------------------------
@@ -793,7 +894,20 @@ mod tests {
         assert_eq!(slug("base os/x86 64"), "base-os-x86-64");
         assert_eq!(derived_repo_name("web", "rhel9 baseos"), "pulp-tui-cv-web-rhel9-baseos");
         assert_eq!(distribution_name("web", "Prod", "os"), "pulp-tui-cv-web-Prod-os");
-        assert_eq!(base_path("cv", "web", "Prod", "os"), "cv/prod/web/os");
+        assert_eq!(base_path("cv", "web", "prod", "os"), "cv/prod/web/os");
+        assert_eq!(base_path("", "web", "prod", "os"), "prod/web/os");
+    }
+
+    #[test]
+    fn prefix_warning_only_for_an_explicit_other_prefix() {
+        assert_eq!(prefix_warning("", "cv"), None);
+        assert_eq!(prefix_warning("acme", "acme"), None);
+        assert_eq!(prefix_warning("acme", "cv").unwrap(), "cv_base_path_prefix acme differs from the stored cv for this server; using cv");
+        assert_eq!(
+            prefix_warning("acme", "").unwrap(),
+            "cv_base_path_prefix acme differs from the stored no prefix for this server; using no prefix",
+            "a server that started without a prefix keeps none"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -962,6 +1076,98 @@ mod tests {
         assert!(e.to_string().ends_with(&want), "{e}");
         assert_none(&server, "PATCH").await;
         assert_eq!(svc.store.binding_repos(lib, cv).await.unwrap()[0].publication, old.publication, "still recorded as served");
+    }
+
+    /// Scope "k" with stored prefix "cv": Library, Dev (label "dev"), view "web" with a published version bound to Dev.
+    async fn web_in_dev(svc: &CvService) -> (i64, i64) {
+        svc.store.cv_prefix("k", "cv").await.unwrap();
+        let lib = svc.store.ensure_library("k").await.unwrap();
+        let dev = svc.store.create_env("k", "Dev", lib, false).await.unwrap();
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let v = svc.store.begin_version(cv, "", &[]).await.unwrap();
+        svc.store.finish_version(v.id, "published", None).await.unwrap();
+        svc.store.set_binding(dev, cv, v.id, "active").await.unwrap();
+        (dev, cv)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relabel_moves_owned_rows_and_keeps_failed_ones() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (dev, cv) = web_in_dev(&svc).await;
+        let owned = json!({ LABEL_CV: "web", LABEL_ENV: "Dev", LABEL_DB: svc.store.db_id() });
+        // (repo, stored path, what Pulp serves and its labels; None: not requested)
+        let rows = [
+            ("os", "cv/dev/web/os", Some(("cv/dev/web/os", owned.clone()))),
+            ("docs", "cv/qa/web/docs", None),
+            ("pkgs", "cv/dev/web/pkgs", Some(("cv/qa/web/pkgs", owned.clone()))), // PATCH sent, row not saved
+            ("tools", "cv/dev/web/tools", Some(("cv/dev/web/tools", json!({})))),
+            // Our cv/env labels, but the database id of another database (not ours, not an alias).
+            ("mirror", "cv/dev/web/mirror", Some(("cv/dev/web/mirror", json!({ LABEL_CV: "web", LABEL_ENV: "Dev", LABEL_DB: "other" })))),
+        ];
+        for (i, (repo, stored, served)) in rows.iter().enumerate() {
+            let href = format!("/pulp/api/v3/distributions/rpm/rpm/{i}/");
+            let b = BindingRepo {
+                env_id: dev,
+                cv_id: cv,
+                repo_href: format!("/pulp/api/v3/repositories/rpm/rpm/{i}/"),
+                repo_name: repo.to_string(),
+                repo_type: RepoType::Rpm,
+                distribution: href.clone(),
+                base_path: stored.to_string(),
+                publication: None,
+            };
+            svc.store.save_binding_repo(&b).await.unwrap();
+            if let Some((bp, labels)) = served {
+                let d = json!({ "pulp_href": href, "name": distribution_name("web", "Dev", repo), "base_path": bp, "pulp_labels": labels });
+                Mock::given(method("GET")).and(path(href)).respond_with(ResponseTemplate::new(200).set_body_json(d)).mount(&server).await;
+            }
+        }
+        Mock::given(method("PATCH")).respond_with(ResponseTemplate::new(200).set_body_json(json!({}))).mount(&server).await;
+        let patches = || async {
+            let all = server.received_requests().await.unwrap();
+            all.into_iter()
+                .filter(|r| r.method.as_str() == "PATCH")
+                .map(|r| (r.url.path().to_string(), r.body_json::<Value>().unwrap()))
+                .collect::<Vec<_>>()
+        };
+
+        let (lines, failed) = svc.relabel_env(dev, "qa", &|_| {}, &ops::no_progress).await.unwrap();
+        assert_eq!(failed, 2, "{lines:?}");
+        assert_eq!(patches().await, [("/pulp/api/v3/distributions/rpm/rpm/0/".to_string(), json!({ "base_path": "cv/qa/web/os" }))]);
+        let paths: Vec<_> = svc.store.binding_repos(dev, cv).await.unwrap().into_iter().map(|b| b.base_path).collect();
+        assert_eq!(paths, ["cv/qa/web/docs", "cv/dev/web/mirror", "cv/qa/web/os", "cv/qa/web/pkgs", "cv/dev/web/tools"]);
+        assert!(lines.contains(&"moved os of web: /cv/dev/web/os -> /cv/qa/web/os".to_string()), "{lines:?}");
+        let tools = lines.iter().find(|l| l.starts_with("FAILED tools of web:")).expect("tools failed");
+        assert!(tools.contains("lacks ownership labels") && tools.ends_with("(still at /cv/dev/web/tools)"), "{tools}");
+        let mirror = lines.iter().find(|l| l.starts_with("FAILED mirror of web:")).expect("mirror failed");
+        assert!(
+            mirror.contains("owned by another pulp-tui database (other)") && mirror.ends_with("(still at /cv/dev/web/mirror)"),
+            "{mirror}"
+        );
+        assert_eq!(svc.store.environments("k").await.unwrap()[1].label, "qa");
+
+        // A second run with the same label sends no PATCH (os/pkgs/docs are skipped) and reports tools and mirror again.
+        let (_, failed) = svc.relabel_env(dev, "qa", &|_| {}, &ops::no_progress).await.unwrap();
+        assert_eq!(failed, 2);
+        assert_eq!(patches().await.len(), 1);
+        let audit: Vec<_> = svc.store.audit_log("k", 10).await.unwrap().into_iter().filter(|a| a.action == "env.relabel").collect();
+        assert_eq!(audit.len(), 1, "the rerun changed nothing: {audit:?}");
+        assert_eq!(audit[0].detail, "Dev: dev -> qa: 2 moved, 2 failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relabel_refuses_while_a_view_is_locked() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (dev, cv) = web_in_dev(&svc).await;
+        let _held = CvLock::acquire(svc.store.clone(), cv, "web", "b@h", "publish").await.unwrap();
+        let e = svc.relabel_env(dev, "qa", &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert!(e.to_string().starts_with("Content View web is locked by b@h (publish) since "), "{e}");
+        assert_eq!(svc.store.environments("k").await.unwrap()[1].label, "dev");
+        assert_none(&server, "PATCH").await;
     }
 
     #[test]

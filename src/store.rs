@@ -70,6 +70,16 @@ const MIGRATIONS: &[&str] = &[
      CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
      CREATE TABLE scope_settings(scope TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(scope, key));
      ALTER TABLE audit ADD COLUMN actor TEXT NOT NULL DEFAULT '';",
+    // 3: environment labels (the served path segment) and the base path prefix of servers that served before it was stored.
+    // Names pass `validate_name`, so `lower(name)` is exactly `slug(name).to_lowercase()`: no path moves.
+    "ALTER TABLE environments ADD COLUMN label TEXT NOT NULL DEFAULT '';
+     UPDATE environments SET label = lower(name);
+     INSERT INTO scope_settings(scope, key, value)
+        SELECT c.profile, 'cv_base_path_prefix', MIN(substr(b.base_path, 1, instr(b.base_path, '/') - 1))
+        FROM binding_repos b JOIN content_views c ON c.id = b.cv_id
+        WHERE instr(b.base_path, '/') > 0
+          AND NOT EXISTS (SELECT 1 FROM scope_settings s WHERE s.scope = c.profile AND s.key = 'cv_base_path_prefix')
+        GROUP BY c.profile;",
 ];
 
 /// `MIGRATIONS` for PostgreSQL: every integer is BIGINT (sqlx `Any` reads SQLite integers as
@@ -124,6 +134,15 @@ pub const PG_MIGRATIONS: &[&str] = &[
      CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
      CREATE TABLE scope_settings(scope TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(scope, key));
      ALTER TABLE audit ADD COLUMN actor TEXT NOT NULL DEFAULT '';",
+    // 3: environment labels and the seeded base path prefix (see `MIGRATIONS`)
+    "ALTER TABLE environments ADD COLUMN label TEXT NOT NULL DEFAULT '';
+     UPDATE environments SET label = lower(name);
+     INSERT INTO scope_settings(scope, key, value)
+        SELECT c.profile, 'cv_base_path_prefix', MIN(split_part(b.base_path, '/', 1))
+        FROM binding_repos b JOIN content_views c ON c.id = b.cv_id
+        WHERE strpos(b.base_path, '/') > 0
+          AND NOT EXISTS (SELECT 1 FROM scope_settings s WHERE s.scope = c.profile AND s.key = 'cv_base_path_prefix')
+        GROUP BY c.profile;",
 ];
 
 /// A Content View lock not renewed for this long is expired; the next operator takes it over.
@@ -218,6 +237,8 @@ pub struct Environment {
     pub name: String,
     pub prior_id: Option<i64>,
     pub protected: bool,
+    /// The path segment of this environment's served paths; unique per scope.
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -748,11 +769,14 @@ impl Store {
     // ---- environments and bindings -----------------------------------------------
 
     pub async fn ensure_library(&self, profile: &str) -> Result<i64> {
-        sqlx::query("INSERT INTO environments(profile, name, prior_id) VALUES ($1, $2, NULL) ON CONFLICT(profile, name) DO NOTHING")
-            .bind(profile)
-            .bind(LIBRARY)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO environments(profile, name, prior_id, label) VALUES ($1, $2, NULL, $3) ON CONFLICT(profile, name) DO NOTHING",
+        )
+        .bind(profile)
+        .bind(LIBRARY)
+        .bind(default_label(LIBRARY))
+        .execute(&self.pool)
+        .await?;
         Ok(sqlx::query_scalar("SELECT id FROM environments WHERE profile = $1 AND name = $2")
             .bind(profile)
             .bind(LIBRARY)
@@ -761,16 +785,67 @@ impl Store {
     }
 
     pub async fn create_env(&self, profile: &str, name: &str, prior_id: i64, protected: bool) -> Result<i64> {
+        self.insert_env(profile, name, prior_id, protected, &default_label(name)).await
+    }
+
+    async fn insert_env(&self, profile: &str, name: &str, prior_id: i64, protected: bool, label: &str) -> Result<i64> {
         validate_name(name)?;
-        let id = sqlx::query_scalar("INSERT INTO environments(profile, name, prior_id, protected) VALUES ($1, $2, $3, $4) RETURNING id")
-            .bind(profile)
-            .bind(name)
-            .bind(prior_id)
-            .bind(protected as i64)
-            .fetch_one(&self.pool)
-            .await
-            .with_context(|| format!("environment {name} already exists?"))?;
+        validate_label(label)?;
+        // shortcut: label uniqueness is checked, not indexed (old databases can hold case-only duplicates); add a unique index once none are left.
+        if let Some(used) = self.label_user(profile, label, 0).await? {
+            bail!("label {label} is already used by environment {used}");
+        }
+        let id = sqlx::query_scalar(
+            "INSERT INTO environments(profile, name, prior_id, protected, label) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(profile)
+        .bind(name)
+        .bind(prior_id)
+        .bind(protected as i64)
+        .bind(label)
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("environment {name} already exists?"))?;
         Ok(id)
+    }
+
+    /// Name of another environment (not `except`) of the scope that has this label.
+    /// An older pulp-tui can insert a row without a label (''); it reads as the default for its name.
+    async fn label_user(&self, profile: &str, label: &str, except: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT name FROM environments WHERE profile = $1 AND (label = $2 OR (label = '' AND lower(name) = $2)) AND id != $3
+             ORDER BY id LIMIT 1",
+        )
+        .bind(profile)
+        .bind(label)
+        .bind(except)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Change the path segment of an environment. Only the row changes: moving served paths is the caller's job.
+    pub async fn set_env_label(&self, id: i64, label: &str) -> Result<()> {
+        validate_label(label)?;
+        let profile: String = sqlx::query_scalar("SELECT profile FROM environments WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow!("unknown environment"))?;
+        if let Some(used) = self.label_user(&profile, label, id).await? {
+            bail!("label {label} is already used by environment {used}");
+        }
+        sqlx::query("UPDATE environments SET label = $2 WHERE id = $1").bind(id).bind(label).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Ids of the views with a binding or served rows in the environment, ascending.
+    pub async fn env_cv_ids(&self, env_id: i64) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT cv_id FROM bindings WHERE env_id = $1 UNION SELECT cv_id FROM binding_repos WHERE env_id = $1 ORDER BY cv_id",
+        )
+        .bind(env_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn set_env_protected(&self, id: i64, protected: bool) -> Result<()> {
@@ -795,15 +870,17 @@ impl Store {
 
     /// Environments in path order (Library first, then each successor chain).
     pub async fn environments(&self, profile: &str) -> Result<Vec<Environment>> {
-        let rows = sqlx::query("SELECT id, name, prior_id, protected FROM environments WHERE profile = $1 ORDER BY id")
+        let rows = sqlx::query("SELECT id, name, prior_id, protected, label FROM environments WHERE profile = $1 ORDER BY id")
             .bind(profile)
             .fetch_all(&self.pool)
             .await?;
         let all = rows
             .iter()
             .map(|r| {
+                let (name, label): (String, String) = (r.try_get(1)?, r.try_get(4)?);
                 let protected: i64 = r.try_get(3)?;
-                Ok(Environment { id: r.try_get(0)?, name: r.try_get(1)?, prior_id: r.try_get(2)?, protected: protected != 0 })
+                let label = if label.is_empty() { default_label(&name) } else { label }; // a row from an older pulp-tui
+                Ok(Environment { id: r.try_get(0)?, name, prior_id: r.try_get(2)?, protected: protected != 0, label })
             })
             .collect::<Result<Vec<_>>>()?;
         let mut out = vec![];
@@ -1045,7 +1122,12 @@ impl Store {
         let environments = envs
             .iter()
             .filter(|e| e.prior_id.is_some())
-            .map(|e| ExportEnv { name: e.name.clone(), prior: name_of(e.prior_id).unwrap_or_default(), protected: e.protected })
+            .map(|e| ExportEnv {
+                name: e.name.clone(),
+                prior: name_of(e.prior_id).unwrap_or_default(),
+                protected: e.protected,
+                label: e.label.clone(),
+            })
             .collect();
         Ok(Export { format: 1, content_views: views, environments })
     }
@@ -1068,7 +1150,11 @@ impl Store {
                     continue;
                 }
                 match existing.iter().find(|x| x.name == e.prior) {
-                    Some(p) => envs += self.create_env(profile, &e.name, p.id, e.protected).await.is_ok() as usize,
+                    Some(p) => {
+                        let label = if e.label.is_empty() { default_label(&e.name) } else { e.label.clone() };
+                        self.insert_env(profile, &e.name, p.id, e.protected, &label).await?;
+                        envs += 1;
+                    }
                     None => waiting.push(e),
                 }
             }
@@ -1124,6 +1210,16 @@ impl Store {
         if let Some(e) = envs.iter().find(|e| e.prior_id.is_some() && have.iter().any(|h| h.name == e.name)) {
             bail!("target already has environment {} for this server; db copy never merges", e.name);
         }
+        if let Some(e) = envs.iter().find(|e| e.prior_id.is_some() && have.iter().any(|h| h.label == e.label)) {
+            bail!("target already has an environment with label {} for this server; db copy never merges", e.label);
+        }
+        let src_library = envs.iter().find(|e| e.prior_id.is_none()).map(|e| e.label.clone());
+        if let (Some(s), Some(t)) = (&src_library, have.iter().find(|h| h.prior_id.is_none()))
+            && t.label != *s
+        {
+            bail!("target Library has label {}, the source {s}; db copy never merges", t.label);
+        }
+        let src_library = src_library.unwrap_or_else(|| default_label(LIBRARY));
         let mut log = src.audit_log(src_scope, i64::MAX as usize).await?;
         log.reverse(); // oldest first, so the new ids keep the order
         let mut report = CopyReport {
@@ -1136,11 +1232,14 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         // Source ids to target ids; environments come in path order, so a prior is always mapped first.
         let mut env_ids = HashMap::new();
-        sqlx::query("INSERT INTO environments(profile, name, prior_id) VALUES ($1, $2, NULL) ON CONFLICT(profile, name) DO NOTHING")
-            .bind(dst_scope)
-            .bind(LIBRARY)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO environments(profile, name, prior_id, label) VALUES ($1, $2, NULL, $3) ON CONFLICT(profile, name) DO NOTHING",
+        )
+        .bind(dst_scope)
+        .bind(LIBRARY)
+        .bind(&src_library)
+        .execute(&mut *tx)
+        .await?;
         let library: i64 = sqlx::query_scalar("SELECT id FROM environments WHERE profile = $1 AND name = $2")
             .bind(dst_scope)
             .bind(LIBRARY)
@@ -1150,13 +1249,16 @@ impl Store {
             let id = match e.prior_id {
                 None => library,
                 Some(prior) => {
-                    sqlx::query_scalar("INSERT INTO environments(profile, name, prior_id, protected) VALUES ($1, $2, $3, $4) RETURNING id")
-                        .bind(dst_scope)
-                        .bind(&e.name)
-                        .bind(env_ids[&prior])
-                        .bind(e.protected as i64)
-                        .fetch_one(&mut *tx)
-                        .await?
+                    sqlx::query_scalar(
+                        "INSERT INTO environments(profile, name, prior_id, protected, label) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                    )
+                    .bind(dst_scope)
+                    .bind(&e.name)
+                    .bind(env_ids[&prior])
+                    .bind(e.protected as i64)
+                    .bind(&e.label)
+                    .fetch_one(&mut *tx)
+                    .await?
                 }
             };
             env_ids.insert(e.id, id);
@@ -1314,6 +1416,9 @@ pub struct ExportEnv {
     pub prior: String,
     #[serde(default)]
     pub protected: bool,
+    /// Empty (a file from before labels): the default for the name.
+    #[serde(default)]
+    pub label: String,
 }
 
 fn lock_row(r: &AnyRow) -> Result<LockHolder> {
@@ -1367,6 +1472,20 @@ fn binding_repo_row(r: &AnyRow) -> Result<BindingRepo> {
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
         bail!("name must be 1-64 characters of [A-Za-z0-9-_.]");
+    }
+    Ok(())
+}
+
+/// The label a new environment gets: its name as a lower-case path segment.
+pub fn default_label(name: &str) -> String {
+    crate::cv::slug(name).to_lowercase()
+}
+
+/// A label is one segment of a served path.
+pub fn validate_label(label: &str) -> Result<()> {
+    let ok = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c);
+    if label.is_empty() || label.len() > 64 || label == "." || label == ".." || !label.chars().all(ok) {
+        bail!("label must be 1-64 characters of [a-z0-9-_.]");
     }
     Ok(())
 }
@@ -1507,7 +1626,7 @@ mod tests {
         assert!(s.delete_env(dev).await.is_err()); // bound + has successor
         s.delete_env(qa).await.unwrap();
         assert!(s.environments("lab").await.unwrap().iter().all(|e| e.id != qa));
-        let _ = prod;
+        s.set_env_label(prod, "production").await.unwrap();
 
         let ex = s.export("lab").await.unwrap();
         let s2 = Store::open_in_memory().await.unwrap();
@@ -1522,6 +1641,140 @@ mod tests {
     #[test]
     fn migration_lists_match() {
         assert_eq!(MIGRATIONS.len(), PG_MIGRATIONS.len());
+    }
+
+    #[tokio::test]
+    async fn migration_3_keeps_todays_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pulp-tui.db");
+        {
+            // Rows as schema 2 wrote them, in raw SQL (the new store code writes columns schema 2 lacks).
+            // "dev" next to "Dev" shares today's segment; scope "new" has a view but no served rows.
+            let s = Store::open_at_version(&path, 2).await.unwrap();
+            sqlx::raw_sql(
+                "INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'old', 'web', 't'), (2, 'new', 'api', 't');
+                 INSERT INTO environments(id, profile, name, prior_id) VALUES (1, 'old', 'Library', NULL), (2, 'old', 'Dev', 1), (3, 'old', 'dev', 1);
+                 INSERT INTO binding_repos VALUES (2, 1, '/r/1/', 'os', 'rpm', '/d/1/', 'acme/dev/web/os', '/p/1/');",
+            )
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let s = Store::open(&path).await.unwrap();
+        let labels: Vec<String> = s.environments("old").await.unwrap().iter().map(|e| format!("{}={}", e.name, e.label)).collect();
+        assert_eq!(labels, ["Library=library", "Dev=dev", "dev=dev"]);
+        assert_eq!(s.stored_prefix("old").await.unwrap().as_deref(), Some("acme"));
+        assert_eq!(s.stored_prefix("new").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn labels_default_validate_and_stay_unique() {
+        let s = Store::open_in_memory().await.unwrap();
+        let lib = s.ensure_library("k").await.unwrap();
+        let dev = s.create_env("k", "Dev", lib, false).await.unwrap();
+        let envs = s.environments("k").await.unwrap();
+        assert_eq!((envs[0].label.as_str(), envs[1].label.as_str()), ("library", "dev"));
+        for bad in ["", "Dev", "a/b", ".", "..", &"x".repeat(65)] {
+            assert!(validate_label(bad).is_err(), "{bad}");
+        }
+        validate_label("dev-2.x_y").unwrap();
+        assert_eq!(s.set_env_label(dev, "Bad").await.unwrap_err().to_string(), "label must be 1-64 characters of [a-z0-9-_.]");
+        assert_eq!(s.set_env_label(dev, "library").await.unwrap_err().to_string(), "label library is already used by environment Library");
+        assert_eq!(s.create_env("k", "dev", lib, false).await.unwrap_err().to_string(), "label dev is already used by environment Dev");
+        s.set_env_label(dev, "dev").await.unwrap(); // its own label is not a clash
+        s.set_env_label(dev, "development").await.unwrap();
+        s.create_env("k", "dev", lib, false).await.unwrap(); // the default is free now
+        s.create_env("other", "Dev", s.ensure_library("other").await.unwrap(), false).await.unwrap(); // per scope
+    }
+
+    #[tokio::test]
+    async fn an_environment_row_without_a_label_reads_as_its_default() {
+        let s = Store::open_in_memory().await.unwrap();
+        let lib = s.ensure_library("k").await.unwrap();
+        // A row as an older pulp-tui writes it after schema 3: the column default, ''.
+        sqlx::query("INSERT INTO environments(profile, name, prior_id) VALUES ('k', 'QA', $1)").bind(lib).execute(&s.pool).await.unwrap();
+        let envs = s.environments("k").await.unwrap();
+        assert_eq!(envs[1].label, "qa");
+        assert_eq!(crate::cv::base_path("", "web", &envs[1].label, "os"), "qa/web/os");
+        assert_eq!(s.create_env("k", "qa", lib, false).await.unwrap_err().to_string(), "label qa is already used by environment QA");
+        let dev = s.create_env("k", "Dev", lib, false).await.unwrap();
+        assert_eq!(s.set_env_label(dev, "qa").await.unwrap_err().to_string(), "label qa is already used by environment QA");
+        s.set_env_label(envs[1].id, "qa").await.unwrap(); // its own default is not a clash
+        assert_eq!(s.environments("k").await.unwrap()[1].label, "qa");
+    }
+
+    #[tokio::test]
+    async fn env_cv_ids_lists_views_with_a_binding_or_served_rows() {
+        let s = Store::open_in_memory().await.unwrap();
+        let lib = s.ensure_library("k").await.unwrap();
+        let dev = s.create_env("k", "Dev", lib, false).await.unwrap();
+        let (a, _unbound, c) =
+            (s.create_cv("k", "a", "").await.unwrap(), s.create_cv("k", "b", "").await.unwrap(), s.create_cv("k", "c", "").await.unwrap());
+        assert!(s.env_cv_ids(dev).await.unwrap().is_empty());
+        let v = s.begin_version(c, "", &[]).await.unwrap();
+        s.set_binding(dev, c, v.id, "active").await.unwrap(); // a binding, no served rows
+        let row = BindingRepo {
+            env_id: dev,
+            cv_id: a,
+            repo_href: "/r/1/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: "/d/1/".into(),
+            base_path: "dev/a/os".into(),
+            publication: None,
+        };
+        s.save_binding_repo(&row).await.unwrap(); // served rows, no binding
+        s.save_binding_repo(&BindingRepo { repo_href: "/r/2/".into(), ..row }).await.unwrap();
+        assert_eq!(s.env_cv_ids(dev).await.unwrap(), [a, c]);
+    }
+
+    #[tokio::test]
+    async fn copy_keeps_labels_and_refuses_label_clash() {
+        let src = Store::open_in_memory().await.unwrap();
+        let lib = src.ensure_library("lab").await.unwrap();
+        let dev = src.create_env("lab", "Dev", lib, false).await.unwrap();
+        src.set_env_label(lib, "base").await.unwrap();
+        src.set_env_label(dev, "development").await.unwrap();
+        let labels = |envs: Vec<Environment>| envs.iter().map(|e| format!("{}={}", e.name, e.label)).collect::<Vec<_>>();
+
+        // An empty scope: both labels are kept, Library's too.
+        let dst = Store::open_in_memory().await.unwrap();
+        dst.copy_from(&src, "lab", "k").await.unwrap();
+        assert_eq!(labels(dst.environments("k").await.unwrap()), ["Library=base", "Dev=development"]);
+
+        // Another environment of the target scope uses the label.
+        let dst2 = Store::open_in_memory().await.unwrap();
+        let lib2 = dst2.ensure_library("k").await.unwrap();
+        let staging = dst2.create_env("k", "Staging", lib2, false).await.unwrap();
+        dst2.set_env_label(staging, "development").await.unwrap();
+        let e = dst2.copy_from(&src, "lab", "k").await.unwrap_err().to_string();
+        assert_eq!(e, "target already has an environment with label development for this server; db copy never merges");
+        assert_eq!(labels(dst2.environments("k").await.unwrap()), ["Library=library", "Staging=development"]);
+
+        // The target Library has another label than the source Library.
+        let dst3 = Store::open_in_memory().await.unwrap();
+        let lib3 = dst3.ensure_library("k").await.unwrap();
+        dst3.set_env_label(lib3, "lib").await.unwrap();
+        let e = dst3.copy_from(&src, "lab", "k").await.unwrap_err().to_string();
+        assert_eq!(e, "target Library has label lib, the source base; db copy never merges");
+        assert_eq!(labels(dst3.environments("k").await.unwrap()), ["Library=lib"]);
+    }
+
+    #[tokio::test]
+    async fn import_takes_labels_and_defaults_missing_ones() {
+        let s = Store::open_in_memory().await.unwrap();
+        let env = |name: &str, label: &str| ExportEnv { name: name.into(), prior: "Library".into(), protected: false, label: label.into() };
+        let ex = Export { format: 1, content_views: vec![], environments: vec![env("Dev", "development"), env("QA", "")] };
+        s.import("k", &ex).await.unwrap();
+        let labels: Vec<_> = s.environments("k").await.unwrap().iter().map(|e| format!("{}={}", e.name, e.label)).collect();
+        assert_eq!(labels, ["Library=library", "Dev=development", "QA=qa"]);
+        // An old export has no label field.
+        let old: Export =
+            serde_json::from_str(r#"{"format":1,"content_views":[],"environments":[{"name":"Test","prior":"Library"}]}"#).unwrap();
+        assert_eq!(old.environments[0].label, "");
+        // A clash is reported, not skipped.
+        let e = s.import("k", &Export { environments: vec![env("Other", "qa")], ..ex }).await.unwrap_err().to_string();
+        assert_eq!(e, "label qa is already used by environment QA");
     }
 
     #[tokio::test]

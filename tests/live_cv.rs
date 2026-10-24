@@ -83,7 +83,7 @@ async fn content_view_lifecycle() {
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
     assert_eq!(svc.verify(cv, dev).await.unwrap(), Vec::<String>::new());
     let dev_docs = c
-        .fetch_content(&format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, &id, "Dev", "docs")), 1 << 20)
+        .fetch_content(&format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, &id, "dev", "docs")), 1 << 20)
         .await
         .unwrap();
     assert_eq!(dev_docs.0, 200);
@@ -126,7 +126,7 @@ async fn content_view_lifecycle() {
     let blocker = create(
         &c,
         RepoType::File.distributions(),
-        json!({ "name": format!("{id}-blocker"), "base_path": base_path(&id, &id, "QA", "docs") }),
+        json!({ "name": format!("{id}-blocker"), "base_path": base_path(&id, &id, "qa", "docs") }),
         "/distributions/",
     )
     .await;
@@ -184,6 +184,59 @@ async fn content_view_lifecycle() {
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     assert!(c.get::<serde_json::Value>(os_v1.derived_repo.as_deref().unwrap(), &[]).await.unwrap_err().is_not_found());
     cleanup(&c, &[&rpm_repo, &file_repo, &rpm_remote, &file_remote]).await;
+}
+
+/// Relabeling an environment moves its served paths in place; later promotions use the new label.
+#[tokio::test]
+async fn environment_relabel_moves_served_paths() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvlb");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService {
+        client: c.clone(),
+        store: store.clone(),
+        prefix: id.clone(),
+        scope: profile.clone(),
+        actor: "test@live".into(),
+        lock: None,
+    };
+    let cv = store.create_cv(&profile, &id, "").await.unwrap();
+    store
+        .set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] })
+        .await
+        .unwrap();
+    let v1 = svc.publish(cv, "", &quiet, &no_progress).await.unwrap();
+    let lib = store.ensure_library(&profile).await.unwrap();
+    let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
+    svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    let readme = |label: &str| format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, &id, label, "docs"));
+    assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 200);
+
+    // The impact names the move; the relabel moves the one served row and the view still verifies.
+    let dist = store.binding_repos(dev, cv).await.unwrap()[0].distribution.clone();
+    let impact = svc.relabel_impact(dev, "dev2").await.unwrap();
+    assert_eq!((impact.len(), impact[0].1.as_str()), (1, base_path(&id, &id, "dev2", "docs").as_str()));
+    let (lines, failed) = svc.relabel_env(dev, "dev2", &quiet, &no_progress).await.unwrap();
+    assert_eq!(failed, 0, "{lines:?}");
+    assert!(svc.verify(cv, dev).await.unwrap().is_empty());
+    assert_eq!(c.fetch_content(&readme("dev2"), 1 << 20).await.unwrap().0, 200);
+    assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 404, "the old path is gone");
+    assert_eq!(store.binding_repos(dev, cv).await.unwrap()[0].base_path, base_path(&id, &id, "dev2", "docs"));
+
+    // The distribution moved in place (same object), and a second promotion serves at the new label.
+    svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    let row = store.binding_repos(dev, cv).await.unwrap().remove(0);
+    assert_eq!((row.distribution, row.base_path), (dist, base_path(&id, &id, "dev2", "docs")));
+    assert!(svc.verify(cv, dev).await.unwrap().is_empty());
+    assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 404);
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote]).await;
 }
 
 /// Two databases (stores with different ids) share one Pulp and one Content View name.

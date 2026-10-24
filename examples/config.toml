@@ -13,7 +13,10 @@ poll_min_ms = 1000            # adaptive task polling bounds
 poll_max_ms = 10000
 max_response_mb = 64          # larger API responses are rejected
 upload_chunk_mb = 8           # chunked upload size
-cv_base_path_prefix = "cv"    # Content View distributions: <prefix>/<env>/<view>/<repo>
+# cv_base_path_prefix: optional. Content View paths are <lc label>/<view>/<repo>.
+# A value adds a first segment for servers that have no stored prefix yet.
+# "cv" is the old default and is ignored. A server keeps the first prefix it used.
+# cv_base_path_prefix = "acme"
 
 # Shared Content View / lifecycle database (optional): the default for profiles without their own
 # `database` (see [profiles.prod.database] below). Without either, they stay in the local file.

@@ -102,7 +102,7 @@ impl Ctx {
         Ok(CvService {
             client: self.client.clone(),
             store: self.cv_store.clone().map_err(unavailable)?,
-            prefix: self.settings.cv_base_path_prefix.clone(),
+            prefix: self.settings.new_server_prefix().into(),
             scope: self.scope.clone(),
             actor: self.actor.clone(),
             lock: None,

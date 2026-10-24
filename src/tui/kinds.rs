@@ -277,7 +277,8 @@ impl Act {
         match k {
             // Migrate and copy change a database; import creates Content Views and environments in the shared one.
             Kind::Profiles => matches!(self, MigrateDb | CopyDb) || shared && matches!(self, ImportCv),
-            Kind::Environments => shared,
+            // Edit changes the label, which moves distributions on the server.
+            Kind::Environments => shared || matches!(self, Edit),
             Kind::ContentViews => {
                 matches!(self, Delete | CvPublish | CvSyncRepos | Promote | Rollback | BreakLock)
                     || shared && matches!(self, Create | Edit | CvAddRepo | CvFilters | CvRemoveRepo)
@@ -533,6 +534,7 @@ impl Kind {
             ],
             Kind::Environments => vec![
                 col("name", 18, |v| s(v, "name")),
+                col("label", 14, |v| s(v, "label")),
                 col("after", 14, |v| s(v, "prior")),
                 col("protected", 9, |v| s(v, "protected")),
                 col("bound views", 40, |v| s(v, "bound")),
@@ -615,7 +617,7 @@ impl Kind {
                 Inspect,
             ],
             Kind::CvVersions { .. } => vec![Promote, Rollback, Compare, Resume, Delete, Inspect],
-            Kind::Environments => vec![Create, ToggleProtected, Delete],
+            Kind::Environments => vec![Create, Edit, ToggleProtected, Delete],
             Kind::UpstreamPulps => vec![Replicate, ReplicationHistory, FallbackReplicate, Create, Edit, Delete, Inspect],
             Kind::Users => vec![Roles, Create, Edit, Password, ToggleActive, Delete, Inspect],
             Kind::UserRoles { .. } | Kind::GroupRoles { .. } | Kind::GroupUsers { .. } => vec![Create, Delete],
@@ -768,7 +770,7 @@ pub async fn load(
                     }
                 }
                 out.push(json!({
-                    "id": e.id, "name": e.name, "library": e.name == LIBRARY && e.prior_id.is_none(),
+                    "id": e.id, "name": e.name, "label": e.label, "library": e.name == LIBRARY && e.prior_id.is_none(),
                     "prior": e.prior_id.and_then(|p| envs.iter().find(|x| x.id == p)).map(|x| x.name.clone()).unwrap_or_default(),
                     "protected": e.protected, "bound": bound.join(", "),
                 }));
@@ -850,6 +852,8 @@ mod tests {
         assert!(Act::Create.mutates(&Kind::ContentViews, true), "shared CV definitions");
         assert!(Act::ToggleProtected.mutates(&Kind::Environments, true));
         assert!(!Act::ToggleProtected.mutates(&Kind::Environments, false));
+        assert!(Act::Edit.mutates(&Kind::Environments, false), "a relabel moves distributions");
+        assert!(Kind::Environments.actions().contains(&Act::Edit));
         assert!(Act::CvPublish.mutates(&Kind::ContentViews, false));
         assert!(Act::BreakLock.mutates(&Kind::ContentViews, false), "removes another operator's lock");
         assert!(Kind::ContentViews.actions().contains(&Act::BreakLock) && Act::BreakLock.needs_item());

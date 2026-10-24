@@ -528,7 +528,7 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
                 r.repo_name,
                 r.repo_type.label(),
                 distribution_name(&name, &env, &r.repo_name),
-                base_path(&prefix, &name, &env, &r.repo_name)
+                base_path(&prefix, &name, &e.label, &r.repo_name)
             ));
         }
         for b in st.binding_repos(e.id, cv).await? {
@@ -686,6 +686,39 @@ fn env_action(app: &mut App, scope: &str, act: Act, item: Value) {
                 })
             });
         }
+        Act::Edit => {
+            let old = s(&item, "label");
+            let form = Form::new(
+                format!("Edit environment {name}"),
+                vec![
+                    Field::text("label", "Label")
+                        .value(old.clone())
+                        .required()
+                        .help("lowercase [a-z0-9-_.], the <lc> part of served paths"),
+                ],
+            )
+            .note("Changing the label moves every served path of this environment.");
+            app.form(form, move |app, f| {
+                let label = f.get("label").to_string();
+                crate::store::validate_label(&label).map_err(|e| e.to_string())?;
+                let (name, old) = (name.clone(), old.clone());
+                app.job(format!("read served paths of {name}"), move |ctx| async move {
+                    let rows = ctx.cv()?.relabel_impact(id, &label).await?;
+                    ap(move |app| {
+                        if rows.is_empty() {
+                            return relabel(app, id, name, label);
+                        }
+                        let mut lines = vec![format!("Label {old} -> {label}. Served paths move:")];
+                        lines.extend(rows.iter().map(|(b, new)| format!("  /{} -> /{new}", b.base_path)));
+                        lines.push("Clients using the old paths stop getting content.".into());
+                        app.confirm_danger(format!("Change label of {name}"), lines, &name.clone(), move |app| {
+                            relabel(app, id, name, label)
+                        });
+                    })
+                });
+                Ok(())
+            });
+        }
         Act::ToggleProtected => {
             let prot = item["protected"] != true;
             local(app, "toggle protected", async move |st| {
@@ -711,6 +744,22 @@ fn env_action(app: &mut App, scope: &str, act: Act, item: Value) {
         }
         _ => {}
     }
+}
+
+/// Change the label of environment `id` (its served paths move) and show what moved.
+fn relabel(app: &mut App, id: i64, name: String, label: String) {
+    app.job(format!("relabel {name}"), move |ctx| async move {
+        let (lines, failed) = ctx.cv()?.relabel_env(id, &label, &ctx.log(), &ctx.on_task()).await?;
+        ap(move |app| {
+            app.text(format!("Label of {name}"), lines);
+            if failed == 0 {
+                app.ok(format!("label of {name} is {label}"));
+            } else {
+                app.notify(Level::Warn, format!("{failed} path(s) not moved; run Edit again with the same label to retry"));
+            }
+            app.reload();
+        })
+    });
 }
 
 #[cfg(test)]

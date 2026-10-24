@@ -121,6 +121,51 @@ async fn postgres_schema_lifecycle() {
     s.drop_schema().await;
 }
 
+/// A schema 2 database (rows as the previous pulp-tui wrote them) migrates to 3 without moving a served path.
+#[tokio::test]
+async fn postgres_migration_3_keeps_served_paths() {
+    if !live_enabled() {
+        return;
+    }
+    let s = Schema::new().await;
+    let n = PG_MIGRATIONS.len() as i64;
+    {
+        let mut c = sqlx::AnyConnection::connect(&s.connect()).await.unwrap();
+        for m in &PG_MIGRATIONS[..2] {
+            c.execute(sqlx::raw_sql(m)).await.unwrap();
+        }
+        // k: "Dev" and "dev" share the segment `dev`, prefix acme. kept: has a stored prefix already.
+        // plain: a path without a prefix. The new store code writes columns schema 2 lacks, so this is raw SQL.
+        c.execute(sqlx::raw_sql(
+            "INSERT INTO schema_version(version) VALUES (2);
+             INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'k', 'web', 't'), (2, 'kept', 'web', 't'), (3, 'plain', 'web', 't');
+             INSERT INTO environments(id, profile, name, prior_id) VALUES (1, 'k', 'Library', NULL), (2, 'k', 'Dev', 1), (3, 'k', 'dev', 1);
+             INSERT INTO scope_settings(scope, key, value) VALUES ('kept', 'cv_base_path_prefix', 'custom');
+             INSERT INTO binding_repos VALUES
+                (2, 1, '/r/1/', 'os', 'rpm', '/d/1/', 'acme/dev/web/os', '/p/1/'),
+                (2, 2, '/r/2/', 'os', 'rpm', '/d/2/', 'other/dev/web/os', '/p/2/'),
+                (2, 3, '/r/3/', 'os', 'rpm', '/d/3/', 'os', '/p/3/');",
+        ))
+        .await
+        .unwrap();
+    }
+    assert_eq!(s.migrate().await, (2, n));
+    let st = s.open().await;
+    let labels: Vec<String> = st.environments("k").await.unwrap().iter().map(|e| format!("{}={}", e.name, e.label)).collect();
+    assert_eq!(labels, ["Library=library", "Dev=dev", "dev=dev"]);
+    assert_eq!(st.binding_repos(2, 1).await.unwrap()[0].base_path, "acme/dev/web/os");
+    assert_eq!(st.stored_prefix("k").await.unwrap().as_deref(), Some("acme"));
+    assert_eq!(st.stored_prefix("kept").await.unwrap().as_deref(), Some("custom"), "a stored prefix is not replaced");
+    assert_eq!(st.stored_prefix("plain").await.unwrap(), None, "a path without `/` seeds nothing");
+
+    // Labels stay unique per scope on PostgreSQL too.
+    let e = st.set_env_label(2, "library").await.unwrap_err().to_string();
+    assert!(e.contains("label library is already used by environment Library"), "{e}");
+    st.set_env_label(2, "stage").await.unwrap();
+    assert_eq!(st.environments("k").await.unwrap()[1].label, "stage");
+    s.drop_schema().await;
+}
+
 #[tokio::test]
 async fn two_operators_share_state_and_locks() {
     if !live_enabled() {

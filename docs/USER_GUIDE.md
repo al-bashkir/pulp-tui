@@ -186,6 +186,12 @@ repositories does not lock the view; it writes one audit entry (`cv.sync`) when 
 submitted, with how many were submitted, failed or skipped (the per-repository result of the
 finished tasks is shown in the result view, not in the entry).
 
+Each promoted repository is served at
+`https://<pulp>/pulp/content/[<prefix>/]<lc label>/<view>/<repo>/`, where `<lc label>` is
+the label of the lifecycle environment (see "Lifecycle Environments"). Servers that served
+Content Views with an earlier pulp-tui keep their prefix (`cv/` unless you set another one);
+new servers have no prefix. See "Base path prefix" under "Shared database".
+
 Filter syntax (rules separated by `;`):
 
 ```
@@ -211,6 +217,22 @@ Library exists automatically. **c** creates an environment after an existing one
 (paths can branch). **L** toggles protection. **d** deletes an unused environment. With a
 shared database, environments belong to the server and every operator sees them.
 
+Each environment has a **label**, the part of the served path that names it (column
+*label*). A new environment gets its name in lower case as the label (`Dev` gives `dev`).
+**e** edits the label: 1-64 characters of `a-z 0-9 - _ .`, unique for the server. pulp-tui
+loads the served paths that change and shows them as `/old -> /new`, with the line
+`Clients using the old paths stop getting content.` When served paths move, you type the
+environment name to confirm (when none move, there is no confirmation). Then it moves each
+distribution to the new path in place (one Pulp task each), and a result view lists what
+moved, and the drift check of each bound view. The distribution names do not change. The label is stored first. If a row fails, it stays at its old path
+and is named in the result; run Edit again with the same label to move the rest. A relabel
+locks every view that is bound in the environment (see "Locks"), and stops with the
+holder's name if another operator holds one of them. A view bound in the environment during
+the relabel is not moved; run Edit again. When the server has no path prefix, a label must
+not overlap the base path of another distribution (for example a repository distributed at
+`dev`, or at `dev/tools`): Pulp refuses a path that is equal to, a parent of, or a child of
+another path, and the rows that fail stay as described above.
+
 ### Replication
 Native Upstream Pulp objects (tech preview). **c**/**e** create/edit: upstream base URL
 as reachable from *this* Pulp server, relative API root (`pulp/`), domain, credentials,
@@ -219,7 +241,10 @@ CA/client certificates, TLS validation, distribution filter (`q_select`, e.g.
 confirmation). **R** replicates and shows the task group result. **H** shows recent
 replication task groups. **F** starts the fallback: choose another configured profile as
 source, types, a name filter and additive or mirror mode; a dry run lists
-CREATE / SYNC / SKIP per distribution before anything changes; reruns are safe.
+CREATE / SYNC / SKIP per distribution before anything changes; reruns are safe. The
+fallback does not follow an upstream label change: a distribution that the source moved to
+another base path is reported as a 409 conflict, and the replica stays at its old path.
+Delete the replica distribution, or move it by hand, to make it follow.
 
 ### Users, Groups, Roles
 Users: **R** roles, **c**/**e** create/edit, **w** set password (Pulp's local users
@@ -345,11 +370,11 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreS
   (open Servers, Connect again to migrate, or run pulp-tui db migrate --profile prod)`, and
   Connect offers the migration (see below). The command-line Content View commands
   (`export-cv`, `import-cv`, `db copy`) stop with, for example, `... database schema 1 is
-  older than this pulp-tui (2); run pulp-tui db migrate --profile prod` or `...: database is
+  older than this pulp-tui (3); run pulp-tui db migrate --profile prod` or `...: database is
   not initialized; run pulp-tui db migrate --profile prod`.
 * **Migrate from the TUI.** When Connect finds a database with no schema, or an older one,
   it asks `Migrate database of <profile>?`. The dialog shows the database, the schema
-  change (for example `empty -> 2`) and a warning that other operators then need this
+  change (for example `empty -> 3`) and a warning that other operators then need this
   pulp-tui version or newer. Enter migrates (with the role of the connection, which must
   create tables, as for `db migrate`). Esc does not migrate; the Content View screens then
   show the message above. When you save a profile with a new database, pulp-tui opens it at
@@ -376,7 +401,11 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreS
    the schema the first time and upgrades it after you upgrade pulp-tui. A normal start
    never changes the schema. If the schema is older, the Content View screens show
    `... database not migrated (...)` (see above). If it is newer, upgrade pulp-tui. When two
-   administrators migrate at the same time, the second one waits.
+   administrators migrate at the same time, the second one waits. After you upgrade to the
+   pulp-tui version with lifecycle environment labels, migrate an external database that is
+   at schema 2 once (the TUI offers it on Connect, or run `pulp-tui db migrate --profile
+   <name>`). Schema 3 gives each environment the label of its lower-case name and stores the
+   base path prefix of servers that already serve, so no served path moves.
 3. Give the operators' role only `SELECT`, `INSERT`, `UPDATE` and `DELETE`. After a migration
    that adds tables, grant again (or use `ALTER DEFAULT PRIVILEGES`).
 
@@ -440,16 +469,24 @@ database of a profile and choose "copy and switch" (see above).
   upgrade) shows no `by`; `db copy` marks such rows `by copied`. In a container the host
   name is a random container ID: start the container with `--hostname` (for example
   `--hostname ws12`), so that the lock owner and the audit actor stay the same.
-* **Base path prefix.** `cv_base_path_prefix` is stored per server the first time a
-  promotion uses it. Later promotions use the stored value. If your setting is different,
-  the workflow log says so and pulp-tui uses the stored value, so served URLs do not move.
+* **Base path prefix.** `cv_base_path_prefix` in `[settings]` is optional. Without it a new
+  server has no prefix and its paths start with the environment label. The prefix is stored
+  per server the first time a promotion uses it; the first value wins. Later promotions use
+  the stored value. If your setting is different, the workflow log says so and pulp-tui
+  uses the stored value, so served URLs do not move. The value `"cv"` is read as unset (an
+  older pulp-tui wrote it into every config), so a new server cannot get a `cv/` prefix with
+  this value; use another value. A server that served Content Views before environment
+  labels keeps its prefix: the migration to schema 3 stores the first path segment of its
+  served paths (for example `cv`).
 * **Read-only profiles.** When the database of the profile is external (its own, or
   `[database]`), creating or editing a Content View, adding or removing repositories and
   filters, and creating, deleting or protecting an environment change state that other
   operators publish from. A read-only profile does not show these actions. `import-cv` and
   `db copy` refuse a read-only profile, and the TUI neither migrates its database nor
   offers "copy and switch" for it. When the profile uses the local file, these actions stay
-  available, because they change only the local file.
+  available, because they change only the local file. The exception is the label edit on
+  Lifecycle Environments: it moves distributions in Pulp, so a read-only profile does not
+  show it, also with the local file.
 
 ### Locks
 
@@ -458,8 +495,12 @@ database of a profile and choose "copy and switch" (see above).
   `Content View web is locked by alice@ws12 (promote to Prod) since 14:02 UTC` before
   anything is sent to Pulp. The lock is also taken when two pulp-tui processes use one
   local file.
+* Changing the label of an environment (Edit on Lifecycle Environments) takes the locks of
+  **all** views that are bound in it, in the order of their IDs. If another operator holds
+  one of them, the relabel stops before it changes anything, with that operator's name.
 * Preview, compare and the drift check do not lock. Edits (create, add or remove
-  repositories, filters, environments) do not lock either: the last write wins.
+  repositories, filters, create, protect or delete an environment) do not lock either: the
+  last write wins.
 * The holder renews the lock every 30 seconds. A lock that is not renewed for 2 minutes is
   expired, and the next operator takes it over. Times come from the client clocks.
 * The lock is released when the workflow ends (also with an error), and when you press Esc

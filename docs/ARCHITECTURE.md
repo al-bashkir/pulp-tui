@@ -85,9 +85,24 @@ idle group whose counts stay the same for three polls is also treated as final.
   `Library -> Dev -> Test -> Prod`. Publishing makes the new version active in Library.
 * **Promote** binds a version to an environment. The version must be active in the prior
   environment. Each (view, environment, repository) has a stable distribution
-  `pulp-tui-cv-<view>-<env>-<repo>` at `<prefix>/<env>/<view>/<repo>`. Promotion re-points
-  it to the version's publication. Repositories that are bound but not part of the version
-  stop serving (`publication: null`); the distribution stays for a later rollback.
+  `pulp-tui-cv-<view>-<env>-<repo>` at `[<prefix>/]<env label>/<view>/<repo>`
+  (`cv::base_path`; an empty prefix leaves out its segment). The distribution name and the
+  ownership label `pulp_tui_env` keep the environment **name**; only the served path uses
+  the environment **label**. Promotion re-points the distribution to the version's
+  publication. Repositories that are bound but not part of the version stop serving
+  (`publication: null`); the distribution stays for a later rollback.
+* **Relabel** (`CvService::relabel_env`, Edit on Lifecycle Environments) changes the label
+  of an environment and moves its distributions with a `PATCH` of `base_path`
+  (`ops::move_distribution`: Pulp moves the distribution in place, the task is awaited and
+  the old path stops serving). Steps: load the impact (`relabel_impact`: served rows whose
+  path changes); `confirm_danger` typed with the environment name; take the locks of every
+  view with a binding or served rows in the environment, in `cv_id` order; store the new
+  label (the checkpoint) and the server prefix; then for each row check the ownership
+  labels and the database ID, `PATCH`, wait, and save the row. A row that fails keeps its old
+  path and is reported; a rerun with the same label continues with the rows that are left
+  (a row whose `PATCH` finished before the crash is saved without a second `PATCH`). A row
+  of a view bound after the locks were taken is reported as failed and not touched. The
+  audit entry is `env.relabel`.
 * **Rollback** is a promotion of any earlier published version. Newer versions are never
   deleted.
 * **Verify / drift**: for every binding, check that the distribution serves the expected
@@ -194,6 +209,14 @@ schema with a message. Operators need only
 Schema 2 added the `meta` table (database ID `db_id` and aliases `alias:<id>`),
 `scope_settings` (the base path prefix per server, first value wins), `locks` and
 `audit.actor`.
+Schema 3 added `environments.label`, the path segment of an environment (unique per
+scope; `validate_label`). The migration sets it to `lower(name)`, which is exactly the
+segment that served paths used before (so `Dev` and `dev` share `dev` and nothing moves),
+and seeds the prefix of every scope that has served rows but no stored prefix: the first
+segment of their `binding_repos.base_path` (usually `cv`). A new server stores an empty
+prefix (`Settings::new_server_prefix`). Export (format 1) and `db copy` carry the labels;
+`db copy` refuses a label that another environment uses in the target scope. An external
+database at schema 2 needs `db migrate` after the upgrade.
 
 **Connection.** `Database::connect_url` (`src/config.rs`) builds the URL: it adds the
 password from the secret reference and forces `sslmode=verify-full` for every PostgreSQL
@@ -238,7 +261,10 @@ Dropping the `CvLock` (workflow end, Esc) releases the row
 by token. A crash leaves the row until it expires. The same code runs for the local file, so
 two pulp-tui processes on one host also exclude each other. Publish, resume, promote
 (rollback, reconcile), delete view and delete version lock; preview, compare, verify and
-edits do not.
+edits do not. The exception is an environment relabel: it takes the locks of every view
+bound in the environment, in `cv_id` order, and fails with the holder's name if one is taken,
+before it changes anything. `CvLock::acquire` never waits, so two relabels cannot block each
+other; the order only fixes which holder is named in the refusal.
 
 **Read-only mode.** When the store in use by the active profile is external (`App::shared()`;
 like `scope`, it follows `cv_store`, not the edited config, so an Edit applies at Connect),

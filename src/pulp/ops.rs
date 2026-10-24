@@ -141,19 +141,7 @@ pub async fn ensure_distribution(
                 message: format!("distribution {name} serves {} instead of {base_path}", d.base_path),
             });
         }
-        let owned = labels.as_object().into_iter().flatten().all(|(k, v)| d.pulp_labels.get(k).map(String::as_str) == v.as_str());
-        if !owned {
-            return Err(PulpError::Api { status: 409, message: format!("distribution {name} exists but lacks ownership labels {labels}") });
-        }
-        let adopt = match db {
-            Some((key, id, aliases)) => label_owner(&d.pulp_labels, key, id, aliases)
-                .map_err(|o| PulpError::Api {
-                    status: 409,
-                    message: format!("distribution {name} is owned by another pulp-tui database ({o})"),
-                })?
-                .then_some((key, id)),
-            None => None,
-        };
+        let adopt = owner_check(&d, labels, db)?;
         let repoint = d.publication.as_deref() != publication || d.repository.is_some() || d.repository_version.is_some();
         if repoint || adopt.is_some() {
             let mut body = json!({});
@@ -166,7 +154,7 @@ pub async fn ensure_distribution(
             if let Some((key, id)) = adopt {
                 // Pulp replaces the whole label map; `labels` are already present (checked above).
                 let mut all = d.pulp_labels.clone();
-                all.insert(key.into(), id.into());
+                all.insert(key, id);
                 body["pulp_labels"] = json!(all);
             }
             let m = c.patch(&d.pulp_href, &body).await?;
@@ -193,6 +181,47 @@ pub async fn ensure_distribution(
         on,
     )
     .await
+}
+
+/// Ownership of an existing distribution: it must carry `labels` and must not belong to another
+/// database (`db` as in `ensure_distribution`). Returns the database-id label to adopt, if any.
+fn owner_check(d: &Distribution, labels: &Value, db: Option<(&str, &str, &[String])>) -> Result<Option<(String, String)>> {
+    let name = &d.name;
+    let owned = labels.as_object().into_iter().flatten().all(|(k, v)| d.pulp_labels.get(k).map(String::as_str) == v.as_str());
+    if !owned {
+        return Err(PulpError::Api { status: 409, message: format!("distribution {name} exists but lacks ownership labels {labels}") });
+    }
+    let Some((key, id, aliases)) = db else { return Ok(None) };
+    let adopt = label_owner(&d.pulp_labels, key, id, aliases)
+        .map_err(|o| PulpError::Api { status: 409, message: format!("distribution {name} is owned by another pulp-tui database ({o})") })?;
+    Ok(adopt.then(|| (key.to_string(), id.to_string())))
+}
+
+/// Move a distribution at `href` to `base_path` in place, after the checks of `owner_check`, and
+/// wait for the task. `Ok(false)`: it already serves at `base_path` and needs no adoption (nothing sent).
+pub async fn move_distribution(
+    c: &PulpClient,
+    href: &str,
+    base_path: &str,
+    labels: &Value,
+    db: Option<(&str, &str, &[String])>,
+    on: OnTask<'_>,
+) -> Result<bool> {
+    let d: Distribution = c.get(href, &[]).await?;
+    let adopt = owner_check(&d, labels, db)?;
+    if d.base_path == base_path && adopt.is_none() {
+        return Ok(false);
+    }
+    let mut body = json!({ "base_path": base_path });
+    if let Some((key, id)) = adopt {
+        // Pulp replaces the whole label map; `labels` are already present (checked above).
+        let mut all = d.pulp_labels.clone();
+        all.insert(key, id);
+        body["pulp_labels"] = json!(all);
+    }
+    let m = c.patch(href, &body).await?;
+    settle(c, m, on).await?;
+    Ok(true)
 }
 
 /// Who owns an object by its database-id label: `Ok(false)` this database, `Ok(true)` nobody
