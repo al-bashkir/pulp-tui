@@ -5,7 +5,7 @@ FROM docker.io/library/rust:1.90-alpine3.22 AS build
 # C toolchain for bundled SQLite and aws-lc (rustls crypto provider).
 RUN apk add --no-cache musl-dev build-base cmake perl
 WORKDIR /src
-COPY Cargo.toml Cargo.lock rustfmt.toml ./
+COPY Cargo.toml Cargo.lock rustfmt.toml build.rs ./
 COPY src src
 COPY examples examples
 # No system keyring in containers: secrets come from env:VAR or file:/run/secrets/...

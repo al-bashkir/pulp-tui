@@ -240,6 +240,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     };
     let [h, n] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
     f.render_widget(Paragraph::new(hints).style(Style::default().fg(Color::DarkGray)), h);
+    let ver = env!("PULP_TUI_VERSION");
+    let [n, v] = Layout::horizontal([Constraint::Min(0), Constraint::Length(ver.len() as u16 + 1)]).areas(n);
+    f.render_widget(Paragraph::new(ver).right_aligned().style(Style::default().fg(Color::DarkGray)), v);
     let job = app.jobs.iter().rev().find(|j| !j.is_load);
     let notice = app.notices.back().filter(|x| x.at.elapsed() < Duration::from_secs(10));
     let line = match (notice, job) {

@@ -11,7 +11,7 @@ use std::sync::Arc;
 /// Terminal management for Pulp 3 servers (RPM and File repositories, Content Views,
 /// lifecycle environments, replication, users and tasks).
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = env!("PULP_TUI_VERSION"), about)]
 struct Cli {
     /// Config file (default: $XDG_CONFIG_HOME/pulp-tui/config.toml).
     #[arg(long, global = true, env = "PULP_TUI_CONFIG")]
