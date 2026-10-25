@@ -131,7 +131,7 @@ are visible.
 |---|---|
 | v | versions of the repository |
 | o | browse content of the latest version |
-| f | sync: choose remote (empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File: additive, mirror). Mirror policies show a warning first. |
+| f | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File: additive, mirror). Mirror policies show a warning first. |
 | H | sync history (tasks that touched this repository) |
 | u | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed or cancelled (Esc) chunked uploads are deleted |
 | P | publish the latest version (reuses an existing publication) |

@@ -762,33 +762,44 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         }
         Act::Sync => {
             let policies = sync_policies(caps(app).as_deref(), t);
-            let form = Form::new(
-                format!("Sync {name}"),
-                vec![
-                    Field::pick("remote", "Remote", Source::Remotes(t)).help("empty = the repository's default remote"),
-                    Field::new("policy", "Sync policy", FieldKind::Choice(policies)),
-                ],
-            )
-            .note(if item["remote"].is_string() {
-                "repository has a default remote"
-            } else {
-                "repository has NO default remote: pick one"
-            });
-            app.form(form, move |app, f| {
-                let (remote, policy) = (f.opt("remote").map(str::to_string), f.get("policy").to_string());
-                let (href, name) = (href.clone(), name.clone());
-                let go = move |app: &mut App| {
-                    submit(app, format!("sync {name} ({policy})"), move |c| async move {
-                        let r = match remote {
-                            Some(r) => Some(href_by_name(&c, t.remotes(), &r).await?),
-                            None => None,
-                        };
-                        Ok(ops::sync(&c, t, &href, r.as_deref(), &policy).await?)
-                    })
-                };
-                confirm_mirror(app, f.get("policy"), go);
-                Ok(())
-            });
+            let default = item["remote"].as_str().map(str::to_string);
+            let note = if default.is_some() { "repository has a default remote" } else { "repository has NO default remote: pick one" };
+            let label = format!("remote of {name}");
+            let open = move |app: &mut App, current: String| {
+                let form = Form::new(
+                    format!("Sync {name}"),
+                    vec![
+                        Field::pick("remote", "Remote", Source::Remotes(t)).help("empty = the repository's default remote").value(current),
+                        Field::new("policy", "Sync policy", FieldKind::Choice(policies)),
+                    ],
+                )
+                .note(note);
+                app.form(form, move |app, f| {
+                    let (remote, policy) = (f.opt("remote").map(str::to_string), f.get("policy").to_string());
+                    let (href, name) = (href.clone(), name.clone());
+                    let go = move |app: &mut App| {
+                        submit(app, format!("sync {name} ({policy})"), move |c| async move {
+                            let r = match remote {
+                                Some(r) => Some(href_by_name(&c, t.remotes(), &r).await?),
+                                None => None,
+                            };
+                            Ok(ops::sync(&c, t, &href, r.as_deref(), &policy).await?)
+                        })
+                    };
+                    confirm_mirror(app, f.get("policy"), go);
+                    Ok(())
+                });
+            };
+            match default {
+                // The picker holds names: read the default remote's name so the field shows it.
+                Some(r) => app.job(label, move |ctx| async move {
+                    let v = ctx.client.get::<Value>(&r, &[("fields", "name".into())]).await;
+                    // An unreadable remote leaves the field empty, which still syncs from the default remote.
+                    let current = v.map(|v| s(&v, "name")).unwrap_or_default();
+                    ap(move |app| open(app, current))
+                }),
+                None => open(app, String::new()),
+            }
         }
         Act::SyncHistory => app.job(format!("sync history {name}"), move |ctx| async move {
             let c = &ctx.client;
@@ -1880,6 +1891,24 @@ mod tests {
         assert!(app.modal.is_none());
         let e = &app.notices.back().unwrap().text;
         assert!(e.contains("refused: Content View web serves publication 0190aaaa-bbbb in Library"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn sync_form_shows_the_default_remote() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let remote = format!("{API}remotes/rpm/rpm/1/");
+        get(&server, &remote, json!({ "name": "epel" })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let repo = json!({ "pulp_href": format!("{API}repositories/rpm/rpm/r/"), "name": "os", "remote": remote });
+        repo_action(&mut app, RepoType::Rpm, Act::Sync, repo);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.get("remote"), "epel");
+        // Without a default remote the form opens at once, empty.
+        repo_action(&mut app, RepoType::Rpm, Act::Sync, json!({ "pulp_href": "/r/", "name": "x", "remote": null }));
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.get("remote"), "");
     }
 
     #[tokio::test]
