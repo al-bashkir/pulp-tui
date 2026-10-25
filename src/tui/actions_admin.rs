@@ -502,7 +502,7 @@ pub fn fallback(app: &mut App) {
         let types: Vec<RepoType> = match f.get("types") {
             "rpm" => vec![RepoType::Rpm],
             "file" => vec![RepoType::File],
-            _ => RepoType::ALL.to_vec(),
+            _ => vec![RepoType::Rpm, RepoType::File],
         };
         let (filter, mirror, settings) = (f.get("filter").to_string(), f.bool("mirror"), app.cfg.settings.clone());
         app.job(format!("plan replication from {src_name}"), move |ctx| async move {

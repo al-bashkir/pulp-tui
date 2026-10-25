@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use pulp_tui::pulp::models::{Package, RepoVersion};
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{Mutation, PulpClient, RepoType};
+use pulp_tui::pulp::{Mutation, PulpClient, RepoType, file, rpm};
 use serde_json::{Value, json};
 
 async fn dist_url(c: &PulpClient, dist: &str) -> String {
@@ -37,7 +37,7 @@ async fn rpm_lifecycle() {
     // Remote + sync; advisories survive (metadata is not dropped).
     let (repo, remote) = synced_repo(&c, t, &name, "rpm/", "mirror_complete").await;
     let v1 = latest(&c, &repo).await;
-    let names: Vec<String> = ops::packages_in(&c, &v1).await.unwrap().iter().map(Package::nevra).collect();
+    let names: Vec<String> = rpm::packages_in(&c, &v1).await.unwrap().iter().map(Package::nevra).collect();
     assert_eq!(names.len(), 3, "{names:?}");
     assert!(names.contains(&"fixture-alpha-1.0-1.noarch".to_string()));
     let rv: RepoVersion = c.get(&v1, &[]).await.unwrap();
@@ -112,24 +112,24 @@ async fn file_lifecycle() {
     .unwrap();
     assert!(progress.lock().unwrap().len() >= 4, "chunked upload reports progress");
     assert_eq!(up.sha256.len(), 64);
-    let files: Vec<String> = ops::files_in(&c, &latest(&c, &local).await).await.unwrap().into_iter().map(|f| f.relative_path).collect();
+    let files: Vec<String> = file::files_in(&c, &latest(&c, &local).await).await.unwrap().into_iter().map(|f| f.relative_path).collect();
     assert_eq!(files.len(), 2);
     let uploads: Value = c.get(&c.api("uploads/"), &[]).await.unwrap();
     assert_eq!(uploads["count"], 0, "no leftover chunked uploads");
 
     // Remove content without touching older versions.
-    let one = ops::files_in(&c, &latest(&c, &local).await).await.unwrap().into_iter().find(|f| f.relative_path == "a/one.txt").unwrap();
+    let one = file::files_in(&c, &latest(&c, &local).await).await.unwrap().into_iter().find(|f| f.relative_path == "a/one.txt").unwrap();
     let before = latest(&c, &local).await;
     let m = c.post(&format!("{local}modify/"), &json!({ "remove_content_units": [one.pulp_href] })).await.unwrap();
     assert!(matches!(m, Mutation::Task(_)));
     ops::settle(&c, m, &no_progress).await.unwrap();
-    assert_eq!(ops::files_in(&c, &before).await.unwrap().len(), 2, "old version unchanged");
-    assert_eq!(ops::files_in(&c, &latest(&c, &local).await).await.unwrap().len(), 1);
+    assert_eq!(file::files_in(&c, &before).await.unwrap().len(), 2, "old version unchanged");
+    assert_eq!(file::files_in(&c, &latest(&c, &local).await).await.unwrap().len(), 1);
 
     // Sync from a manifest, publish, distribute, verify served manifest.
     let (repo, remote) = synced_repo(&c, t, &name, "file/PULP_MANIFEST", "mirror").await;
     let v1 = latest(&c, &repo).await;
-    assert_eq!(ops::files_in(&c, &v1).await.unwrap().len(), 3);
+    assert_eq!(file::files_in(&c, &v1).await.unwrap().len(), 3);
     let pub1 = ops::ensure_publication(&c, t, &v1, &no_progress).await.unwrap();
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
@@ -138,7 +138,7 @@ async fn file_lifecycle() {
     assert_eq!((status, body.as_slice()), (200, &b"readme v1\n"[..]));
 
     // New content (copy a unit from the local repo), publish, serve, then roll back.
-    let big = ops::files_in(&c, &latest(&c, &local).await).await.unwrap().remove(0);
+    let big = file::files_in(&c, &latest(&c, &local).await).await.unwrap().remove(0);
     let m = c.post(&format!("{repo}modify/"), &json!({ "add_content_units": [big.pulp_href] })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
     let v2 = latest(&c, &repo).await;

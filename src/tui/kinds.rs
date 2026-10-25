@@ -331,8 +331,8 @@ impl Kind {
             Kind::Versions(Some((_, n))) => format!("Versions of {n}"),
             Kind::Versions(None) => "Repository Versions (all repositories)".into(),
             Kind::Content { version, ctype } => {
-                let t = RepoType::from_href(version).unwrap_or(RepoType::File);
-                format!("Content {} of {}  [t: type]", content_types(t).get(*ctype).map(|c| c.0).unwrap_or("?"), short(version))
+                let label = RepoType::from_href(version).and_then(|t| content_types(t).get(*ctype)).map_or("?", |c| c.0);
+                format!("Content {label} of {}  [t: type]", short(version))
             }
             Kind::Publications(t) => format!("{} Publications  [t: toggle type]", t.label()),
             Kind::Distributions(t) => format!("{} Distributions  [t: toggle type]", t.label()),
@@ -364,14 +364,7 @@ impl Kind {
     /// Precise message when the server lacks what this screen needs.
     pub fn unsupported(&self, caps: &Capabilities) -> Option<String> {
         let f = match self {
-            Kind::Repos(RepoType::Rpm, _)
-            | Kind::Remotes(RepoType::Rpm)
-            | Kind::Publications(RepoType::Rpm)
-            | Kind::Distributions(RepoType::Rpm) => Feature::Rpm,
-            Kind::Repos(RepoType::File, _)
-            | Kind::Remotes(RepoType::File)
-            | Kind::Publications(RepoType::File)
-            | Kind::Distributions(RepoType::File) => Feature::File,
+            Kind::Repos(t, _) | Kind::Remotes(t) | Kind::Publications(t) | Kind::Distributions(t) => t.feature(),
             Kind::UpstreamPulps => Feature::NativeReplication,
             Kind::Users | Kind::UserRoles { .. } | Kind::Groups | Kind::GroupUsers { .. } | Kind::GroupRoles { .. } => Feature::Users,
             Kind::Roles => Feature::Roles,
@@ -387,12 +380,11 @@ impl Kind {
     }
 
     pub fn toggle(&self) -> Option<Kind> {
-        let flip = |t: &RepoType| if *t == RepoType::Rpm { RepoType::File } else { RepoType::Rpm };
         Some(match self {
             Kind::Repos(t, snapshots) => Kind::Repos(*t, !snapshots),
-            Kind::Remotes(t) => Kind::Remotes(flip(t)),
-            Kind::Publications(t) => Kind::Publications(flip(t)),
-            Kind::Distributions(t) => Kind::Distributions(flip(t)),
+            Kind::Remotes(t) => Kind::Remotes(t.next()),
+            Kind::Publications(t) => Kind::Publications(t.next()),
+            Kind::Distributions(t) => Kind::Distributions(t.next()),
             Kind::Content { version, ctype } => {
                 let n = content_types(RepoType::from_href(version)?).len();
                 Kind::Content { version: version.clone(), ctype: (ctype + 1) % n }
@@ -421,13 +413,14 @@ impl Kind {
             Kind::Content { version, ctype } => {
                 let t = RepoType::from_href(version)?;
                 let (_, path) = content_types(t)[*ctype];
-                let search = match (t, ctype) {
-                    (RepoType::Rpm, 0) => Some("name__contains"),
-                    (RepoType::File, _) => Some("relative_path__icontains"),
-                    _ => None,
+                // Search field, and whether to drop the heavy package fields (RPM packages only).
+                let (search, exclude_fields) = match (t, *ctype) {
+                    (RepoType::Rpm, 0) => (Some("name__contains"), true),
+                    (RepoType::Rpm, 1..) => (None, false),
+                    (RepoType::File, _) => (Some("relative_path__icontains"), false),
                 };
                 let mut q = vec![("repository_version", version.clone())];
-                if (t, *ctype) == (RepoType::Rpm, 0) {
+                if exclude_fields {
                     q.push(("ordering", "name".into()));
                     q.push((
                         "exclude_fields",
@@ -516,7 +509,9 @@ impl Kind {
                     col("relative_path", 50, |v| s(v, "relative_path")),
                     col("sha256", 20, |v| s(v, "sha256").chars().take(16).collect()),
                 ],
-                _ => vec![col("href", 70, |v| s(v, "pulp_href")), col("created", 19, |v| ts(v, "pulp_created"))],
+                (Some(RepoType::Rpm), 4..) | (None, _) => {
+                    vec![col("href", 70, |v| s(v, "pulp_href")), col("created", 19, |v| ts(v, "pulp_created"))]
+                }
             },
             Kind::Publications(t) => {
                 let mut c = vec![
@@ -525,8 +520,11 @@ impl Kind {
                     col("created", 19, |v| ts(v, "pulp_created")),
                 ];
                 // Only File publications have the field; Delete looks up the distributions of both types.
-                if *t == RepoType::File {
-                    c.push(col("distributions", 6, |v| v["distributions"].as_array().map(|a| a.len().to_string()).unwrap_or_default()));
+                match t {
+                    RepoType::Rpm => {}
+                    RepoType::File => {
+                        c.push(col("distributions", 6, |v| v["distributions"].as_array().map(|a| a.len().to_string()).unwrap_or_default()))
+                    }
                 }
                 c.push(col("checkpoint", 5, |v| s(v, "checkpoint")));
                 c

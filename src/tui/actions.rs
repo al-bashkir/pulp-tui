@@ -5,11 +5,11 @@ use super::app::{App, Apply, Ctx, Level, item_key};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, s, short};
 use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile, database_keyring_user};
-use crate::filters::{Selector, parse_rules};
+use crate::filters::{Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
 use crate::pulp::models::{Distribution, Publication, Task};
 use crate::pulp::ops;
-use crate::pulp::{Capabilities, Mutation, PulpClient, RepoType};
+use crate::pulp::{Capabilities, Mutation, PulpClient, RepoType, file, rpm};
 use crate::store::Store;
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
@@ -610,13 +610,48 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
 
 // ---- repositories --------------------------------------------------------------------
 
+/// Repository form fields that only some plugins have.
+fn repo_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec<Field> {
+    let has = |f: &str| caps.is_none_or(|c| c.has_field(t.repository_schema(), f));
+    let mut fields = Vec::new();
+    match t {
+        RepoType::Rpm => {
+            if has("retain_package_versions") {
+                fields.push(
+                    Field::new("retain_package_versions", "Retain package versions", FieldKind::Number)
+                        .value(s(v, "retain_package_versions"))
+                        .help("0 = keep all"),
+                );
+            }
+            if has("checksum_type") {
+                let mut c: Vec<String> =
+                    caps.and_then(|c| c.enum_values("PackageChecksumTypeEnum")).map(|e| e.to_vec()).unwrap_or_default();
+                c.retain(|x| !matches!(x.as_str(), "unknown" | "md5" | "sha1"));
+                c.insert(0, String::new());
+                fields.push(Field::new("checksum_type", "Checksum type", FieldKind::Choice(c)).value(s(v, "checksum_type")));
+            }
+            if has("metadata_signing_service") {
+                fields.push(
+                    Field::pick("metadata_signing_service", "Metadata signing service", Source::SigningServices)
+                        .value(s(v, "metadata_signing_service")),
+                );
+            }
+        }
+        RepoType::File => {
+            if has("manifest") {
+                fields.push(Field::text("manifest", "Manifest file name").value(if v.is_null() {
+                    "PULP_MANIFEST".into()
+                } else {
+                    s(v, "manifest")
+                }));
+            }
+        }
+    }
+    fields
+}
+
 fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>) -> Form {
     let v = item.cloned().unwrap_or(Value::Null);
-    let schema = match t {
-        RepoType::Rpm => "rpm.RpmRepository",
-        RepoType::File => "file.FileRepository",
-    };
-    let has = |f: &str| caps.is_none_or(|c| c.has_field(schema, f));
     let mut fields = vec![
         Field::text("name", "Name").required().value(s(&v, "name")),
         Field::text("description", "Description").value(s(&v, "description")),
@@ -627,34 +662,7 @@ fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>) -> 
         Field::new("autopublish", "Autopublish", FieldKind::Bool).value(if v["autopublish"] == true { "true" } else { "false" }),
         Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
     ];
-    if t == RepoType::Rpm {
-        if has("retain_package_versions") {
-            fields.push(
-                Field::new("retain_package_versions", "Retain package versions", FieldKind::Number)
-                    .value(s(&v, "retain_package_versions"))
-                    .help("0 = keep all"),
-            );
-        }
-        if has("checksum_type") {
-            let mut c: Vec<String> = caps.and_then(|c| c.enum_values("PackageChecksumTypeEnum")).map(|e| e.to_vec()).unwrap_or_default();
-            c.retain(|x| !matches!(x.as_str(), "unknown" | "md5" | "sha1"));
-            c.insert(0, String::new());
-            fields.push(Field::new("checksum_type", "Checksum type", FieldKind::Choice(c)).value(s(&v, "checksum_type")));
-        }
-        if has("metadata_signing_service") {
-            fields.push(
-                Field::pick("metadata_signing_service", "Metadata signing service", Source::SigningServices)
-                    .value(s(&v, "metadata_signing_service")),
-            );
-        }
-    }
-    if t == RepoType::File && has("manifest") {
-        fields.push(Field::text("manifest", "Manifest file name").value(if v.is_null() {
-            "PULP_MANIFEST".into()
-        } else {
-            s(&v, "manifest")
-        }));
-    }
+    fields.extend(repo_extra_fields(t, caps, &v));
     let mut form =
         Form::new(if item.is_some() { format!("Edit {} repository", t.label()) } else { format!("New {} repository", t.label()) }, fields);
     if let Some(r) = v["remote"].as_str() {
@@ -828,8 +836,9 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         }),
         Act::Upload => {
             let mut fields = vec![Field::text("path", "Local file path").required()];
-            if t == RepoType::File {
-                fields.push(Field::text("relative_path", "Relative path in repository").help("default: file name"));
+            match t {
+                RepoType::Rpm => {}
+                RepoType::File => fields.push(Field::text("relative_path", "Relative path in repository").help("default: file name")),
             }
             app.form(
                 Form::new(format!("Upload to {name}"), fields)
@@ -870,14 +879,11 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         Act::CopyContent => {
             let mut fields = vec![
                 Field::pick("source", "Source repository", Source::Repos(Some(t))).required(),
-                Field::text("filters", "Filter rules").help(if t == RepoType::Rpm {
-                    "e.g. include name=kernel* arch=x86_64; exclude name=*-debuginfo (empty = all)"
-                } else {
-                    "e.g. include path=docs/* (empty = all)"
-                }),
+                Field::text("filters", "Filter rules").help(filter_help(t)),
             ];
-            if t == RepoType::Rpm {
-                fields.push(Field::new("deps", "Copy dependencies", FieldKind::Bool).value("true"));
+            match t {
+                RepoType::Rpm => fields.push(Field::new("deps", "Copy dependencies", FieldKind::Bool).value("true")),
+                RepoType::File => {}
             }
             app.form(
                 Form::new(format!("Copy content into {name}"), fields)
@@ -896,10 +902,10 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         let units: Option<Vec<String>> = match (t, rules.is_empty()) {
                             (RepoType::Rpm, true) => None,
                             (RepoType::Rpm, false) => {
-                                Some(ops::packages_in(c, &sv).await?.into_iter().filter(|p| sel.package(p)).map(|p| p.pulp_href).collect())
+                                Some(rpm::packages_in(c, &sv).await?.into_iter().filter(|p| sel.package(p)).map(|p| p.pulp_href).collect())
                             }
                             (RepoType::File, _) => {
-                                Some(ops::files_in(c, &sv).await?.into_iter().filter(|x| sel.file(x)).map(|x| x.pulp_href).collect())
+                                Some(file::files_in(c, &sv).await?.into_iter().filter(|x| sel.file(x)).map(|x| x.pulp_href).collect())
                             }
                         };
                         let what = units.as_ref().map(|u| format!("{} unit(s)", u.len())).unwrap_or("all content".into());
@@ -911,17 +917,8 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                             app.confirm("Confirm copy", lines, move |app| {
                                 submit(app, format!("copy {source} -> {name}"), move |c| async move {
                                     Ok(match t {
-                                        RepoType::Rpm => {
-                                            let mut cfg = json!({ "source_repo_version": sv, "dest_repo": href });
-                                            if let Some(u) = units {
-                                                cfg["content"] = u.into();
-                                            }
-                                            c.post(&c.api("rpm/copy/"), &json!({ "config": [cfg], "dependency_solving": deps })).await?
-                                        }
-                                        RepoType::File => {
-                                            c.post(&format!("{href}modify/"), &json!({ "add_content_units": units.unwrap_or_default() }))
-                                                .await?
-                                        }
+                                        RepoType::Rpm => rpm::copy(&c, &sv, &href, None, units, deps).await?,
+                                        RepoType::File => file::modify(&c, &href, false, units.unwrap_or_default()).await?,
                                     })
                                 })
                             })
@@ -1006,6 +1003,27 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
 
 // ---- remotes -------------------------------------------------------------------------
 
+fn remote_url_help(t: RepoType) -> &'static str {
+    match t {
+        RepoType::Rpm => "yum repository base URL",
+        RepoType::File => "URL of the PULP_MANIFEST",
+    }
+}
+
+/// Remote form fields that only some plugins have.
+fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, _v: &Value) -> Vec<Field> {
+    match t {
+        RepoType::Rpm => {
+            if caps.is_none_or(|c| c.has_field(t.remote_schema(), "sles_auth_token")) {
+                vec![Field::new("sles_auth_token", "SLES auth token", FieldKind::Secret)]
+            } else {
+                vec![]
+            }
+        }
+        RepoType::File => vec![],
+    }
+}
+
 fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
@@ -1014,18 +1032,13 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             let edit = act == Act::Edit;
             let v = if edit { item.clone() } else { Value::Null };
             let caps = caps(app);
-            let schema = if t == RepoType::Rpm { "rpm.RpmRemote" } else { "file.FileRemote" };
             let policies = caps
                 .as_ref()
                 .and_then(|c| c.enum_values("Policy692Enum").map(|e| e.to_vec()))
                 .unwrap_or_else(|| vec!["immediate".into(), "on_demand".into(), "streamed".into()]);
             let mut fields = vec![
                 Field::text("name", "Name").required().value(s(&v, "name")),
-                Field::text("url", "URL").required().value(s(&v, "url")).help(if t == RepoType::File {
-                    "URL of the PULP_MANIFEST"
-                } else {
-                    "yum repository base URL"
-                }),
+                Field::text("url", "URL").required().value(s(&v, "url")).help(remote_url_help(t)),
                 Field::new("policy", "Download policy", FieldKind::Choice(policies)).value(if edit {
                     s(&v, "policy")
                 } else {
@@ -1052,9 +1065,7 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                     .help("seconds one download may take (large packages need more); empty = server default"),
                 Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
             ];
-            if t == RepoType::Rpm && caps.as_ref().is_none_or(|c| c.has_field(schema, "sles_auth_token")) {
-                fields.push(Field::new("sles_auth_token", "SLES auth token", FieldKind::Secret));
-            }
+            fields.extend(remote_extra_fields(t, caps.as_deref(), &v));
             let form = Form::new(if edit { format!("Edit remote {name}") } else { format!("New {} remote", t.label()) }, fields);
             app.form(form, move |app, f| {
                 let mut b = json!({});

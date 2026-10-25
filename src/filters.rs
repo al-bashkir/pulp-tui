@@ -60,6 +60,14 @@ pub fn format_rules(rules: &[FilterRule]) -> String {
     rules.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
 }
 
+/// Form help text with example rules for a repository type.
+pub fn filter_help(t: RepoType) -> &'static str {
+    match t {
+        RepoType::Rpm => "e.g. include name=kernel* arch=x86_64; exclude name=*-debuginfo (empty = all)",
+        RepoType::File => "e.g. include path=docs/* (empty = all)",
+    }
+}
+
 pub fn parse_rules(s: &str, t: RepoType) -> Result<Vec<FilterRule>, String> {
     s.split(';').map(str::trim).filter(|r| !r.is_empty()).map(|r| parse_rule(r, t)).collect()
 }
@@ -99,9 +107,16 @@ pub fn parse_rule(s: &str, t: RepoType) -> Result<FilterRule, String> {
     }
     let rpm_crit = r.name.is_some() || r.arch.is_some() || r.evr.is_some();
     match t {
-        RepoType::Rpm if r.path.is_some() => return Err("path= applies to File repositories only".into()),
-        RepoType::File if rpm_crit => return Err("name=/arch=/evr applies to RPM repositories only".into()),
-        _ => {}
+        RepoType::Rpm => {
+            if r.path.is_some() {
+                return Err("path= applies to File repositories only".into());
+            }
+        }
+        RepoType::File => {
+            if rpm_crit {
+                return Err("name=/arch=/evr applies to RPM repositories only".into());
+            }
+        }
     }
     if !rpm_crit && r.path.is_none() {
         return Err(format!("rule {s:?} has no criteria"));

@@ -517,7 +517,10 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                 return;
             }
             let has = |t: &str| items.iter().any(|i| i.note == t);
-            let t = if has("rpm") { RepoType::Rpm } else { RepoType::File };
+            let Some(t) = RepoType::ALL.into_iter().find(|t| has(t.component())) else {
+                app.error("unknown repository type");
+                return;
+            };
             let all = items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("\n");
             let mut form = Form::new(
                 format!("Sync repositories of {name}"),

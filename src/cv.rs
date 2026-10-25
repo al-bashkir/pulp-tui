@@ -16,7 +16,7 @@
 use crate::filters::Selector;
 use crate::pulp::models::{Distribution, Package, RepoVersion, Repository, Task};
 use crate::pulp::ops::{self, OnTask};
-use crate::pulp::{Mutation, PulpClient, PulpError, RepoType};
+use crate::pulp::{Mutation, PulpClient, PulpError, RepoType, file, rpm};
 use crate::store::{
     BindingRepo, Component, ContentView, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, LOCK_RENEW_SECS, LOCK_TTL_SECS,
     LockHolder, Store, UsedVersion, validate_label,
@@ -263,69 +263,70 @@ impl CvService {
     // ---- selection ---------------------------------------------------------------
 
     async fn select(&self, repo: &CvRepo, source_version: &str, with_keys: bool) -> Result<Selection> {
+        match repo.repo_type {
+            RepoType::Rpm => self.select_rpm(repo, source_version, with_keys).await,
+            RepoType::File => self.select_file(repo, source_version, with_keys).await,
+        }
+    }
+
+    async fn select_rpm(&self, repo: &CvRepo, source_version: &str, with_keys: bool) -> Result<Selection> {
         let c = &self.client;
         let sel = Selector::new(&repo.filters);
-        match repo.repo_type {
-            RepoType::Rpm => {
-                if repo.filters.is_empty() && !with_keys {
-                    return Ok(Selection { hrefs: None, keys: BTreeSet::new() });
-                }
-                let pkgs = ops::packages_in(c, source_version).await?;
-                let chosen: Vec<&Package> = pkgs.iter().filter(|p| sel.package(p)).collect();
-                let keys = chosen.iter().map(|p| p.nevra()).collect();
-                if repo.filters.is_empty() {
-                    return Ok(Selection { hrefs: None, keys });
-                }
-                let chosen_nevra: HashSet<(String, String, String, String, String)> = chosen
-                    .iter()
-                    .map(|p| (p.name.clone(), norm_epoch(&p.epoch), p.version.clone(), p.release.clone(), p.arch.clone()))
-                    .collect();
-                let all_nevra: HashSet<_> = pkgs
-                    .iter()
-                    .map(|p| (p.name.clone(), norm_epoch(&p.epoch), p.version.clone(), p.release.clone(), p.arch.clone()))
-                    .collect();
-                let mut hrefs: Vec<String> = chosen.iter().map(|p| p.pulp_href.clone()).collect();
-                // Advisories: kept only if every referenced package present in the source is selected.
-                let advisories: Vec<Value> = c
-                    .list_all(
-                        &c.api("content/rpm/advisories/"),
-                        &[("repository_version", source_version.into()), ("fields", "pulp_href,pkglist".into())],
-                        1_000_000,
-                    )
-                    .await?;
-                for a in &advisories {
-                    let refs: Vec<_> = a["pkglist"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|coll| coll["packages"].as_array().cloned().unwrap_or_default())
-                        .map(|p| {
-                            let s = |k: &str| p[k].as_str().map(str::to_string).unwrap_or_else(|| p[k].to_string());
-                            (s("name"), norm_epoch(&s("epoch")), s("version"), s("release"), s("arch"))
-                        })
-                        .filter(|n| all_nevra.contains(n))
-                        .collect();
-                    if refs.iter().all(|n| chosen_nevra.contains(n)) {
-                        hrefs.push(a["pulp_href"].as_str().unwrap_or_default().into());
-                    }
-                }
-                // Other metadata (comps, modules, distribution trees, repo metadata files) is kept as is.
-                for h in ops::content_in(c, source_version).await? {
-                    if !h.contains("/content/rpm/packages/") && !h.contains("/content/rpm/advisories/") {
-                        hrefs.push(h);
-                    }
-                }
-                Ok(Selection { hrefs: Some(hrefs), keys })
-            }
-            RepoType::File => {
-                let files = ops::files_in(c, source_version).await?;
-                let chosen: Vec<_> = files.iter().filter(|f| sel.file(f)).collect();
-                Ok(Selection {
-                    keys: chosen.iter().map(|f| ops::file_key(f)).collect(),
-                    hrefs: Some(chosen.into_iter().map(|f| f.pulp_href.clone()).collect()),
+        if repo.filters.is_empty() && !with_keys {
+            return Ok(Selection { hrefs: None, keys: BTreeSet::new() });
+        }
+        let pkgs = rpm::packages_in(c, source_version).await?;
+        let chosen: Vec<&Package> = pkgs.iter().filter(|p| sel.package(p)).collect();
+        let keys = chosen.iter().map(|p| p.nevra()).collect();
+        if repo.filters.is_empty() {
+            return Ok(Selection { hrefs: None, keys });
+        }
+        let chosen_nevra: HashSet<(String, String, String, String, String)> =
+            chosen.iter().map(|p| (p.name.clone(), norm_epoch(&p.epoch), p.version.clone(), p.release.clone(), p.arch.clone())).collect();
+        let all_nevra: HashSet<_> =
+            pkgs.iter().map(|p| (p.name.clone(), norm_epoch(&p.epoch), p.version.clone(), p.release.clone(), p.arch.clone())).collect();
+        let mut hrefs: Vec<String> = chosen.iter().map(|p| p.pulp_href.clone()).collect();
+        // Advisories: kept only if every referenced package present in the source is selected.
+        let advisories: Vec<Value> = c
+            .list_all(
+                &c.api("content/rpm/advisories/"),
+                &[("repository_version", source_version.into()), ("fields", "pulp_href,pkglist".into())],
+                1_000_000,
+            )
+            .await?;
+        for a in &advisories {
+            let refs: Vec<_> = a["pkglist"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|coll| coll["packages"].as_array().cloned().unwrap_or_default())
+                .map(|p| {
+                    let s = |k: &str| p[k].as_str().map(str::to_string).unwrap_or_else(|| p[k].to_string());
+                    (s("name"), norm_epoch(&s("epoch")), s("version"), s("release"), s("arch"))
                 })
+                .filter(|n| all_nevra.contains(n))
+                .collect();
+            if refs.iter().all(|n| chosen_nevra.contains(n)) {
+                hrefs.push(a["pulp_href"].as_str().unwrap_or_default().into());
             }
         }
+        // Other metadata (comps, modules, distribution trees, repo metadata files) is kept as is.
+        for h in ops::content_in(c, source_version).await? {
+            if !h.contains("/content/rpm/packages/") && !h.contains("/content/rpm/advisories/") {
+                hrefs.push(h);
+            }
+        }
+        Ok(Selection { hrefs: Some(hrefs), keys })
+    }
+
+    async fn select_file(&self, repo: &CvRepo, source_version: &str, _with_keys: bool) -> Result<Selection> {
+        let sel = Selector::new(&repo.filters);
+        let files = file::files_in(&self.client, source_version).await?;
+        let chosen: Vec<_> = files.iter().filter(|f| sel.file(f)).collect();
+        Ok(Selection {
+            keys: chosen.iter().map(|f| file::key(f)).collect(),
+            hrefs: Some(chosen.into_iter().map(|f| f.pulp_href.clone()).collect()),
+        })
     }
 
     // ---- publish -------------------------------------------------------------------
@@ -545,18 +546,9 @@ impl CvService {
                     log(format!("{}: selecting content from {sv}", repo.repo_name));
                     let sel = self.select(&repo, &sv, false).await?;
                     self.alive()?;
-                    let m = match (t, sel.hrefs) {
-                        (RepoType::Rpm, hrefs) => {
-                            let mut cfg = json!({ "source_repo_version": sv, "dest_repo": derived, "dest_base_version": 0 });
-                            if let Some(h) = hrefs {
-                                cfg["content"] = h.into();
-                            }
-                            c.post(&c.api("rpm/copy/"), &json!({ "config": [cfg], "dependency_solving": false })).await?
-                        }
-                        (RepoType::File, hrefs) => {
-                            let body = json!({ "remove_content_units": ["*"], "add_content_units": hrefs.unwrap_or_default() });
-                            c.post(&format!("{derived}modify/"), &body).await?
-                        }
+                    let m = match t {
+                        RepoType::Rpm => rpm::copy(c, &sv, &derived, Some(0), sel.hrefs, false).await?,
+                        RepoType::File => file::modify(c, &derived, true, sel.hrefs.unwrap_or_default()).await?,
                     };
                     let Mutation::Task(h) = m else { bail!("copy did not return a task") };
                     vr.pending_task = Some(h.clone());
@@ -589,19 +581,22 @@ impl CvService {
             self.store.save_version_repo(vr).await?;
         }
         let dv = vr.derived_version.clone().unwrap_or_default();
-        if t == RepoType::Rpm {
-            let (src, dst): (Value, Value) = (c.get(&repo.repo_href, &[]).await?, c.get(&derived, &[]).await?);
-            let patch = publish_settings(&src, &dst);
-            if !patch.is_empty() {
-                log(format!(
-                    "{}: publish settings of the source: {}",
-                    repo.repo_name,
-                    patch.keys().cloned().collect::<Vec<_>>().join(", ")
-                ));
-                self.alive()?;
-                let m = c.patch(&derived, &Value::Object(patch)).await?;
-                ops::settle(c, m, on).await?;
+        match t {
+            RepoType::Rpm => {
+                let (src, dst): (Value, Value) = (c.get(&repo.repo_href, &[]).await?, c.get(&derived, &[]).await?);
+                let patch = publish_settings(&src, &dst);
+                if !patch.is_empty() {
+                    log(format!(
+                        "{}: publish settings of the source: {}",
+                        repo.repo_name,
+                        patch.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ));
+                    self.alive()?;
+                    let m = c.patch(&derived, &Value::Object(patch)).await?;
+                    ops::settle(c, m, on).await?;
+                }
             }
+            RepoType::File => {}
         }
         log(format!("{}: publishing {dv}", repo.repo_name));
         self.alive()?;

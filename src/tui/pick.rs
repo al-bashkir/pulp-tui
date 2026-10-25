@@ -22,10 +22,10 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
     let specs: Vec<Spec> = match source {
         Source::Repos(Some(t)) => vec![(t.repositories(), NAME_HREF, "name", "name", "")],
         // A server may lack one of the plugins: list only what its API offers.
-        Source::Repos(None) => [(RepoType::Rpm, "rpm"), (RepoType::File, "file")]
+        Source::Repos(None) => RepoType::ALL
             .into_iter()
-            .filter(|(t, _)| ctx.caps.has_endpoint(t.repositories()))
-            .map(|(t, note)| (t.repositories(), NAME_HREF, "name", "pulp_href", note))
+            .filter(|t| ctx.caps.has_endpoint(t.repositories()))
+            .map(|t| (t.repositories(), NAME_HREF, "name", "pulp_href", t.component()))
             .collect(),
         Source::Remotes(t) => vec![(t.remotes(), NAME_HREF, "name", "name", "")],
         Source::Distributions(t) => vec![(t.distributions(), NAME_HREF, "name", "name", "")],

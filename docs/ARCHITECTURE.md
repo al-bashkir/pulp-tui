@@ -10,10 +10,18 @@ tools for normal operation.
 |---|---|---|
 | Transport | `src/pulp/client.rs` | Auth (basic, bearer, mTLS), TLS (always verified, custom CA bundles), proxies, timeouts, bounded concurrency (semaphore), retries for reads only, pagination, response size limit, error mapping, href confinement to the configured API root, recording of each request attempt in the in-memory session log |
 | Capabilities | `src/pulp/caps.rs` | `status/` (component versions, health, content origin), `login/` or `users/?username=` (current user), live OpenAPI schema (endpoints, fields, enums) |
-| Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs` | RPM/File endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification |
+| Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs`, `src/pulp/rpm.rs`, `src/pulp/file.rs` | RPM/File endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification |
 | Services | `src/cv.rs`, `src/replication.rs`, `src/filters.rs` | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules and `rpmvercmp` |
 | Storage | `src/store.rs` | sqlx (SQLite, optionally PostgreSQL): task references, Content View definitions, versions, checkpoints, environments, bindings, audit log with operator, locks, replication runs |
 | TUI | `src/tui/*` | Event loop, state, screens, forms, confirmations, Task Center |
+
+### Plugins
+
+REST operations of one Pulp plugin go in `src/pulp/<plugin>.rs` (`rpm.rs`, `file.rs`).
+`RepoType` in `models.rs` holds the per-type facts: component name, label, endpoints,
+schema names and required `Feature`. Every dispatch on `RepoType` is an exhaustive
+`match`, so a new type is a compile error in each place that must handle it. There is no
+`== RepoType::X`, no `_ =>` arm and no `unwrap_or(RepoType::X)` on a type.
 
 ### Event model
 

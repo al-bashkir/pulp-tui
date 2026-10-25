@@ -3,6 +3,7 @@
 
 use super::client::{Mutation, Page, PulpClient, PulpError, Result, jitter, retryable};
 use super::models::*;
+use super::{file, rpm};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -252,20 +253,6 @@ pub fn label_owner(labels: &BTreeMap<String, String>, key: &str, id: &str, alias
     }
 }
 
-pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<Package>> {
-    let fields = "pulp_href,name,epoch,version,release,arch,location_href,sha256";
-    c.list_all(&c.api(RepoType::Rpm.content()), &[("repository_version", version.into()), ("fields", fields.into())], 2_000_000).await
-}
-
-pub async fn files_in(c: &PulpClient, version: &str) -> Result<Vec<FileContent>> {
-    c.list_all(
-        &c.api(RepoType::File.content()),
-        &[("repository_version", version.into()), ("fields", "pulp_href,relative_path,sha256".into())],
-        2_000_000,
-    )
-    .await
-}
-
 /// Hrefs of all content units (any type) of a version. The generic endpoint returns no
 /// type field; callers classify by href path (`/content/rpm/packages/`, ...).
 pub async fn content_in(c: &PulpClient, version: &str) -> Result<Vec<String>> {
@@ -278,13 +265,9 @@ pub async fn content_in(c: &PulpClient, version: &str) -> Result<Vec<String>> {
 pub async fn content_keys(c: &PulpClient, t: RepoType, version: Option<&str>) -> Result<BTreeSet<String>> {
     let Some(v) = version else { return Ok(BTreeSet::new()) };
     Ok(match t {
-        RepoType::Rpm => packages_in(c, v).await?.iter().map(Package::nevra).collect(),
-        RepoType::File => files_in(c, v).await?.iter().map(file_key).collect(),
+        RepoType::Rpm => rpm::packages_in(c, v).await?.iter().map(Package::nevra).collect(),
+        RepoType::File => file::files_in(c, v).await?.iter().map(file::key).collect(),
     })
-}
-
-pub fn file_key(f: &FileContent) -> String {
-    format!("{}  ({})", f.relative_path, f.sha256.as_deref().map(|s| &s[..s.len().min(12)]).unwrap_or("?"))
 }
 
 /// Fetch what a distribution actually serves and compare it with a repository version:
@@ -292,58 +275,9 @@ pub fn file_key(f: &FileContent) -> String {
 /// the smallest package must be downloadable with the expected digest.
 pub async fn verify_served(c: &PulpClient, t: RepoType, base_url: &str, version: &str, layout: &str) -> Result<String> {
     let base = if base_url.ends_with('/') { base_url.to_string() } else { format!("{base_url}/") };
-    let fail = |m: String| Err(PulpError::Unsupported(m));
-    let (status, body) = c.fetch_content(&format!("{base}{}", t.probe_file()), 64 << 20).await?;
-    if status != 200 {
-        return fail(format!("{} returned HTTP {status}", t.probe_file()));
-    }
     match t {
-        RepoType::File => {
-            let served: BTreeSet<(String, String)> = String::from_utf8_lossy(&body)
-                .lines()
-                .filter_map(|l| {
-                    let mut it = l.splitn(3, ',');
-                    Some((it.next()?.to_string(), it.next()?.to_string()))
-                })
-                .collect();
-            let want: BTreeSet<(String, String)> =
-                files_in(c, version).await?.into_iter().map(|f| (f.relative_path, f.sha256.unwrap_or_default())).collect();
-            if served != want {
-                return fail(format!("served manifest differs from snapshot ({} served, {} expected)", served.len(), want.len()));
-            }
-            Ok(format!("PULP_MANIFEST matches {} files", want.len()))
-        }
-        RepoType::Rpm => {
-            let q = [
-                ("repository_version", version.to_string()),
-                ("fields", "location_href,sha256".into()),
-                ("ordering", "size_package".into()),
-                ("limit", "1".into()),
-            ];
-            let pkgs: Page<Value> = c.list(&c.api(t.content()), &q).await?;
-            let Some(p) = pkgs.results.first() else { return Ok("repomd.xml served (no packages)".into()) };
-            let loc = p["location_href"].as_str().unwrap_or_default();
-            // Publications use the layout; mirror_complete publications keep upstream paths.
-            let candidates: Vec<String> = rpm_package_path(layout, loc).into_iter().chain([loc.to_string()]).collect();
-            for path in &candidates {
-                let (status, body) = c.fetch_content(&format!("{base}{path}"), 64 << 20).await?;
-                if status == 200 && p["sha256"].as_str() == Some(hex::encode(Sha256::digest(&body)).as_str()) {
-                    return Ok(format!("repomd.xml and {path} served with matching digest ({} packages)", pkgs.count));
-                }
-            }
-            fail(format!("package {loc} not served with the expected digest (tried {})", candidates.join(", ")))
-        }
-    }
-}
-
-/// Path of a package inside a published RPM repository for the publication `layout`.
-// shortcut: nested_by_digest paths are not derived, callers skip the package probe; add when needed.
-pub fn rpm_package_path(layout: &str, location_href: &str) -> Option<String> {
-    let file = location_href.rsplit('/').next().filter(|f| !f.is_empty())?;
-    match layout {
-        "flat" => Some(format!("Packages/{file}")),
-        "nested_alphabetically" | "" => Some(format!("Packages/{}/{file}", file.chars().next()?.to_ascii_lowercase())),
-        _ => None,
+        RepoType::Rpm => rpm::verify(c, &base, version, layout).await,
+        RepoType::File => file::verify(c, &base, version).await,
     }
 }
 
@@ -407,8 +341,9 @@ pub async fn upload(
     if let Some(r) = repository {
         fields.push(("repository", r.into()));
     }
-    if t == RepoType::File {
-        fields.push(("relative_path", relative_path.unwrap_or(&file_name).into()));
+    match t {
+        RepoType::Rpm => {}
+        RepoType::File => fields.push(("relative_path", relative_path.unwrap_or(&file_name).into())),
     }
     let chunk = c.upload_chunk();
     let mut f = tokio::fs::File::open(path).await.map_err(io)?;

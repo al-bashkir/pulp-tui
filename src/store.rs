@@ -344,11 +344,7 @@ pub struct NotMigrated {
 pub const LIBRARY: &str = "Library";
 
 fn repo_type(s: &str) -> Result<RepoType> {
-    match s {
-        "rpm" => Ok(RepoType::Rpm),
-        "file" => Ok(RepoType::File),
-        _ => bail!("unknown repository type {s:?}"),
-    }
+    RepoType::ALL.into_iter().find(|t| t.component() == s).ok_or_else(|| anyhow!("unknown repository type {s:?}"))
 }
 
 fn type_str(t: RepoType) -> &'static str {

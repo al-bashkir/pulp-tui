@@ -244,7 +244,7 @@ async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror:
     let policy = match (t, mirror) {
         (RepoType::Rpm, true) => "mirror_content_only",
         (RepoType::File, true) => "mirror",
-        _ => "additive",
+        (RepoType::Rpm, false) | (RepoType::File, false) => "additive",
     };
     ops::settle(c, ops::sync(c, t, &repo, Some(&remote), policy).await?, on).await?;
     let r: Repository = c.get(&repo, &[]).await?;

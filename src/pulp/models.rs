@@ -1,6 +1,7 @@
 //! Typed views of the Pulp objects the application logic depends on. Unknown fields are
 //! kept in `extra` so detail views never silently drop server metadata.
 
+use super::caps::Feature;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -27,6 +28,32 @@ impl RepoType {
         match self {
             RepoType::Rpm => "RPM",
             RepoType::File => "File",
+        }
+    }
+    /// The next type in `ALL`, wrapping around (type toggles on screens).
+    pub fn next(self) -> RepoType {
+        let i = Self::ALL.iter().position(|t| *t == self).map_or(0, |i| i + 1);
+        Self::ALL[i % Self::ALL.len()]
+    }
+    /// Server capability the plugin needs.
+    pub fn feature(self) -> Feature {
+        match self {
+            RepoType::Rpm => Feature::Rpm,
+            RepoType::File => Feature::File,
+        }
+    }
+    /// OpenAPI schema of the plugin's repository serializer.
+    pub fn repository_schema(self) -> &'static str {
+        match self {
+            RepoType::Rpm => "rpm.RpmRepository",
+            RepoType::File => "file.FileRepository",
+        }
+    }
+    /// OpenAPI schema of the plugin's remote serializer.
+    pub fn remote_schema(self) -> &'static str {
+        match self {
+            RepoType::Rpm => "rpm.RpmRemote",
+            RepoType::File => "file.FileRemote",
         }
     }
     pub fn repositories(self) -> &'static str {
@@ -68,13 +95,6 @@ impl RepoType {
             Some(RepoType::File)
         } else {
             None
-        }
-    }
-    /// File served at the root of a published repository; used to verify serving.
-    pub fn probe_file(self) -> &'static str {
-        match self {
-            RepoType::Rpm => "repodata/repomd.xml",
-            RepoType::File => "PULP_MANIFEST",
         }
     }
 }
@@ -331,6 +351,14 @@ mod tests {
         assert_eq!(RepoType::from_href("/pulp/api/v3/repositories/rpm/rpm/0190-ab/versions/2/"), Some(RepoType::Rpm));
         assert_eq!(RepoType::from_href("/pulp/api/v3/content/file/files/1/"), Some(RepoType::File));
         assert_eq!(RepoType::from_href("/pulp/api/v3/repositories/container/container/1/"), None);
+    }
+
+    #[test]
+    fn type_helpers_cover_all() {
+        assert_eq!(RepoType::Rpm.next(), RepoType::File);
+        assert_eq!(RepoType::File.next(), RepoType::Rpm);
+        assert_eq!(RepoType::Rpm.feature(), Feature::Rpm);
+        assert_eq!(RepoType::File.remote_schema(), "file.FileRemote");
     }
 
     #[test]
