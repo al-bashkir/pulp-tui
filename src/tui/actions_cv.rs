@@ -7,7 +7,7 @@ use super::kinds::{Act, Kind, s};
 use crate::cv::{Mode, check_repo_clash, distribution_name};
 use crate::filters::{format_rules, parse_rules};
 use crate::pulp::ops::{self, OnTask};
-use crate::pulp::{Mutation, PulpClient, PulpError, RepoType};
+use crate::pulp::{Mutation, PulpClient, RepoType};
 use crate::store::{Component, CvRepo, CvVersion, LIBRARY, Store};
 use anyhow::anyhow;
 use futures::future::join_all;
@@ -208,9 +208,8 @@ async fn finish_sync(c: &PulpClient, state: RepoSync, on: OnTask<'_>) -> RepoSyn
         // `wait_task` accepts a skipped task as done, but a skipped sync did not sync.
         Ok(t) if t.state == "skipped" => RepoSync::Failed("task skipped".into()),
         Ok(t) => t.created_matching("/versions/").map_or(RepoSync::NoChange, RepoSync::NewVersion),
-        Err(e @ PulpError::TaskFailed { .. }) => RepoSync::Failed(e.to_string()),
-        // The task itself did not fail: reading it did. It may still run, or may be done.
-        Err(e) => RepoSync::Failed(format!("could not read the task, it may still be running (see Tasks): {e}")),
+        // `TaskUnknown` says when reading the task failed, not the task: it may still run, or may be done.
+        Err(e) => RepoSync::Failed(e.to_string()),
     }
 }
 
@@ -734,7 +733,7 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
             if protected {
                 app.confirm_danger(danger_title, lines, &typed, go);
             } else {
-                app.confirm(title, lines, go);
+                app.confirm_prod(title, lines, &typed, go);
             }
         })
     });
@@ -1116,7 +1115,7 @@ mod tests {
         serve(&server, "GET", format!("{TASKS}1/"), 500, json!({ "detail": "boom" })).await;
         let out = finish_syncs(&client(&server), vec![("os".into(), RepoSync::Submitted(format!("{TASKS}1/")))], &ops::no_progress).await;
         let RepoSync::Failed(e) = &out[0].1 else { panic!("{:?}", out[0]) };
-        assert!(e.starts_with("could not read the task, it may still be running (see Tasks): "), "{e}");
+        assert!(e.starts_with(&format!("could not read task {TASKS}1/, it may still be running (see Tasks): ")), "{e}");
         assert!(e.contains("server error [500]"), "{e}");
     }
 

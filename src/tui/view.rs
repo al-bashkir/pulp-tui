@@ -69,6 +69,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     }
     let ops = app.jobs.iter().filter(|j| !j.is_load).count();
     spans.push(Span::raw(format!(" | jobs {ops} | tasks {} active ", app.tasks.active())));
+    if !app.queued.is_empty() {
+        spans.push(Span::raw(format!("| {} dialog(s) waiting ", app.queued.len())));
+    }
     let style = if prod { Style::default().bg(Color::Red).fg(Color::White) } else { Style::default().bg(Color::Blue).fg(Color::White) };
     f.render_widget(Paragraph::new(Line::from(spans)).style(style), area);
 }

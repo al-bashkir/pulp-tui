@@ -506,13 +506,19 @@ impl Kind {
                 ],
                 _ => vec![col("href", 70, |v| s(v, "pulp_href")), col("created", 19, |v| ts(v, "pulp_created"))],
             },
-            Kind::Publications(_) => vec![
-                col("id", 13, |v| short(&s(v, "pulp_href"))),
-                col("version", 14, |v| short(&s(v, "repository_version"))),
-                col("created", 19, |v| ts(v, "pulp_created")),
-                col("distributions", 6, |v| v["distributions"].as_array().map(|a| a.len().to_string()).unwrap_or_default()),
-                col("checkpoint", 5, |v| s(v, "checkpoint")),
-            ],
+            Kind::Publications(t) => {
+                let mut c = vec![
+                    col("id", 13, |v| short(&s(v, "pulp_href"))),
+                    col("version", 14, |v| short(&s(v, "repository_version"))),
+                    col("created", 19, |v| ts(v, "pulp_created")),
+                ];
+                // Only File publications have the field; Delete looks up the distributions of both types.
+                if *t == RepoType::File {
+                    c.push(col("distributions", 6, |v| v["distributions"].as_array().map(|a| a.len().to_string()).unwrap_or_default()));
+                }
+                c.push(col("checkpoint", 5, |v| s(v, "checkpoint")));
+                c
+            }
             Kind::Distributions(_) => vec![
                 col("name", 26, |v| s(v, "name")),
                 col("base_path", 26, |v| s(v, "base_path")),

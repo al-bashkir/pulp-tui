@@ -153,6 +153,31 @@ async fn unreachable_server_is_a_network_error() {
 }
 
 #[tokio::test]
+async fn task_polling_survives_a_short_outage_and_never_calls_an_unread_task_failed() {
+    let server = MockServer::start().await;
+    // More 503s than the client retries for one GET (4 attempts).
+    Mock::given(method("GET"))
+        .and(path(format!("{API}tasks/3/")))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(5)
+        .mount(&server)
+        .await;
+    let done = json!({ "pulp_href": format!("{API}tasks/3/"), "state": "completed", "name": "publish" });
+    Mock::given(method("GET"))
+        .and(path(format!("{API}tasks/3/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done))
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+    assert_eq!(ops::wait_task(&c, &format!("{API}tasks/3/"), &no_progress).await.unwrap().state, "completed");
+
+    Mock::given(method("GET")).and(path(format!("{API}tasks/4/"))).respond_with(ResponseTemplate::new(403)).mount(&server).await;
+    let e = ops::wait_task(&c, &format!("{API}tasks/4/"), &no_progress).await.unwrap_err();
+    assert!(matches!(e, PulpError::TaskUnknown { .. }), "{e}");
+    assert!(e.to_string().contains("it may still be running (see Tasks)"), "{e}");
+}
+
+#[tokio::test]
 async fn task_polling_until_completion_or_failure() {
     let server = MockServer::start().await;
     let running = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "running", "name": "sync" });

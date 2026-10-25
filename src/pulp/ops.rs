@@ -1,7 +1,7 @@
 //! Typed Pulp operations shared by the TUI and the workflow services. Every mutation
 //! that Pulp runs as a task is awaited here with adaptive polling.
 
-use super::client::{Mutation, Page, PulpClient, PulpError, Result, jitter};
+use super::client::{Mutation, Page, PulpClient, PulpError, Result, jitter, retryable};
 use super::models::*;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -15,14 +15,27 @@ pub type OnTask<'a> = &'a (dyn Fn(&Task) + Send + Sync);
 
 pub fn no_progress(_: &Task) {}
 
+/// How long `wait_task` keeps polling through transient read errors (each GET is also retried by the client).
+const POLL_OUTAGE: Duration = Duration::from_secs(120);
+
 /// Poll a task until it reaches a final state. The interval grows while nothing changes
-/// and resets on progress, so long tasks cost few requests.
+/// and resets on progress, so long tasks cost few requests. A task that cannot be read
+/// gives `TaskUnknown`, never `TaskFailed`: it may still run.
 pub async fn wait_task(c: &PulpClient, href: &str, on: OnTask<'_>) -> Result<Task> {
     let (min, max) = c.poll();
     let mut interval = min;
     let mut last: Option<Task> = None;
+    let mut failing: Option<std::time::Instant> = None;
     loop {
-        let t: Task = c.get(href, &[]).await?;
+        let t: Task = match c.get(href, &[]).await {
+            Ok(t) => t,
+            Err(e) if retryable(&e) && failing.get_or_insert_with(std::time::Instant::now).elapsed() < POLL_OUTAGE => {
+                tokio::time::sleep(max).await;
+                continue;
+            }
+            Err(e) => return Err(PulpError::TaskUnknown { href: href.into(), message: e.to_string() }),
+        };
+        failing = None;
         let changed = last.as_ref() != Some(&t);
         if changed {
             on(&t);
@@ -89,6 +102,11 @@ pub async fn create(c: &PulpClient, collection: &str, body: &Value, needle: &str
     let obj = if let Mutation::Object(o) = &m { Some(o.clone()) } else { None };
     let task = settle(c, m, on).await?;
     created_href(obj.as_ref(), task.as_ref(), needle)
+}
+
+/// All distributions of a type. Callers match bindings client-side: the list has no `publication` filter.
+pub async fn distributions(c: &PulpClient, t: RepoType) -> Result<Vec<Distribution>> {
+    c.list_all(&c.api(t.distributions()), &[], 100_000).await
 }
 
 pub async fn find_by_name<T: serde::de::DeserializeOwned>(c: &PulpClient, collection: &str, name: &str) -> Result<Option<T>> {
@@ -348,6 +366,21 @@ impl Diff {
     }
 }
 
+/// Deletes an unfinished chunked upload when its future is dropped (the job was aborted with Esc).
+/// Disarmed once the upload is committed: then a Pulp task uses it and must not lose it.
+struct DeleteOnDrop(Option<(PulpClient, String)>);
+
+impl Drop for DeleteOnDrop {
+    fn drop(&mut self) {
+        // shortcut: a quit stops the runtime before this delete runs; Pulp keeps that upload until its own cleanup.
+        if let (Some((c, href)), Ok(rt)) = (self.0.take(), tokio::runtime::Handle::try_current()) {
+            rt.spawn(async move {
+                let _ = c.delete(&href).await;
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UploadResult {
     pub content_href: String,
@@ -391,6 +424,7 @@ pub async fn upload(
         let up = c.post(&c.api("uploads/"), &json!({ "size": size })).await?;
         let Mutation::Object(o) = up else { return Err(PulpError::Decode("upload create returned no object".into())) };
         let href = o["pulp_href"].as_str().ok_or_else(|| PulpError::Decode("upload without href".into()))?.to_string();
+        let mut guard = DeleteOnDrop(Some((c.clone(), href.clone())));
         let res = async {
             let mut offset = 0u64;
             let mut buf = vec![0u8; chunk];
@@ -415,6 +449,7 @@ pub async fn upload(
             c.post_form(&c.api(t.content()), &fields, None).await
         }
         .await;
+        guard.0 = None;
         match res {
             Ok(m) => (m, Some(href)),
             Err(e) => {

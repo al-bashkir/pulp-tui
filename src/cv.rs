@@ -147,6 +147,18 @@ pub fn slug(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' }).collect()
 }
 
+/// Repository fields that pulp_rpm uses at publish time when the publication does not set them.
+const RPM_PUBLISH_FIELDS: [&str; 5] = ["metadata_signing_service", "checksum_type", "repo_config", "compression_type", "layout"];
+
+/// The PATCH that gives a derived repository the publish settings of its source (empty: they agree), so a
+/// view of a signed repository serves signed metadata. Fields this server does not have are never sent.
+fn publish_settings(source: &Value, derived: &Value) -> serde_json::Map<String, Value> {
+    RPM_PUBLISH_FIELDS
+        .iter()
+        .filter_map(|&k| source.get(k).filter(|v| derived.get(k) != Some(*v)).map(|v| (k.to_string(), v.clone())))
+        .collect()
+}
+
 pub fn derived_repo_name(cv: &str, repo: &str) -> String {
     format!("pulp-tui-cv-{}-{}", slug(cv), slug(repo))
 }
@@ -565,6 +577,20 @@ impl CvService {
             self.store.save_version_repo(vr).await?;
         }
         let dv = vr.derived_version.clone().unwrap_or_default();
+        if t == RepoType::Rpm {
+            let (src, dst): (Value, Value) = (c.get(&repo.repo_href, &[]).await?, c.get(&derived, &[]).await?);
+            let patch = publish_settings(&src, &dst);
+            if !patch.is_empty() {
+                log(format!(
+                    "{}: publish settings of the source: {}",
+                    repo.repo_name,
+                    patch.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+                self.alive()?;
+                let m = c.patch(&derived, &Value::Object(patch)).await?;
+                ops::settle(c, m, on).await?;
+            }
+        }
         log(format!("{}: publishing {dv}", repo.repo_name));
         self.alive()?;
         vr.publication = Some(ops::ensure_publication(c, t, &dv, on).await?);
@@ -1119,6 +1145,18 @@ mod tests {
     const DIST: &str = "/pulp/api/v3/distributions/rpm/rpm/5/";
 
     /// A service against a mock Pulp, with an in-memory store.
+    #[test]
+    fn snapshots_get_the_publish_settings_of_their_source() {
+        let src = json!({ "name": "os", "metadata_signing_service": "/s/1/", "checksum_type": "sha256", "repo_config": { "gpgcheck": 1 },
+            "layout": "nested_alphabetically", "retain_repo_versions": 3 });
+        let dst =
+            json!({ "name": "web-os", "metadata_signing_service": null, "checksum_type": "sha256", "layout": "nested_alphabetically" });
+        let patch = publish_settings(&src, &dst);
+        assert_eq!(Value::Object(patch), json!({ "metadata_signing_service": "/s/1/", "repo_config": { "gpgcheck": 1 } }));
+        assert!(publish_settings(&src, &src).is_empty(), "nothing to send when they agree");
+        assert!(publish_settings(&json!({ "name": "old server" }), &dst).is_empty(), "fields the server lacks are never sent");
+    }
+
     async fn mock_service(server: &wiremock::MockServer) -> CvService {
         let p = crate::config::Profile { url: server.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
         let client = PulpClient::new("t", &p, &crate::config::Settings::default()).unwrap();

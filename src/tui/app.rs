@@ -203,6 +203,9 @@ pub enum Focus {
 
 pub const PAGE: u64 = 100;
 
+/// A dialog that a job opens ignores keys this long: they were typed before it appeared.
+const KEY_GUARD: Duration = Duration::from_millis(300);
+
 pub struct App {
     pub cfg: Config,
     pub cfg_path: PathBuf,
@@ -222,6 +225,11 @@ pub struct App {
     pub list: ListState,
     pub history: Vec<(Screen, ListState)>,
     pub modal: Option<Modal>,
+    /// Dialogs that finished jobs opened over another dialog; each opens when the one before it closes.
+    pub queued: VecDeque<Modal>,
+    guard_until: Option<Instant>,
+    /// A job result is being applied: its dialogs never replace an open one.
+    applying: bool,
     pub notices: VecDeque<Notice>,
     pub jobs: Vec<Job>,
     pub tasks: TaskCenter,
@@ -257,6 +265,9 @@ impl App {
             list: ListState::new(Kind::Profiles),
             history: vec![],
             modal: None,
+            queued: VecDeque::new(),
+            guard_until: None,
+            applying: false,
             notices: VecDeque::new(),
             jobs: vec![],
             tasks,
@@ -463,8 +474,11 @@ impl App {
     }
 
     fn abort_all(&mut self) {
-        for j in self.jobs.drain(..) {
+        for j in std::mem::take(&mut self.jobs) {
             j.abort.abort();
+            if !j.is_load {
+                self.notify(Level::Warn, format!("stopped waiting for '{}' (Pulp tasks already submitted keep running)", j.label));
+            }
         }
     }
 
@@ -474,9 +488,14 @@ impl App {
                 let Some(i) = self.jobs.iter().position(|j| j.id == id) else { return }; // aborted
                 let job = self.jobs.remove(i);
                 match result {
-                    Ok(apply) => apply(self),
+                    Ok(apply) => {
+                        self.applying = true;
+                        apply(self);
+                        self.applying = false;
+                    }
                     Err(e) => self.error(format!("{}: {e}", job.label)),
                 }
+                self.next_queued();
             }
             Msg::JobProgress { id, text } => {
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
@@ -547,21 +566,32 @@ impl App {
         let href = t.pulp_href.clone();
         let state = t.state.clone();
         let err = t.error_message();
-        if self.tasks.update(t, driven) {
-            let label = self.tasks.items.iter().find(|x| x.href == href).map(|x| x.label.clone()).unwrap_or_default();
-            if let Some(p) = self.profile.clone() {
-                let (st, href, state) = (self.store.clone(), href.clone(), state.clone());
-                self.spawn("persist task state".into(), true, async move {
+        // A task that a workflow reports is not tracked yet: store it too, so a restart re-attaches it.
+        let new = !self.tasks.items.iter().any(|x| x.href == href);
+        let finished = self.tasks.update(t, driven);
+        let label = self.tasks.items.iter().find(|x| x.href == href).map(|x| x.label.clone()).unwrap_or_default();
+        if let Some(p) = self.profile.clone()
+            && (new || finished)
+        {
+            let (st, href, state, label) = (self.store.clone(), href.clone(), state.clone(), label.clone());
+            self.spawn("persist task state".into(), true, async move {
+                if new {
+                    st.track_task(&p, &href, &label, &state).await?;
+                }
+                if finished {
                     st.finish_task(&p, &href, &state).await?;
-                    ap(|_| {})
-                });
-            }
+                }
+                ap(|_| {})
+            });
+        }
+        if finished {
             match state.as_str() {
                 "completed" => self.ok(format!("task completed: {label}")),
                 _ => self.error(format!("task {state}: {label}{}", err.map(|e| format!(": {e}")).unwrap_or_default())),
             }
-            // Refresh the visible list once when a task finishes (not on every tick).
-            if matches!(self.screen, Screen::List(_)) && !self.list.loading {
+            // Refresh the visible list once when a task finishes (not on every tick). A newer load
+            // replaces one in flight, which may hold the state from before the task.
+            if matches!(self.screen, Screen::List(_)) {
                 self.reload();
             }
         }
@@ -591,12 +621,28 @@ impl App {
 
     // ---- connection ----------------------------------------------------------------
 
+    /// Connect to a profile. Running operations stop waiting, so the operator confirms that first.
     pub fn connect(&mut self, name: &str) {
+        let busy: Vec<String> = self.jobs.iter().filter(|j| !j.is_load).map(|j| format!("  {}", j.label)).collect();
+        if busy.is_empty() {
+            return self.connect_now(name);
+        }
+        let mut lines = vec![format!("{} operation(s) are still running in this client:", busy.len())];
+        lines.extend(busy);
+        lines.push("Connecting stops waiting for them. Pulp tasks already submitted keep running on the".into());
+        lines.push("server; Content View publishes can be resumed from their checkpoints.".into());
+        let n = name.to_string();
+        self.confirm(format!("Connect to {name}?"), lines, move |app| app.connect_now(&n));
+    }
+
+    fn connect_now(&mut self, name: &str) {
         let Some(p) = self.cfg.profiles.get(name).cloned() else {
             self.error(format!("unknown profile {name}"));
             return;
         };
         self.abort_all();
+        // Their actions would run against the new server.
+        self.queued.clear();
         self.conn = None;
         self.profile = Some(name.to_string());
         self.connecting = true;
@@ -826,8 +872,30 @@ impl App {
 
     // ---- modals --------------------------------------------------------------------
 
+    /// Open a dialog. One that a finished job opens never replaces an open dialog, where the next key
+    /// typed for that dialog would answer it: it waits in `queued`.
+    fn show(&mut self, m: Modal) {
+        if !self.applying {
+            self.modal = Some(m);
+        } else if self.modal.is_some() {
+            self.queued.push_back(m);
+        } else {
+            self.modal = Some(m);
+            self.guard_until = Some(Instant::now() + KEY_GUARD);
+        }
+    }
+
+    fn next_queued(&mut self) {
+        if self.modal.is_none()
+            && let Some(m) = self.queued.pop_front()
+        {
+            self.modal = Some(m);
+            self.guard_until = Some(Instant::now() + KEY_GUARD);
+        }
+    }
+
     pub fn form(&mut self, form: Form, submit: impl FnMut(&mut App, &Form) -> Result<(), String> + 'static) {
-        self.modal = Some(Modal::Form { form, submit: Box::new(submit) });
+        self.show(Modal::Form { form, submit: Box::new(submit) });
     }
 
     /// Load the options of a pick field in the background. The answer, also a load error, goes into the popup.
@@ -851,7 +919,7 @@ impl App {
     }
 
     pub fn confirm(&mut self, title: impl Into<String>, lines: Vec<String>, on_yes: impl FnOnce(&mut App) + 'static) {
-        self.modal = Some(Modal::Confirm {
+        self.show(Modal::Confirm {
             title: title.into(),
             lines,
             typed: None,
@@ -862,6 +930,15 @@ impl App {
         });
     }
 
+    fn production(&self) -> bool {
+        self.profile.as_ref().and_then(|p| self.cfg.profiles.get(p)).is_some_and(|p| p.production)
+    }
+
+    /// `confirm`, but on a production profile the operator types `typed` (a name), as in `confirm_danger`.
+    pub fn confirm_prod(&mut self, title: impl Into<String>, lines: Vec<String>, typed: &str, on_yes: impl FnOnce(&mut App) + 'static) {
+        if self.production() { self.confirm_danger(title, lines, typed, on_yes) } else { self.confirm(title, lines, on_yes) }
+    }
+
     /// Destructive confirmation: the operator types `typed` (a name) to proceed.
     pub fn confirm_danger(
         &mut self,
@@ -870,10 +947,10 @@ impl App {
         typed: &str,
         on_yes: impl FnOnce(&mut App) + 'static,
     ) {
-        if self.profile.as_ref().and_then(|p| self.cfg.profiles.get(p)).is_some_and(|p| p.production) {
+        if self.production() {
             lines.insert(0, format!("!!! PRODUCTION SERVER: {} !!!", self.profile.clone().unwrap_or_default()));
         }
-        self.modal = Some(Modal::Confirm {
+        self.show(Modal::Confirm {
             title: title.into(),
             lines,
             typed: Some(typed.to_string()),
@@ -885,11 +962,11 @@ impl App {
     }
 
     pub fn text(&mut self, title: impl Into<String>, lines: Vec<String>) {
-        self.modal = Some(Modal::Text { title: title.into(), lines, scroll: 0, watch: None });
+        self.show(Modal::Text { title: title.into(), lines, scroll: 0, watch: None });
     }
 
     pub fn input(&mut self, title: impl Into<String>, initial: &str, on_done: impl FnOnce(&mut App, String) + 'static) {
-        self.modal = Some(Modal::Input { title: title.into(), input: initial.into(), on_done: Some(Box::new(on_done)) });
+        self.show(Modal::Input { title: title.into(), input: initial.into(), on_done: Some(Box::new(on_done)) });
     }
 
     // ---- keys ----------------------------------------------------------------------
@@ -900,7 +977,10 @@ impl App {
             return;
         }
         if self.modal.is_some() {
-            self.modal_key(k);
+            if self.guard_until.is_none_or(|g| Instant::now() >= g) {
+                self.modal_key(k);
+                self.next_queued();
+            }
             return;
         }
         match k.code {
@@ -1617,6 +1697,7 @@ mod tests {
             if title == "Migrate database of lab?" && lines.last().unwrap() == "Esc: do not migrate now."));
         let note = app.notices.iter().find(|n| n.text.contains("not changed")).expect("no notice").text.clone();
         assert!(note.contains("database not migrated") && !note.contains("db migrate"), "{note}");
+        tokio::time::sleep(KEY_GUARD).await; // a job opened the question
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         settle(&mut app, &mut rx).await;
         assert!(app.modal.is_none() && !missing.exists());
@@ -1752,6 +1833,57 @@ mod tests {
         assert!(text_lines(&app).contains(&"  [running] Associating Content 3/9".to_string()), "{:?}", text_lines(&app));
         app.handle_msg(Msg::TaskPolled { href: "/t/1/".into(), result: Ok(task("completed")) });
         assert!(text_lines(&app).contains(&"state: completed".to_string()), "{:?}", text_lines(&app));
+    }
+
+    #[tokio::test]
+    async fn a_job_dialog_waits_for_the_open_one_and_ignores_early_keys() {
+        let mut app = app_on(Kind::Profiles).await;
+        let mut rx = app.rx.take().unwrap();
+        app.form(Form::new("typing", vec![super::super::form::Field::text("name", "Name")]), |_, _| Ok(()));
+        app.spawn("rollback preview".into(), false, async { ap(|app| app.confirm("Roll back", vec![], |app| app.quit = true)) });
+        settle(&mut app, &mut rx).await;
+        app.handle_key(ch('y'));
+        assert!(matches!(app.modal, Some(Modal::Form { .. })) && !app.quit, "the key belongs to the form");
+        assert_eq!(app.queued.len(), 1);
+        app.handle_key(key(KeyCode::Esc)); // ends editing the field
+        app.handle_key(key(KeyCode::Esc)); // closes the form
+        assert!(matches!(&app.modal, Some(Modal::Confirm { title, .. }) if title == "Roll back"));
+        app.handle_key(ch('y'));
+        assert!(!app.quit, "keys right after it opens are dropped");
+        tokio::time::sleep(KEY_GUARD).await;
+        app.handle_key(ch('y'));
+        assert!(app.quit && app.queued.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_asks_first_while_operations_run() {
+        let st = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(lab("http://127.0.0.1:9"), "/dev/null".into(), st.clone(), Ok(st));
+        app.spawn("publish web".into(), false, std::future::pending());
+        app.connect("lab");
+        assert!(matches!(&app.modal, Some(Modal::Confirm { title, lines, .. })
+            if title == "Connect to lab?" && lines.contains(&"  publish web".to_string())));
+        assert_eq!((app.jobs.len(), app.profile.as_deref()), (1, None), "nothing stopped before the answer");
+        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { unreachable!() };
+        on_yes.unwrap()(&mut app);
+        assert!(app.notices.iter().any(|n| n.text.starts_with("stopped waiting for 'publish web'")));
+        assert_eq!(app.profile.as_deref(), Some("lab"));
+    }
+
+    #[tokio::test]
+    async fn tasks_that_a_workflow_reports_are_stored_for_the_next_start() {
+        let mut app = app_on(Kind::Profiles).await;
+        let mut rx = app.rx.take().unwrap();
+        let task = |state: &str| {
+            serde_json::from_value::<Task>(serde_json::json!({ "pulp_href": "/t/9/", "state": state, "name": "publish" })).unwrap()
+        };
+        app.handle_msg(Msg::Task(task("running")));
+        settle(&mut app, &mut rx).await;
+        let refs = app.store.tasks("lab", 10).await.unwrap();
+        assert_eq!((refs.len(), refs[0].href.as_str(), refs[0].state.as_str()), (1, "/t/9/", "running"));
+        app.handle_msg(Msg::Task(task("completed")));
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.store.tasks("lab", 10).await.unwrap()[0].state, "completed");
     }
 
     #[tokio::test]

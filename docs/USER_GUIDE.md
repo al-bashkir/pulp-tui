@@ -46,7 +46,10 @@ checkbox. `Ctrl-S` submits from either mode (also from an open picker, after it 
 selection), `Ctrl-U` clears the field while editing, and `Esc` in move mode cancels. A form
 with a single text, secret or number field opens in edit mode. In confirmations:
 `y`/`Enter` confirms, `n`/`Esc` cancels; destructive operations require typing the shown
-name; `j k g G Ctrl-D Ctrl-U ↑↓ PgUp PgDn Home End` scroll long previews. With a typed name
+name, and so do rollbacks and promotions on a production profile. A dialog that a finished
+background job opens never replaces the open one: it waits until that one closes (the footer
+shows `N dialog(s) waiting`), and it ignores keys for 0.3 s after it appears, so keys typed
+for another dialog never answer it. `j k g G Ctrl-D Ctrl-U ↑↓ PgUp PgDn Home End` scroll long previews. With a typed name
 letters type, so only `Ctrl-D`/`Ctrl-U`, `PgUp`/`PgDn`, `Home`/`End` and the arrows scroll
 (`Ctrl-J`/`Ctrl-K` do not).
 
@@ -69,7 +72,10 @@ the typed text as the value (with no text, it closes the list and keeps the old 
 
 1. **Esc on a loading list** cancels the HTTP request in the client.
 2. **Quitting** stops waiting for client operations. Pulp tasks continue on the server and
-   are re-attached in the Task Center at the next start.
+   are re-attached in the Task Center at the next start. **Connect** to a profile also stops
+   waiting for them, so it asks first while operations run. When a task cannot be read
+   (network or server error for more than about two minutes), the operation ends with
+   "could not read task …, it may still be running": it is not reported as failed.
 3. **Tasks → X** asks Pulp to cancel a server task. The Task Center then shows the state
    that Pulp reports (`canceled`, or `failed`/`completed` if the task ended first).
 
@@ -116,15 +122,15 @@ retention and mark Content View snapshot repositories.
 | o | browse content of the latest version |
 | f | sync: choose remote (empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File: additive, mirror). Mirror policies show a warning first. |
 | H | sync history (tasks that touched this repository) |
-| u | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed chunked uploads are deleted |
+| u | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed or cancelled (Esc) chunked uploads are deleted |
 | P | publish the latest version (reuses an existing publication) |
 | D | distribute: pin the latest version (publication) or follow the repository latest |
 | C | copy content from another repository (filter rules; RPM can copy dependencies) |
-| c / e / d | create / edit / delete (delete shows versions, publications, dependent distributions and Content View snapshots first) |
+| c / e / d | create / edit / delete (delete names every distribution that serves the repository, a version or a publication of it; refused while it holds Content View snapshots) |
 | i | full JSON |
 
 Edit sends only changed fields. Retention cannot be set on Content View snapshot
-repositories. Sync, upload and copy are refused on snapshot repositories.
+repositories. Sync, upload, copy and content add/remove are refused on snapshot repositories.
 
 ### Remotes
 `t` switches RPM/File. Create/edit: URL (File: URL of `PULP_MANIFEST`), download policy,
@@ -137,8 +143,9 @@ From a repository (**v**) or for all repositories. Columns: number, created, pre
 added / removed counts. Actions: **o** content, **P** publish this version, **D**
 distribute it, **b** point a distribution to it (rollback, with preview), **m** compare
 with the marked version (`Space` on one, `m` on the other; shows added/removed NEVRAs or
-files, older → newer), **d** delete (refused for Content View snapshots; never needed for
-rollback).
+files, older → newer), **d** delete (names the distributions that serve the version or its
+publications, and you type the version id; refused for Content View snapshots; never needed
+for rollback).
 
 ### Content browser
 Opened from a repository or version. `t` cycles the RPM content types (packages,
@@ -150,14 +157,18 @@ repository version; old versions are unchanged.
 
 ### Publications
 `t` switches RPM/File. **c** create from repository name and optional version number,
-**D** distribute, **d** delete (warns when distributions serve it).
+**D** distribute, **d** delete (names the distributions that serve it, and you type the
+publication id; refused for publications of Content View snapshots).
 
 ### Distributions
 `t` switches RPM/File. Details say whether a distribution is **PINNED** (publication or
 repository version) or **FOLLOWS LATEST** (repository). **y** copies the content URL
-(OSC 52 terminal clipboard), **V** verifies what is served, **b** re-points to a version
-(preview first), **c**/**e** create/edit (name, base path, binding, content guard,
-labels), **d** delete.
+(OSC 52 terminal clipboard), **V** verifies what is served (for a distribution that follows
+a repository: its newest publication, which is not the latest version when that version has
+no publication), **b** re-points to a version (preview first), **c**/**e** create/edit
+(name, base path, binding, content guard, labels), **d** delete. A distribution of a
+Content View (label `pulp_tui_cv`) cannot be re-pointed or re-bound here (use promote or
+roll back); its base path and labels can be edited, and delete warns.
 
 ### Content Views
 Managed by pulp-tui (see `docs/ARCHITECTURE.md`). Columns: composite (`yes` for a

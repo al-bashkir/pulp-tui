@@ -76,8 +76,23 @@ server gives the final answer; the dashboard shows a warning.
   the derived repository of a publication that another view still serves.
 * **mirror_complete** RPM syncs create their own publication with upstream package paths.
   Served-content checks therefore try the layout path and the original `location_href`.
+  The RPM publication response has no `distributions` field (the File one has), and the
+  distribution list has no `publication` filter: pulp-tui lists the distributions of the
+  type and matches the bindings in the client before it deletes a publication, a version
+  or a repository (checked on 3.123.0 / pulp_rpm 3.39.3).
 * **Native replication** pins distributions with `repository_version`, not a publication.
-  pulp-tui shows these as pinned and re-points them correctly.
+  pulp-tui shows these as pinned and re-points them correctly. A distribution PATCH is
+  merged with the stored object (pulpcore `serializers/publication.py`): a body with
+  `publication` but without `repository_version: null` gets HTTP 400, and
+  `{publication: null, repository: null}` answers 200 but keeps serving the version. Every
+  binding change of pulp-tui therefore also sends `repository_version: null`.
+* **A distribution that follows a repository** serves the newest complete publication of
+  the repository (pulpcore `models/publication.py`: ordered by repository version, then
+  creation), not the latest version. Verify compares with that publication.
+* **RPM publish settings** (`metadata_signing_service`, `checksum_type`, `repo_config`,
+  `compression_type`, `layout`) come from the repository when the publication request does
+  not set them (pulp_rpm `viewsets/repository.py`). A Content View publish copies them from
+  the source repository to the snapshot repository first.
 * **Task cancellation** is asynchronous. A task blocked in a network read can end as
   `failed` before the worker processes the cancel request; pulp-tui shows Pulp's final
   state. Cancelling a completed task returns 409 and is shown as such.

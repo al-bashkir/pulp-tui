@@ -32,6 +32,8 @@ pub enum PulpError {
     Unsupported(String),
     #[error("task {state}: {message}")]
     TaskFailed { href: String, state: String, message: String },
+    #[error("could not read task {href}, it may still be running (see Tasks): {message}")]
+    TaskUnknown { href: String, message: String },
     #[error("{0}")]
     Config(String),
 }
@@ -479,7 +481,7 @@ fn json_or_text(b: &[u8]) -> Body {
     if b.is_empty() { Body::None } else { serde_json::from_slice(b).map_or_else(|_| Body::Text(b.to_vec()), Body::Json) }
 }
 
-fn retryable(e: &PulpError) -> bool {
+pub(crate) fn retryable(e: &PulpError) -> bool {
     match e {
         PulpError::Network(_) | PulpError::Timeout => true,
         PulpError::Api { status, .. } => matches!(status, 429 | 502 | 503 | 504),
