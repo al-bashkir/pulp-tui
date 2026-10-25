@@ -530,22 +530,6 @@ async fn deb_copy_is_structured_without_dependency_solving() {
     );
 }
 
-#[tokio::test]
-async fn deb_copy_names_the_body_limit_of_the_server() {
-    // Pulp refuses a body above Django's DATA_UPLOAD_MAX_MEMORY_SIZE with an HTML 400 (no message).
-    let server = MockServer::start().await;
-    let page = "<!doctype html><title>Bad Request (400)</title>";
-    Mock::given(method("POST")).respond_with(ResponseTemplate::new(400).set_body_string(page)).mount(&server).await;
-    let c = client(&server, |_, _| {});
-    // 74 bytes per href of this length in compact JSON: 36,000 hrefs are above the limit.
-    let hrefs: Vec<String> = (0..36_000).map(|i| format!("/pulp/api/v3/content/deb/packages/{i:036}/")).collect();
-    let e = deb::copy(&c, "/sv/", "/dr/", Some(0), Some(hrefs)).await.unwrap_err().to_string();
-    assert!(e.starts_with("rejected [400]: request body ") && e.contains(" bytes, 36000 hrefs; "), "{e}");
-    assert!(e.ends_with("raise it in the Pulp settings, or narrow the selection with include rules"), "{e}");
-    let e = deb::copy(&c, "/sv/", "/dr/", Some(0), Some(vec!["/p/1/".into()])).await.unwrap_err().to_string();
-    assert_eq!(e, "rejected [400]", "a small body: the server's answer as it is");
-}
-
 /// A server that lists one Release, two components (one of another release) and `packages`, and
 /// serves the Release file, a `Packages` index for `amd64` and the package bytes.
 async fn deb_server(packages: Value) -> (MockServer, String) {

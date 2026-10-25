@@ -581,21 +581,49 @@ impl CvService {
         }
         let derived = vr.derived_repo.clone().unwrap_or_default();
         if vr.derived_version.is_none() {
-            let sv = vr.source_version.clone();
-            let copy = async {
-                let sv = sv.ok_or_else(|| anyhow!("missing source version"))?;
-                log(format!("{}: selecting content from {sv}", repo.repo_name));
-                let sel = self.select(&repo, &sv, false).await?;
-                self.alive()?;
-                anyhow::Ok(match t {
-                    RepoType::Rpm => rpm::copy(c, &sv, &derived, Some(0), sel.hrefs, false).await?,
-                    RepoType::File => file::modify(c, &derived, true, sel.hrefs.unwrap_or_default()).await?,
-                    RepoType::Deb => deb::copy(c, &sv, &derived, Some(0), sel.hrefs).await?,
-                })
+            let sv = vr.source_version.clone().ok_or_else(|| anyhow!("missing source version"))?;
+            // A pending task is a copy batch already sent; the batches before it are in its version.
+            let resumed = match vr.pending_task {
+                Some(_) => Some(self.tracked_task(vr, "copy", std::future::ready(Err(anyhow!("no copy task"))), log, on).await?),
+                None => None,
             };
-            let task = self.tracked_task(vr, "copy", copy, log, on).await?;
+            log(format!("{}: selecting content from {sv}", repo.repo_name));
+            let sel = self.select(&repo, &sv, false).await?;
+            let batches: Vec<Option<Vec<String>>> = match (sel.hrefs, resumed.is_some()) {
+                // Without filters one request copies everything: the pending task was that request.
+                (None, true) => vec![],
+                (None, false) => vec![None],
+                (Some(all), true) => {
+                    let r: Repository = c.get(&derived, &[]).await?;
+                    let latest = r.latest_version_href.ok_or_else(|| anyhow!("derived repository has no version"))?;
+                    let present: HashSet<String> = ops::content_in(c, &latest).await?.into_iter().collect();
+                    let rest: Vec<String> = all.into_iter().filter(|h| !present.contains(h)).collect();
+                    if rest.is_empty() { vec![] } else { ops::batches(&rest).into_iter().map(|b| Some(b.to_vec())).collect() }
+                }
+                (Some(all), false) => ops::batches(&all).into_iter().map(|b| Some(b.to_vec())).collect(),
+            };
+            let (n, fresh) = (batches.len(), resumed.is_none());
+            let mut task = resumed;
+            for (i, units) in batches.into_iter().enumerate() {
+                // The first batch starts from an empty version; the others add to the latest one.
+                let empty = fresh && i == 0;
+                // In memory only: until the next batch is saved, the row keeps the last one for Resume.
+                vr.pending_task = None;
+                if n > 1 {
+                    log(format!("{}: copy batch {}/{n}", repo.repo_name, i + 1));
+                }
+                let copy = async {
+                    self.alive()?;
+                    anyhow::Ok(match t {
+                        RepoType::Rpm => rpm::copy(c, &sv, &derived, empty.then_some(0), units, false).await?,
+                        RepoType::File => file::modify(c, &derived, empty, units.unwrap_or_default()).await?,
+                        RepoType::Deb => deb::copy(c, &sv, &derived, empty.then_some(0), units).await?,
+                    })
+                };
+                task = Some(self.tracked_task(vr, "copy", copy, log, on).await?);
+            }
             // No new version is created when the content equals the latest version.
-            let version = match task.created_matching("/versions/") {
+            let version = match task.as_ref().and_then(|t| t.created_matching("/versions/")) {
                 Some(v) => v,
                 None => {
                     let r: Repository = c.get(&derived, &[]).await?;
@@ -1403,6 +1431,99 @@ mod tests {
         let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
         assert_eq!(saved.pending_task, None, "Resume copies again instead of waiting on the dead task");
         assert_none(&server, "POST").await;
+    }
+
+    const FILE_DERIVED: &str = "/pulp/api/v3/repositories/file/file/2/";
+
+    /// A File row before its copy, with `n` files in the source version, and a server that completes
+    /// every task with version 3 of the derived repository. The publish step after the copy is not served.
+    async fn file_copy(server: &wiremock::MockServer, svc: &CvService, n: usize) -> (CvVersionRepo, Vec<String>) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let repo = CvRepo {
+            repo_href: "/pulp/api/v3/repositories/file/file/1/".into(),
+            repo_name: "iso".into(),
+            repo_type: RepoType::File,
+            filters: vec![],
+        };
+        let v = svc.store.begin_version(cv, "", &[repo]).await.unwrap();
+        let mut vr = svc.store.version_repos(v.id).await.unwrap().remove(0);
+        vr.source_version = Some("/pulp/api/v3/repositories/file/file/1/versions/1/".into());
+        vr.derived_repo = Some(FILE_DERIVED.into());
+        let hrefs: Vec<String> = (0..n).map(|i| format!("/pulp/api/v3/content/file/files/{i:036}/")).collect();
+        let files: Vec<Value> = hrefs.iter().map(|h| json!({ "pulp_href": h, "relative_path": h })).collect();
+        let page = |results: Vec<Value>| {
+            ResponseTemplate::new(200).set_body_json(json!({ "count": results.len(), "next": null, "results": results }))
+        };
+        Mock::given(method("GET")).and(path("/pulp/api/v3/content/file/files/")).respond_with(page(files)).mount(server).await;
+        let latest = format!("{FILE_DERIVED}versions/3/");
+        let derived = json!({ "pulp_href": FILE_DERIVED, "name": "web-iso", "latest_version_href": latest, "pulp_labels": { LABEL_DB: svc.store.db_id() } });
+        Mock::given(method("GET"))
+            .and(path(FILE_DERIVED))
+            .respond_with(ResponseTemplate::new(200).set_body_json(derived))
+            .mount(server)
+            .await;
+        let task = json!({ "task": "/pulp/api/v3/tasks/1/" });
+        Mock::given(method("POST"))
+            .and(path(format!("{FILE_DERIVED}modify/")))
+            .respond_with(ResponseTemplate::new(202).set_body_json(task))
+            .mount(server)
+            .await;
+        let done = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "completed", "name": "modify", "created_resources": [latest] });
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/tasks/1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(done))
+            .mount(server)
+            .await;
+        let version = json!({ "pulp_href": latest, "number": 3 });
+        Mock::given(method("GET")).and(path(latest)).respond_with(ResponseTemplate::new(200).set_body_json(version)).mount(server).await;
+        (vr, hrefs)
+    }
+
+    /// The bodies of the modify requests the server received.
+    async fn modify_bodies(server: &wiremock::MockServer) -> Vec<Value> {
+        let sent = server.received_requests().await.unwrap();
+        sent.iter().filter(|r| r.method.as_str() == "POST").map(|r| r.body_json().unwrap()).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_large_selection_is_copied_in_batches() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (mut vr, hrefs) = file_copy(&server, &svc, 30_000).await;
+        svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err(); // the publish step is not served
+        let bodies = modify_bodies(&server).await;
+        assert_eq!(bodies.len(), 2, "30,000 hrefs of 73 bytes do not fit in one body");
+        assert_eq!(bodies[0]["remove_content_units"], json!(["*"]), "the first batch starts from an empty version");
+        assert!(bodies[1].get("remove_content_units").is_none(), "the next batch adds to it");
+        let sent: Vec<String> =
+            bodies.iter().flat_map(|b| serde_json::from_value::<Vec<String>>(b["add_content_units"].clone()).unwrap()).collect();
+        assert_eq!(sent, hrefs);
+        let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
+        assert_eq!((saved.derived_version.as_deref(), saved.pending_task), (Some(format!("{FILE_DERIVED}versions/3/").as_str()), None));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_sends_only_the_batches_not_in_the_version() {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (mut vr, hrefs) = file_copy(&server, &svc, 30_000).await;
+        // The first batch was sent and completed before the client stopped; its version has those units.
+        vr.pending_task = Some("/pulp/api/v3/tasks/1/".into());
+        svc.store.save_version_repo(&vr).await.unwrap();
+        let present: Vec<Value> = hrefs[..20_000].iter().map(|h| json!({ "pulp_href": h })).collect();
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/content/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 20_000, "next": null, "results": present })))
+            .mount(&server)
+            .await;
+        svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err(); // the publish step is not served
+        let bodies = modify_bodies(&server).await;
+        assert_eq!(bodies.len(), 1, "only the rest is sent");
+        assert!(bodies[0].get("remove_content_units").is_none(), "added to the version of the earlier batches");
+        assert_eq!(bodies[0]["add_content_units"], json!(hrefs[20_000..]));
     }
 
     const DEB_DERIVED: &str = "/pulp/api/v3/repositories/deb/apt/2/";

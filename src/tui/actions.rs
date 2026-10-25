@@ -924,11 +924,23 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         ap(move |app| {
                             app.confirm("Confirm copy", lines, move |app| {
                                 submit(app, format!("copy {source} -> {name}"), move |c| async move {
-                                    Ok(match t {
-                                        RepoType::Rpm => rpm::copy(&c, &sv, &href, None, units, deps).await?,
-                                        RepoType::File => file::modify(&c, &href, false, units.unwrap_or_default()).await?,
-                                        RepoType::Deb => deb::copy(&c, &sv, &href, None, units).await?,
-                                    })
+                                    let batches: Vec<Option<Vec<String>>> = match units {
+                                        None => vec![None],
+                                        Some(u) => ops::batches(&u).into_iter().map(|b| Some(b.to_vec())).collect(),
+                                    };
+                                    // Each batch adds to the latest version: wait for one before the next; the last goes to Tasks.
+                                    let mut sent = None;
+                                    for units in batches {
+                                        if let Some(m) = sent.take() {
+                                            ops::settle(&c, m, &ops::no_progress).await?;
+                                        }
+                                        sent = Some(match t {
+                                            RepoType::Rpm => rpm::copy(&c, &sv, &href, None, units, deps).await?,
+                                            RepoType::File => file::modify(&c, &href, false, units.unwrap_or_default()).await?,
+                                            RepoType::Deb => deb::copy(&c, &sv, &href, None, units).await?,
+                                        });
+                                    }
+                                    sent.ok_or_else(|| anyhow!("nothing to copy"))
                                 })
                             })
                         })
@@ -2006,6 +2018,50 @@ mod tests {
             }
             assert_eq!(sent, json!({ "config": [cfg], "structured": true, "dependency_solving": false }));
         }
+    }
+
+    #[tokio::test]
+    async fn a_large_copy_is_sent_in_batches_one_after_the_other() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let (src, dst) = (format!("{API}repositories/deb/apt/src/"), format!("{API}repositories/deb/apt/dst/"));
+        let repo = json!([{ "pulp_href": src, "name": "src", "latest_version_href": format!("{src}versions/3/") }]);
+        get(&server, &format!("{API}repositories/deb/apt/"), page(repo)).await;
+        let hrefs: Vec<String> = (0..30_000).map(|i| format!("{API}content/deb/packages/{i:036}/")).collect();
+        let pkgs: Vec<Value> =
+            hrefs.iter().map(|h| json!({ "pulp_href": h, "package": "p", "version": "1.0-1", "architecture": "amd64" })).collect();
+        get(&server, &format!("{API}content/deb/packages/"), page(json!(pkgs))).await;
+        get(&server, &format!("{API}tasks/1/"), json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "name": "copy" }))
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(format!("{API}deb/copy/")))
+            .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        repo_action(&mut app, RepoType::Deb, Act::CopyContent, json!({ "pulp_href": dst, "name": "dst" }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        form.fields[0].value = "src".into();
+        form.fields[1].value = "include arch=amd64".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        let sent = server.received_requests().await.unwrap();
+        let kinds: Vec<_> = sent
+            .iter()
+            .filter(|r| r.method.as_str() == "POST" || r.url.path().ends_with("/tasks/1/"))
+            .map(|r| r.method.to_string())
+            .collect();
+        assert_eq!(kinds, ["POST", "GET", "POST"], "the first batch is done before the second is sent");
+        let units: Vec<String> = sent
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .flat_map(|r| serde_json::from_value::<Vec<String>>(r.body_json::<Value>().unwrap()["config"][0]["content"].clone()).unwrap())
+            .collect();
+        assert_eq!(units, hrefs);
     }
 
     #[tokio::test]

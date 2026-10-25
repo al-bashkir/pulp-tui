@@ -151,11 +151,13 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
   | 35,000 | 2,625,297 | 400 HTML `Bad Request (400)` (body refused) |
   | 60,000 | 4,500,297 | 400 HTML `Bad Request (400)` (body refused) |
 
-  One copy body holds every selected href (no batching), so a filtered Deb snapshot of more
-  than about 35,000 packages fails. `deb::copy` then adds the body size, the number of hrefs
-  and the workaround to the error: raise `DATA_UPLOAD_MAX_MEMORY_SIZE` in the Pulp settings,
-  or narrow the selection with include rules. `rpm/copy/` has the same limit (the error
-  there is the plain `rejected [400]`).
+  `rpm/copy/` and `modify/` have the same limit. So pulp-tui sends a selection in batches of
+  at most 2,000,000 bytes of hrefs (`ops::batches`, sized by the longest href), one task
+  after the other: the first batch of a Content View snapshot starts from an empty version
+  (`dest_base_version: 0`, or `remove_content_units: ["*"]` for File), the others add to the
+  latest version. Each batch makes a version of the derived repository; the last one is the
+  snapshot. A resumed publish lists the content of the latest derived version and sends only
+  the hrefs it lacks.
 
 ## Shared database (PostgreSQL)
 

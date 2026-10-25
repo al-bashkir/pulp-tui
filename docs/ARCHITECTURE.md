@@ -106,8 +106,8 @@ idle group whose counts stay the same for three polls is also treated as final.
 * Deb filters select binary packages by name glob, architecture glob and dpkg version
   comparison. A filtered snapshot has only the selected packages and the release records
   that the structured copy adds; source packages and upstream index files are dropped (the
-  publication makes new indices). One copy body holds every selected href, and Pulp refuses
-  a body above 2.5 MiB (see COMPATIBILITY.md); batching is not implemented.
+  publication makes new indices). Pulp refuses a body above 2.5 MiB, so a large selection
+  is copied in batches, each a version of the derived repository (see COMPATIBILITY.md).
 * A **Content View Version** is immutable. It refers to exact derived repository versions
   and publications. Version numbers are never reused.
 * **Lifecycle environments** form paths from `Library`, for example

@@ -74,9 +74,6 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String>
     fail(format!("package {} not listed in any Packages index (tried {})", p.key(), tried.join(", ")))
 }
 
-/// Django's default `DATA_UPLOAD_MAX_MEMORY_SIZE` in Pulp: a larger request body gets HTTP 400 (an HTML page).
-const MAX_BODY: usize = 2_621_440;
-
 /// Copy content of a repository version into `dest_repo` (Deb copy API). `content` limits the
 /// copy to those hrefs; `dest_base_version` starts the new version from that base (0 = empty).
 /// `structured` also copies the release, component and architecture records of the packages.
@@ -91,21 +88,8 @@ pub async fn copy(
     if let Some(b) = dest_base_version {
         cfg["dest_base_version"] = b.into();
     }
-    let n = content.as_ref().map_or(0, Vec::len);
     if let Some(u) = content {
         cfg["content"] = u.into();
     }
-    // shortcut: one copy body holds every selected href; Pulp (Django DATA_UPLOAD_MAX_MEMORY_SIZE, default 2.5 MiB ≈ 34,900 hrefs) refuses larger bodies; batch when that limit matters.
-    let body = json!({ "config": [cfg], "structured": true, "dependency_solving": false });
-    let size = body.to_string().len();
-    c.post(&c.api("deb/copy/"), &body).await.map_err(|e| match e {
-        PulpError::Api { status: 400, message } if size > MAX_BODY => {
-            let hint = format!(
-                "request body {size} bytes, {n} hrefs; the server refuses request bodies above DATA_UPLOAD_MAX_MEMORY_SIZE \
-                 (default 2.5 MiB): raise it in the Pulp settings, or narrow the selection with include rules"
-            );
-            PulpError::Api { status: 400, message: if message.is_empty() { hint } else { format!("{message}; {hint}") } }
-        }
-        e => e,
-    })
+    c.post(&c.api("deb/copy/"), &json!({ "config": [cfg], "structured": true, "dependency_solving": false })).await
 }

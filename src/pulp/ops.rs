@@ -272,6 +272,21 @@ pub async fn content_in(c: &PulpClient, version: &str) -> Result<Vec<String>> {
     Ok(v.into_iter().filter_map(|x| x["pulp_href"].as_str().map(str::to_string)).collect())
 }
 
+/// Bytes of hrefs in one copy or modify body. Pulp refuses a body above Django's
+/// `DATA_UPLOAD_MAX_MEMORY_SIZE` (default 2,621,440) with HTTP 400; this leaves room for the rest.
+const BATCH_BYTES: usize = 2_000_000;
+
+/// `hrefs` in batches that each fit in one request body, sized by the longest href (with its JSON
+/// quotes and comma). An empty list is one empty batch: it still makes the request (an empty version).
+pub fn batches(hrefs: &[String]) -> Vec<&[String]> {
+    let longest = hrefs.iter().map(|h| h.len() + 3).max().unwrap_or(1);
+    let mut out: Vec<_> = hrefs.chunks((BATCH_BYTES / longest).max(1)).collect();
+    if out.is_empty() {
+        out.push(hrefs);
+    }
+    out
+}
+
 /// Human-readable identity of each unit in a version (NEVRA or path+digest) for diffs.
 pub async fn content_keys(c: &PulpClient, t: RepoType, version: Option<&str>) -> Result<BTreeSet<String>> {
     let Some(v) = version else { return Ok(BTreeSet::new()) };
@@ -439,6 +454,17 @@ mod tests {
         assert_eq!(label_owner(&l(None), "pulp_tui_db", "me", &aliases), Ok(true));
         assert_eq!(label_owner(&l(Some("old")), "pulp_tui_db", "me", &aliases), Ok(true));
         assert_eq!(label_owner(&l(Some("other")), "pulp_tui_db", "me", &aliases), Err("other".into()));
+    }
+
+    #[test]
+    fn batches_fit_one_request_body() {
+        let hrefs: Vec<String> = (0..60_000).map(|i| format!("/pulp/api/v3/content/deb/packages/{i:036}/")).collect();
+        let b = batches(&hrefs);
+        assert_eq!(b.len(), 3, "60,000 hrefs of 73 bytes");
+        assert!(b.iter().all(|x| serde_json::to_string(x).unwrap().len() <= BATCH_BYTES));
+        assert_eq!(b.concat(), hrefs, "every href once, in order");
+        assert_eq!(batches(&hrefs[..10]).len(), 1);
+        assert_eq!(batches(&[]), [&[] as &[String]], "an empty selection is still one request");
     }
 
     #[test]

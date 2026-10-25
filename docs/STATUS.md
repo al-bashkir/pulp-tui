@@ -101,9 +101,8 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
   Not goals: upload of `.deb` files, replication (native or fallback; a Deb distribution is
   skipped with a note), verbatim publications, dependency solving on copy. The signing
   service pickers list the services of all plugins (pulpcore has no type filter); Pulp
-  refuses a wrong one. A filtered Deb snapshot sends every selected href in one body, and
-  Pulp refuses a body above 2.5 MiB (about 35,000 packages; COMPATIBILITY.md); there is no
-  batching. Deb Content View publications are never reused, so each version has its own.
+  refuses a wrong one. A large selection is sent in batches below Pulp's 2.5 MiB body limit
+  (COMPATIBILITY.md). Deb Content View publications are never reused, so each version has its own.
 * The TUI flows of Deb (Publish with a signing service, the Deb signing choice of a
   Content View publish) were not run by hand in a terminal. They are covered by unit
   tests; the services behind them by `live_deb`.

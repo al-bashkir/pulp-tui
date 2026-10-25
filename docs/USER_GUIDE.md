@@ -309,11 +309,13 @@ previous version). A composite uses the publications of its component versions, 
 Publish does not ask.
 
 **Large selections.** Pulp refuses a request body above 2.5 MiB (Django
-`DATA_UPLOAD_MAX_MEMORY_SIZE`) with `rejected [400]`. That is about 35,000 package hrefs in one
-Deb copy. pulp-tui then adds the body size and the number of hrefs to the error. Raise
-`DATA_UPLOAD_MAX_MEMORY_SIZE` in the Pulp settings, or narrow the selection with include rules
-(for example `include arch=amd64`). An RPM repository with filter rules has the same limit
-(`rpm/copy/`). A repository without filter rules sends no list of hrefs.
+`DATA_UPLOAD_MAX_MEMORY_SIZE`), which is about 35,000 package hrefs. So pulp-tui sends a large
+selection in batches, one after the other; the job's progress shows `copy batch 2/3`. Each batch
+makes one version of the snapshot repository, and the last one is the snapshot, so the
+snapshot repository can have more versions than the view. When a publish stops between
+batches, Resume sends only the batches that are not in the snapshot repository yet. Copy
+content (`C` on a repository) also sends batches; Tasks shows the last one. A repository
+without filter rules sends no list of hrefs.
 
 #### Composite Content Views
 
