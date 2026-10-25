@@ -78,8 +78,8 @@ podman run --rm -it --read-only \
 cargo test                     # unit + mock HTTP tests (live tests skip themselves)
 tests/run-live.sh              # starts Pulp in Podman/Docker, runs all live scenarios
 tests/run-live.sh repos cv     # selected scenarios (repos cv rbac failures replication shared_db)
-tests/env/pulp-env.sh down pulp1; tests/env/pulp-env.sh down pulp2; tests/env/pulp-env.sh http-down
-tests/env/pulp-env.sh pg-down  # remove the PostgreSQL container
+tests/env/pulp-env.sh up-all     # start pulp1, pulp2, PostgreSQL and the fixture http server
+tests/env/pulp-env.sh down-all   # remove all of them (containers and volumes)
 ```
 
 The live environment uses `quay.io/pulp/pulp` (pulpcore, pulp_rpm, pulp_file), local RPM

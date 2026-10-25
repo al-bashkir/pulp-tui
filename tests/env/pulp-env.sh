@@ -5,6 +5,7 @@
 #   tests/env/pulp-env.sh down [pulp1|pulp2]   stop and remove container + volumes
 #   tests/env/pulp-env.sh status
 #   tests/env/pulp-env.sh pg-up | pg-down   PostgreSQL for the shared-database tests
+#   tests/env/pulp-env.sh up-all | down-all   pulp1, pulp2, PostgreSQL and the fixture http server
 #
 # pulp1 (port 8080) is the main/downstream server. pulp2 (port 8081) is only
 # needed by the replication tests (upstream). Both use admin/password.
@@ -130,6 +131,8 @@ case "$cmd" in
   pg-down) pg_down ;;
   http-up) http_up ;;
   http-down) http_down ;;
+  up-all) up pulp1; up pulp2; pg_up; http_up ;;
+  down-all) down pulp1; down pulp2; pg_down; http_down ;;
   status) $RUNTIME ps -a --filter name=pulp --format '{{.Names}} {{.Status}} {{.Ports}}' ;;
-  *) echo "usage: $0 up|down|status [pulp1|pulp2] | pg-up|pg-down | http-up|http-down" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|status [pulp1|pulp2] | pg-up|pg-down | http-up|http-down | up-all|down-all" >&2; exit 2 ;;
 esac

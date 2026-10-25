@@ -47,7 +47,7 @@ cargo audit
 ```
 
 Live tests skip unless `PULP_TUI_LIVE=1`. They use unique object names, so they can rerun
-against the same containers; `tests/env/pulp-env.sh down …` resets everything.
+against the same containers; `tests/env/pulp-env.sh down-all` resets everything.
 
 ## Database migrations
 
