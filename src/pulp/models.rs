@@ -272,6 +272,8 @@ pub struct Publication {
     pub repository_version: Option<String>,
     pub repository: Option<String>,
     pub pulp_created: Option<String>,
+    #[serde(default)]
+    pub signing_service: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

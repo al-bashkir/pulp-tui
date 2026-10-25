@@ -98,23 +98,23 @@ fn served_by(ds: &[Distribution], serves: impl Fn(&Distribution) -> bool) -> Vec
     ds.iter().filter(|d| serves(d)).map(|d| format!("  {} ({})", d.name, d.base_url.as_deref().unwrap_or(&d.base_path))).collect()
 }
 
-/// What a distribution serves: (repository version, publication layout, how). `None`: nothing.
+/// What a distribution serves: (repository version, its publication or `Null`, how). `None`: nothing.
 /// A repository binding serves the newest publication of the repository (pulpcore orders by repository
 /// version, then creation), which is not the latest version when that one has no publication.
-async fn served_now(c: &PulpClient, t: RepoType, d: &Value) -> anyhow::Result<Option<(String, String, String)>> {
+async fn served_now(c: &PulpClient, t: RepoType, d: &Value) -> anyhow::Result<Option<(String, Value, String)>> {
     if let Some(p) = d["publication"].as_str() {
         let pv: Value = c.get(p, &[]).await?;
-        return Ok(Some((s(&pv, "repository_version"), s(&pv, "layout"), format!("pinned to publication {}", short(p)))));
+        return Ok(Some((s(&pv, "repository_version"), pv, format!("pinned to publication {}", short(p)))));
     }
     if let Some(v) = d["repository_version"].as_str() {
-        return Ok(Some((v.to_string(), String::new(), "pinned to repository version".into())));
+        return Ok(Some((v.to_string(), Value::Null, "pinned to repository version".into())));
     }
     let Some(r) = d["repository"].as_str() else { return Ok(None) };
     let pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository", r.into())], 100_000).await?;
     let newest = pubs.into_iter().max_by_key(|p| (version_number(&s(p, "repository_version")), s(p, "pulp_created")));
     Ok(newest.map(|p| {
         let how = format!("follows repository {}: newest publication {}", short(r), short(&s(&p, "pulp_href")));
-        (s(&p, "repository_version"), s(&p, "layout"), how)
+        (s(&p, "repository_version"), p, how)
     }))
 }
 
@@ -874,13 +874,12 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             None => app.error("repository has no versions"),
             Some(v) => {
                 let v = v.to_string();
-                app.job(format!("publish {name} {}", short(&v)), move |ctx| async move {
-                    let p = ops::ensure_publication(&ctx.client, t, &v, &ctx.on_task()).await?;
-                    ap(move |app| app.ok(format!("publication {} for {}", short(&p), short(&v))))
-                });
+                publish_form(app, t, format!("Publish {name}"), move |app, sv| publish(app, t, &name, v.clone(), sv));
             }
         },
-        Act::Distribute => distribute_form(app, t, name.clone(), item["latest_version_href"].as_str().map(str::to_string), Some(href)),
+        Act::Distribute => {
+            distribute_form(app, t, name.clone(), item["latest_version_href"].as_str().map(str::to_string), Some(href), None)
+        }
         Act::CopyContent => {
             let mut fields = vec![
                 Field::pick("source", "Source repository", Source::Repos(Some(t))).required(),
@@ -942,28 +941,61 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     }
 }
 
-/// Create or re-point a distribution to the publication of `version` (pinned), or bind it to
-/// the repository (follows the latest publication).
-fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<String>, repo: Option<String>) {
+/// The optional signing service of a Deb publication; `None` for other types and when the server's Deb
+/// publications have no such field (the repository's keys apply).
+fn signing_field(app: &App, t: RepoType) -> Option<Field> {
+    match t {
+        RepoType::Rpm | RepoType::File => None,
+        RepoType::Deb => caps(app).is_none_or(|c| c.has_field("deb.AptPublication", "signing_service")).then(|| {
+            // shortcut: signing-services/ has no type filter, so non-Deb services are listed and Pulp refuses them; filter when pulpcore exposes the type.
+            Field::pick("signing_service", "Signing service", Source::SigningServices)
+                .help("empty = repository default (the repository's own keys apply; a publication cannot turn them off)")
+        }),
+    }
+}
+
+/// Run `go` with the signing service of a publish: asked first when `signing_field` offers one, else `None`.
+fn publish_form(app: &mut App, t: RepoType, title: String, go: impl Fn(&mut App, Option<String>) + 'static) {
+    match signing_field(app, t) {
+        None => go(app, None),
+        Some(field) => app.form(Form::new(title, vec![field]), move |app, f| {
+            go(app, f.opt("signing_service").map(str::to_string));
+            Ok(())
+        }),
+    }
+}
+
+fn publish(app: &mut App, t: RepoType, name: &str, version: String, signing_service: Option<String>) {
+    app.job(format!("publish {name} {}", short(&version)), move |ctx| async move {
+        let p = ops::ensure_publication(&ctx.client, t, &version, signing_service.as_deref(), &ctx.on_task()).await?;
+        ap(move |app| app.ok(format!("publication {} for {}", short(&p), short(&version))))
+    });
+}
+
+/// Create or re-point a distribution to `publication`, or to the publication of `version` (pinned), or bind
+/// it to the repository (follows the latest publication).
+fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<String>, repo: Option<String>, publication: Option<String>) {
     let modes = if repo.is_some() {
         vec!["pin this version".to_string(), "follow repository latest".to_string()]
     } else {
         vec!["pin this version".to_string()]
     };
-    let form = Form::new(
-        format!("Distribute {name}"),
-        vec![
-            Field::text("dist", "Distribution name").required().value(name.clone()),
-            Field::text("base_path", "Base path").required().value(name.clone()),
-            Field::new("mode", "Binding", FieldKind::Choice(modes)),
-        ],
-    )
-    .note("Pinned: serves exactly one immutable publication. Following latest: serves the newest publication (RPM: use autopublish).")
-    .note("An existing distribution with this name is re-pointed; base paths of other distributions are never taken over.");
+    let mut fields = vec![
+        Field::text("dist", "Distribution name").required().value(name.clone()),
+        Field::text("base_path", "Base path").required().value(name.clone()),
+        Field::new("mode", "Binding", FieldKind::Choice(modes)),
+    ];
+    if publication.is_none() {
+        fields.extend(signing_field(app, t));
+    }
+    let form = Form::new(format!("Distribute {name}"), fields)
+        .note("Pinned: serves exactly one immutable publication. Following latest: serves the newest publication (RPM: use autopublish).")
+        .note("An existing distribution with this name is re-pointed; base paths of other distributions are never taken over.");
     app.form(form, move |app, f| {
         let (dist, bp, follow) =
             (f.get("dist").to_string(), f.get("base_path").trim_matches('/').to_string(), f.get("mode").starts_with("follow"));
-        let (version, repo) = (version.clone(), repo.clone());
+        let (version, repo, publication) = (version.clone(), repo.clone(), publication.clone());
+        let signing = f.opt("signing_service").map(str::to_string);
         app.job(format!("distribute {dist}"), move |ctx| async move {
             let c = &ctx.client;
             let on = ctx.on_task();
@@ -996,8 +1028,13 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
                     }
                 }
             } else {
-                let v = version.ok_or_else(|| anyhow!("repository has no versions"))?;
-                let p = ops::ensure_publication(c, t, &v, &on).await?;
+                let p = match publication {
+                    Some(p) => p,
+                    None => {
+                        let v = version.ok_or_else(|| anyhow!("repository has no versions"))?;
+                        ops::ensure_publication(c, t, &v, signing.as_deref(), &on).await?
+                    }
+                };
                 ops::ensure_distribution(c, t, &dist, &bp, Some(&p), &json!({}), None, &on).await?
             };
             let d: Value = c.get(&href, &[]).await?;
@@ -1164,13 +1201,16 @@ fn version_action(app: &mut App, act: Act, item: Value) {
     let repo = repo_of_version(&href);
     match act {
         Act::Content => app.push(Kind::Content { version: href, ctype: 0 }),
-        Act::Publish => app.job(format!("publish {}", short(&href)), move |ctx| async move {
-            let p = ops::ensure_publication(&ctx.client, t, &href, &ctx.on_task()).await?;
-            ap(move |app| app.ok(format!("publication {} for version {number}", short(&p))))
+        Act::Publish => publish_form(app, t, format!("Publish version {number}"), move |app, sv| {
+            let (href, number) = (href.clone(), number.clone());
+            app.job(format!("publish {}", short(&href)), move |ctx| async move {
+                let p = ops::ensure_publication(&ctx.client, t, &href, sv.as_deref(), &ctx.on_task()).await?;
+                ap(move |app| app.ok(format!("publication {} for version {number}", short(&p))))
+            })
         }),
         Act::Distribute => {
             let name = app.last_repo.as_ref().filter(|r| r.1 == repo).map(|r| r.2.clone()).unwrap_or_else(|| short(&repo));
-            distribute_form(app, t, name, Some(href), None);
+            distribute_form(app, t, name, Some(href), None, None);
         }
         Act::Rollback => {
             let form = Form::new(
@@ -1240,9 +1280,10 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
         let d: Value =
             ops::find_by_name(c, &c.api(t.distributions()), &dist).await?.ok_or_else(|| anyhow!("no {} distribution {dist}", t.label()))?;
         cv_distribution_refusal(&d)?;
-        let current = match served_now(c, t, &d).await? {
-            Some((v, _, how)) => format!("{} ({how})", short(&v)),
-            None => "nothing".into(),
+        // The new publication keeps the signing service of the served one (a Deb publication can have its own).
+        let (current, signing) = match served_now(c, t, &d).await? {
+            Some((v, p, how)) => (format!("{} ({how})", short(&v)), p["signing_service"].as_str().map(str::to_string)),
+            None => ("nothing".into(), None),
         };
         let lines = vec![
             format!("Distribution {dist} ({})", s(&d, "base_url")),
@@ -1259,7 +1300,7 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
                 app.job(format!("rollback {dist}"), move |ctx| async move {
                     let c = &ctx.client;
                     let on = ctx.on_task();
-                    let p = ops::ensure_publication(c, t, &version, &on).await?;
+                    let p = ops::ensure_publication(c, t, &version, signing.as_deref(), &on).await?;
                     let base = s(&d, "base_path");
                     ops::ensure_distribution(c, t, &dist, &base, Some(&p), &json!({}), None, &on).await?;
                     let pv: Value = c.get(&p, &[]).await?;
@@ -1317,7 +1358,7 @@ fn content_action(app: &mut App, version: String, act: Act) {
                 vec![Field::pick("target", "Target repository", Source::Repos(Some(t))).required()],
             );
             app.form(form, move |app, f| {
-                let (target, units, kind) = (f.get("target").to_string(), units.clone(), app.list.kind.clone());
+                let (target, units, kind, version) = (f.get("target").to_string(), units.clone(), app.list.kind.clone(), version.clone());
                 let label = format!("add {} unit(s) to {target}", units.len());
                 app.job(label.clone(), move |ctx| async move {
                     let c = &ctx.client;
@@ -1326,7 +1367,13 @@ fn content_action(app: &mut App, version: String, act: Act) {
                     if let Some(e) = snapshot_refusal(&r) {
                         bail!(e);
                     }
-                    let m = c.post(&format!("{}modify/", s(&r, "pulp_href")), &json!({ "add_content_units": units })).await?;
+                    let m = match t {
+                        RepoType::Rpm | RepoType::File => {
+                            c.post(&format!("{}modify/", s(&r, "pulp_href")), &json!({ "add_content_units": units })).await?
+                        }
+                        // modify/ adds no release component records, so apt would not see the packages.
+                        RepoType::Deb => deb::copy(c, &version, &s(&r, "pulp_href"), None, Some(units)).await?,
+                    };
                     ap(move |app| {
                         if app.list.kind == kind {
                             app.list.marked.clear();
@@ -1364,7 +1411,7 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         Some(n) => version_of(&s(&r, "pulp_href"), n),
                         None => r["latest_version_href"].as_str().ok_or_else(|| anyhow!("no versions"))?.to_string(),
                     };
-                    let p = ops::ensure_publication(c, t, &v, &ctx.on_task()).await?;
+                    let p = ops::ensure_publication(c, t, &v, None, &ctx.on_task()).await?;
                     ap(move |app| {
                         app.ok(format!("publication {} of {}", short(&p), short(&v)));
                         app.reload();
@@ -1375,7 +1422,12 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         }
         Act::Distribute => {
             let v = s(&item, "repository_version");
-            distribute_form(app, t, short(&repo_of_version(&v)), Some(v), None);
+            // Deb: this publication can have a signing service that a reuse by version would not find.
+            let p = match t {
+                RepoType::Rpm | RepoType::File => None,
+                RepoType::Deb => Some(href),
+            };
+            distribute_form(app, t, short(&repo_of_version(&v)), Some(v), None, p);
         }
         Act::Delete => {
             let (id, version) = (short(&href), s(&item, "repository_version"));
@@ -1418,10 +1470,10 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         Act::Verify => app.job(format!("verify {name}"), move |ctx| async move {
             let c = &ctx.client;
             let d: Value = c.get(&href, &[]).await?;
-            let Some((version, layout, how)) = served_now(c, t, &d).await? else {
+            let Some((version, publication, how)) = served_now(c, t, &d).await? else {
                 bail!("distribution serves nothing (no binding, or its repository has no publication)");
             };
-            let res = ops::verify_served(c, t, &s(&d, "base_url"), &version, &layout).await;
+            let res = ops::verify_served(c, t, &s(&d, "base_url"), &version, &s(&publication, "layout")).await;
             let lines = vec![
                 format!("{name}: {how}"),
                 format!("expected content: {}", short(&version)),
@@ -1525,7 +1577,7 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                                 Some(n) => version_of(&rh, n),
                                 None => rv["latest_version_href"].as_str().ok_or_else(|| anyhow!("no versions"))?.to_string(),
                             };
-                            b["publication"] = ops::ensure_publication(c, t, &v, &on).await?.into();
+                            b["publication"] = ops::ensure_publication(c, t, &v, None, &on).await?.into();
                             b["repository"] = Value::Null;
                         }
                     }
@@ -1957,6 +2009,234 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deb_content_is_added_with_a_structured_copy() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") }));
+        wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(accepted).mount(&server).await;
+        let (mut app, mut rx) = connected(&server).await;
+        for (t, coll) in [(RepoType::Deb, "deb/apt"), (RepoType::Rpm, "rpm/rpm")] {
+            let dst = format!("{API}repositories/{coll}/dst/");
+            get(&server, &format!("{API}repositories/{coll}/"), page(json!([{ "pulp_href": dst, "name": "dst" }]))).await;
+            let unit = format!("{API}{}1/", t.content());
+            app.list.marked = [unit.clone()].into();
+            content_action(&mut app, format!("{API}repositories/{coll}/src/versions/2/"), Act::AddToRepo);
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            form.fields[0].value = "dst".into();
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+            let sent = server.received_requests().await.unwrap();
+            let post = sent.iter().rfind(|r| r.method.as_str() == "POST").unwrap();
+            let body: Value = post.body_json().unwrap();
+            match t {
+                RepoType::Deb => {
+                    assert_eq!(post.url.path(), format!("{API}deb/copy/"));
+                    let cfg = json!({ "source_repo_version": format!("{API}repositories/deb/apt/src/versions/2/"), "dest_repo": dst, "content": [unit] });
+                    assert_eq!(body, json!({ "config": [cfg], "structured": true, "dependency_solving": false }));
+                }
+                RepoType::Rpm | RepoType::File => {
+                    assert_eq!((post.url.path(), body), (format!("{dst}modify/").as_str(), json!({ "add_content_units": [unit] })));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_deb_publish_asks_for_a_signing_service() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        for coll in ["publications/deb/apt/", "publications/rpm/rpm/"] {
+            get(&server, &format!("{API}{coll}"), page(json!([]))).await;
+            wiremock::Mock::given(method("POST"))
+                .and(path(format!("{API}{coll}")))
+                .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{API}{coll}1/") })))
+                .mount(&server)
+                .await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        let repo = |t: &str| json!({ "pulp_href": format!("{API}repositories/{t}/r/"), "name": "r", "latest_version_href": "/v/" });
+
+        repo_action(&mut app, RepoType::Rpm, Act::Publish, repo("rpm/rpm"));
+        assert!(app.modal.is_none(), "RPM publishes at once");
+        settle(&mut app, &mut rx).await;
+
+        repo_action(&mut app, RepoType::Deb, Act::Publish, repo("deb/apt"));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.fields.len(), 1);
+        assert_eq!(form.fields[0].key, "signing_service");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        form.fields[0].value = "/ss/1/".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        let posts: Vec<Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| r.body_json().unwrap())
+            .collect();
+        assert_eq!(
+            posts,
+            [
+                json!({ "repository_version": "/v/" }),
+                json!({ "repository_version": "/v/" }),
+                json!({ "repository_version": "/v/", "signing_service": "/ss/1/" }),
+            ]
+        );
+    }
+
+    /// The bodies of the POSTs to `p`.
+    async fn posts_to(server: &wiremock::MockServer, p: &str) -> Vec<Value> {
+        let sent = server.received_requests().await.unwrap();
+        sent.iter().filter(|r| r.method.as_str() == "POST" && r.url.path() == p).map(|r| r.body_json().unwrap()).collect()
+    }
+
+    /// A Deb server without publications and distributions: each POST creates `.../9/`.
+    async fn deb_distribute_server() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        for coll in ["publications/deb/apt/", "distributions/deb/apt/", "distributions/"] {
+            get(&server, &format!("{API}{coll}"), page(json!([]))).await;
+        }
+        for coll in ["publications/deb/apt/", "distributions/deb/apt/"] {
+            wiremock::Mock::given(method("POST"))
+                .and(path(format!("{API}{coll}")))
+                .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{API}{coll}9/") })))
+                .mount(&server)
+                .await;
+            get(&server, &format!("{API}{coll}9/"), json!({ "pulp_href": format!("{API}{coll}9/"), "base_url": "http://h/d/" })).await;
+        }
+        server
+    }
+
+    fn keys(f: &Form) -> Vec<String> {
+        f.fields.iter().map(|x| x.key.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn deb_distribute_pins_the_picked_service_or_the_selected_publication() {
+        use crate::tui::app::Modal;
+        let server = deb_distribute_server().await;
+        let (mut app, mut rx) = connected(&server).await;
+        let pubs = format!("{API}publications/deb/apt/");
+        let repo = |coll: &str| json!({ "pulp_href": format!("{API}repositories/{coll}/r/"), "name": "r", "latest_version_href": "/v/" });
+        repo_action(&mut app, RepoType::Rpm, Act::Distribute, repo("rpm/rpm"));
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["dist", "base_path", "mode"], "RPM: no signing service");
+
+        repo_action(&mut app, RepoType::Deb, Act::Distribute, repo("deb/apt"));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["dist", "base_path", "mode", "signing_service"]);
+        form.fields[3].value = "/ss/1/".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &pubs).await, [json!({ "repository_version": "/v/", "signing_service": "/ss/1/" })]);
+
+        // Publications D: the selected publication itself, no lookup by version and no new publication.
+        let lookups = |sent: &[wiremock::Request]| sent.iter().filter(|r| r.method.as_str() == "GET" && r.url.path() == pubs).count();
+        let before = lookups(&server.received_requests().await.unwrap());
+        let selected = format!("{pubs}5/");
+        let item = json!({ "pulp_href": selected, "repository_version": format!("{API}repositories/deb/apt/r/versions/1/") });
+        publication_action(&mut app, RepoType::Deb, Act::Distribute, item);
+        let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["dist", "base_path", "mode"]);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(lookups(&server.received_requests().await.unwrap()), before);
+        assert_eq!(posts_to(&server, &pubs).await.len(), 1);
+        let pinned: Vec<Value> =
+            posts_to(&server, &format!("{API}distributions/deb/apt/")).await.iter().map(|d| d["publication"].clone()).collect();
+        assert_eq!(pinned, [json!(format!("{pubs}9/")), json!(selected)]);
+    }
+
+    #[tokio::test]
+    async fn deb_version_publish_asks_for_a_signing_service() {
+        use crate::tui::app::Modal;
+        let server = deb_distribute_server().await;
+        let (mut app, mut rx) = connected(&server).await;
+        let v = format!("{API}repositories/deb/apt/r/versions/1/");
+        version_action(&mut app, Act::Publish, json!({ "pulp_href": v, "number": 1 }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["signing_service"]);
+        form.fields[0].value = "/ss/1/".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(
+            posts_to(&server, &format!("{API}publications/deb/apt/")).await,
+            [json!({ "repository_version": v, "signing_service": "/ss/1/" })]
+        );
+        assert!(
+            app.notices.iter().any(|n| n.text == "publication 9 for version 1"),
+            "{:?}",
+            app.notices.iter().map(|n| &n.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_signing_service_picker_without_the_publication_field() {
+        use crate::tui::app::Modal;
+        let server = deb_distribute_server().await;
+        let (mut app, mut rx) = connected(&server).await;
+        let mut caps = Capabilities::default();
+        caps.schemas.insert("deb.AptPublication".into(), ["repository_version"].map(String::from).into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let r = format!("{API}repositories/deb/apt/r/");
+        let repo = json!({ "pulp_href": r, "name": "r", "latest_version_href": "/v/" });
+        repo_action(&mut app, RepoType::Deb, Act::Distribute, repo.clone());
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["dist", "base_path", "mode"]);
+        repo_action(&mut app, RepoType::Deb, Act::Publish, repo);
+        assert!(app.modal.is_none(), "publishes at once with the repository default");
+        settle(&mut app, &mut rx).await;
+        version_action(&mut app, Act::Publish, json!({ "pulp_href": format!("{r}versions/1/"), "number": 1 }));
+        assert!(app.modal.is_none());
+        settle(&mut app, &mut rx).await;
+        let sent = posts_to(&server, &format!("{API}publications/deb/apt/")).await;
+        assert_eq!(sent, [json!({ "repository_version": "/v/" }), json!({ "repository_version": format!("{r}versions/1/") })]);
+    }
+
+    #[tokio::test]
+    async fn deb_rollback_keeps_the_signing_service_of_the_served_publication() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = deb_distribute_server().await;
+        let (old, now, d) = (
+            format!("{API}repositories/deb/apt/r/versions/1/"),
+            format!("{API}publications/deb/apt/5/"),
+            format!("{API}distributions/deb/apt/1/"),
+        );
+        let dist = json!({ "pulp_href": d, "name": "prod", "base_path": "prod", "base_url": "http://h/prod/", "publication": now });
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}distributions/deb/apt/")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([dist]))))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let served = json!({ "pulp_href": now, "repository_version": format!("{API}repositories/deb/apt/r/versions/2/"), "signing_service": "/ss/1/" });
+        get(&server, &now, served).await;
+        wiremock::Mock::given(method("PATCH"))
+            .and(path(d.clone()))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": d })))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        rollback_preview(&mut app, RepoType::Deb, "prod".into(), old.clone());
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        let pubs = format!("{API}publications/deb/apt/");
+        assert_eq!(posts_to(&server, &pubs).await, [json!({ "repository_version": old, "signing_service": "/ss/1/" })]);
+        let sent = server.received_requests().await.unwrap();
+        let patch: Value = sent.iter().find(|r| r.method.as_str() == "PATCH").unwrap().body_json().unwrap();
+        assert_eq!(patch["publication"], json!(format!("{pubs}9/")));
+    }
+
+    #[tokio::test]
     async fn mirror_policies_ask_first() {
         use crate::tui::app::Modal;
         use std::{cell::Cell, rc::Rc};
@@ -2135,7 +2415,7 @@ mod tests {
         let (app, _rx) = connected(&server).await;
         let c = &app.conn.as_ref().unwrap().client;
         let served = served_now(c, RepoType::Rpm, &json!({ "repository": repo })).await.unwrap().unwrap();
-        assert_eq!((served.0, served.1.as_str()), (format!("{repo}versions/2/"), "flat"));
+        assert_eq!((served.0, s(&served.1, "layout").as_str()), (format!("{repo}versions/2/"), "flat"));
         assert_eq!(served_now(c, RepoType::Rpm, &json!({ "name": "unbound" })).await.unwrap(), None);
     }
 }

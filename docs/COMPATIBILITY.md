@@ -2,7 +2,7 @@
 
 ## Tested versions
 
-All live tests (`tests/run-live.sh`) passed on 2026-10-24 against the
+All live tests (`tests/run-live.sh`) passed on 2026-10-25 against the
 `quay.io/pulp/pulp:latest` all-in-one image:
 
 | Component | Version |
@@ -10,6 +10,7 @@ All live tests (`tests/run-live.sh`) passed on 2026-10-24 against the
 | pulpcore | 3.123.0 |
 | pulp_rpm | 3.39.3 |
 | pulp_file | 3.123.0 |
+| pulp_deb | 3.11.1 |
 | PostgreSQL (optional shared database) | 16.15 (`docker.io/library/postgres:16`), through sqlx 0.8.6 |
 | Client OS | Fedora 44 (Linux 7.2), Rust 1.99 |
 
@@ -23,6 +24,8 @@ something the server does not have.
 |---|---|---|
 | RPM screens | `status/` component `rpm` | screen shows "not supported: pulp_rpm plugin" |
 | File screens | `status/` component `file` | same for pulp_file |
+| Deb screens | `status/` component `deb` | same for pulp_deb |
+| Deb Content View signing (`signing_service`, `signing_service_release_overrides`) | the field is in the JSON of the derived repository | the field is not sent; a chosen signing service stops the publish with "not supported by this server" |
 | RPM copy (Content Views, copy action) | OpenAPI path `rpm/copy/` | action fails with a precise error |
 | Chunked upload | OpenAPI `uploads/` | — (large uploads need it) |
 | Native replication | pulpcore ≥ 3.23 and OpenAPI `upstream-pulps/`, `{upstream_pulp_href}replicate/` | Replication screen points to the fallback |
@@ -45,6 +48,7 @@ server gives the final answer; the dashboard shows a warning.
 | Distribution base path conflicts | refused with 409 |
 | Distribution `base_path` PATCH (environment relabel): runs as a task (`ageneral_update`), moves the distribution in place (same href, same publication), the new path answers 200 and the old path 404 as soon as the task ends (no content-cache delay seen); a promotion after the relabel serves at the new label | verified |
 | Content Views: multi-repo snapshot, RPM/File filters, advisory filtering, numbered versions, Library auto-binding, promotion path rules, rollback, served-content verification, retention protection, partial failure + retry, resume with re-attach to a submitted task, version and view deletion | verified |
+| Deb (`live_deb`): mirror sync of the fixture, filtered structured copy, publication, distribution, served `Release`, `Packages` index and package digest; a publication with the test signing service is reused only for that service and serves `Release.gpg` and `InRelease`; a Deb Content View with `exclude name=*-dbg`, signed with a service, unsigned (`none`), resumed from a checkpoint with the service, promoted to Dev, and used by a composite; a per-release key of the source signs a `same as source` publish and a `none` publish removes it | verified |
 | Composite Content Views (`live_cv::composite_content_view_rocky9`): one publication served by two distributions at once (the component's Library distribution and the composite's own), auto publish after the extras view publishes, deleting a composite version or a composite keeps the publications and repositories of its components | verified |
 | Native replication: select by `q_select`, nodelete policy, rerun, upstream update | verified |
 | Fallback replication: dry run, create, idempotent rerun, upstream update, conflict with native-replicated objects, loop guard, self-replication guard | verified |
@@ -118,10 +122,40 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
   service of the publication, then the release override of the repository
   (`signing_service_release_overrides`), then the signing service of the repository
   (`publishing.py`, `AptRepository.release_signing_service`).
+* A PATCH of `signing_service_release_overrides` merges
+  (`serializers/repository_serializers.py`, `_update_signing_service_overrides`): only the
+  distributions in the body change, a `null` value deletes that override, and `{}` changes
+  nothing. So pulp-tui sends `null` for each per-release key that a Content View snapshot
+  repository must lose (signing `none` or a service, or a key the source no longer has).
 * `AptPublication` defaults are `structured=true` and `simple=false`.
 * `signing-services/` is the pulpcore endpoint for all plugins. It has no type filter (only
   `name`, `q`, `pulp_href__in` and similar), so a Deb signing service cannot be told from an
   RPM one by a query.
+* A publication signed with the keys of its repository stores `signing_service: null`, the
+  same as an unsigned one. A `deb/copy/` with the same content as the latest version makes
+  no new version, so two Content View versions with other signing choices can have the same
+  derived version. Seen live: after a signed publish, a `none` publish of the same content
+  reused the signed publication. So pulp-tui never reuses publications for Deb Content Views:
+  each version creates its own (the task href is checkpointed before the wait).
+* **Request body limit.** Pulp refuses a request body above Django's
+  `DATA_UPLOAD_MAX_MEMORY_SIZE` (2,621,440 bytes, the default in the test image) with HTTP 400
+  and an HTML page `Bad Request (400)`, not 413. The log shows
+  `django.core.exceptions.RequestDataTooBig`. nginx in the image allows 10 MB
+  (`client_max_body_size 10m`). Measured with `deb/copy/` bodies of synthetic package hrefs
+  (75 bytes each in that test; pulp-tui writes compact JSON, 74 bytes each):
+
+  | hrefs | body bytes | result |
+  |---|---|---|
+  | 1 | 372 | 400 with a JSON validation error (body accepted) |
+  | 34,900 | 2,617,797 | 400 with a JSON validation error (body accepted) |
+  | 35,000 | 2,625,297 | 400 HTML `Bad Request (400)` (body refused) |
+  | 60,000 | 4,500,297 | 400 HTML `Bad Request (400)` (body refused) |
+
+  One copy body holds every selected href (no batching), so a filtered Deb snapshot of more
+  than about 35,000 packages fails. `deb::copy` then adds the body size, the number of hrefs
+  and the workaround to the error: raise `DATA_UPLOAD_MAX_MEMORY_SIZE` in the Pulp settings,
+  or narrow the selection with include rules. `rpm/copy/` has the same limit (the error
+  there is the plain `rejected [400]`).
 
 ## Shared database (PostgreSQL)
 
@@ -173,7 +207,9 @@ The live tests connect to `127.0.0.1` without TLS, so they do not exercise this 
 
 ## Unsupported or limited
 
-* Plugins other than pulp_rpm and pulp_file (container, deb, python, …) are not managed.
+* Plugins other than pulp_rpm, pulp_file and pulp_deb (container, python, …) are not managed.
+* pulp_deb: no upload of `.deb` files, no replication (native or fallback), no verbatim
+  publications, no dependency solving on copy.
 * RPM publication layout `nested_by_digest`: the package probe of served-content checks is
   skipped (metadata is still checked).
 * Signing: repository fields for signing services are editable, but pulp-tui does not

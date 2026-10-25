@@ -474,10 +474,24 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             ap(move |app| app.text(format!("Preview of {name} (draft vs latest published)"), lines))
         }),
         Act::CvPublish => {
-            let form = Form::new(format!("Publish {name}"), vec![Field::text("notes", "Change notes")])
-                .note("A preview of the exact content is shown before anything is created.");
+            let mut fields = vec![Field::text("notes", "Change notes")];
+            if item["repos"].as_array().into_iter().flatten().any(|r| r["type"] == "deb") {
+                let choices = vec!["same as source".into(), "none".into(), "service".into()];
+                fields.push(Field::new("signing", "Deb signing", FieldKind::Choice(choices)));
+                fields.push(
+                    Field::pick("signing_service", "Signing service", Source::SigningServices).help("used when Deb signing = service"),
+                );
+            }
+            let form =
+                Form::new(format!("Publish {name}"), fields).note("A preview of the exact content is shown before anything is created.");
             app.form(form, move |app, f| {
                 let notes = f.get("notes").to_string();
+                // Stored with the version (`CvVersionRepo::signing`): "" = same as source.
+                let signing = match f.get("signing") {
+                    "none" => "none".to_string(),
+                    "service" => f.opt("signing_service").ok_or("pick a signing service")?.to_string(),
+                    _ => String::new(),
+                };
                 let name = name.clone();
                 app.job(format!("preview {name}"), move |ctx| async move {
                     let svc = ctx.cv()?;
@@ -488,7 +502,12 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                     ap(move |app| {
                         app.confirm(format!("Publish {name}"), lines, move |app| {
                             app.job(format!("publish {name}"), move |ctx| async move {
-                                let v = ctx.cv()?.locked(id, "publish").await?.publish(id, &notes, &ctx.log(), &ctx.on_task()).await?;
+                                let v = ctx
+                                    .cv()?
+                                    .locked(id, "publish")
+                                    .await?
+                                    .publish(id, &notes, &signing, &ctx.log(), &ctx.on_task())
+                                    .await?;
                                 // After the lock of this view is released; composites take their own locks.
                                 let auto = ctx.cv()?.auto_publish(id, &ctx.log(), &ctx.on_task()).await;
                                 ap(move |app| {
@@ -845,10 +864,17 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
             // Read again: the list is stale while another operator publishes.
             app.spawn("read pending task".into(), true, async move {
                 // Repositories publish one at a time, so at most one row has a pending task.
-                let pending = st.version_repos(vid).await?.into_iter().find_map(|r| Some((r.repo().repo_name.clone(), r.pending_task?)));
+                // With a derived version, the task is the publication of a Deb repository.
+                let pending = st.version_repos(vid).await?.into_iter().find_map(|r| {
+                    let step = if r.derived_version.is_some() { "publish" } else { "copy" };
+                    Some((step, r.repo().repo_name.clone(), r.pending_task?))
+                });
                 ap(move |app| match pending {
-                    Some((repo, h)) => app.watch_task(&h, &format!("{name} v{number}: copy {repo}")),
-                    None => app.notify(Level::Info, format!("v{number} has no pending Pulp task now (only the copy step stores one)")),
+                    Some((step, repo, h)) => app.watch_task(&h, &format!("{name} v{number}: {step} {repo}")),
+                    None => app.notify(
+                        Level::Info,
+                        format!("v{number} has no pending Pulp task now (only the copy step and a Deb publication store one)"),
+                    ),
                 })
             });
         }
@@ -1200,6 +1226,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cv_publish_asks_for_deb_signing_only_with_a_deb_repository() {
+        let mut app = test_app().await;
+        let rpm = json!({ "name": "os", "type": "rpm", "href": format!("{REPOS}rpm/rpm/1/") });
+        let deb = json!({ "name": "apt", "type": "deb", "href": format!("{REPOS}deb/apt/2/") });
+        let keys = |f: &crate::tui::form::Form| f.fields.iter().map(|x| x.key.clone()).collect::<Vec<_>>();
+        cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": 1, "name": "web", "repos": [rpm] }));
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no publish form") };
+        assert_eq!(keys(&form), ["notes"]);
+        cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": 1, "name": "web", "repos": [rpm, deb] }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no publish form") };
+        assert_eq!(keys(&form), ["notes", "signing", "signing_service"]);
+        assert_eq!(form.get("signing"), "same as source");
+        form.fields[1].value = "service".into();
+        assert_eq!(submit(&mut app, &form), Err("pick a signing service".to_string()));
+    }
+
+    #[tokio::test]
     async fn cv_sync_form_marks_every_repository() {
         let mut app = test_app().await;
         let both = json!([
@@ -1357,16 +1400,27 @@ mod tests {
         version_action(&mut app, "lab", cv, "web".into(), Act::WatchTask, row.clone());
         drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none());
-        assert_eq!(last_notice(&app), (Level::Info, "v1 has no pending Pulp task now (only the copy step stores one)"));
+        assert_eq!(
+            last_notice(&app),
+            (Level::Info, "v1 has no pending Pulp task now (only the copy step and a Deb publication store one)")
+        );
 
         let mut vr = st.version_repos(v.id).await.unwrap().remove(0);
         vr.pending_task = Some(format!("{TASKS}7/"));
         st.save_version_repo(&vr).await.unwrap();
-        version_action(&mut app, "lab", cv, "web".into(), Act::WatchTask, row);
+        version_action(&mut app, "lab", cv, "web".into(), Act::WatchTask, row.clone());
         drain(&mut app, &mut rx).await;
         let Some(Modal::Text { title, watch, .. }) = &app.modal else { panic!("no watch view") };
         assert_eq!((title.as_str(), watch.clone()), ("Watch task web v1: copy os", Some(format!("{TASKS}7/"))));
         assert_eq!(app.tasks.items[0].href, format!("{TASKS}7/"), "tracked, so the Task Center polls it");
+
+        // After the copy, a pending task is the publication (Deb).
+        vr.derived_version = Some("/dv/1/".into());
+        st.save_version_repo(&vr).await.unwrap();
+        version_action(&mut app, "lab", cv, "web".into(), Act::WatchTask, row);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Text { title, .. }) = &app.modal else { panic!("no watch view") };
+        assert_eq!(title, "Watch task web v1: publish os");
     }
 
     /// Apply job results until no job runs.

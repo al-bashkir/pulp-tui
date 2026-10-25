@@ -14,7 +14,7 @@
 //! Partial promotions are recorded as `partial` and can be retried or reverted.
 
 use crate::filters::Selector;
-use crate::pulp::models::{Distribution, Package, RepoVersion, Repository, Task};
+use crate::pulp::models::{DebPackage, Distribution, Package, RepoVersion, Repository, Task};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::{
@@ -159,6 +159,34 @@ fn publish_settings(source: &Value, derived: &Value) -> serde_json::Map<String, 
         .collect()
 }
 
+/// The PATCH that gives a derived Deb repository the signing choice of the publish (empty: it has it already):
+/// "" = the keys of the source, "none" = no keys, else that signing service and no per-release keys.
+/// Fields the derived repository does not have are never sent.
+fn deb_signing_patch(choice: &str, source: &Value, derived: &Value) -> serde_json::Map<String, Value> {
+    let want = |k: &str| match choice {
+        "" => source.get(k).cloned(),
+        _ if k == "signing_service_release_overrides" => Some(json!({})),
+        "none" => Some(Value::Null),
+        href => Some(href.into()),
+    };
+    ["signing_service", "signing_service_release_overrides"]
+        .into_iter()
+        .filter_map(|k| {
+            let (mut v, have) = (want(k)?, derived.get(k)?);
+            if v == *have {
+                return None;
+            }
+            // pulp_deb changes only the per-release keys a PATCH names; `null` deletes one.
+            if let (Some(w), Some(h)) = (v.as_object_mut(), have.as_object()) {
+                for gone in h.keys() {
+                    w.entry(gone.clone()).or_insert(Value::Null);
+                }
+            }
+            Some((k.to_string(), v))
+        })
+        .collect()
+}
+
 pub fn derived_repo_name(cv: &str, repo: &str) -> String {
     format!("pulp-tui-cv-{}-{}", slug(cv), slug(repo))
 }
@@ -266,9 +294,21 @@ impl CvService {
         match repo.repo_type {
             RepoType::Rpm => self.select_rpm(repo, source_version, with_keys).await,
             RepoType::File => self.select_file(repo, source_version, with_keys).await,
-            // TEMPORARY: replaced when Deb Content Views land.
-            RepoType::Deb => bail!("Deb Content Views are not supported yet"),
+            RepoType::Deb => self.select_deb(repo, source_version, with_keys).await,
         }
+    }
+
+    /// Like RPM without advisories: the structured copy brings the release records of the chosen packages.
+    async fn select_deb(&self, repo: &CvRepo, source_version: &str, with_keys: bool) -> Result<Selection> {
+        if repo.filters.is_empty() && !with_keys {
+            return Ok(Selection { hrefs: None, keys: BTreeSet::new() });
+        }
+        let sel = Selector::new(&repo.filters);
+        let chosen: Vec<DebPackage> =
+            deb::packages_in(&self.client, source_version).await?.into_iter().filter(|p| sel.deb_package(p)).collect();
+        let keys = chosen.iter().map(DebPackage::key).collect();
+        let hrefs = (!repo.filters.is_empty()).then(|| chosen.into_iter().map(|p| p.pulp_href).collect());
+        Ok(Selection { hrefs, keys })
     }
 
     async fn select_rpm(&self, repo: &CvRepo, source_version: &str, with_keys: bool) -> Result<Selection> {
@@ -333,8 +373,9 @@ impl CvService {
 
     // ---- publish -------------------------------------------------------------------
 
-    /// Create a new numbered version from the current definition and publish it.
-    pub async fn publish(&self, cv_id: i64, notes: &str, log: Log<'_>, on: OnTask<'_>) -> Result<CvVersion> {
+    /// Create a new numbered version from the current definition and publish it. `signing` applies to every
+    /// Deb repository: "" = same as source, "none", or a signing service href (a composite ignores it).
+    pub async fn publish(&self, cv_id: i64, notes: &str, signing: &str, log: Log<'_>, on: OnTask<'_>) -> Result<CvVersion> {
         let cv = self.store.content_view(cv_id).await?;
         if cv.composite {
             return self.publish_composite(&cv, notes, log, on).await;
@@ -359,6 +400,7 @@ impl CvService {
         let v = self.store.begin_version(cv_id, notes, &repos).await?;
         for (mut vr, sv) in self.store.version_repos(v.id).await?.into_iter().zip(sources) {
             vr.source_version = Some(sv);
+            vr.signing = signing.into(); // a checkpoint: a resumed publish signs as asked
             self.alive()?;
             self.store.save_version_repo(&vr).await?;
         }
@@ -427,8 +469,9 @@ impl CvService {
         };
         let mut out = vec![];
         for c in composites {
-            let res =
-                async { CvService { lock: None, ..self.clone() }.locked(c.id, "auto publish").await?.publish(c.id, &notes, log, on).await };
+            let res = async {
+                CvService { lock: None, ..self.clone() }.locked(c.id, "auto publish").await?.publish(c.id, &notes, "", log, on).await
+            };
             out.push(match res.await {
                 Ok(v) => Ok(format!("{} v{} published", c.name, v.number)),
                 Err(e) => Err(format!("{}: {e:#}", c.name)),
@@ -538,36 +581,19 @@ impl CvService {
         }
         let derived = vr.derived_repo.clone().unwrap_or_default();
         if vr.derived_version.is_none() {
-            let task = match vr.pending_task.clone() {
-                Some(h) => {
-                    log(format!("{}: re-attaching to task {h}", repo.repo_name));
-                    ops::wait_task(c, &h, on).await
-                }
-                None => {
-                    let sv = vr.source_version.clone().ok_or_else(|| anyhow!("missing source version"))?;
-                    log(format!("{}: selecting content from {sv}", repo.repo_name));
-                    let sel = self.select(&repo, &sv, false).await?;
-                    self.alive()?;
-                    let m = match t {
-                        RepoType::Rpm => rpm::copy(c, &sv, &derived, Some(0), sel.hrefs, false).await?,
-                        RepoType::File => file::modify(c, &derived, true, sel.hrefs.unwrap_or_default()).await?,
-                        RepoType::Deb => deb::copy(c, &sv, &derived, Some(0), sel.hrefs).await?,
-                    };
-                    let Mutation::Task(h) = m else { bail!("copy did not return a task") };
-                    vr.pending_task = Some(h.clone());
-                    // Saved even when the lock is lost: it records a task already sent, so Resume re-attaches.
-                    self.store.save_version_repo(vr).await?;
-                    self.alive()?;
-                    ops::wait_task(c, &h, on).await
-                }
-            };
-            // A failed or canceled copy is not re-attached: the next Resume sends it again (it starts from an empty base).
-            if let Err(PulpError::TaskFailed { .. }) = &task {
-                vr.pending_task = None;
+            let sv = vr.source_version.clone();
+            let copy = async {
+                let sv = sv.ok_or_else(|| anyhow!("missing source version"))?;
+                log(format!("{}: selecting content from {sv}", repo.repo_name));
+                let sel = self.select(&repo, &sv, false).await?;
                 self.alive()?;
-                self.store.save_version_repo(vr).await?;
-            }
-            let task: Task = task?;
+                anyhow::Ok(match t {
+                    RepoType::Rpm => rpm::copy(c, &sv, &derived, Some(0), sel.hrefs, false).await?,
+                    RepoType::File => file::modify(c, &derived, true, sel.hrefs.unwrap_or_default()).await?,
+                    RepoType::Deb => deb::copy(c, &sv, &derived, Some(0), sel.hrefs).await?,
+                })
+            };
+            let task = self.tracked_task(vr, "copy", copy, log, on).await?;
             // No new version is created when the content equals the latest version.
             let version = match task.created_matching("/versions/") {
                 Some(v) => v,
@@ -584,31 +610,89 @@ impl CvService {
             self.store.save_version_repo(vr).await?;
         }
         let dv = vr.derived_version.clone().unwrap_or_default();
-        match t {
+        // `service`: the signing service that the PATCH sets (Deb only).
+        let (what, patch, service) = match t {
             RepoType::Rpm => {
                 let (src, dst): (Value, Value) = (c.get(&repo.repo_href, &[]).await?, c.get(&derived, &[]).await?);
-                let patch = publish_settings(&src, &dst);
-                if !patch.is_empty() {
-                    log(format!(
-                        "{}: publish settings of the source: {}",
-                        repo.repo_name,
-                        patch.keys().cloned().collect::<Vec<_>>().join(", ")
-                    ));
-                    self.alive()?;
-                    let m = c.patch(&derived, &Value::Object(patch)).await?;
-                    ops::settle(c, m, on).await?;
-                }
+                ("publish settings of the source", publish_settings(&src, &dst), None)
             }
-            RepoType::File => {}
-            // TEMPORARY: replaced when Deb Content Views land.
-            RepoType::Deb => {}
+            RepoType::File => ("", serde_json::Map::new(), None),
+            RepoType::Deb => {
+                let (src, dst): (Value, Value) = (c.get(&repo.repo_href, &[]).await?, c.get(&derived, &[]).await?);
+                let service = Some(vr.signing.as_str()).filter(|s| !["", "none"].contains(s));
+                if service.is_some() && dst.get("signing_service").is_none() {
+                    bail!("not supported by this server: signing_service on Deb repositories");
+                }
+                ("signing", deb_signing_patch(&vr.signing, &src, &dst), service)
+            }
+        };
+        if !patch.is_empty() {
+            log(format!("{}: {what}: {}", repo.repo_name, patch.keys().cloned().collect::<Vec<_>>().join(", ")));
+            self.alive()?;
+            let m = match (c.patch(&derived, &Value::Object(patch)).await, service) {
+                // The choice is stored with the version, so Resume would send the refused service again.
+                (Err(e @ PulpError::Api { status: 400, .. }), Some(s)) => {
+                    return Err(e).context(format!(
+                        "signing service {s} was refused by the server; delete this Content View version and publish again with another choice"
+                    ));
+                }
+                (m, _) => m?,
+            };
+            ops::settle(c, m, on).await?;
         }
         log(format!("{}: publishing {dv}", repo.repo_name));
         self.alive()?;
-        vr.publication = Some(ops::ensure_publication(c, t, &dv, on).await?);
+        vr.publication = Some(match t {
+            RepoType::Rpm | RepoType::File => ops::ensure_publication(c, t, &dv, None, on).await?,
+            // Never reused: a publication signed with the repository's keys stores `signing_service: null`, so
+            // one of another signing choice cannot be told apart. Checkpointed like the copy.
+            RepoType::Deb => {
+                // With `derived_version` set, `pending_task` is the publication task (the copy step clears it with the version).
+                let post = async { anyhow::Ok(c.post(&c.api(t.publications()), &json!({ "repository_version": dv })).await?) };
+                let task = self.tracked_task(vr, "publish", post, log, on).await?;
+                let publication =
+                    task.created_matching("/publications/").ok_or_else(|| anyhow!("the publish task created no publication"))?;
+                vr.pending_task = None;
+                publication
+            }
+        });
         self.alive()?;
         self.store.save_version_repo(vr).await?;
         Ok(())
+    }
+
+    /// The task of one checkpointed step of `vr` (the copy, or a Deb publication): re-attach to `vr.pending_task`,
+    /// else run `submit` and record the task before waiting. A failed or canceled task is not re-attached: it is
+    /// cleared, so the next Resume sends it again (a copy starts from an empty base).
+    async fn tracked_task(
+        &self,
+        vr: &mut CvVersionRepo,
+        what: &str,
+        submit: impl Future<Output = Result<Mutation>>,
+        log: Log<'_>,
+        on: OnTask<'_>,
+    ) -> Result<Task> {
+        let c = &self.client;
+        let task = match vr.pending_task.clone() {
+            Some(h) => {
+                log(format!("{}: re-attaching to task {h}", vr.repo().repo_name));
+                ops::wait_task(c, &h, on).await
+            }
+            None => {
+                let Mutation::Task(h) = submit.await? else { bail!("{what} did not return a task") };
+                vr.pending_task = Some(h.clone());
+                // Saved even when the lock is lost: it records a task already sent, so Resume re-attaches.
+                self.store.save_version_repo(vr).await?;
+                self.alive()?;
+                ops::wait_task(c, &h, on).await
+            }
+        };
+        if let Err(PulpError::TaskFailed { .. }) = &task {
+            vr.pending_task = None;
+            self.alive()?;
+            self.store.save_version_repo(vr).await?;
+        }
+        Ok(task?)
     }
 
     // ---- promote / rollback --------------------------------------------------------
@@ -1186,11 +1270,65 @@ mod tests {
         CvService { client, store, scope: "k".into(), actor: "a@h".into(), lock: None }
     }
 
+    #[test]
+    fn deb_snapshots_get_the_signing_choice() {
+        let src = json!({ "name": "apt", "signing_service": "/s/1/", "signing_service_release_overrides": { "bookworm": "/s/2/" } });
+        let dst = json!({ "name": "web-apt", "signing_service": null, "signing_service_release_overrides": {} });
+        let patch = |choice: &str, src: &Value, dst: &Value| Value::Object(deb_signing_patch(choice, src, dst));
+        assert_eq!(
+            patch("", &src, &dst),
+            json!({ "signing_service": "/s/1/", "signing_service_release_overrides": { "bookworm": "/s/2/" } })
+        );
+        // Pulp changes only the per-release keys a PATCH names: a key the derived repository must lose is sent as null.
+        let over = |m: Value| json!({ "signing_service": null, "signing_service_release_overrides": m });
+        assert_eq!(
+            patch("none", &src, &over(json!({ "bookworm": "/s/2/" }))),
+            json!({ "signing_service_release_overrides": { "bookworm": null } })
+        );
+        assert_eq!(patch("none", &src, &src), over(json!({ "bookworm": null })));
+        assert_eq!(
+            patch("/s/3/", &src, &src),
+            json!({ "signing_service": "/s/3/", "signing_service_release_overrides": { "bookworm": null } })
+        );
+        let dropped = over(json!({ "bookworm": "/s/2/", "bullseye": "/s/4/" }));
+        assert_eq!(
+            patch("", &src, &dropped),
+            json!({ "signing_service": "/s/1/", "signing_service_release_overrides": { "bookworm": "/s/2/", "bullseye": null } }),
+            "same as source removes a key the source dropped"
+        );
+        assert_eq!(patch("none", &src, &dst), json!({}), "nothing to send when the derived repository already has it");
+        assert_eq!(patch("", &src, &src), json!({}));
+        let old = json!({ "name": "old server", "signing_service": "/s/1/" });
+        assert_eq!(patch("", &old, &dst), json!({ "signing_service": "/s/1/" }), "a key the source lacks is never sent");
+        assert_eq!(patch("/s/3/", &old, &old), json!({ "signing_service": "/s/3/" }));
+        assert_eq!(patch("none", &old, &old), json!({ "signing_service": null }));
+    }
+
     #[tokio::test]
-    async fn deb_repositories_cannot_be_selected_yet() {
-        let svc = mock_service(&wiremock::MockServer::start().await).await;
-        let repo = CvRepo { repo_href: "/r/".into(), repo_name: "apt".into(), repo_type: RepoType::Deb, filters: vec![] };
-        assert_eq!(svc.select(&repo, "/r/versions/1/", false).await.err().unwrap().to_string(), "Deb Content Views are not supported yet");
+    async fn deb_selection_keeps_the_filtered_packages() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let mut repo = CvRepo { repo_href: "/r/".into(), repo_name: "apt".into(), repo_type: RepoType::Deb, filters: vec![] };
+        let all = svc.select(&repo, "/r/versions/1/", false).await.unwrap();
+        assert!(all.hrefs.is_none() && all.keys.is_empty(), "no filters: the copy takes everything, no listing");
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let p = |href: &str, name: &str| json!({ "pulp_href": href, "package": name, "version": "1.0-1", "architecture": "amd64" });
+        let pkgs = json!({ "count": 2, "next": null, "results": [p("/p/1/", "nginx"), p("/p/2/", "nginx-dbg")] });
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/content/deb/packages/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pkgs))
+            .mount(&server)
+            .await;
+        let keys = svc.select(&repo, "/r/versions/1/", true).await.unwrap();
+        assert_eq!(
+            (keys.hrefs, keys.keys.into_iter().collect::<Vec<_>>()),
+            (None, vec!["nginx-dbg_1.0-1_amd64".into(), "nginx_1.0-1_amd64".into()])
+        );
+        repo.filters = crate::filters::parse_rules("exclude name=*-dbg", RepoType::Deb).unwrap();
+        let sel = svc.select(&repo, "/r/versions/1/", false).await.unwrap();
+        assert_eq!((sel.hrefs, sel.keys.into_iter().collect::<Vec<_>>()), (Some(vec!["/p/1/".into()]), vec!["nginx_1.0-1_amd64".into()]));
     }
 
     /// The object at `href` carries the database ID label `db`.
@@ -1267,6 +1405,105 @@ mod tests {
         assert_none(&server, "POST").await;
     }
 
+    const DEB_DERIVED: &str = "/pulp/api/v3/repositories/deb/apt/2/";
+
+    /// A Deb row after its copy: the derived version is recorded, the publication is not. Neither repository
+    /// has signing fields, so the signing step sends nothing.
+    async fn copied_deb_version(server: &wiremock::MockServer, svc: &CvService) -> (i64, CvVersionRepo) {
+        let src = "/pulp/api/v3/repositories/deb/apt/1/";
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let repo = CvRepo { repo_href: src.into(), repo_name: "apt".into(), repo_type: RepoType::Deb, filters: vec![] };
+        let v = svc.store.begin_version(cv, "", &[repo]).await.unwrap();
+        let mut vr = svc.store.version_repos(v.id).await.unwrap().remove(0);
+        vr.source_version = Some(format!("{src}versions/1/"));
+        vr.derived_repo = Some(DEB_DERIVED.into());
+        vr.derived_version = Some(format!("{DEB_DERIVED}versions/1/"));
+        svc.store.save_version_repo(&vr).await.unwrap();
+        serve_owner(server, DEB_DERIVED, svc.store.db_id()).await;
+        serve_owner(server, src, svc.store.db_id()).await;
+        (cv, vr)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deb_publish_never_reuses_and_is_recorded_before_the_wait() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (cv, mut vr) = copied_deb_version(&server, &svc).await;
+        let svc = svc.locked(cv, "publish").await.unwrap();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/pulp/api/v3/publications/deb/apt/"))
+            .respond_with(LoseLockOnPost(svc.lock.as_ref().unwrap().lost.clone()))
+            .mount(&server)
+            .await;
+        let e = svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert!(e.to_string().starts_with("lock on web lost: "), "{e}");
+        let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
+        assert_eq!((saved.pending_task.as_deref(), saved.publication), (Some("/pulp/api/v3/tasks/1/"), None), "Resume re-attaches");
+        let sent = server.received_requests().await.unwrap();
+        assert!(
+            sent.iter().all(|r| r.method.as_str() == "POST" || r.url.path() != "/pulp/api/v3/publications/deb/apt/"),
+            "no reuse lookup"
+        );
+        let posts: Vec<Value> = sent.iter().filter(|r| r.method.as_str() == "POST").map(|r| r.body_json().unwrap()).collect();
+        assert_eq!(posts, [json!({ "repository_version": format!("{DEB_DERIVED}versions/1/") })], "the derived repository's keys apply");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_signing_service_needs_the_repository_field() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, mut vr) = copied_deb_version(&server, &svc).await;
+        vr.signing = "/pulp/api/v3/signing-services/1/".into();
+        let e = svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), "not supported by this server: signing_service on Deb repositories", "never published unsigned");
+        assert_none(&server, "POST").await;
+        vr.signing = "none".into(); // nothing to clear: the publish goes on
+        let e = svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert!(!e.to_string().contains("signing_service"), "{e}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_signing_service_says_how_to_go_on() {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, mut vr) = copied_deb_version(&server, &svc).await;
+        let derived =
+            json!({ "pulp_labels": { LABEL_DB: svc.store.db_id() }, "signing_service": null, "signing_service_release_overrides": {} });
+        let ok = wiremock::ResponseTemplate::new(200).set_body_json(derived);
+        wiremock::Mock::given(method("GET")).and(path(DEB_DERIVED)).respond_with(ok).with_priority(1).mount(&server).await;
+        let refused = json!({ "signing_service": ["Invalid hyperlink - Object does not exist."] });
+        let refused = wiremock::ResponseTemplate::new(400).set_body_json(refused);
+        wiremock::Mock::given(method("PATCH")).and(path(DEB_DERIVED)).respond_with(refused).mount(&server).await;
+        vr.signing = "/pulp/api/v3/signing-services/1/".into();
+        let e = format!("{:#}", svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err());
+        let want = "signing service /pulp/api/v3/signing-services/1/ was refused by the server; \
+                    delete this Content View version and publish again with another choice: rejected [400]";
+        assert!(e.starts_with(want), "{e}");
+        assert_none(&server, "POST").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_re_attaches_to_the_deb_publish_task() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, mut vr) = copied_deb_version(&server, &svc).await;
+        vr.pending_task = Some("/pulp/api/v3/tasks/9/".into());
+        svc.store.save_version_repo(&vr).await.unwrap();
+        let p = "/pulp/api/v3/publications/deb/apt/5/";
+        let done = json!({ "pulp_href": "/pulp/api/v3/tasks/9/", "state": "completed", "created_resources": [p] });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pulp/api/v3/tasks/9/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(done))
+            .mount(&server)
+            .await;
+        svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap();
+        let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
+        assert_eq!((saved.publication.as_deref(), saved.pending_task), (Some(p), None));
+        assert_none(&server, "POST").await;
+        assert_none(&server, "PATCH").await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_does_not_copy_into_a_repository_of_another_database() {
         let server = wiremock::MockServer::start().await;
@@ -1292,7 +1529,7 @@ mod tests {
                 "latest_version_href": format!("{DERIVED}versions/1/"), "pulp_labels": { LABEL_CV: "web" } })))
             .mount(&server)
             .await;
-        let e = svc.publish(cv, "", &|_| {}, &ops::no_progress).await.unwrap_err();
+        let e = svc.publish(cv, "", "", &|_| {}, &ops::no_progress).await.unwrap_err();
         assert_eq!(
             e.to_string(),
             "pulp-tui-cv-web-os is a snapshot repository of content view web; remove it from outer and add its source"
@@ -1548,7 +1785,7 @@ mod tests {
         let dup = s.create_cv("k", "dup", "").await.unwrap();
         published(&svc, dup, "baseos", href).await;
         s.set_component(c, dup, None).await.unwrap();
-        let e = svc.publish(c, "", &|_| {}, &ops::no_progress).await.unwrap_err();
+        let e = svc.publish(c, "", "", &|_| {}, &ops::no_progress).await.unwrap_err();
         assert_eq!(e.to_string(), "components dup and os both contain repository baseos");
         assert!(s.versions(c).await.unwrap().is_empty(), "refused before any write");
         s.remove_component(c, dup).await.unwrap();
@@ -1562,7 +1799,7 @@ mod tests {
             let r = CvRepo { repo_href: h.into(), repo_name: n.into(), repo_type: RepoType::Rpm, filters: vec![] };
             s.set_cv_repo(web, &r).await.unwrap();
         }
-        let e = svc.publish(web, "", &|_| {}, &ops::no_progress).await.unwrap_err();
+        let e = svc.publish(web, "", "", &|_| {}, &ops::no_progress).await.unwrap_err();
         assert_eq!(e.to_string(), "repositories base os (web) and base-os (web) would be served at the same path segment base-os");
         assert!(s.versions(web).await.unwrap().is_empty());
         assert!(server.received_requests().await.unwrap().is_empty(), "no Pulp call");
@@ -1617,7 +1854,7 @@ mod tests {
         let done = json!({ "pulp_href": t, "state": "completed", "created_resources": [DIST] });
         Mock::given(method("GET")).and(path(t)).respond_with(ResponseTemplate::new(200).set_body_json(done)).mount(&server).await;
 
-        let v = svc.publish(c, "", &|_| {}, &ops::no_progress).await.unwrap();
+        let v = svc.publish(c, "", "", &|_| {}, &ops::no_progress).await.unwrap();
         assert_eq!((v.number, v.state.as_str()), (1, "published"));
         let posts: Vec<_> = server.received_requests().await.unwrap().into_iter().filter(|r| r.method.as_str() == "POST").collect();
         assert_eq!(

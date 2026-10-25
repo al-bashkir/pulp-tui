@@ -1,7 +1,7 @@
 # Implementation status
 
-Date: 2026-10-23. Tested against pulpcore 3.123.0, pulp_rpm 3.39.3, pulp_file 3.123.0
-(`quay.io/pulp/pulp:latest`), see [COMPATIBILITY.md](COMPATIBILITY.md).
+Date: 2026-10-25. Tested against pulpcore 3.123.0, pulp_rpm 3.39.3, pulp_file 3.123.0,
+pulp_deb 3.11.1 (`quay.io/pulp/pulp:latest`), see [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Verified workflows
 
@@ -11,6 +11,8 @@ Automated against real Pulp containers (`tests/run-live.sh`):
 |---|---|
 | RPM: local repo, upload, remote, sync, inspect version, publish, distribute, fetch served metadata and package, update, publish, roll back, verify | `live_repos::rpm_lifecycle` |
 | File: local repo, single and chunked upload, remove content, sync from manifest, publish, distribute, fetch served files, update, roll back, verify | `live_repos::file_lifecycle` |
+| Deb: remote with distribution `fixture`, mirror sync (4 packages), structured copy with `exclude name=*-dbg` (3 packages and the Release records), publish, distribute, served `Packages` index without the excluded package and package digest; a publication with the test signing service `pulp-tui-deb-test` is reused for that service only (the repository default gets another one) and serves `Release`, `Release.gpg` and `InRelease` | `live_deb::deb_mirror_copy_publish_verify` |
+| Deb Content View: `exclude name=*-dbg`, preview (`+ fixture-alpha_1.0-1_amd64`, no `fixture-beta-dbg`), publish signed with the test service (Library verifies), promote to Dev (signature served, excluded package not in `Packages`), publish again with `none` (Library serves `Release` without `Release.gpg`/`InRelease`, Dev still signed), a version begun with the service in its checkpoint and finished by Resume (signed again), a composite with this view as its only component (publishes, verifies, serves the signature) | `live_deb::deb_content_view` |
 | Content Views: RPM + File snapshot with filters, preview, numbered versions, Library, Dev, Prod path rule, rollback, served-content verification, retention protection, advisory filtering, partial failure and retry, resume of an interrupted publish (re-attach to the submitted task), cleanup | `live_cv::content_view_lifecycle` |
 | Lifecycle environment relabel: a File view promoted to Dev serves at `dev/<view>/docs/`; Edit label `dev2` moves the distribution in place (PATCH `base_path`, task awaited), the new URL answers 200 and the old one 404, the stored row and the drift check follow, and a second promotion of the same version keeps the new path | `live_cv::environment_relabel_moves_served_paths` |
 | Composite Content View `rocky9`: the view `<id>-os` (File) pinned at v1 and `<id>-extras` (RPM) on latest; the composite publishes v1 without copying anything, Library serves its own paths (`docs/readme.txt`, `repomd.xml` answer 200) and verifies, and the component's own Library distribution verifies too (one publication, two distributions); after the extras are synced from `rpm2/` and published as v2, auto publish returns `<id> v2 published`, composite v2 uses extras v2 and os v1, compare shows `<id>-extras: v1 -> v2` and `+ fixture-gamma-0.5-1.noarch`; deleting extras v1 and the os view is refused (`used by <id> v1`, `is used by`); deleting composite v1 keeps the extras v1 publication (GET 200); deleting the composite removes its two distributions (GET 404), keeps the derived repositories of both components (GET 200) and both components still verify; cleanup | `live_cv::composite_content_view_rocky9` |
@@ -39,14 +41,14 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
 
 ## Test results (last run)
 
-* `cargo test --lib`: 214 passed
-* `cargo test --test mock_http`: 18 passed
-* Live (`tests/run-live.sh`, 2026-10-24): repos 2, cv 4, rbac 1, failures 2,
-  replication 2, shared_db 6 (PostgreSQL 16) — all passed
+* `cargo test --lib`: 261 passed
+* `cargo test --test mock_http`: 25 passed
+* Live (`tests/run-live.sh`, 2026-10-25): repos 2, cv 4, rbac 1, failures 2,
+  replication 2, shared_db 6 (PostgreSQL 16, schema 5), deb 2 — all passed
 * `cargo fmt --check`, `cargo clippy --all-targets -D warnings` (default and
   `--no-default-features`): clean
-* `podman build -f Containerfile .`: built (29.5 MB image; no keyring; it contains the
-  PostgreSQL driver and `pulp-tui db --help` runs)
+* `podman build -f Containerfile .`: built (30.5 MB image; no keyring; it contains the
+  PostgreSQL driver; `pulp-tui --version` runs)
 * `cargo audit` (494 crates): no vulnerabilities; 3 "unmaintained" warnings, unchanged
   (RUSTSEC-2026-0370/0371/0372: `zvariant`, `zvariant_derive`, `zbus_names`), all
   reached only through the optional `keyring` feature (Secret Service over D-Bus). Builds
@@ -92,8 +94,19 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
   mock servers and SQLite stores; the service behind them is covered by `live_cv`.
 * A composite has no filters of its own and cannot be a component of another composite.
   Reusable filter sets are not implemented.
-* Plugins other than RPM and File, content guard creation, signing service creation,
+* Plugins other than RPM, File and Deb, content guard creation, signing service creation,
   OIDC token refresh: not supported.
+* Deb is supported for repositories, remotes, content, copy, publish (optional signing
+  service), distributions and Content Views (filters, signing choice, resume, composites).
+  Not goals: upload of `.deb` files, replication (native or fallback; a Deb distribution is
+  skipped with a note), verbatim publications, dependency solving on copy. The signing
+  service pickers list the services of all plugins (pulpcore has no type filter); Pulp
+  refuses a wrong one. A filtered Deb snapshot sends every selected href in one body, and
+  Pulp refuses a body above 2.5 MiB (about 35,000 packages; COMPATIBILITY.md); there is no
+  batching. Deb Content View publications are never reused, so each version has its own.
+* The TUI flows of Deb (Publish with a signing service, the Deb signing choice of a
+  Content View publish) were not run by hand in a terminal. They are covered by unit
+  tests; the services behind them by `live_deb`.
 * Not tested: Pulp domains, macOS at runtime (CI builds and runs unit tests), Windows.
 * `nested_by_digest` RPM layout: served-content checks verify metadata only.
 

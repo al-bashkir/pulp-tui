@@ -545,7 +545,7 @@ impl Kind {
                     col("version", 14, |v| short(&s(v, "repository_version"))),
                     col("created", 19, |v| ts(v, "pulp_created")),
                 ];
-                // Only File publications have the field; Delete looks up the distributions of both types.
+                // Only File publications have the field; Delete looks up the distributions for every type.
                 match t {
                     RepoType::Rpm | RepoType::Deb => {}
                     RepoType::File => {

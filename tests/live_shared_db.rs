@@ -242,6 +242,7 @@ async fn store_methods_on_postgres() {
         pending_task: Some("/t/9/".into()),
         content_count: Some(7),
         borrowed: false,
+        signing: "none".into(),
     };
     st.save_version_repo(&vr).await.unwrap();
     assert_eq!(st.version_repos(v1.id).await.unwrap().iter().find(|r| r.repo().repo_name == "os"), Some(&vr));

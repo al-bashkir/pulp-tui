@@ -9,7 +9,7 @@ use pulp_tui::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, Rep
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use wiremock::matchers::{body_partial_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const API: &str = "/pulp/api/v3/";
@@ -463,6 +463,32 @@ async fn deb_sync_maps_rpm_mirror_policies_to_mirror() {
 }
 
 #[tokio::test]
+async fn deb_publication_reuse_respects_signing_service() {
+    let server = MockServer::start().await;
+    let coll = format!("{API}publications/deb/apt/");
+    let listed = json!({ "pulp_href": format!("{coll}1/"), "repository_version": "/v/", "signing_service": null });
+    Mock::given(method("GET"))
+        .and(path(&coll))
+        .and(query_param("repository_version", "/v/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [listed] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(&coll))
+        .and(body_json(json!({ "repository_version": "/v/", "signing_service": "/ss/1/" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{coll}2/") })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+    let signed = ops::ensure_publication(&c, RepoType::Deb, "/v/", Some("/ss/1/"), &no_progress).await.unwrap();
+    assert_eq!(signed, format!("{coll}2/"));
+    let plain = ops::ensure_publication(&c, RepoType::Deb, "/v/", None, &no_progress).await.unwrap();
+    assert_eq!(plain, format!("{coll}1/"));
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn deb_packages_cannot_be_uploaded() {
     let server = MockServer::start().await;
     let c = client(&server, |_, _| {});
@@ -502,6 +528,22 @@ async fn deb_copy_is_structured_without_dependency_solving() {
         sent,
         json!({ "structured": true, "dependency_solving": false, "config": [{ "source_repo_version": "/sv/", "dest_repo": "/dr/" }] })
     );
+}
+
+#[tokio::test]
+async fn deb_copy_names_the_body_limit_of_the_server() {
+    // Pulp refuses a body above Django's DATA_UPLOAD_MAX_MEMORY_SIZE with an HTML 400 (no message).
+    let server = MockServer::start().await;
+    let page = "<!doctype html><title>Bad Request (400)</title>";
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(400).set_body_string(page)).mount(&server).await;
+    let c = client(&server, |_, _| {});
+    // 74 bytes per href of this length in compact JSON: 36,000 hrefs are above the limit.
+    let hrefs: Vec<String> = (0..36_000).map(|i| format!("/pulp/api/v3/content/deb/packages/{i:036}/")).collect();
+    let e = deb::copy(&c, "/sv/", "/dr/", Some(0), Some(hrefs)).await.unwrap_err().to_string();
+    assert!(e.starts_with("rejected [400]: request body ") && e.contains(" bytes, 36000 hrefs; "), "{e}");
+    assert!(e.ends_with("raise it in the Pulp settings, or narrow the selection with include rules"), "{e}");
+    let e = deb::copy(&c, "/sv/", "/dr/", Some(0), Some(vec!["/p/1/".into()])).await.unwrap_err().to_string();
+    assert_eq!(e, "rejected [400]", "a small body: the server's answer as it is");
 }
 
 /// A server that lists one Release, two components (one of another release) and `packages`, and
@@ -555,4 +597,34 @@ async fn deb_verify_checks_release_index_and_package_digest() {
     let (server, base) = deb_server(json!([])).await;
     let c = client(&server, |_, _| {});
     assert_eq!(deb::verify(&c, &base, "/v/").await.unwrap(), "Release served (no packages)");
+}
+
+#[tokio::test]
+async fn deb_verify_finds_the_package_in_another_distribution() {
+    // A remote of `stable stable-updates`: the smallest package is only in the second distribution.
+    let gamma = json!([{ "pulp_href": "/p/3/", "package": "fixture-gamma", "version": "1.0-1", "architecture": "amd64",
+        "relative_path": "pool/g.deb", "sha256": hex::encode(Sha256::digest(b"gamma bytes")) }]);
+    let (server, base) = deb_server(gamma).await;
+    let components = json!([
+        { "component": "main", "plain_component": "main", "distribution": "/stable/" },
+        { "component": "main", "plain_component": "main", "distribution": "stable-updates" },
+    ]);
+    Mock::given(method("GET"))
+        .and(path(format!("{API}content/deb/release_components/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 2, "next": null, "results": components })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let file = "pool/main/f/fixture-gamma_1.0-1_amd64.deb";
+    let index = format!("Package: fixture-gamma\nVersion: 1.0-1\nArchitecture: amd64\nFilename: {file}\n");
+    for (p, body) in [("dists/stable-updates/main/binary-amd64/Packages", index.as_str()), (file, "gamma bytes")] {
+        Mock::given(method("GET"))
+            .and(path(format!("/pulp/content/d/{p}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+    }
+    let c = client(&server, |_, _| {});
+    let ok = deb::verify(&c, &base, "/v/").await.unwrap();
+    assert_eq!(ok, format!("Release and {file} served with matching digest (1 packages)"));
 }

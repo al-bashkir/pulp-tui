@@ -10,14 +10,14 @@ tools for normal operation.
 |---|---|---|
 | Transport | `src/pulp/client.rs` | Auth (basic, bearer, mTLS), TLS (always verified, custom CA bundles), proxies, timeouts, bounded concurrency (semaphore), retries for reads only, pagination, response size limit, error mapping, href confinement to the configured API root, recording of each request attempt in the in-memory session log |
 | Capabilities | `src/pulp/caps.rs` | `status/` (component versions, health, content origin), `login/` or `users/?username=` (current user), live OpenAPI schema (endpoints, fields, enums) |
-| Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs`, `src/pulp/rpm.rs`, `src/pulp/file.rs` | RPM/File endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification |
-| Services | `src/cv.rs`, `src/replication.rs`, `src/filters.rs` | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules and `rpmvercmp` |
+| Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs`, `src/pulp/rpm.rs`, `src/pulp/file.rs`, `src/pulp/deb.rs` | RPM/File/Deb endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification |
+| Services | `src/cv.rs`, `src/replication.rs`, `src/filters.rs` | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules, `rpmvercmp` and the dpkg version comparison |
 | Storage | `src/store.rs` | sqlx (SQLite, optionally PostgreSQL): task references, Content View definitions, versions, checkpoints, environments, bindings, audit log with operator, locks, replication runs |
 | TUI | `src/tui/*` | Event loop, state, screens, forms, confirmations, Task Center |
 
 ### Plugins
 
-REST operations of one Pulp plugin go in `src/pulp/<plugin>.rs` (`rpm.rs`, `file.rs`).
+REST operations of one Pulp plugin go in `src/pulp/<plugin>.rs` (`rpm.rs`, `file.rs`, `deb.rs`).
 `RepoType` in `models.rs` holds the per-type facts: component name, label, endpoints,
 schema names and required `Feature`. Every dispatch on `RepoType` is an exhaustive
 `match`, so a new type is a compile error in each place that must handle it. There is no
@@ -69,28 +69,45 @@ idle group whose counts stay the same for three polls is also treated as final.
 
 ### Content View implementation
 
-* A **Content View** is a named list of RPM and File repositories. Each repository has
+* A **Content View** is a named list of RPM, File and Deb repositories. Each repository has
   optional filter rules (`src/filters.rs`). A composite view lists other Content Views
   instead (see "Composite Content Views" below).
 * **Publish** first records the latest version of every source repository, so the
-  snapshot is consistent in time. Then for each repository:
+  snapshot is consistent in time, together with the Deb signing choice of the publish
+  (`cv_version_repos.signing`: `''` = same as source, `none`, or a signing service href).
+  Then for each repository:
   1. find or create the derived repository `pulp-tui-cv-<view>-<repo>`, labeled
      `pulp_tui_cv=<view>`, with no retention limit;
   2. copy the selected content into it from an empty base: RPM uses `rpm/copy/` with
      `dest_base_version: 0` (all content, or an explicit list when filters exist); File
-     uses `modify` with `remove_content_units: ["*"]`;
+     uses `modify` with `remove_content_units: ["*"]`; Deb uses `deb/copy/` like RPM, with
+     `structured: true` (the release, component and architecture records of the copied
+     packages come with them) and `dependency_solving: false`;
   3. record the new repository version (or the latest one if the content did not change);
-  4. reuse or create the publication of that version.
+  4. give the derived repository the publish settings of the source (RPM) or the signing
+     choice (Deb: `signing_service` and `signing_service_release_overrides`, only the fields
+     that differ, and only fields the server has);
+  5. RPM and File: reuse or create the publication of that version. Deb: always create one,
+     because a publication signed with repository keys stores `signing_service: null` and
+     cannot be told apart from an unsigned one.
   Every step writes a checkpoint. The href of a submitted copy task is stored before
   waiting, so an interrupted publish **re-attaches to the same task** and does not submit
   it again. A copy task that failed or was canceled is cleared from the checkpoint, so the
-  next *Resume* submits the copy again (it starts from an empty base).
+  next *Resume* submits the copy again (it starts from an empty base). The Deb publication
+  task uses the same checkpoint column (`pending_task`): with no derived version recorded it
+  is the copy task, with one it is the publication task (the copy step clears it in the same
+  write that records the version).
 * RPM filters select packages by name glob, architecture glob and EVR comparison
   (`rpmvercmp` port, tested with rpm's own cases). An advisory is kept only when every
   package it references that exists in the source is selected. Other metadata (comps,
   modules, distribution trees, repo metadata files) is copied unchanged. Module artifact
   packages are copied with their module even when a filter excludes them, because
   `rpm/copy/` adds module children.
+* Deb filters select binary packages by name glob, architecture glob and dpkg version
+  comparison. A filtered snapshot has only the selected packages and the release records
+  that the structured copy adds; source packages and upstream index files are dropped (the
+  publication makes new indices). One copy body holds every selected href, and Pulp refuses
+  a body above 2.5 MiB (see COMPATIBILITY.md); batching is not implemented.
 * A **Content View Version** is immutable. It refers to exact derived repository versions
   and publications. Version numbers are never reused.
 * **Lifecycle environments** form paths from `Library`, for example
@@ -121,7 +138,9 @@ idle group whose counts stay the same for three polls is also treated as final.
 * **Verify / drift**: for every binding, check that the distribution serves the expected
   publication, that the publication belongs to the expected snapshot version, that the
   snapshot still exists, and that served content matches (`PULP_MANIFEST` equal to the
-  snapshot for File; `repomd.xml` plus the smallest package with digest check for RPM).
+  snapshot for File; `repomd.xml` plus the smallest package with digest check for RPM;
+  `dists/<distribution>/Release` plus the smallest package, found in a `Packages` index,
+  with digest check for Deb).
   Retention set on a derived repository is reported. Drift is reconciled by promoting the
   bound version again (idempotent).
 * **Ownership**: pulp-tui never modifies a derived repository or CV distribution that does
@@ -287,6 +306,12 @@ versions and the borrowed rows, with every id remapped. The links between compos
 components and versions are written after all views and versions, so a composite that
 sorts before its components (`rocky9` < `rocky9-os`) is copied correctly. An external
 database at schema 3 needs `db migrate` after the upgrade.
+Schema 5 added `cv_version_repos.signing`, the Deb signing choice of a publish (`''` = same
+as source, `none`, or a signing service href; rows of earlier versions read `''`). It is a
+checkpoint like the source version, so a resumed publish signs as asked; composite rows and
+`db copy` carry it. The schema number also stops an older pulp-tui on a shared database,
+which would otherwise fail on a `deb` repository row and drop its `version` filter rules.
+An external database at schema 4 needs `db migrate` after the upgrade.
 
 **Connection.** `Database::connect_url` (`src/config.rs`) builds the URL: it adds the
 password from the secret reference and forces `sslmode=verify-full` for every PostgreSQL

@@ -44,8 +44,8 @@ async fn rpm_lifecycle() {
     assert_eq!(rv.content_summary.present["rpm.advisory"].count, 1);
 
     // Publish exact version and distribute it.
-    let pub1 = ops::ensure_publication(&c, t, &v1, &no_progress).await.unwrap();
-    assert_eq!(ops::ensure_publication(&c, t, &v1, &no_progress).await.unwrap(), pub1, "publication is reused");
+    let pub1 = ops::ensure_publication(&c, t, &v1, None, &no_progress).await.unwrap();
+    assert_eq!(ops::ensure_publication(&c, t, &v1, None, &no_progress).await.unwrap(), pub1, "publication is reused");
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
     let msg = ops::verify_served(&c, t, &base, &v1, "nested_alphabetically").await.unwrap();
@@ -65,7 +65,7 @@ async fn rpm_lifecycle() {
     assert_eq!(d.added, vec!["fixture-alpha-1.1-1.noarch", "fixture-gamma-0.5-1.noarch"]);
     assert!(d.removed.is_empty());
 
-    let pub2 = ops::ensure_publication(&c, t, &v2, &no_progress).await.unwrap();
+    let pub2 = ops::ensure_publication(&c, t, &v2, None, &no_progress).await.unwrap();
     ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), None, &no_progress).await.unwrap();
     assert_eq!(served(&c, &alpha11).await.0, 200);
     assert_ne!(served(&c, &format!("{base}repodata/repomd.xml")).await.1, repomd1);
@@ -130,7 +130,7 @@ async fn file_lifecycle() {
     let (repo, remote) = synced_repo(&c, t, &name, "file/PULP_MANIFEST", "mirror").await;
     let v1 = latest(&c, &repo).await;
     assert_eq!(file::files_in(&c, &v1).await.unwrap().len(), 3);
-    let pub1 = ops::ensure_publication(&c, t, &v1, &no_progress).await.unwrap();
+    let pub1 = ops::ensure_publication(&c, t, &v1, None, &no_progress).await.unwrap();
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
     ops::verify_served(&c, t, &base, &v1, "").await.unwrap();
@@ -142,7 +142,7 @@ async fn file_lifecycle() {
     let m = c.post(&format!("{repo}modify/"), &json!({ "add_content_units": [big.pulp_href] })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
     let v2 = latest(&c, &repo).await;
-    let pub2 = ops::ensure_publication(&c, t, &v2, &no_progress).await.unwrap();
+    let pub2 = ops::ensure_publication(&c, t, &v2, None, &no_progress).await.unwrap();
     ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), None, &no_progress).await.unwrap();
     assert_eq!(served(&c, &format!("{base}big.bin")).await.0, 200);
     ops::verify_served(&c, t, &base, &v2, "").await.unwrap();

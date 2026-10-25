@@ -128,13 +128,24 @@ pub async fn sync(c: &PulpClient, t: RepoType, repo: &str, remote: Option<&str>,
     c.post(&format!("{repo}sync/"), &body).await
 }
 
-/// Reuse the publication of a version if one exists (publishing is deterministic).
-pub async fn ensure_publication(c: &PulpClient, t: RepoType, version: &str, on: OnTask<'_>) -> Result<String> {
-    let p: Page<Publication> = c.list(&c.api(t.publications()), &[("repository_version", version.into()), ("limit", "1".into())]).await?;
-    if let Some(pubn) = p.results.into_iter().next() {
+/// Reuse a publication of the version made with the same signing service (publishing is
+/// deterministic). `signing_service` is sent only when set: Deb is the only type that takes it.
+pub async fn ensure_publication(
+    c: &PulpClient,
+    t: RepoType,
+    version: &str,
+    signing_service: Option<&str>,
+    on: OnTask<'_>,
+) -> Result<String> {
+    let all: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository_version", version.into())], 1_000).await?;
+    if let Some(pubn) = all.into_iter().find(|p| p.signing_service.as_deref() == signing_service) {
         return Ok(pubn.pulp_href);
     }
-    create(c, &c.api(t.publications()), &json!({ "repository_version": version }), "/publications/", on).await
+    let mut body = json!({ "repository_version": version });
+    if let Some(s) = signing_service {
+        body["signing_service"] = s.into();
+    }
+    create(c, &c.api(t.publications()), &body, "/publications/", on).await
 }
 
 /// Create or re-point a distribution. Refuses to take over a base path owned by a

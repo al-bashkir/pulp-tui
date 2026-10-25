@@ -57,7 +57,7 @@ async fn content_view_lifecycle() {
     assert!(!preview.contains("boot.iso"), "{preview}");
 
     // v1: publish auto-binds Library and is verified against served content.
-    let v1 = svc.publish(cv, "first", &quiet, &no_progress).await.unwrap();
+    let v1 = svc.publish(cv, "first", "", &quiet, &no_progress).await.unwrap();
     assert_eq!((v1.number, v1.state.as_str()), (1, "published"));
     let lib = store.ensure_library(&profile).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
@@ -86,7 +86,7 @@ async fn content_view_lifecycle() {
     ops::settle(&c, m, &no_progress).await.unwrap();
     let m = ops::sync(&c, RepoType::Rpm, &rpm_repo, None, "additive").await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    let v2 = svc.publish(cv, "upstream update", &quiet, &no_progress).await.unwrap();
+    let v2 = svc.publish(cv, "upstream update", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(v2.number, 2);
     assert_eq!(store.binding(lib, cv).await.unwrap().unwrap().version_id, v2.id);
     svc.promote(cv, v2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
@@ -108,7 +108,7 @@ async fn content_view_lifecycle() {
     // Advisory filtering: excluding the package referenced by the advisory drops it.
     os.filters = parse_rules("exclude name=*-debuginfo; exclude name=fixture-beta", RepoType::Rpm).unwrap();
     store.set_cv_repo(cv, &os).await.unwrap();
-    let v3 = svc.publish(cv, "no beta", &quiet, &no_progress).await.unwrap();
+    let v3 = svc.publish(cv, "no beta", "", &quiet, &no_progress).await.unwrap();
     let os_v3 = store.version_repos(v3.id).await.unwrap().into_iter().find(|v| v.repo().repo_name == "os").unwrap();
     let rv: RepoVersion = c.get(os_v3.derived_version.as_deref().unwrap(), &[]).await.unwrap();
     assert!(!rv.content_summary.present.contains_key("rpm.advisory"));
@@ -196,7 +196,7 @@ async fn environment_relabel_moves_served_paths() {
         .set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] })
         .await
         .unwrap();
-    let v1 = svc.publish(cv, "", &quiet, &no_progress).await.unwrap();
+    let v1 = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
     let lib = store.ensure_library(&profile).await.unwrap();
     let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
@@ -251,7 +251,7 @@ async fn content_view_owned_by_another_database() {
     };
 
     // A publishes and promotes to Library: its derived repository and distribution carry A's id.
-    let v = a.publish(a_cv, "", &quiet, &no_progress).await.unwrap();
+    let v = a.publish(a_cv, "", "", &quiet, &no_progress).await.unwrap();
     let derived = a.store.version_repos(v.id).await.unwrap().remove(0).derived_repo.unwrap();
     let lib = a.store.ensure_library(&profile).await.unwrap();
     let dist = a.store.binding_repos(lib, a_cv).await.unwrap().remove(0).distribution;
@@ -259,14 +259,14 @@ async fn content_view_owned_by_another_database() {
     assert_eq!(label(dist.clone()).await.as_deref(), Some(a.store.db_id()));
 
     // B refuses the foreign derived repository, and writes nothing.
-    let err = format!("{:#}", b.publish(b_cv, "", &quiet, &no_progress).await.unwrap_err());
+    let err = format!("{:#}", b.publish(b_cv, "", "", &quiet, &no_progress).await.unwrap_err());
     let foreign = format!("is owned by another pulp-tui database ({})", a.store.db_id());
     assert!(err.contains(&foreign), "{err}");
     assert_eq!(label(derived.clone()).await.as_deref(), Some(a.store.db_id()));
 
     // Once B knows A's id as an alias, B adopts both objects.
     b.store.add_alias(a.store.db_id()).await.unwrap();
-    b.publish(b_cv, "", &quiet, &no_progress).await.unwrap();
+    b.publish(b_cv, "", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(label(derived.clone()).await.as_deref(), Some(b.store.db_id()));
     assert_eq!(label(dist.clone()).await.as_deref(), Some(b.store.db_id()));
 
@@ -303,15 +303,15 @@ async fn composite_content_view_rocky9() {
     let repo = |href: &str, name: &str, t| CvRepo { repo_href: href.into(), repo_name: name.into(), repo_type: t, filters: vec![] };
     store.set_cv_repo(os, &repo(&file_repo, "docs", RepoType::File)).await.unwrap();
     store.set_cv_repo(extras, &repo(&rpm_repo, "os", RepoType::Rpm)).await.unwrap();
-    let os_v1 = svc.publish(os, "", &quiet, &no_progress).await.unwrap();
-    let extras_v1 = svc.publish(extras, "", &quiet, &no_progress).await.unwrap();
+    let os_v1 = svc.publish(os, "", "", &quiet, &no_progress).await.unwrap();
+    let extras_v1 = svc.publish(extras, "", "", &quiet, &no_progress).await.unwrap();
 
     // v1: os pinned, extras latest; nothing is copied, and Library serves the composite's own paths.
     let comp = store.create_composite(&profile, &id, "").await.unwrap();
     store.set_component(comp, os, Some(os_v1.id)).await.unwrap();
     store.set_component(comp, extras, None).await.unwrap();
     store.set_auto_publish(comp, true).await.unwrap();
-    let c1 = svc.publish(comp, "first", &quiet, &no_progress).await.unwrap();
+    let c1 = svc.publish(comp, "first", "", &quiet, &no_progress).await.unwrap();
     assert_eq!((c1.number, c1.state.as_str()), (1, "published"));
     let lib = store.ensure_library(&profile).await.unwrap();
     assert_eq!(svc.verify(comp, lib).await.unwrap(), Vec::<String>::new());
@@ -332,7 +332,7 @@ async fn composite_content_view_rocky9() {
     ops::settle(&c, m, &no_progress).await.unwrap();
     let m = ops::sync(&c, RepoType::Rpm, &rpm_repo, None, "additive").await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    let extras_v2 = svc.publish(extras, "update", &quiet, &no_progress).await.unwrap();
+    let extras_v2 = svc.publish(extras, "update", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(extras_v2.number, 2);
     let auto = svc.auto_publish(extras, &quiet, &no_progress).await;
     let want: Vec<Result<String, String>> = vec![Ok(format!("{id} v2 published"))];

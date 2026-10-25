@@ -3,10 +3,11 @@
 A keyboard-driven terminal application to manage one or more **Pulp 3** servers through
 the Pulp REST API:
 
-* **RPM and File repositories**: repositories and remotes (separate objects), sync with
-  policy previews, uploads (chunked, digest-verified), content browsing and metadata,
-  add/remove/copy content, versions and diffs, publications, distributions (pinned or
-  following latest), rollback by re-pointing, served-content verification.
+* **RPM, File and Deb repositories**: repositories and remotes (separate objects), sync with
+  policy previews, uploads (chunked, digest-verified; not for Deb), content browsing and
+  metadata, add/remove/copy content, versions and diffs, publications (Deb: optional signing
+  service), distributions (pinned or following latest), rollback by re-pointing,
+  served-content verification.
 * **Content Views and lifecycle environments** (Katello-inspired, implemented by pulp-tui
   on top of Pulp; not a Pulp or Katello API): filtered multi-repository snapshots,
   numbered immutable versions, promotion along `Library -> Dev -> … -> Prod`, rollback,
@@ -89,16 +90,17 @@ podman run --rm -it --read-only \
 ```sh
 cargo test                     # unit + mock HTTP tests (live tests skip themselves)
 tests/run-live.sh              # starts Pulp in Podman/Docker, runs all live scenarios
-tests/run-live.sh repos cv     # selected scenarios (repos cv rbac failures replication shared_db)
+tests/run-live.sh repos cv     # selected scenarios (repos cv rbac failures replication shared_db deb)
 tests/env/pulp-env.sh up-all     # start pulp1, pulp2, PostgreSQL and the fixture http server
 tests/env/pulp-env.sh down-all   # remove all of them (containers and volumes)
 ```
 
-The live environment uses `quay.io/pulp/pulp` (pulpcore, pulp_rpm, pulp_file), local RPM
-and File fixtures built with `rpmbuild`/`createrepo_c`, and a static HTTP server as the
-upstream repository. A second Pulp instance starts only for replication tests, and a
-PostgreSQL 16 container (`127.0.0.1:55432`, test password `pulp_tui_test`) only for the
-`shared_db` scenario.
+The live environment uses `quay.io/pulp/pulp` (pulpcore, pulp_rpm, pulp_file, pulp_deb),
+local RPM, File and Deb fixtures built with `rpmbuild`/`createrepo_c` (and GNU `ar` and `tar`
+for Deb), and a static HTTP server as the upstream repository. A second Pulp instance starts
+only for replication tests, and a PostgreSQL 16 container (`127.0.0.1:55432`, test password
+`pulp_tui_test`) only for the `shared_db` scenario. The `deb` scenario registers a test-only
+Deb signing service (with a test GPG key made in the container) on pulp1.
 
 ## License
 

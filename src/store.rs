@@ -94,6 +94,8 @@ const MIGRATIONS: &[&str] = &[
         version_id INTEGER NOT NULL REFERENCES cv_versions(id) ON DELETE CASCADE,
         component_version_id INTEGER NOT NULL REFERENCES cv_versions(id) ON DELETE CASCADE,
         PRIMARY KEY(version_id, component_version_id));",
+    // 5: Deb signing choice of a Content View publish ('' = same as source, 'none', or a signing service href)
+    "ALTER TABLE cv_version_repos ADD COLUMN signing TEXT NOT NULL DEFAULT '';",
 ];
 
 /// `MIGRATIONS` for PostgreSQL: every integer is BIGINT (sqlx `Any` reads SQLite integers as
@@ -170,6 +172,8 @@ pub const PG_MIGRATIONS: &[&str] = &[
         version_id BIGINT NOT NULL REFERENCES cv_versions(id) ON DELETE CASCADE,
         component_version_id BIGINT NOT NULL REFERENCES cv_versions(id) ON DELETE CASCADE,
         PRIMARY KEY(version_id, component_version_id));",
+    // 5: Deb signing choice of a Content View publish ('' = same as source, 'none', or a signing service href)
+    "ALTER TABLE cv_version_repos ADD COLUMN signing TEXT NOT NULL DEFAULT '';",
 ];
 
 /// A Content View lock not renewed for this long is expired; the next operator takes it over.
@@ -271,6 +275,8 @@ pub struct CvVersionRepo {
     pub content_count: Option<i64>,
     /// A composite's row: the objects belong to a component version and are never deleted with it.
     pub borrowed: bool,
+    /// Deb signing choice of the publish: "" = same as source, "none", or a signing service href.
+    pub signing: String,
 }
 
 impl CvVersionRepo {
@@ -932,7 +938,7 @@ impl Store {
     pub async fn version_repos(&self, version_id: i64) -> Result<Vec<CvVersionRepo>> {
         let rows = sqlx::query(
             "SELECT repo_href, repo_name, repo_type, filters, source_version, derived_repo, derived_version, publication,
-                    pending_task, content_count, borrowed FROM cv_version_repos WHERE version_id = $1 ORDER BY repo_name",
+                    pending_task, content_count, borrowed, signing FROM cv_version_repos WHERE version_id = $1 ORDER BY repo_name",
         )
         .bind(version_id)
         .fetch_all(&self.pool)
@@ -950,6 +956,7 @@ impl Store {
                     pending_task: r.try_get(8)?,
                     content_count: r.try_get(9)?,
                     borrowed: borrowed != 0,
+                    signing: r.try_get(11)?,
                 })
             })
             .collect()
@@ -959,7 +966,7 @@ impl Store {
     pub async fn save_version_repo(&self, vr: &CvVersionRepo) -> Result<()> {
         sqlx::query(
             "UPDATE cv_version_repos SET source_version = $3, derived_repo = $4, derived_version = $5, publication = $6,
-                    pending_task = $7, content_count = $8 WHERE version_id = $1 AND repo_href = $2",
+                    pending_task = $7, content_count = $8, signing = $9 WHERE version_id = $1 AND repo_href = $2",
         )
         .bind(vr.version_id)
         .bind(&vr.repo().repo_href)
@@ -969,6 +976,7 @@ impl Store {
         .bind(&vr.publication)
         .bind(&vr.pending_task)
         .bind(vr.content_count)
+        .bind(&vr.signing)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1757,8 +1765,8 @@ async fn insert_version_repo(c: &mut AnyConnection, vr: &CvVersionRepo) -> Resul
     let r = vr.repo();
     sqlx::query(
         "INSERT INTO cv_version_repos(version_id, repo_href, repo_name, repo_type, filters, source_version, derived_repo,
-                derived_version, publication, pending_task, content_count, borrowed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                derived_version, publication, pending_task, content_count, borrowed, signing)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(vr.version_id)
     .bind(&r.repo_href)
@@ -1772,6 +1780,7 @@ async fn insert_version_repo(c: &mut AnyConnection, vr: &CvVersionRepo) -> Resul
     .bind(&vr.pending_task)
     .bind(vr.content_count)
     .bind(vr.borrowed as i64)
+    .bind(&vr.signing)
     .execute(&mut *c)
     .await?;
     Ok(())
@@ -1992,6 +2001,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deb_signing_choice_is_a_checkpoint() {
+        let s = Store::open_in_memory().await.unwrap();
+        let cv = s.create_cv("k", "web", "").await.unwrap();
+        let v = s.begin_version(cv, "", &[repo("apt", RepoType::Deb)]).await.unwrap();
+        let mut vr = s.version_repos(v.id).await.unwrap().remove(0);
+        assert_eq!(vr.signing, "", "same as source until the publish sets it");
+        vr.source_version = Some("/r/1/versions/2/".into());
+        vr.signing = "/pulp/api/v3/signing-services/1/".into();
+        s.save_version_repo(&vr).await.unwrap();
+        assert_eq!(s.version_repos(v.id).await.unwrap(), [vr]);
+    }
+
+    #[tokio::test]
+    async fn deb_repository_with_a_version_rule_loads() {
+        let s = Store::open_in_memory().await.unwrap();
+        let cv = s.create_cv("k", "web", "").await.unwrap();
+        let rules = r#"[{"action":"exclude","name":"*-dbg","version":["<","1.0"]}]"#;
+        sqlx::query("INSERT INTO cv_repos(cv_id, repo_href, repo_name, repo_type, filters) VALUES ($1, '/r/deb/', 'apt', 'deb', $2)")
+            .bind(cv)
+            .bind(rules)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let r = s.cv_repos(cv).await.unwrap().remove(0);
+        assert_eq!(r.repo_type, RepoType::Deb);
+        assert_eq!(r.filters, parse_rules("exclude name=*-dbg version<1.0", RepoType::Deb).unwrap());
+        assert_eq!(r.filters[0].version, Some(("<".into(), "1.0".into())));
+    }
+
+    #[tokio::test]
     async fn migration_3_keeps_todays_paths() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pulp-tui.db");
@@ -2040,6 +2079,7 @@ mod tests {
         assert_eq!((r.derived_repo.as_deref(), r.derived_version.as_deref()), (Some("/d/1/"), Some("/d/1/versions/1/")));
         assert_eq!((r.publication.as_deref(), r.pending_task.as_deref(), r.content_count), (Some("/p/1/"), None, Some(7)));
         assert!(!r.borrowed);
+        assert_eq!(r.signing, "", "schema 5: a row written before it is same as source");
     }
 
     #[tokio::test]
@@ -2387,6 +2427,7 @@ mod tests {
             pending_task: Some("/t/9/".into()),
             content_count: Some(7),
             borrowed: false,
+            signing: "none".into(),
         };
         src.save_version_repo(&vr).await.unwrap();
         for (env, ver) in [(dev, v1.id), (prod, v2.id)] {

@@ -136,8 +136,8 @@ are visible.
 | f | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File and Deb: additive, mirror). Mirror policies show a warning first. |
 | H | sync history (tasks that touched this repository) |
 | u | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed or cancelled (Esc) chunked uploads are deleted. Not offered for Deb repositories (upload of `.deb` files is not supported). |
-| P | publish the latest version (reuses an existing publication) |
-| D | distribute: pin the latest version (publication) or follow the repository latest |
+| P | publish the latest version (reuses an existing publication). Deb asks for an optional signing service (empty = the repository's own keys); a publication is reused only when its signing service is the same. The field is not asked when the server's Deb publications have no `signing_service`. |
+| D | distribute: pin the latest version (publication) or follow the repository latest. Deb asks for the same optional signing service as **P**, for the pinned publication. |
 | C | copy content from another repository (filter rules; RPM can copy dependencies; a Deb copy is structured: it also copies the Release, component and architecture records of the packages, and never solves dependencies) |
 | c / e / d | create / edit / delete (delete names every distribution that serves the repository, a version or a publication of it; refused while it holds Content View snapshots) |
 | i | full JSON |
@@ -149,8 +149,9 @@ Deb repositories use the same keys. Sync a Deb repository from a Deb remote, pub
 (**P**) and distribute it (**D**) as for the other types. A Deb distribution is served
 at `<content URL>/dists/<distribution>/...`. Distribution verification (**V** in
 Distributions) fetches the `Release` file, finds the smallest package in a `Packages`
-index and compares the digest of the downloaded `.deb`. Deb repositories cannot be used in
-Content Views yet. The fallback replication handles RPM and File only.
+index and compares the digest of the downloaded `.deb`. Deb repositories can be used in
+Content Views (see "Deb repositories in Content Views"). The fallback replication handles RPM
+and File only.
 
 ### Remotes
 `t` switches RPM/File/Deb. Create/edit: URL (File: URL of `PULP_MANIFEST`; Deb: the Debian
@@ -173,7 +174,9 @@ Deb remote fields (each is shown only when the server has it):
 ### Repository Versions
 From a repository (**v**) or for all repositories. Columns: number, created, present /
 added / removed counts. Actions: **o** content, **P** publish this version, **D**
-distribute it, **b** point a distribution to it (rollback, with preview), **m** compare
+distribute it (Deb: both ask for the optional signing service, as in Repositories), **b**
+point a distribution to it (rollback, with preview; Deb: the new publication keeps the
+signing service of the publication that the distribution serves now), **m** compare
 with the marked version (`Space` on one, `m` on the other; shows added/removed NEVRAs or
 files, older → newer), **d** delete (names the distributions that serve the version or its
 publications, and you type the version id; refused for Content View snapshots; never needed
@@ -186,12 +189,13 @@ files. Deb: packages (package, version, architecture, sha256), releases (distrib
 codename, suite, version), release components, source packages. `/`
 searches package names (on the RPM and Deb packages lists) or file paths. **i** shows all metadata of a unit (requires,
 provides, files, advisory package lists, …). **x** removes the marked (or selected)
-units from the repository; **a** adds them to another repository. Both create a new
+units from the repository; **a** adds them to another repository (Deb: a structured copy,
+which also copies the Release, component and architecture records, so apt finds the packages). Both create a new
 repository version; old versions are unchanged.
 
 ### Publications
 `t` switches RPM/File/Deb. **c** create from repository name and optional version number,
-**D** distribute, **d** delete (names the distributions that serve it, and you type the
+**D** distribute (Deb: pins the selected publication, also one with a signing service), **d** delete (names the distributions that serve it, and you type the
 publication id; refused for publications of Content View snapshots).
 
 ### Distributions
@@ -199,7 +203,8 @@ publication id; refused for publications of Content View snapshots).
 repository version) or **FOLLOWS LATEST** (repository). **y** copies the content URL
 (OSC 52 terminal clipboard), **V** verifies what is served (for a distribution that follows
 a repository: its newest publication, which is not the latest version when that version has
-no publication), **b** re-points to a version (preview first), **c**/**e** create/edit
+no publication), **b** re-points to a version (preview first; Deb: with the signing service
+of the publication it serves now), **c**/**e** create/edit
 (name, base path, binding, content guard, labels), **d** delete. A distribution of a
 Content View (label `pulp_tui_cv`) cannot be re-pointed or re-bound here (use promote or
 roll back); its base path and labels can be edited, and delete warns.
@@ -213,12 +218,12 @@ Views" below.
 | Key | Action |
 |---|---|
 | c / e / d | create / edit description / delete (removes the view's distributions and snapshot repositories, never source repositories; the dialog lists every served path, and a served protected environment must be typed after the view name, for example `web Prod`). On a composite, Edit also sets auto publish and the pin of each component, and Delete removes only its distributions. |
-| a | add repositories: a multi-select picker of RPM and File repositories (those already in the view and Content View snapshot repositories are not listed) and filter rules; the rules apply to each selected repository, so mixed RPM and File selections need empty rules. On a composite: add components (see below). |
+| a | add repositories: a multi-select picker of RPM, File and Deb repositories (those already in the view and Content View snapshot repositories are not listed) and filter rules; the rules apply to each selected repository, so a selection of more than one type needs empty rules. On a composite: add components (see below). |
 | F | edit the filter rules of one repository (not offered on a composite) |
 | x | remove a repository from the definition (published versions are unchanged). On a composite: remove a component. |
-| f | sync repositories: a multi-select picker of the view's repositories (all marked) and one sync policy (RPM values when the view has an RPM repository, else File values; File repositories treat any mirror policy as mirror). Each repository syncs from its own default remote; one without is skipped. Mirror policies show a warning first. The tasks show in Tasks; the result lists each repository: new version, no change, failed or skipped. Sync does not publish. Not offered on a composite. |
+| f | sync repositories: a multi-select picker of the view's repositories (all marked) and one sync policy (RPM values when the view has an RPM repository, else the File and Deb values additive and mirror; File and Deb repositories treat any mirror policy as mirror). Each repository syncs from its own default remote; one without is skipped. Mirror policies show a warning first. The tasks show in Tasks; the result lists each repository: new version, no change, failed or skipped. Sync does not publish. Not offered on a composite. |
 | w | preview: exact content the draft selects compared with the latest published version |
-| P | publish a new version: notes → preview → confirm; the version becomes active in Library |
+| P | publish a new version: notes (and the Deb signing, when the view has a Deb repository) → preview → confirm; the version becomes active in Library |
 | v | versions of the view |
 | M | promote a version to an environment (preview of every distribution; protected environments require typing their name) |
 | b | roll back an environment to an earlier version |
@@ -269,6 +274,46 @@ is refused with a message that names the types that have it: RPM takes `name=`, 
 same operators as `evr` with the Debian rules for version comparison (`~` sorts before
 everything, `epoch:` is optional, and a rule without a revision matches every revision of
 that upstream version). The same rules filter the copy action (**C**) of a repository.
+
+#### Deb repositories in Content Views
+
+A Content View can hold Deb repositories, also together with RPM and File repositories (then
+without filter rules). Publish copies the selected packages with a structured copy
+(`deb/copy/`): it also copies the Release, component and architecture records of these
+packages, so apt finds the same distributions and components. Without filter rules, all
+content is copied. A filtered snapshot has only the selected binary packages: source packages
+and the upstream index files are not copied, and the publication makes new indices.
+
+**Deb signing.** The Publish form shows this choice when the view has a Deb repository. One
+choice applies to every Deb repository of the publish:
+
+* `same as source` (the default): the snapshot repository gets the `signing_service` and the
+  per-release keys (`signing_service_release_overrides`) of its source repository.
+* `none`: the snapshot repository has no keys (no signing service and no per-release keys).
+  Clients get an unsigned `Release` (no `Release.gpg` and no `InRelease`).
+* `service`: pick a signing service in **Signing service**. The snapshot repository gets it,
+  and no per-release keys. The picker lists the signing services of all plugins; Pulp
+  refuses one that is not a Deb (APT) signing service, and Publish stops with `signing
+  service <href> was refused by the server; delete this Content View version and publish
+  again with another choice` (*Resume* would send the same choice). Publish stops with `pick a signing
+  service` when you pick none, and with `not supported by this server: signing_service on
+  Deb repositories` when the server's Deb repositories have no signing field.
+
+Pulp changes only the per-release keys that a request names, so pulp-tui removes each
+per-release key that the snapshot repository must not keep (also one that the source no
+longer has). pulp-tui changes only the snapshot repository, never the source. The choice is saved with
+the version, so *Resume* signs as you asked. Each Deb repository of a version gets its own
+publication: a publication that repository keys signed does not record the keys, so
+pulp-tui never reuses one for a Deb repository (also when the content is the same as in the
+previous version). A composite uses the publications of its component versions, so its
+Publish does not ask.
+
+**Large selections.** Pulp refuses a request body above 2.5 MiB (Django
+`DATA_UPLOAD_MAX_MEMORY_SIZE`) with `rejected [400]`. That is about 35,000 package hrefs in one
+Deb copy. pulp-tui then adds the body size and the number of hrefs to the error. Raise
+`DATA_UPLOAD_MAX_MEMORY_SIZE` in the Pulp settings, or narrow the selection with include rules
+(for example `include arch=amd64`). An RPM repository with filter rules has the same limit
+(`rpm/copy/`). A repository without filter rules sends no list of hrefs.
 
 #### Composite Content Views
 
@@ -335,7 +380,8 @@ extras.
 publish that failed or was interrupted (continues from checkpoints and re-attaches to a
 submitted task; with a shared database it can also continue a publish that another
 operator started), **W** watch the pending copy task of a publishing version (see Tasks;
-only the copy step stores its task, so during other steps W says that no task is pending),
+only the copy step, and the publication of a Deb repository, store their task, so during
+other steps W says that no task is pending),
 **d** delete (refused while bound, and while a composite uses it),
 **i** details (source versions, snapshot versions, publications, unit counts; for a
 composite version, the component versions). A `publishing` version shows as `interrupted`
@@ -543,11 +589,11 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreS
   (open Servers, Connect again to migrate, or run pulp-tui db migrate --profile prod)`, and
   Connect offers the migration (see below). The command-line Content View commands
   (`export-cv`, `import-cv`, `db copy`) stop with, for example, `... database schema 1 is
-  older than this pulp-tui (4); run pulp-tui db migrate --profile prod` or `...: database is
+  older than this pulp-tui (5); run pulp-tui db migrate --profile prod` or `...: database is
   not initialized; run pulp-tui db migrate --profile prod`.
 * **Migrate from the TUI.** When Connect finds a database with no schema, or an older one,
   it asks `Migrate database of <profile>?`. The dialog shows the database, the schema
-  change (for example `empty -> 4`) and a warning that other operators then need this
+  change (for example `empty -> 5`) and a warning that other operators then need this
   pulp-tui version or newer. Enter migrates (with the role of the connection, which must
   create tables, as for `db migrate`). Esc does not migrate; the Content View screens then
   show the message above. When you save a profile with a new database, pulp-tui opens it at
@@ -581,6 +627,11 @@ ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreS
    path moves. An external
    database at schema 3 needs the same migration (the TUI offer, or `db migrate`) before
    composite Content Views work: schema 4 adds their tables and columns.
+   **Upgrade to the version with Deb Content Views:** this version adds schema 5: run
+   `pulp-tui db migrate`; every operator of a shared database must upgrade; older versions
+   stop with `database schema 5 is newer than this pulp-tui`. Schema 5 adds the column
+   `cv_version_repos.signing` (the Deb signing choice of a publish). An older pulp-tui also
+   cannot read a view with a Deb repository.
 3. Give the operators' role only `SELECT`, `INSERT`, `UPDATE` and `DELETE`. After a migration
    that adds tables, grant again (or use `ALTER DEFAULT PRIVILEGES`).
 
