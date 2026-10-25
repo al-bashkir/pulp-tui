@@ -84,7 +84,7 @@ fn new_cv_repos(picked: &[PickItem], rules: &str) -> Result<Vec<CvRepo>, String>
     }
     let t = repos[0].repo_type;
     if repos.iter().any(|r| r.repo_type != t) {
-        return Err("filter rules need repositories of one type; add RPM and File repositories separately".into());
+        return Err("filter rules need repositories of one type; add repositories of different types separately".into());
     }
     let filters = parse_rules(rules, t)?;
     for r in &mut repos {
@@ -366,7 +366,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                 vec![
                     Field::pick("repos", "Repositories", Source::Repos(None)).multi().required().exclude(present),
                     Field::text("filters", "Filter rules")
-                        .help("rpm: include name=x* arch=.. evr>=1.0; exclude name=*-debuginfo | file: exclude path=isos/*"),
+                        .help("rpm: include name=x* arch=.. evr>=1.0; exclude name=*-debuginfo | file: exclude path=isos/* | deb: exclude name=*-dbg version<1.0"),
                 ],
             )
             .note("Each repository keeps its own type and distribution; formats are never merged.")
@@ -531,8 +531,8 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             )
             .note("Each repository syncs from its own default remote; one without a default remote is skipped.")
             .note("This only syncs. Publish a new version (P) afterwards to use the new content.");
-            if has("rpm") && has("file") {
-                form = form.note("File repositories: additive stays additive; any mirror policy means mirror.");
+            if has("rpm") && (has("file") || has("deb")) {
+                form = form.note("File and Deb repositories: additive stays additive; any mirror policy means mirror.");
             }
             // All marked, so the picker needs no server request.
             form.set_options(0, Ok(items));
@@ -979,13 +979,28 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn item(name: &str, t: &str) -> PickItem {
-        PickItem { label: name.into(), value: format!("/pulp/api/v3/repositories/{t}/{t}/{name}/"), note: t.into() }
+        let collection = match t {
+            "deb" => "deb/apt".to_string(),
+            _ => format!("{t}/{t}"),
+        };
+        PickItem { label: name.into(), value: format!("/pulp/api/v3/repositories/{collection}/{name}/"), note: t.into() }
     }
 
     #[test]
     fn mixed_types_with_rules_rejected() {
-        let e = new_cv_repos(&[item("a", "rpm"), item("b", "file")], "exclude name=*-debuginfo").unwrap_err();
-        assert!(e.contains("one type"), "{e}");
+        let msg = "filter rules need repositories of one type; add repositories of different types separately";
+        for other in ["file", "deb"] {
+            let e = new_cv_repos(&[item("a", "rpm"), item("b", other)], "exclude name=*-debuginfo").unwrap_err();
+            assert_eq!(e, msg);
+        }
+    }
+
+    #[test]
+    fn deb_repositories_take_deb_rules() {
+        let r = new_cv_repos(&[item("a", "deb"), item("b", "deb")], "exclude name=*-dbg version<1.0").unwrap();
+        assert_eq!((r[0].repo_type, r[1].repo_type), (RepoType::Deb, RepoType::Deb));
+        assert_eq!(r[1].filters[0].to_string(), "exclude name=*-dbg version<1.0");
+        assert!(new_cv_repos(&[item("a", "deb")], "exclude evr<1.0").is_err());
     }
 
     #[test]
@@ -1194,9 +1209,21 @@ mod tests {
         let form = sync_form(&mut app, both).expect("no form");
         assert_eq!((form.picked("repos").len(), form.fields[0].shown.as_str()), (2, "2 selected"));
         assert_eq!(form.fields[1].kind, FieldKind::Choice(super::super::actions::sync_policies(None, RepoType::Rpm)));
+        let note = "File and Deb repositories: additive stays additive; any mirror policy means mirror.";
+        assert!(form.notes.iter().any(|n| n == note), "RPM + File still shows the mixed-sync note: {:?}", form.notes);
         // A file-only view gets the File values.
         let files = json!([{ "name": "iso", "type": "file", "href": format!("{REPOS}file/file/2/") }]);
         let form = sync_form(&mut app, files).expect("no form");
+        assert_eq!(form.fields[1].kind, FieldKind::Choice(vec!["additive".into(), "mirror".into()]));
+        // RPM mixed with File or Deb: the note says how the other types read the RPM values.
+        assert!(form.notes.iter().all(|n| n != note));
+        let deb = json!({ "name": "apt", "type": "deb", "href": format!("{REPOS}deb/apt/3/") });
+        let rpm = json!({ "name": "os", "type": "rpm", "href": format!("{REPOS}rpm/rpm/1/") });
+        let form = sync_form(&mut app, json!([rpm, deb])).expect("no form");
+        assert!(form.notes.iter().any(|n| n == note), "{:?}", form.notes);
+        assert_eq!(form.fields[1].kind, FieldKind::Choice(super::super::actions::sync_policies(None, RepoType::Rpm)));
+        let form = sync_form(&mut app, json!([deb])).expect("no form");
+        assert!(form.notes.iter().all(|n| n != note));
         assert_eq!(form.fields[1].kind, FieldKind::Choice(vec!["additive".into(), "mirror".into()]));
         // No repositories: no form, an error notice.
         let mut empty = test_app().await;

@@ -471,6 +471,15 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
     }
 }
 
+/// The types a "Types" choice of the fallback form selects. Deb has no fallback replication.
+fn replication_types(choice: &str) -> Vec<RepoType> {
+    match choice {
+        "rpm" => vec![RepoType::Rpm],
+        "file" => vec![RepoType::File],
+        _ => vec![RepoType::Rpm, RepoType::File],
+    }
+}
+
 /// Content synchronization from another configured profile when native replication is
 /// unavailable or unsuitable.
 pub fn fallback(app: &mut App) {
@@ -499,11 +508,7 @@ pub fn fallback(app: &mut App) {
         let src_profile = app.cfg.profiles.get(&src_name).cloned().ok_or("unknown profile")?;
         let dst_profile = app.cfg.profiles.get(&dst).cloned().ok_or("unknown profile")?;
         replication::guard_self(&src_profile.origin(), &dst_profile.origin()).map_err(|e| e.to_string())?;
-        let types: Vec<RepoType> = match f.get("types") {
-            "rpm" => vec![RepoType::Rpm],
-            "file" => vec![RepoType::File],
-            _ => vec![RepoType::Rpm, RepoType::File],
-        };
+        let types = replication_types(f.get("types"));
         let (filter, mirror, settings) = (f.get("filter").to_string(), f.bool("mirror"), app.cfg.settings.clone());
         app.job(format!("plan replication from {src_name}"), move |ctx| async move {
             let src = PulpClient::new(&src_name, &src_profile, &settings)?;
@@ -548,6 +553,15 @@ pub fn fallback(app: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use crate::pulp::RepoType;
+
+    #[test]
+    fn replication_types_stay_rpm_and_file() {
+        assert_eq!(super::replication_types("rpm+file"), [RepoType::Rpm, RepoType::File]);
+        assert_eq!(super::replication_types("rpm"), [RepoType::Rpm]);
+        assert_eq!(super::replication_types("file"), [RepoType::File]);
+    }
+
     #[test]
     fn powerful_roles() {
         assert!(super::is_powerful("rpm.rpmrepository_owner"));

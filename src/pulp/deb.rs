@@ -1,0 +1,93 @@
+//! Deb plugin operations: package listing, serving checks and the copy API.
+
+use super::client::{Mutation, Page, PulpClient, PulpError, Result};
+use super::models::*;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+const FIELDS: &str = "pulp_href,package,version,architecture,relative_path,sha256";
+
+pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<DebPackage>> {
+    c.list_all(&c.api("content/deb/packages/"), &[("repository_version", version.into()), ("fields", FIELDS.into())], 2_000_000).await
+}
+
+/// `Filename:` of the stanza of `p` in a `Packages` index.
+fn served_path(index: &str, p: &DebPackage) -> Option<String> {
+    let field =
+        |stanza: &str, name: &str| stanza.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(':')).map(|v| v.trim().to_string());
+    index.split("\n\n").find_map(|s| {
+        let is_p = field(s, "Package").as_deref() == Some(&p.package)
+            && field(s, "Version").as_deref() == Some(&p.version)
+            && field(s, "Architecture").as_deref() == Some(&p.architecture);
+        if is_p { field(s, "Filename") } else { None }
+    })
+}
+
+/// The Release file must be served and the smallest package must be listed in a `Packages` index
+/// and downloadable with the expected digest. `base` ends with `/`.
+pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String> {
+    let fail = |m: String| Err(PulpError::Unsupported(m));
+    let q = [("repository_version", version.to_string()), ("fields", "distribution".into()), ("limit", "1".into())];
+    let releases: Page<Value> = c.list(&c.api("content/deb/releases/"), &q).await?;
+    let Some(dist) = releases.results.first().and_then(|r| r["distribution"].as_str()) else {
+        return fail("the version has no Release".into());
+    };
+    // pulp_deb publishes under `dists/<distribution without slashes>/<last part of the component>/`.
+    let dir = dist.trim_matches('/');
+    let probe = format!("dists/{dir}/Release");
+    let (status, _) = c.fetch_content(&format!("{base}{probe}"), 64 << 20).await?;
+    if status != 200 {
+        return fail(format!("{probe} returned HTTP {status}"));
+    }
+    let q = [
+        ("repository_version", version.to_string()),
+        ("fields", FIELDS.into()),
+        ("ordering", "installed_size".into()),
+        ("limit", "1".into()),
+    ];
+    let pkgs: Page<DebPackage> = c.list(&c.api("content/deb/packages/"), &q).await?;
+    let Some(p) = pkgs.results.first() else { return Ok("Release served (no packages)".into()) };
+    let comps: Vec<Value> = c
+        .list_all(
+            &c.api("content/deb/release_components/"),
+            &[("repository_version", version.into()), ("fields", "plain_component,distribution".into())],
+            10_000,
+        )
+        .await?;
+    let mut tried = vec![];
+    for comp in comps.iter().filter(|r| r["distribution"] == dist).filter_map(|r| r["plain_component"].as_str()) {
+        let index = format!("dists/{dir}/{comp}/binary-{}/Packages", p.architecture);
+        let (status, body) = c.fetch_content(&format!("{base}{index}"), 64 << 20).await?;
+        let path = if status == 200 { served_path(&String::from_utf8_lossy(&body), p) } else { None };
+        let Some(path) = path else {
+            tried.push(index);
+            continue;
+        };
+        let (status, body) = c.fetch_content(&format!("{base}{path}"), 64 << 20).await?;
+        if status == 200 && p.sha256.as_deref() == Some(hex::encode(Sha256::digest(&body)).as_str()) {
+            return Ok(format!("Release and {path} served with matching digest ({} packages)", pkgs.count));
+        }
+        return fail(format!("package {path} not served with the expected digest"));
+    }
+    fail(format!("package {} not listed in any Packages index (tried {})", p.key(), tried.join(", ")))
+}
+
+/// Copy content of a repository version into `dest_repo` (Deb copy API). `content` limits the
+/// copy to those hrefs; `dest_base_version` starts the new version from that base (0 = empty).
+/// `structured` also copies the release, component and architecture records of the packages.
+pub async fn copy(
+    c: &PulpClient,
+    source_version: &str,
+    dest_repo: &str,
+    dest_base_version: Option<u64>,
+    content: Option<Vec<String>>,
+) -> Result<Mutation> {
+    let mut cfg = json!({ "source_repo_version": source_version, "dest_repo": dest_repo });
+    if let Some(b) = dest_base_version {
+        cfg["dest_base_version"] = b.into();
+    }
+    if let Some(u) = content {
+        cfg["content"] = u.into();
+    }
+    c.post(&c.api("deb/copy/"), &json!({ "config": [cfg], "structured": true, "dependency_solving": false })).await
+}

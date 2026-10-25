@@ -527,7 +527,7 @@ pub fn help_lines() -> Vec<String> {
         "  ↑↓ j k  PgUp PgDn Ctrl-D Ctrl-U  g G  move   h  screen list     Enter  action menu (shortcut letters shown)",
         "  /   server-side search  s/S sort column / reverse   n/p next/previous page",
         "  Space  mark item (multi-select: compare, remove/add content)",
-        "  t   toggle RPM/File, content type, tracked/server tasks, task polling in Logs, or CV snapshots in Repositories",
+        "  t   toggle RPM/File/Deb, content type, tracked/server tasks, task polling in Logs, or CV snapshots in Repositories",
         "  r   refresh   Esc  cancel loading request / clear marks / go back",
         "",
         "Forms",

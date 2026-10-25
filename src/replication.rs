@@ -143,6 +143,11 @@ pub async fn plan(
                     };
                     format!("{base}{}", manifest.unwrap_or_else(|| "PULP_MANIFEST".into()))
                 }
+                RepoType::Deb => {
+                    it.note = "Deb replication is not supported".into();
+                    out.push(it);
+                    continue;
+                }
             };
             let repo = ops::find_by_name::<Repository>(dst, &dst.api(t.repositories()), &d.name).await?;
             let remote = ops::find_by_name::<Value>(dst, &dst.api(t.remotes()), &d.name).await?;
@@ -204,6 +209,13 @@ pub async fn run(
 
 async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror: bool, on: OnTask<'_>) -> Result<String> {
     let t = it.t;
+    // First, so that an unsupported type changes nothing on the server.
+    let policy = match (t, mirror) {
+        (RepoType::Rpm, true) => "mirror_content_only",
+        (RepoType::File, true) => "mirror",
+        (RepoType::Rpm | RepoType::File, false) => "additive",
+        (RepoType::Deb, _) => bail!("Deb replication is not supported"),
+    };
     let labels = json!({ LABEL_REPLICA: src_profile });
     // Checked again here: an object with this name may have been created since the dry run.
     let foreign = |kind: &str| anyhow!("a local {kind} named {} exists and is not managed by this replication", it.name);
@@ -240,11 +252,6 @@ async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror:
             )
             .await?
         }
-    };
-    let policy = match (t, mirror) {
-        (RepoType::Rpm, true) => "mirror_content_only",
-        (RepoType::File, true) => "mirror",
-        (RepoType::Rpm, false) | (RepoType::File, false) => "additive",
     };
     ops::settle(c, ops::sync(c, t, &repo, Some(&remote), policy).await?, on).await?;
     let r: Repository = c.get(&repo, &[]).await?;
@@ -292,6 +299,27 @@ mod tests {
         };
         let e = replicate_one(&c, "up", &it, true, &ops::no_progress).await.unwrap_err();
         assert_eq!(e.to_string(), "a local remote named os exists and is not managed by this replication");
+        let sent = server.received_requests().await.unwrap();
+        assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed: {sent:?}");
+    }
+
+    #[tokio::test]
+    async fn deb_distributions_are_skipped_and_never_replicated() {
+        let server = wiremock::MockServer::start().await;
+        let p = crate::config::Profile { url: server.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
+        let c = PulpClient::new("up", &p, &crate::config::Settings::default()).unwrap();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pulp/api/v3/distributions/deb/apt/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null,
+                "results": [{ "pulp_href": "/pulp/api/v3/distributions/deb/apt/1/", "name": "apt", "base_path": "apt",
+                    "base_url": "https://up/pulp/content/apt", "publication": "/pulp/api/v3/publications/deb/apt/1/" }] })))
+            .mount(&server)
+            .await;
+        let plan = plan(&c, &c, &[RepoType::Deb], "", None).await.unwrap();
+        assert_eq!((plan.len(), &plan[0].action, plan[0].note.as_str()), (1, &PlanAction::Skip, "Deb replication is not supported"));
+        let it = PlanItem { action: PlanAction::Create, ..plan[0].clone() };
+        let e = replicate_one(&c, "up", &it, true, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), "Deb replication is not supported");
         let sent = server.received_requests().await.unwrap();
         assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed: {sent:?}");
     }

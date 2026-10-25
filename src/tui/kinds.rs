@@ -57,6 +57,7 @@ pub const NAV: &[(&str, Kind)] = &[
     ("Servers", Kind::Profiles),
     ("RPM Repositories", Kind::Repos(RepoType::Rpm, false)),
     ("File Repositories", Kind::Repos(RepoType::File, false)),
+    ("Deb Repositories", Kind::Repos(RepoType::Deb, false)),
     ("Remotes", Kind::Remotes(RepoType::Rpm)),
     ("Repository Versions", Kind::Versions(None)),
     ("Publications", Kind::Publications(RepoType::Rpm)),
@@ -86,6 +87,12 @@ pub fn content_types(t: RepoType) -> &'static [(&'static str, &'static str)] {
             ("repo metadata files", "content/rpm/repo_metadata_files/"),
         ],
         RepoType::File => &[("files", "content/file/files/")],
+        RepoType::Deb => &[
+            ("packages", "content/deb/packages/"),
+            ("releases", "content/deb/releases/"),
+            ("release components", "content/deb/release_components/"),
+            ("source packages", "content/deb/source_packages/"),
+        ],
     }
 }
 
@@ -413,15 +420,19 @@ impl Kind {
             Kind::Content { version, ctype } => {
                 let t = RepoType::from_href(version)?;
                 let (_, path) = content_types(t)[*ctype];
-                // Search field, and whether to drop the heavy package fields (RPM packages only).
-                let (search, exclude_fields) = match (t, *ctype) {
-                    (RepoType::Rpm, 0) => (Some("name__contains"), true),
-                    (RepoType::Rpm, 1..) => (None, false),
-                    (RepoType::File, _) => (Some("relative_path__icontains"), false),
+                // Search field, ordering, and whether to drop the heavy package fields (RPM packages only).
+                let (search, ordering, exclude_fields) = match (t, *ctype) {
+                    (RepoType::Rpm, 0) => (Some("name__contains"), Some("name"), true),
+                    (RepoType::Rpm, 1..) => (None, None, false),
+                    (RepoType::File, _) => (Some("relative_path__icontains"), None, false),
+                    (RepoType::Deb, 0) => (Some("package__contains"), Some("package"), false),
+                    (RepoType::Deb, 1..) => (None, None, false),
                 };
                 let mut q = vec![("repository_version", version.clone())];
+                if let Some(o) = ordering {
+                    q.push(("ordering", o.into()));
+                }
                 if exclude_fields {
-                    q.push(("ordering", "name".into()));
                     q.push((
                         "exclude_fields",
                         "changelogs,files,requires,provides,conflicts,obsoletes,suggests,enhances,recommends,supplements".into(),
@@ -509,7 +520,22 @@ impl Kind {
                     col("relative_path", 50, |v| s(v, "relative_path")),
                     col("sha256", 20, |v| s(v, "sha256").chars().take(16).collect()),
                 ],
-                (Some(RepoType::Rpm), 4..) | (None, _) => {
+                (Some(RepoType::Deb), 0) => vec![
+                    col("package", 30, |v| s(v, "package")),
+                    col("version", 24, |v| s(v, "version")),
+                    col("architecture", 8, |v| s(v, "architecture")),
+                    col("sha256", 14, |v| s(v, "sha256").chars().take(12).collect()),
+                ],
+                (Some(RepoType::Deb), 1) => vec![
+                    col("distribution", 20, |v| s(v, "distribution")),
+                    col("codename", 14, |v| s(v, "codename")),
+                    col("suite", 14, |v| s(v, "suite")),
+                    col("version", 10, |v| s(v, "version")),
+                ],
+                (Some(RepoType::Deb), 2) => {
+                    vec![col("distribution", 20, |v| s(v, "distribution")), col("component", 20, |v| s(v, "component"))]
+                }
+                (Some(RepoType::Rpm), 4..) | (Some(RepoType::Deb), 3..) | (None, _) => {
                     vec![col("href", 70, |v| s(v, "pulp_href")), col("created", 19, |v| ts(v, "pulp_created"))]
                 }
             },
@@ -521,7 +547,7 @@ impl Kind {
                 ];
                 // Only File publications have the field; Delete looks up the distributions of both types.
                 match t {
-                    RepoType::Rpm => {}
+                    RepoType::Rpm | RepoType::Deb => {}
                     RepoType::File => {
                         c.push(col("distributions", 6, |v| v["distributions"].as_array().map(|a| a.len().to_string()).unwrap_or_default()))
                     }
@@ -616,8 +642,11 @@ impl Kind {
         use Act::*;
         match self {
             Kind::Profiles => vec![Connect, TestProfile, Create, Edit, Delete, StoreSecret, ExportCv, ImportCv],
-            Kind::Repos(..) => {
-                vec![Versions, Content, Sync, SyncHistory, Upload, Publish, Distribute, CopyContent, Create, Edit, Delete, Inspect]
+            Kind::Repos(t, _) => {
+                let mut actions =
+                    vec![Versions, Content, Sync, SyncHistory, Upload, Publish, Distribute, CopyContent, Create, Edit, Delete, Inspect];
+                actions.retain(|a| *a != Upload || t.uploads());
+                actions
             }
             Kind::Remotes(_) | Kind::Roles => vec![Create, Edit, Delete, Inspect],
             Kind::Versions(_) => vec![Content, Publish, Distribute, Rollback, Compare, Delete, Inspect],
@@ -970,6 +999,30 @@ mod tests {
         assert_eq!(k.toggle(), Some(Kind::Repos(RepoType::Rpm, true)));
         assert_eq!(label(&Kind::Repos(RepoType::Rpm, true)), None);
         assert!(Kind::Repos(RepoType::File, true).title().ends_with(" — snapshots shown"));
+    }
+
+    #[test]
+    fn deb_repositories_have_no_upload_and_their_own_screens() {
+        assert!(!Kind::Repos(RepoType::Deb, false).actions().contains(&Act::Upload));
+        assert!(Kind::Repos(RepoType::File, false).actions().contains(&Act::Upload));
+        assert!(NAV.iter().any(|(l, k)| *l == "Deb Repositories" && *k == Kind::Repos(RepoType::Deb, false)));
+        let names = |k: &Kind| k.columns().iter().map(|c| c.title).collect::<Vec<_>>();
+        let content = |ctype| Kind::Content { version: "/pulp/api/v3/repositories/deb/apt/1/versions/1/".into(), ctype };
+        assert_eq!(
+            content_types(RepoType::Deb).iter().map(|c| c.1).collect::<Vec<_>>(),
+            ["content/deb/packages/", "content/deb/releases/", "content/deb/release_components/", "content/deb/source_packages/"]
+        );
+        assert_eq!(names(&content(0)), ["package", "version", "architecture", "sha256"]);
+        assert_eq!(names(&content(1)), ["distribution", "codename", "suite", "version"]);
+        assert_eq!(names(&content(2)), ["distribution", "component"]);
+        assert_eq!(names(&content(3)), ["href", "created"]);
+        let src = |ctype| content(ctype).source().unwrap();
+        assert_eq!((src(0).2, src(1).2, src(3).2), (Some("package__contains"), None, None));
+        assert!(src(0).1.contains(&("ordering", "package".to_string())));
+        let row = json!({ "package": "p", "version": "1.0-1", "architecture": "amd64", "sha256": "0123456789abcdef0123" });
+        assert_eq!(content(0).columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["p", "1.0-1", "amd64", "0123456789ab"]);
+        let pubs = Kind::Publications(RepoType::Deb).columns();
+        assert!(pubs.iter().all(|c| c.title != "distributions"), "the Deb publication has no distributions field");
     }
 
     #[test]

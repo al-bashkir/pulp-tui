@@ -31,6 +31,7 @@ pub struct Capabilities {
 pub enum Feature {
     Rpm,
     File,
+    Deb,
     RpmCopy,
     ChunkedUpload,
     NativeReplication,
@@ -44,6 +45,7 @@ impl Feature {
         match self {
             Feature::Rpm => "pulp_rpm plugin",
             Feature::File => "pulp_file plugin",
+            Feature::Deb => "pulp_deb plugin",
             Feature::RpmCopy => "RPM copy API (rpm/copy/)",
             Feature::ChunkedUpload => "chunked uploads API (uploads/)",
             Feature::NativeReplication => "Upstream Pulp replication (upstream-pulps/, pulpcore >= 3.23, tech preview)",
@@ -137,6 +139,7 @@ impl Capabilities {
         match f {
             Feature::Rpm => self.versions.contains_key("rpm"),
             Feature::File => self.versions.contains_key("file"),
+            Feature::Deb => self.versions.contains_key("deb"),
             Feature::RpmCopy => self.versions.contains_key("rpm") && self.has_endpoint("rpm/copy/"),
             Feature::ChunkedUpload => self.has_endpoint("uploads/") && self.has_endpoint("{upload_href}"),
             Feature::NativeReplication => {
@@ -188,6 +191,9 @@ mod tests {
         assert!(c.supports(Feature::Rpm));
         assert!(!c.supports(Feature::File));
         assert!(c.require(Feature::File).is_err());
+        assert_eq!(c.require(Feature::Deb).unwrap_err().to_string(), "not supported by this server: pulp_deb plugin");
+        c.versions.insert("deb".into(), "3.8.0".into());
+        assert!(c.supports(Feature::Deb));
         c.versions.insert("core".into(), "3.40.0".into());
         c.load_openapi(&json!({
             "paths": {"/pulp/api/v3/upstream-pulps/": {}, "{upstream_pulp_href}replicate/": {}, "/pulp/{pulp_domain}/api/v3/rpm/copy/": {}},

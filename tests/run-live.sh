@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Run the full test suite against real Pulp containers, one scenario at a time.
 # Reuses running containers and built fixtures; starts pulp2 only for replication and
-# PostgreSQL only for shared_db.
+# PostgreSQL only for shared_db; deb registers the test Deb signing service on pulp1.
 #
 #   tests/run-live.sh            all scenarios
-#   tests/run-live.sh repos cv   selected scenarios (repos cv rbac failures replication shared_db)
+#   tests/run-live.sh repos cv   selected scenarios (repos cv rbac failures replication shared_db deb)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -20,10 +20,11 @@ export PULP_TUI_TEST_PG_PASSWORD=${PULP_TUI_TEST_PG_PASSWORD:-${PG_PASSWORD:-pul
 echo "== unit + mock HTTP tests"
 cargo test --lib --test mock_http
 
-scenarios=${*:-repos cv rbac failures replication shared_db}
+scenarios=${*:-repos cv rbac failures replication shared_db deb}
 for s in $scenarios; do
   [ "$s" = replication ] && $ENV up pulp2
   [ "$s" = shared_db ] && $ENV pg-up
+  [ "$s" = deb ] && $ENV deb-signing-up pulp1
   echo "== live scenario: $s"
   PULP_TUI_LIVE=1 cargo test --test "live_$s" -- --test-threads=1
 done

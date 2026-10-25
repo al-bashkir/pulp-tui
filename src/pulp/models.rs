@@ -12,22 +12,32 @@ use std::collections::BTreeMap;
 pub enum RepoType {
     Rpm,
     File,
+    Deb,
 }
 
 impl RepoType {
-    pub const ALL: [RepoType; 2] = [RepoType::Rpm, RepoType::File];
+    pub const ALL: [RepoType; 3] = [RepoType::Rpm, RepoType::File, RepoType::Deb];
 
     /// Pulp status component name of the plugin.
     pub fn component(self) -> &'static str {
         match self {
             RepoType::Rpm => "rpm",
             RepoType::File => "file",
+            RepoType::Deb => "deb",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             RepoType::Rpm => "RPM",
             RepoType::File => "File",
+            RepoType::Deb => "Deb",
+        }
+    }
+    /// Whether local files can be uploaded into repositories of this type.
+    pub fn uploads(self) -> bool {
+        match self {
+            RepoType::Rpm | RepoType::File => true,
+            RepoType::Deb => false,
         }
     }
     /// The next type in `ALL`, wrapping around (type toggles on screens).
@@ -40,6 +50,7 @@ impl RepoType {
         match self {
             RepoType::Rpm => Feature::Rpm,
             RepoType::File => Feature::File,
+            RepoType::Deb => Feature::Deb,
         }
     }
     /// OpenAPI schema of the plugin's repository serializer.
@@ -47,6 +58,7 @@ impl RepoType {
         match self {
             RepoType::Rpm => "rpm.RpmRepository",
             RepoType::File => "file.FileRepository",
+            RepoType::Deb => "deb.AptRepository",
         }
     }
     /// OpenAPI schema of the plugin's remote serializer.
@@ -54,30 +66,35 @@ impl RepoType {
         match self {
             RepoType::Rpm => "rpm.RpmRemote",
             RepoType::File => "file.FileRemote",
+            RepoType::Deb => "deb.AptRemote",
         }
     }
     pub fn repositories(self) -> &'static str {
         match self {
             RepoType::Rpm => "repositories/rpm/rpm/",
             RepoType::File => "repositories/file/file/",
+            RepoType::Deb => "repositories/deb/apt/",
         }
     }
     pub fn remotes(self) -> &'static str {
         match self {
             RepoType::Rpm => "remotes/rpm/rpm/",
             RepoType::File => "remotes/file/file/",
+            RepoType::Deb => "remotes/deb/apt/",
         }
     }
     pub fn publications(self) -> &'static str {
         match self {
             RepoType::Rpm => "publications/rpm/rpm/",
             RepoType::File => "publications/file/file/",
+            RepoType::Deb => "publications/deb/apt/",
         }
     }
     pub fn distributions(self) -> &'static str {
         match self {
             RepoType::Rpm => "distributions/rpm/rpm/",
             RepoType::File => "distributions/file/file/",
+            RepoType::Deb => "distributions/deb/apt/",
         }
     }
     /// Primary content type (packages / files).
@@ -85,14 +102,17 @@ impl RepoType {
         match self {
             RepoType::Rpm => "content/rpm/packages/",
             RepoType::File => "content/file/files/",
+            RepoType::Deb => "content/deb/packages/",
         }
     }
-    /// Detect the type from any rpm/file href (repository, remote, version, publication...).
+    /// Detect the type from any rpm/file/deb href (repository, remote, version, publication...).
     pub fn from_href(href: &str) -> Option<Self> {
         if href.contains("/rpm/rpm/") || href.contains("/rpm/packages/") {
             Some(RepoType::Rpm)
         } else if href.contains("/file/file/") || href.contains("/file/files/") {
             Some(RepoType::File)
+        } else if href.contains("/deb/apt/") || href.contains("/deb/packages/") {
+            Some(RepoType::Deb)
         } else {
             None
         }
@@ -306,6 +326,24 @@ impl Package {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DebPackage {
+    pub pulp_href: String,
+    pub package: String,
+    pub version: String,
+    pub architecture: String,
+    #[serde(default)]
+    pub relative_path: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+impl DebPackage {
+    pub fn key(&self) -> String {
+        format!("{}_{}_{}", self.package, self.version, self.architecture)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FileContent {
     pub pulp_href: String,
     pub relative_path: String,
@@ -350,15 +388,24 @@ mod tests {
     fn repo_type_from_href() {
         assert_eq!(RepoType::from_href("/pulp/api/v3/repositories/rpm/rpm/0190-ab/versions/2/"), Some(RepoType::Rpm));
         assert_eq!(RepoType::from_href("/pulp/api/v3/content/file/files/1/"), Some(RepoType::File));
+        assert_eq!(RepoType::from_href("/pulp/api/v3/repositories/deb/apt/1/versions/2/"), Some(RepoType::Deb));
+        assert_eq!(RepoType::from_href("/pulp/api/v3/content/deb/packages/1/"), Some(RepoType::Deb));
         assert_eq!(RepoType::from_href("/pulp/api/v3/repositories/container/container/1/"), None);
     }
 
     #[test]
     fn type_helpers_cover_all() {
         assert_eq!(RepoType::Rpm.next(), RepoType::File);
-        assert_eq!(RepoType::File.next(), RepoType::Rpm);
+        assert_eq!(RepoType::File.next(), RepoType::Deb);
+        assert_eq!(RepoType::Deb.next(), RepoType::Rpm);
+        assert_eq!(RepoType::ALL, [RepoType::Rpm, RepoType::File, RepoType::Deb]);
         assert_eq!(RepoType::Rpm.feature(), Feature::Rpm);
         assert_eq!(RepoType::File.remote_schema(), "file.FileRemote");
+        assert_eq!((RepoType::Deb.feature(), RepoType::Deb.component(), RepoType::Deb.label()), (Feature::Deb, "deb", "Deb"));
+        assert_eq!((RepoType::Deb.repository_schema(), RepoType::Deb.remote_schema()), ("deb.AptRepository", "deb.AptRemote"));
+        assert_eq!(RepoType::Deb.repositories(), "repositories/deb/apt/");
+        assert_eq!(RepoType::Deb.content(), "content/deb/packages/");
+        assert_eq!([RepoType::Rpm, RepoType::File, RepoType::Deb].map(RepoType::uploads), [true, true, false]);
     }
 
     #[test]

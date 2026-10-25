@@ -100,6 +100,29 @@ server gives the final answer; the dashboard shows a warning.
   `docs/ARCHITECTURE.md` for how completion is detected.
 * `api_root` of an Upstream Pulp is relative and needs a trailing slash (`pulp/`).
 
+## pulp_deb
+
+Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live OpenAPI:
+
+* The package name field of `content/deb/packages/` is `package` (not `name`). The other
+  fields pulp-tui reads are `version`, `architecture`, `relative_path` and `sha256`.
+* `deb/copy/` with `structured: true` also copies the records that a structured publication
+  needs: the package-release-component (PRC) units of the copied packages, their release
+  components, release architectures and releases (`tasks/copy.py`,
+  `find_structured_publish_content`). pulp-tui always sends `structured: true`.
+* `dependency_solving: true` is not implemented: the task fails with
+  `FeatureNotImplementedError`. pulp-tui always sends `false`.
+* `dest_base_version: 0` starts the new version from the empty version 0 of the destination
+  (the viewset turns the number into the id of that version).
+* A Release file is signed with the first service that exists in this order: the signing
+  service of the publication, then the release override of the repository
+  (`signing_service_release_overrides`), then the signing service of the repository
+  (`publishing.py`, `AptRepository.release_signing_service`).
+* `AptPublication` defaults are `structured=true` and `simple=false`.
+* `signing-services/` is the pulpcore endpoint for all plugins. It has no type filter (only
+  `name`, `q`, `pulp_href__in` and similar), so a Deb signing service cannot be told from an
+  RPM one by a query.
+
 ## Shared database (PostgreSQL)
 
 ### Database TLS and `ca_cert`

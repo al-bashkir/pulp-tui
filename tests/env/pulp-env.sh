@@ -5,6 +5,7 @@
 #   tests/env/pulp-env.sh down [pulp1|pulp2]   stop and remove container + volumes
 #   tests/env/pulp-env.sh status
 #   tests/env/pulp-env.sh pg-up | pg-down   PostgreSQL for the shared-database tests
+#   tests/env/pulp-env.sh deb-signing-up [pulp1|pulp2]   Deb Release signing service (test GPG key)
 #   tests/env/pulp-env.sh up-all | down-all   pulp1, pulp2, PostgreSQL and the fixture http server
 #
 # pulp1 (port 8080) is the main/downstream server. pulp2 (port 8081) is only
@@ -122,6 +123,50 @@ http_down() {
   rm -f "$pidf"
 }
 
+# Signing service for Debian Release files (deb live tests). The GPG key is test-only: it
+# has no passphrase and exists only in the container's storage volume. Everything runs as
+# the pulp user, so the workers can read the key ring and the script. Idempotent.
+deb_signing_up() {
+  local name=$1 port svc=pulp-tui-deb-test
+  port=$(port_of "$name")
+  if curl -fsS -u "admin:$ADMIN_PASSWORD" "http://localhost:$port/pulp/api/v3/signing-services/?name=$svc" | grep -q '"count":1'; then
+    echo "$svc already registered on $name"
+    return 0
+  fi
+  $RUNTIME exec --interactive --user pulp "$name" bash -s -- /var/lib/pulp/pulp-tui-gpg "$svc" <<'EOS'
+set -euo pipefail
+home=$1 svc=$2
+script=$home/sign-release.sh
+mkdir -p "$home"
+chmod 700 "$home"
+export GNUPGHOME=$home
+fpr() { gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}'; }
+[ -n "$(fpr)" ] || gpg --batch --pinentry-mode loopback --passphrase '' \
+  --quick-generate-key 'pulp-tui test <pulp-tui@example.com>' rsa2048 sign never
+# Adapted from DEB_SIGNING_SCRIPT_STRING of the pulp_deb functional tests: writes the
+# inline and detached signatures of the Release file and prints their paths as JSON.
+{
+  echo '#!/bin/bash'
+  echo "export GNUPGHOME=$home"
+  echo "GPG_KEY_ID=$(fpr)"
+  cat <<'EOF'
+set -e
+RELEASE_FILE="$(readlink -f "$1")"
+DETACHED_SIGNATURE_PATH="${PULP_TEMP_WORKING_DIR}/Release.gpg"
+INLINE_SIGNATURE_PATH="${PULP_TEMP_WORKING_DIR}/InRelease"
+COMMON_GPG_OPTS="--batch --armor --digest-algo SHA256"
+gpg ${COMMON_GPG_OPTS} --detach-sign --output "${DETACHED_SIGNATURE_PATH}" --local-user "${GPG_KEY_ID}" "${RELEASE_FILE}"
+gpg ${COMMON_GPG_OPTS} --clearsign --output "${INLINE_SIGNATURE_PATH}" --local-user "${GPG_KEY_ID}" "${RELEASE_FILE}"
+echo "{\"signatures\": {\"inline\": \"${INLINE_SIGNATURE_PATH}\", \"detached\": \"${DETACHED_SIGNATURE_PATH}\"}}"
+EOF
+} >"$script"
+chmod 755 "$script"
+pulpcore-manager add-signing-service "$svc" "$script" "$(fpr)" \
+  --class deb:AptReleaseSigningService --gnupghome "$home"
+EOS
+  echo "$svc registered on $name"
+}
+
 cmd=${1:-status}
 shift || true
 case "$cmd" in
@@ -131,8 +176,9 @@ case "$cmd" in
   pg-down) pg_down ;;
   http-up) http_up ;;
   http-down) http_down ;;
+  deb-signing-up) deb_signing_up "${1:-pulp1}" ;;
   up-all) up pulp1; up pulp2; pg_up; http_up ;;
   down-all) down pulp1; down pulp2; pg_down; http_down ;;
   status) $RUNTIME ps -a --filter name=pulp --format '{{.Names}} {{.Status}} {{.Ports}}' ;;
-  *) echo "usage: $0 up|down|status [pulp1|pulp2] | pg-up|pg-down | http-up|http-down | up-all|down-all" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|status [pulp1|pulp2] | pg-up|pg-down | http-up|http-down | deb-signing-up [pulp1|pulp2] | up-all|down-all" >&2; exit 2 ;;
 esac

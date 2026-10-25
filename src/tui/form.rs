@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Where a picker gets its options (loaded by the app, never by the form).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Source {
-    /// `None` = RPM and File repositories that can be Content View sources (no CV snapshots).
+    /// `None` = RPM, File and Deb repositories that can be Content View sources (no CV snapshots).
     Repos(Option<RepoType>),
     Remotes(RepoType),
     Distributions(RepoType),

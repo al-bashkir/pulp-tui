@@ -3,7 +3,7 @@
 
 use super::client::{Mutation, Page, PulpClient, PulpError, Result, jitter, retryable};
 use super::models::*;
-use super::{file, rpm};
+use super::{deb, file, rpm};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -115,7 +115,7 @@ pub async fn find_by_name<T: serde::de::DeserializeOwned>(c: &PulpClient, collec
     Ok(p.results.into_iter().next())
 }
 
-/// File has only `mirror: bool`: any `mirror*` policy (the RPM values, from a mixed Content View) means mirror.
+/// File and Deb have only `mirror: bool`: any `mirror*` policy (the RPM values, from a mixed Content View) means mirror.
 pub async fn sync(c: &PulpClient, t: RepoType, repo: &str, remote: Option<&str>, policy: &str) -> Result<Mutation> {
     let mut body = json!({});
     if let Some(r) = remote {
@@ -123,7 +123,7 @@ pub async fn sync(c: &PulpClient, t: RepoType, repo: &str, remote: Option<&str>,
     }
     match t {
         RepoType::Rpm => body["sync_policy"] = policy.into(),
-        RepoType::File => body["mirror"] = policy.starts_with("mirror").into(),
+        RepoType::File | RepoType::Deb => body["mirror"] = policy.starts_with("mirror").into(),
     }
     c.post(&format!("{repo}sync/"), &body).await
 }
@@ -267,17 +267,19 @@ pub async fn content_keys(c: &PulpClient, t: RepoType, version: Option<&str>) ->
     Ok(match t {
         RepoType::Rpm => rpm::packages_in(c, v).await?.iter().map(Package::nevra).collect(),
         RepoType::File => file::files_in(c, v).await?.iter().map(file::key).collect(),
+        RepoType::Deb => deb::packages_in(c, v).await?.iter().map(DebPackage::key).collect(),
     })
 }
 
 /// Fetch what a distribution actually serves and compare it with a repository version:
-/// File manifests must list exactly the version's files; RPM metadata must be served and
+/// File manifests must list exactly the version's files; RPM and Deb metadata must be served and
 /// the smallest package must be downloadable with the expected digest.
 pub async fn verify_served(c: &PulpClient, t: RepoType, base_url: &str, version: &str, layout: &str) -> Result<String> {
     let base = if base_url.ends_with('/') { base_url.to_string() } else { format!("{base_url}/") };
     match t {
         RepoType::Rpm => rpm::verify(c, &base, version, layout).await,
         RepoType::File => file::verify(c, &base, version).await,
+        RepoType::Deb => deb::verify(c, &base, version).await,
     }
 }
 
@@ -344,6 +346,7 @@ pub async fn upload(
     match t {
         RepoType::Rpm => {}
         RepoType::File => fields.push(("relative_path", relative_path.unwrap_or(&file_name).into())),
+        RepoType::Deb => return Err(PulpError::Unsupported("upload of Deb packages is not supported".into())),
     }
     let chunk = c.upload_chunk();
     let mut f = tokio::fs::File::open(path).await.map_err(io)?;

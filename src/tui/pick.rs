@@ -21,10 +21,11 @@ fn text(v: &Value, k: &str) -> String {
 pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Result<Vec<PickItem>> {
     let specs: Vec<Spec> = match source {
         Source::Repos(Some(t)) => vec![(t.repositories(), NAME_HREF, "name", "name", "")],
-        // A server may lack one of the plugins: list only what its API offers.
+        // A server may lack one of the plugins: list only what it has installed (status, which needs no
+        // OpenAPI) and what its API offers.
         Source::Repos(None) => RepoType::ALL
             .into_iter()
-            .filter(|t| ctx.caps.has_endpoint(t.repositories()))
+            .filter(|t| ctx.caps.supports(t.feature()) && ctx.caps.has_endpoint(t.repositories()))
             .map(|t| (t.repositories(), NAME_HREF, "name", "pulp_href", t.component()))
             .collect(),
         Source::Remotes(t) => vec![(t.remotes(), NAME_HREF, "name", "name", "")],
@@ -84,7 +85,7 @@ async fn role_objects(ctx: &Ctx, role: &str) -> anyhow::Result<Vec<PickItem>> {
 }
 
 /// Known models: app label, model name (in permission codenames), collection.
-const MODELS: [(&str, &str, &str); 9] = [
+const MODELS: [(&str, &str, &str); 13] = [
     ("rpm", "rpmrepository", "repositories/rpm/rpm/"),
     ("rpm", "rpmremote", "remotes/rpm/rpm/"),
     ("rpm", "rpmdistribution", "distributions/rpm/rpm/"),
@@ -93,6 +94,10 @@ const MODELS: [(&str, &str, &str); 9] = [
     ("file", "fileremote", "remotes/file/file/"),
     ("file", "filedistribution", "distributions/file/file/"),
     ("file", "filepublication", "publications/file/file/"),
+    ("deb", "aptrepository", "repositories/deb/apt/"),
+    ("deb", "aptremote", "remotes/deb/apt/"),
+    ("deb", "aptdistribution", "distributions/deb/apt/"),
+    ("deb", "aptpublication", "publications/deb/apt/"),
     ("core", "group", "groups/"),
 ];
 
@@ -152,6 +157,20 @@ mod tests {
         assert_eq!(role_collection(&p(&["core.view_group", "core.manage_roles_group"])), Some("groups/"));
         assert_eq!(role_collection(&p(&["rpm.view_rpmrepository", "rpm.view_rpmremote"])), None);
         assert_eq!(role_collection(&p(&["file.view_rpmrepository"])), None);
+        let deb_owner = p(&[
+            "deb.change_aptrepository",
+            "deb.delete_aptrepository",
+            "deb.delete_aptrepository_version",
+            "deb.manage_roles_aptrepository",
+            "deb.modify_content_aptrepository",
+            "deb.repair_aptrepository",
+            "deb.sync_aptrepository",
+            "deb.view_aptrepository",
+        ]);
+        assert_eq!(role_collection(&deb_owner), Some("repositories/deb/apt/"));
+        assert_eq!(role_collection(&p(&["deb.view_aptremote"])), Some("remotes/deb/apt/"));
+        assert_eq!(role_collection(&p(&["deb.view_aptdistribution"])), Some("distributions/deb/apt/"));
+        assert_eq!(role_collection(&p(&["deb.view_aptpublication"])), Some("publications/deb/apt/"));
     }
 
     #[test]
@@ -222,11 +241,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_options_lists_rpm_and_file_with_names_only() {
+    async fn load_options_lists_rpm_file_and_deb_with_names_only() {
         let server = MockServer::start().await;
-        for (kind, name) in [("rpm", "r1"), ("file", "f1")] {
+        for (kind, collection, name) in [("rpm", "rpm/rpm", "r1"), ("file", "file/file", "f1"), ("deb", "deb/apt", "d1")] {
             Mock::given(method("GET"))
-                .and(path(format!("/pulp/api/v3/repositories/{kind}/{kind}/")))
+                .and(path(format!("/pulp/api/v3/repositories/{collection}/")))
                 .and(query_param("fields", "name,pulp_href"))
                 .and(query_param("pulp_label_select", "!pulp_tui_cv"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -235,10 +254,41 @@ mod tests {
                 .mount(&server)
                 .await;
         }
-        let ctx = ctx_for(&server, Capabilities::default()).await;
+        let versions = |plugins: &[&str]| plugins.iter().map(|p| (p.to_string(), "1.0.0".to_string())).collect();
+        let ctx = ctx_for(&server, Capabilities { versions: versions(&["rpm", "file", "deb"]), ..Default::default() }).await;
 
         let items = load_options(&ctx, &Source::Repos(None), "").await.unwrap();
         let got: Vec<_> = items.iter().map(|i| (i.label.as_str(), i.value.as_str(), i.note.as_str())).collect();
-        assert_eq!(got, [("r1", "/h/rpm/", "rpm"), ("f1", "/h/file/", "file")]);
+        assert_eq!(got, [("r1", "/h/rpm/", "rpm"), ("f1", "/h/file/", "file"), ("d1", "/h/deb/", "deb")]);
+        // A server without pulp_deb is not asked for it: its API has no such collection.
+        let caps = Capabilities {
+            versions: versions(&["rpm", "file"]),
+            paths: ["repositories/rpm/rpm/", "repositories/file/file/"].map(String::from).into(),
+            ..Default::default()
+        };
+        let items = load_options(&ctx_for(&server, caps).await, &Source::Repos(None), "").await.unwrap();
+        assert_eq!(items.iter().map(|i| i.note.as_str()).collect::<Vec<_>>(), ["rpm", "file"]);
+    }
+
+    #[tokio::test]
+    async fn without_openapi_only_the_installed_plugins_are_listed() {
+        let server = MockServer::start().await;
+        for (kind, collection) in [("rpm", "rpm/rpm"), ("file", "file/file")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pulp/api/v3/repositories/{collection}/")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "count": 1, "next": null, "results": [{ "name": kind, "pulp_href": format!("/h/{kind}/") }]
+                })))
+                .mount(&server)
+                .await;
+        }
+        // Empty `paths` = OpenAPI unavailable: every endpoint counts as present, so the status versions decide.
+        let versions = [("rpm", "3.0.0"), ("file", "3.0.0")].map(|(p, v)| (p.to_string(), v.to_string())).into();
+        let ctx = ctx_for(&server, Capabilities { versions, ..Default::default() }).await;
+        assert!(ctx.caps.paths.is_empty());
+        let items = load_options(&ctx, &Source::Repos(None), "").await.unwrap();
+        assert_eq!(items.iter().map(|i| i.note.as_str()).collect::<Vec<_>>(), ["rpm", "file"]);
+        let asked: Vec<_> = server.received_requests().await.unwrap().iter().map(|r| r.url.path().to_string()).collect();
+        assert!(asked.iter().all(|p| !p.contains("/deb/")), "{asked:?}");
     }
 }

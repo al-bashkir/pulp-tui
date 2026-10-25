@@ -16,7 +16,7 @@
 use crate::filters::Selector;
 use crate::pulp::models::{Distribution, Package, RepoVersion, Repository, Task};
 use crate::pulp::ops::{self, OnTask};
-use crate::pulp::{Mutation, PulpClient, PulpError, RepoType, file, rpm};
+use crate::pulp::{Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::{
     BindingRepo, Component, ContentView, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, LOCK_RENEW_SECS, LOCK_TTL_SECS,
     LockHolder, Store, UsedVersion, validate_label,
@@ -266,6 +266,8 @@ impl CvService {
         match repo.repo_type {
             RepoType::Rpm => self.select_rpm(repo, source_version, with_keys).await,
             RepoType::File => self.select_file(repo, source_version, with_keys).await,
+            // TEMPORARY: replaced when Deb Content Views land.
+            RepoType::Deb => bail!("Deb Content Views are not supported yet"),
         }
     }
 
@@ -549,6 +551,7 @@ impl CvService {
                     let m = match t {
                         RepoType::Rpm => rpm::copy(c, &sv, &derived, Some(0), sel.hrefs, false).await?,
                         RepoType::File => file::modify(c, &derived, true, sel.hrefs.unwrap_or_default()).await?,
+                        RepoType::Deb => deb::copy(c, &sv, &derived, Some(0), sel.hrefs).await?,
                     };
                     let Mutation::Task(h) = m else { bail!("copy did not return a task") };
                     vr.pending_task = Some(h.clone());
@@ -597,6 +600,8 @@ impl CvService {
                 }
             }
             RepoType::File => {}
+            // TEMPORARY: replaced when Deb Content Views land.
+            RepoType::Deb => {}
         }
         log(format!("{}: publishing {dv}", repo.repo_name));
         self.alive()?;
@@ -1179,6 +1184,13 @@ mod tests {
         let client = PulpClient::new("t", &p, &crate::config::Settings::default()).unwrap();
         let store = Arc::new(Store::open_in_memory().await.unwrap());
         CvService { client, store, scope: "k".into(), actor: "a@h".into(), lock: None }
+    }
+
+    #[tokio::test]
+    async fn deb_repositories_cannot_be_selected_yet() {
+        let svc = mock_service(&wiremock::MockServer::start().await).await;
+        let repo = CvRepo { repo_href: "/r/".into(), repo_name: "apt".into(), repo_type: RepoType::Deb, filters: vec![] };
+        assert_eq!(svc.select(&repo, "/r/versions/1/", false).await.err().unwrap().to_string(), "Deb Content Views are not supported yet");
     }
 
     /// The object at `href` carries the database ID label `db`.

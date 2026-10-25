@@ -5,8 +5,9 @@
 use pulp_tui::config::{AuthMethod, Profile, Settings};
 use pulp_tui::pulp::models::Task;
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{Capabilities, Feature, PulpClient, PulpError, RepoType};
+use pulp_tui::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, RepoType, deb};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -437,4 +438,121 @@ async fn file_sync_maps_any_mirror_policy_to_mirror() {
         [json!({"mirror": false}), json!({"mirror": true}), json!({"mirror": true}), json!({"sync_policy": "mirror_complete"})]
     );
     server.verify().await;
+}
+
+#[tokio::test]
+async fn deb_sync_maps_rpm_mirror_policies_to_mirror() {
+    let server = MockServer::start().await;
+    let repo = format!("{API}repositories/deb/apt/r/");
+    Mock::given(method("POST"))
+        .and(path(format!("{repo}sync/")))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+    for policy in ["additive", "mirror", "mirror_complete"] {
+        ops::sync(&c, RepoType::Deb, &repo, Some("/rm/"), policy).await.unwrap();
+    }
+    let bodies: Vec<Value> = server.received_requests().await.unwrap().iter().map(|r| r.body_json().unwrap()).collect();
+    assert_eq!(
+        bodies,
+        [json!({"remote": "/rm/", "mirror": false}), json!({"remote": "/rm/", "mirror": true}), json!({"remote": "/rm/", "mirror": true})]
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn deb_packages_cannot_be_uploaded() {
+    let server = MockServer::start().await;
+    let c = client(&server, |_, _| {});
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let e = ops::upload(&c, RepoType::Deb, file.path(), None, None, &|_, _| {}, &no_progress).await.unwrap_err();
+    assert!(matches!(&e, PulpError::Unsupported(m) if m == "upload of Deb packages is not supported"), "{e}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn deb_copy_is_structured_without_dependency_solving() {
+    let server = MockServer::start().await;
+    let body = json!({
+        "structured": true,
+        "dependency_solving": false,
+        "config": [{ "source_repo_version": "/sv/", "dest_repo": "/dr/", "dest_base_version": 0, "content": ["/p/1/"] }],
+    });
+    Mock::given(method("POST"))
+        .and(path(format!("{API}deb/copy/")))
+        .and(body_partial_json(body))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "task": "/t/1/" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+    let m = deb::copy(&c, "/sv/", "/dr/", Some(0), Some(vec!["/p/1/".into()])).await.unwrap();
+    assert!(matches!(m, Mutation::Task(t) if t == "/t/1/"));
+    server.verify().await;
+
+    // Without a content list the config has no `content` key (copy everything).
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(202).set_body_json(json!({ "task": "/t/2/" }))).mount(&server).await;
+    let c = client(&server, |_, _| {});
+    deb::copy(&c, "/sv/", "/dr/", None, None).await.unwrap();
+    let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
+    assert_eq!(
+        sent,
+        json!({ "structured": true, "dependency_solving": false, "config": [{ "source_repo_version": "/sv/", "dest_repo": "/dr/" }] })
+    );
+}
+
+/// A server that lists one Release, two components (one of another release) and `packages`, and
+/// serves the Release file, a `Packages` index for `amd64` and the package bytes.
+async fn deb_server(packages: Value) -> (MockServer, String) {
+    let server = MockServer::start().await;
+    let page = |results: Value| {
+        ResponseTemplate::new(200).set_body_json(json!({ "count": results.as_array().unwrap().len(), "next": null, "results": results }))
+    };
+    let api = |p: &str| path(format!("{API}content/deb/{p}/"));
+    // pulp_deb strips the slashes of the distribution and keeps the last part of the component in the path.
+    Mock::given(method("GET")).and(api("releases")).respond_with(page(json!([{ "distribution": "/stable/" }]))).mount(&server).await;
+    let components = json!([
+        { "component": "contrib", "plain_component": "contrib", "distribution": "other" },
+        { "component": "updates/main", "plain_component": "main", "distribution": "/stable/" },
+    ]);
+    Mock::given(method("GET"))
+        .and(api("release_components"))
+        .and(query_param("fields", "plain_component,distribution"))
+        .respond_with(page(components))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET")).and(api("packages")).respond_with(page(packages)).mount(&server).await;
+    let served = |p: &str, body: &str| {
+        Mock::given(method("GET"))
+            .and(path(format!("/pulp/content/d/{p}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+    };
+    served("dists/stable/Release", "Suite: stable\n").mount(&server).await;
+    let index = "Package: fixture-beta\nVersion: 2.0-1\nArchitecture: amd64\nFilename: pool/main/f/fixture-beta_2.0-1_amd64.deb\n\n\
+                 Package: fixture-beta\nVersion: 1.0-1\nArchitecture: amd64\nFilename: pool/main/f/fixture-beta_1.0-1_amd64.deb\n";
+    served("dists/stable/main/binary-amd64/Packages", index).mount(&server).await;
+    served("pool/main/f/fixture-beta_1.0-1_amd64.deb", "deb bytes").mount(&server).await;
+    let base = format!("{}/pulp/content/d/", server.uri());
+    (server, base)
+}
+
+#[tokio::test]
+async fn deb_verify_checks_release_index_and_package_digest() {
+    let pkg = |sha: &str| json!([{ "pulp_href": "/p/1/", "package": "fixture-beta", "version": "1.0-1", "architecture": "amd64", "relative_path": "pool/x.deb", "sha256": sha }]);
+    let (server, base) = deb_server(pkg(&hex::encode(Sha256::digest(b"deb bytes")))).await;
+    let c = client(&server, |_, _| {});
+    let ok = deb::verify(&c, &base, "/v/").await.unwrap();
+    assert_eq!(ok, "Release and pool/main/f/fixture-beta_1.0-1_amd64.deb served with matching digest (1 packages)");
+
+    let (server, base) = deb_server(pkg("00")).await;
+    let c = client(&server, |_, _| {});
+    let err = deb::verify(&c, &base, "/v/").await.unwrap_err();
+    assert!(matches!(&err, PulpError::Unsupported(m) if m.contains("not served with the expected digest")), "{err}");
+
+    let (server, base) = deb_server(json!([])).await;
+    let c = client(&server, |_, _| {});
+    assert_eq!(deb::verify(&c, &base, "/v/").await.unwrap(), "Release served (no packages)");
 }

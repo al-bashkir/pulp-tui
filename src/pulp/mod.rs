@@ -1,9 +1,10 @@
 //! Pulp REST API layer: transport (`client`), capability discovery (`caps`),
 //! typed models (`models`), plugin-independent operations (`ops`) and per-plugin
-//! operations (`rpm`, `file`).
+//! operations (`rpm`, `file`, `deb`).
 
 pub mod caps;
 pub mod client;
+pub mod deb;
 pub mod file;
 pub mod models;
 pub mod ops;

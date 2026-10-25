@@ -9,7 +9,7 @@ use crate::filters::{Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
 use crate::pulp::models::{Distribution, Publication, Task};
 use crate::pulp::ops;
-use crate::pulp::{Capabilities, Mutation, PulpClient, RepoType, file, rpm};
+use crate::pulp::{Capabilities, Mutation, PulpClient, RepoType, deb, file, rpm};
 use crate::store::Store;
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
@@ -128,7 +128,7 @@ pub fn sync_policies(caps: Option<&Capabilities>, t: RepoType) -> Vec<String> {
         RepoType::Rpm => caps
             .and_then(|c| c.enum_values("SyncPolicyEnum").map(|e| e.to_vec()))
             .unwrap_or_else(|| vec!["additive".into(), "mirror_complete".into(), "mirror_content_only".into()]),
-        RepoType::File => vec!["additive".into(), "mirror".into()],
+        RepoType::File | RepoType::Deb => vec!["additive".into(), "mirror".into()],
     }
 }
 
@@ -646,6 +646,7 @@ fn repo_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec
                 }));
             }
         }
+        RepoType::Deb => {}
     }
     fields
 }
@@ -839,6 +840,10 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             match t {
                 RepoType::Rpm => {}
                 RepoType::File => fields.push(Field::text("relative_path", "Relative path in repository").help("default: file name")),
+                RepoType::Deb => {
+                    app.error("upload of Deb packages is not supported");
+                    return;
+                }
             }
             app.form(
                 Form::new(format!("Upload to {name}"), fields)
@@ -883,7 +888,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             ];
             match t {
                 RepoType::Rpm => fields.push(Field::new("deps", "Copy dependencies", FieldKind::Bool).value("true")),
-                RepoType::File => {}
+                RepoType::File | RepoType::Deb => {}
             }
             app.form(
                 Form::new(format!("Copy content into {name}"), fields)
@@ -907,6 +912,10 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                             (RepoType::File, _) => {
                                 Some(file::files_in(c, &sv).await?.into_iter().filter(|x| sel.file(x)).map(|x| x.pulp_href).collect())
                             }
+                            (RepoType::Deb, true) => None,
+                            (RepoType::Deb, false) => Some(
+                                deb::packages_in(c, &sv).await?.into_iter().filter(|p| sel.deb_package(p)).map(|p| p.pulp_href).collect(),
+                            ),
                         };
                         let what = units.as_ref().map(|u| format!("{} unit(s)", u.len())).unwrap_or("all content".into());
                         let lines = vec![
@@ -919,6 +928,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                                     Ok(match t {
                                         RepoType::Rpm => rpm::copy(&c, &sv, &href, None, units, deps).await?,
                                         RepoType::File => file::modify(&c, &href, false, units.unwrap_or_default()).await?,
+                                        RepoType::Deb => deb::copy(&c, &sv, &href, None, units).await?,
                                     })
                                 })
                             })
@@ -1007,20 +1017,37 @@ fn remote_url_help(t: RepoType) -> &'static str {
     match t {
         RepoType::Rpm => "yum repository base URL",
         RepoType::File => "URL of the PULP_MANIFEST",
+        RepoType::Deb => "Debian archive base URL (the directory that holds dists/)",
     }
 }
 
-/// Remote form fields that only some plugins have.
-fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, _v: &Value) -> Vec<Field> {
+/// Remote form fields that only some plugins have; `v` is the remote being edited (`Null` on create).
+fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec<Field> {
+    let has = |f: &str| caps.is_none_or(|c| c.has_field(t.remote_schema(), f));
     match t {
         RepoType::Rpm => {
-            if caps.is_none_or(|c| c.has_field(t.remote_schema(), "sles_auth_token")) {
+            if has("sles_auth_token") {
                 vec![Field::new("sles_auth_token", "SLES auth token", FieldKind::Secret)]
             } else {
                 vec![]
             }
         }
         RepoType::File => vec![],
+        RepoType::Deb => {
+            let text = |k: &str, label: &str| Field::text(k, label).value(s(v, k));
+            let flag = |k: &str, label: &str| Field::new(k, label, FieldKind::Bool).value(if v[k] == true { "true" } else { "false" });
+            let all = [
+                text("distributions", "Distributions").required().help("space-separated, e.g. bookworm bookworm-updates"),
+                text("components", "Components").help("space-separated; empty = all"),
+                text("architectures", "Architectures").help("space-separated; empty = all"),
+                flag("sync_sources", "Sync source packages"),
+                flag("sync_udebs", "Sync udebs"),
+                flag("sync_installer", "Sync installer files"),
+                flag("ignore_missing_package_indices", "Ignore missing package indices"),
+                Field::text("gpgkey", "GPG public key (file path)").help(if v.is_null() { "" } else { "empty = unchanged" }),
+            ];
+            all.into_iter().filter(|f| has(&f.key)).collect()
+        }
     }
 }
 
@@ -1073,15 +1100,17 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 for fld in &f.fields {
                     let val = fld.value.trim().to_string();
                     let secretish = matches!(fld.kind, FieldKind::Secret) || matches!(fld.key.as_str(), "username" | "proxy_username");
-                    if (!edit || secretish || fld.key.ends_with("_cert") || fld.key.ends_with("_key")) && val.is_empty() {
+                    // Write-only file paths: the body gets the file's content.
+                    let file = matches!(fld.key.as_str(), "ca_cert" | "client_cert" | "client_key" | "gpgkey");
+                    if (!edit || secretish || file) && val.is_empty() {
                         continue; // write-only: empty keeps the server value
                     }
-                    if edit && !fld.changed() && !secretish && !fld.key.ends_with("_cert") && !fld.key.ends_with("_key") {
+                    if edit && !fld.changed() && !secretish && !file {
                         continue;
                     }
                     match (fld.key.as_str(), &fld.kind) {
                         ("labels", _) => b["pulp_labels"] = parse_labels(&val)?,
-                        ("ca_cert" | "client_cert" | "client_key", _) => files.push((fld.key.clone(), val)),
+                        _ if file => files.push((fld.key.clone(), val)),
                         (_, FieldKind::Bool) => b[fld.key.as_str()] = (val == "true").into(),
                         (_, FieldKind::Number) if val.is_empty() => b[fld.key.as_str()] = Value::Null,
                         (_, FieldKind::Number) => {
@@ -1128,7 +1157,7 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
 fn version_action(app: &mut App, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let Some(t) = RepoType::from_href(&href) else {
-        app.error("only RPM and File repository versions are managed here");
+        app.error("only RPM, File and Deb repository versions are managed here");
         return;
     };
     let number = s(&item, "number");
@@ -1636,6 +1665,7 @@ pub fn load_dashboard(app: &mut App) {
         for (f, label) in [
             (Rpm, "RPM"),
             (File, "File"),
+            (Deb, "Deb"),
             (RpmCopy, "RPM copy API"),
             (ChunkedUpload, "chunked uploads"),
             (NativeReplication, "native replication (tech preview)"),
@@ -1663,6 +1693,14 @@ pub fn load_dashboard(app: &mut App) {
             count("content/rpm/packages/".into(), vec![]).await,
             count("content/file/files/".into(), vec![]).await
         ));
+        if caps.supports(Deb) {
+            lines.push(format!(
+                "  Deb repositories {:>6}   distributions {:>6}   packages {:>8}",
+                count(RepoType::Deb.repositories().into(), vec![]).await,
+                count(RepoType::Deb.distributions().into(), vec![]).await,
+                count(RepoType::Deb.content().into(), vec![]).await
+            ));
+        }
         lines.push(format!(
             "  Tasks running {}  waiting {}  failed (all time) {}",
             count("tasks/".into(), vec![("state", "running".into())]).await,
@@ -1797,6 +1835,125 @@ mod tests {
     fn sync_policies_without_schema() {
         assert_eq!(sync_policies(None, RepoType::Rpm), ["additive", "mirror_complete", "mirror_content_only"]);
         assert_eq!(sync_policies(None, RepoType::File), ["additive", "mirror"]);
+        assert_eq!(sync_policies(None, RepoType::Deb), ["additive", "mirror"]);
+    }
+
+    #[test]
+    fn deb_remote_fields_follow_the_server_schema_and_prefill_on_edit() {
+        let keys = |f: &[Field]| f.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
+        let all = ["distributions", "components", "architectures", "sync_sources", "sync_udebs", "sync_installer"];
+        let all = [&all[..], &["ignore_missing_package_indices", "gpgkey"]].concat();
+        let fields = remote_extra_fields(RepoType::Deb, None, &Value::Null);
+        assert_eq!(keys(&fields), all);
+        assert!(fields[0].required && !fields[1].required);
+        assert_eq!(remote_url_help(RepoType::Deb), "Debian archive base URL (the directory that holds dists/)");
+
+        // A server without these fields (older pulp_deb) shows only what it has.
+        let mut caps = Capabilities::default();
+        caps.schemas.insert("deb.AptRemote".into(), ["distributions", "components"].map(String::from).into());
+        assert_eq!(keys(&remote_extra_fields(RepoType::Deb, Some(&caps), &Value::Null)), ["distributions", "components"]);
+
+        let v = json!({ "distributions": "bookworm", "components": "main", "sync_sources": true, "gpgkey": "-----BEGIN PGP" });
+        let f = remote_extra_fields(RepoType::Deb, None, &v);
+        let value = |k: &str| f.iter().find(|x| x.key == k).unwrap().value.clone();
+        assert_eq!(
+            (value("distributions"), value("components"), value("architectures")),
+            ("bookworm".into(), "main".into(), String::new())
+        );
+        assert_eq!((value("sync_sources"), value("sync_udebs")), ("true".into(), "false".into()));
+        assert_eq!(value("gpgkey"), "", "the key is a file path, never prefilled");
+        assert!(f.iter().all(|x| !x.changed()), "an untouched edit form sends nothing");
+    }
+
+    /// Edit a Deb remote on a mock server: set the fields in `set`, submit, and return the PATCH body.
+    async fn edit_deb_remote(set: &[(&str, &str)]) -> Value {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let href = format!("{API}remotes/deb/apt/1/");
+        wiremock::Mock::given(method("PATCH"))
+            .and(path(href.clone()))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": href })))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        let item = json!({ "pulp_href": href, "name": "d", "url": "http://u/", "policy": "immediate", "distributions": "bookworm",
+            "tls_validation": true, "pulp_labels": {} });
+        remote_action(&mut app, RepoType::Deb, Act::Edit, item);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
+        for (k, v) in set {
+            form.fields.iter_mut().find(|f| f.key == *k).unwrap().value = v.to_string();
+        }
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(
+            app.notices.iter().any(|n| n.text == "update remote d: done"),
+            "{:?}",
+            app.notices.iter().map(|n| &n.text).collect::<Vec<_>>()
+        );
+        let patches = server.received_requests().await.unwrap();
+        patches.iter().find(|r| r.method.as_str() == "PATCH").unwrap().body_json().unwrap()
+    }
+
+    #[tokio::test]
+    async fn deb_remote_gpgkey_is_read_from_a_file_and_kept_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key.asc");
+        std::fs::write(&key, "-----BEGIN PGP PUBLIC KEY BLOCK-----\n").unwrap();
+        let body = edit_deb_remote(&[("gpgkey", key.to_str().unwrap())]).await;
+        assert_eq!(body, json!({ "gpgkey": "-----BEGIN PGP PUBLIC KEY BLOCK-----\n" }));
+        // Empty = unchanged: the key is not sent, other changes still are.
+        let body = edit_deb_remote(&[("distributions", "bookworm bookworm-updates")]).await;
+        assert_eq!(body, json!({ "distributions": "bookworm bookworm-updates" }));
+    }
+
+    #[tokio::test]
+    async fn deb_copy_sends_the_packages_the_filter_selects_as_a_structured_copy() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let (src, dst) = (format!("{API}repositories/deb/apt/src/"), format!("{API}repositories/deb/apt/dst/"));
+        get(
+            &server,
+            &format!("{API}repositories/deb/apt/"),
+            page(json!([{ "pulp_href": src, "name": "src", "latest_version_href": format!("{src}versions/3/") }])),
+        )
+        .await;
+        let pkg = |n: &str| json!({ "pulp_href": format!("{API}content/deb/packages/{n}/"), "package": n, "version": "1.0-1", "architecture": "amd64" });
+        get(&server, &format!("{API}content/deb/packages/"), page(json!([pkg("fixture-beta"), pkg("fixture-beta-dbg")]))).await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(format!("{API}deb/copy/")))
+            .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        for (rules, want) in [("exclude name=*-dbg", Some(json!([format!("{API}content/deb/packages/fixture-beta/")]))), ("", None)] {
+            repo_action(&mut app, RepoType::Deb, Act::CopyContent, json!({ "pulp_href": dst, "name": "dst" }));
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            assert!(form.fields.iter().all(|f| f.key != "deps"), "Deb copy has no dependency solving");
+            assert_eq!(form.fields[1].help, filter_help(RepoType::Deb));
+            form.fields[0].value = "src".into();
+            form.fields[1].value = rules.into();
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
+            assert_eq!(
+                lines[0],
+                format!(
+                    "Copy {} from src@v3 into dst.",
+                    want.as_ref().map_or("all content".into(), |u| format!("{} unit(s)", u.as_array().unwrap().len()))
+                )
+            );
+            on_yes.unwrap()(&mut app);
+            settle(&mut app, &mut rx).await;
+            let posts = server.received_requests().await.unwrap();
+            let sent: Value = posts.iter().rfind(|r| r.method.as_str() == "POST").unwrap().body_json().unwrap();
+            let mut cfg = json!({ "source_repo_version": format!("{src}versions/3/"), "dest_repo": dst });
+            if let Some(u) = want {
+                cfg["content"] = u;
+            }
+            assert_eq!(sent, json!({ "config": [cfg], "structured": true, "dependency_solving": false }));
+        }
     }
 
     #[tokio::test]

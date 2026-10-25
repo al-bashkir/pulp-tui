@@ -35,7 +35,7 @@
 | `s` / `S` | sort by next column / reverse (current page) |
 | `n` / `p` | next / previous page (100 items per page) |
 | `Space` | mark item (compare, bulk remove or add content) |
-| `t` | toggle RPM/File, content type, tracked/server tasks, task polling in Logs, or Content View snapshots in Repositories |
+| `t` | toggle RPM/File/Deb, content type, tracked/server tasks, task polling in Logs, or Content View snapshots in Repositories |
 | `r` | refresh |
 | `Esc` | cancel a loading request, clear marks, or go back |
 
@@ -90,9 +90,10 @@ the typed text as the value (with no text, it closes the list and keeps the old 
 
 ### Dashboard
 Server health (database, Redis, workers, content apps, storage), the current user,
-installed plugins with versions, detected capabilities, counts of repositories,
-distributions, content and tasks, and the number of Content Views and environments (it
-says if they are in the local file or in the shared database). `r` refreshes.
+installed plugins with versions, detected capabilities (RPM, File, Deb, ...), counts of
+repositories, distributions, content and tasks (a Deb line when the server has pulp_deb),
+and the number of Content Views and environments (it says if they are in the local file
+or in the shared database). `r` refreshes.
 
 ### Servers
 Named profiles from the config file. Actions: **o** connect, **T** test connection (shows
@@ -119,9 +120,10 @@ with a new database asks the same. When you change the database location of a pr
 that has Content View data, pulp-tui asks `Database of <profile> changes`: copy and
 switch, switch without copy, or Esc. See "Shared database" for both.
 
-### RPM Repositories / File Repositories
+### RPM Repositories / File Repositories / Deb Repositories
 Columns: name, latest version, default remote, retention, description. Details explain
-retention and mark Content View snapshot repositories.
+retention and mark Content View snapshot repositories. The Deb screen needs the pulp_deb
+plugin on the server.
 
 The list does not show Content View snapshot repositories (`pulp-tui-cv-<view>-<repo>`, label
 `pulp_tui_cv`). Press **t** to show or hide them; the title shows `snapshots shown` when they
@@ -131,23 +133,42 @@ are visible.
 |---|---|
 | v | versions of the repository |
 | o | browse content of the latest version |
-| f | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File: additive, mirror). Mirror policies show a warning first. |
+| f | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File and Deb: additive, mirror). Mirror policies show a warning first. |
 | H | sync history (tasks that touched this repository) |
-| u | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed or cancelled (Esc) chunked uploads are deleted |
+| u | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed or cancelled (Esc) chunked uploads are deleted. Not offered for Deb repositories (upload of `.deb` files is not supported). |
 | P | publish the latest version (reuses an existing publication) |
 | D | distribute: pin the latest version (publication) or follow the repository latest |
-| C | copy content from another repository (filter rules; RPM can copy dependencies) |
+| C | copy content from another repository (filter rules; RPM can copy dependencies; a Deb copy is structured: it also copies the Release, component and architecture records of the packages, and never solves dependencies) |
 | c / e / d | create / edit / delete (delete names every distribution that serves the repository, a version or a publication of it; refused while it holds Content View snapshots) |
 | i | full JSON |
 
 Edit sends only changed fields. Retention cannot be set on Content View snapshot
 repositories. Sync, upload, copy and content add/remove are refused on snapshot repositories.
 
+Deb repositories use the same keys. Sync a Deb repository from a Deb remote, publish it
+(**P**) and distribute it (**D**) as for the other types. A Deb distribution is served
+at `<content URL>/dists/<distribution>/...`. Distribution verification (**V** in
+Distributions) fetches the `Release` file, finds the smallest package in a `Packages`
+index and compares the digest of the downloaded `.deb`. Deb repositories cannot be used in
+Content Views yet. The fallback replication handles RPM and File only.
+
 ### Remotes
-`t` switches RPM/File. Create/edit: URL (File: URL of `PULP_MANIFEST`), download policy,
-TLS validation, CA/client certificate and key (file paths; content is uploaded), username
-and password (write-only: empty keeps the server value), proxy, concurrency, rate limit,
-labels, SLES token (RPM). Delete lists repositories that use the remote.
+`t` switches RPM/File/Deb. Create/edit: URL (File: URL of `PULP_MANIFEST`; Deb: the Debian
+archive base URL, the directory that holds `dists/`), download policy, TLS validation,
+CA/client certificate and key (file paths; content is uploaded), username and password
+(write-only: empty keeps the server value), proxy, concurrency, rate limit, labels, SLES
+token (RPM). Delete lists repositories that use the remote.
+
+Deb remote fields (each is shown only when the server has it):
+
+| Field | Meaning |
+|---|---|
+| Distributions | required; space-separated releases to mirror, for example `bookworm bookworm-updates` |
+| Components | space-separated, for example `main contrib`; empty = all |
+| Architectures | space-separated, for example `amd64 arm64`; empty = all |
+| Sync source packages / udebs / installer files | on or off (default off) |
+| Ignore missing package indices | on or off; keeps a sync going when a `Packages` index is missing upstream |
+| GPG public key | path of a local file; its content is uploaded and Pulp uses it to check the `Release` signature. Write-only: empty on edit keeps the server value |
 
 ### Repository Versions
 From a repository (**v**) or for all repositories. Columns: number, created, present /
@@ -159,20 +180,22 @@ publications, and you type the version id; refused for Content View snapshots; n
 for rollback).
 
 ### Content browser
-Opened from a repository or version. `t` cycles the RPM content types (packages,
-advisories, modulemds, package groups, distribution trees, repo metadata files). `/`
-searches package names or file paths. **i** shows all metadata of a unit (requires,
+Opened from a repository or version. `t` cycles the content types of the repository type.
+RPM: packages, advisories, modulemds, package groups, distribution trees, repo metadata
+files. Deb: packages (package, version, architecture, sha256), releases (distribution,
+codename, suite, version), release components, source packages. `/`
+searches package names (on the RPM and Deb packages lists) or file paths. **i** shows all metadata of a unit (requires,
 provides, files, advisory package lists, …). **x** removes the marked (or selected)
 units from the repository; **a** adds them to another repository. Both create a new
 repository version; old versions are unchanged.
 
 ### Publications
-`t` switches RPM/File. **c** create from repository name and optional version number,
+`t` switches RPM/File/Deb. **c** create from repository name and optional version number,
 **D** distribute, **d** delete (names the distributions that serve it, and you type the
 publication id; refused for publications of Content View snapshots).
 
 ### Distributions
-`t` switches RPM/File. Details say whether a distribution is **PINNED** (publication or
+`t` switches RPM/File/Deb. Details say whether a distribution is **PINNED** (publication or
 repository version) or **FOLLOWS LATEST** (repository). **y** copies the content URL
 (OSC 52 terminal clipboard), **V** verifies what is served (for a distribution that follows
 a repository: its newest publication, which is not the latest version when that version has
@@ -229,6 +252,8 @@ Filter syntax (rules separated by `;`):
 ```
 include name=kernel* arch=x86_64 evr>=5.14-1
 exclude name=*-debuginfo
+include name=nginx* arch=amd64 version>=1.22    # Deb repositories
+exclude name=*-dbg version<1.0                  # Deb repositories
 exclude path=isos/*            # File repositories
 ```
 
@@ -237,6 +262,13 @@ matches. All criteria of one rule must match. `evr` supports `= < <= > >=` with 
 version comparison; `epoch:` is optional (a number); without a release only epoch and
 version are compared. The value must start with a letter or digit, so a typo such as
 `evr=>5.14` is refused instead of meaning `= >5.14`.
+
+Each repository type accepts its own criteria, and a rule with a criterion of another type
+is refused with a message that names the types that have it: RPM takes `name=`, `arch=` and
+`evr`; Deb takes `name=`, `arch=` and `version`; File takes `path=`. `version` supports the
+same operators as `evr` with the Debian rules for version comparison (`~` sorts before
+everything, `epoch:` is optional, and a rule without a revision matches every revision of
+that upstream version). The same rules filter the copy action (**C**) of a repository.
 
 #### Composite Content Views
 
