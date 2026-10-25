@@ -177,7 +177,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         (Kind::Logs { .. }, Act::Inspect) => app.text(s(&item, "summary"), log_lines(&item)),
         (_, Act::Inspect) => inspect(app, &kind, item),
         (Kind::Profiles, _) => profile_action(app, act, item),
-        (Kind::Repos(t), _) => repo_action(app, *t, act, item),
+        (Kind::Repos(t, _), _) => repo_action(app, *t, act, item),
         (Kind::Remotes(t), _) => remote_action(app, *t, act, item),
         (Kind::Versions(_), _) => version_action(app, act, item),
         (Kind::Content { version, .. }, _) => content_action(app, version.clone(), act),
@@ -1030,6 +1030,10 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 Field::new("proxy_password", "Proxy password", FieldKind::Secret),
                 Field::new("download_concurrency", "Download concurrency", FieldKind::Number).value(s(&v, "download_concurrency")),
                 Field::new("rate_limit", "Rate limit (req/s)", FieldKind::Number).value(s(&v, "rate_limit")),
+                // A float on the server: `s()` would show `3600.0`, which is not a whole number.
+                Field::new("total_timeout", "Total timeout (s)", FieldKind::Number)
+                    .value(v["total_timeout"].as_f64().map(|x| x.to_string()).unwrap_or_default())
+                    .help("seconds one download may take (large packages need more); empty = server default"),
                 Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
             ];
             if t == RepoType::Rpm && caps.as_ref().is_none_or(|c| c.has_field(schema, "sles_auth_token")) {

@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
     Profiles,
-    Repos(RepoType),
+    /// `true` also shows the snapshot repositories of Content Views (label `pulp_tui_cv`).
+    Repos(RepoType, bool),
     Remotes(RepoType),
     /// Versions of one repository (href, name) or of all repositories.
     Versions(Option<(String, String)>),
@@ -54,8 +55,8 @@ pub enum Kind {
 
 pub const NAV: &[(&str, Kind)] = &[
     ("Servers", Kind::Profiles),
-    ("RPM Repositories", Kind::Repos(RepoType::Rpm)),
-    ("File Repositories", Kind::Repos(RepoType::File)),
+    ("RPM Repositories", Kind::Repos(RepoType::Rpm, false)),
+    ("File Repositories", Kind::Repos(RepoType::File, false)),
     ("Remotes", Kind::Remotes(RepoType::Rpm)),
     ("Repository Versions", Kind::Versions(None)),
     ("Publications", Kind::Publications(RepoType::Rpm)),
@@ -321,7 +322,11 @@ impl Kind {
     pub fn title(&self) -> String {
         match self {
             Kind::Profiles => "Servers (profiles)".into(),
-            Kind::Repos(t) => format!("{} Repositories", t.label()),
+            Kind::Repos(t, snapshots) => format!(
+                "{} Repositories  [t: show/hide Content View snapshots]{}",
+                t.label(),
+                if *snapshots { " — snapshots shown" } else { "" }
+            ),
             Kind::Remotes(t) => format!("{} Remotes  [t: toggle type]", t.label()),
             Kind::Versions(Some((_, n))) => format!("Versions of {n}"),
             Kind::Versions(None) => "Repository Versions (all repositories)".into(),
@@ -359,11 +364,11 @@ impl Kind {
     /// Precise message when the server lacks what this screen needs.
     pub fn unsupported(&self, caps: &Capabilities) -> Option<String> {
         let f = match self {
-            Kind::Repos(RepoType::Rpm)
+            Kind::Repos(RepoType::Rpm, _)
             | Kind::Remotes(RepoType::Rpm)
             | Kind::Publications(RepoType::Rpm)
             | Kind::Distributions(RepoType::Rpm) => Feature::Rpm,
-            Kind::Repos(RepoType::File)
+            Kind::Repos(RepoType::File, _)
             | Kind::Remotes(RepoType::File)
             | Kind::Publications(RepoType::File)
             | Kind::Distributions(RepoType::File) => Feature::File,
@@ -384,6 +389,7 @@ impl Kind {
     pub fn toggle(&self) -> Option<Kind> {
         let flip = |t: &RepoType| if *t == RepoType::Rpm { RepoType::File } else { RepoType::Rpm };
         Some(match self {
+            Kind::Repos(t, snapshots) => Kind::Repos(*t, !snapshots),
             Kind::Remotes(t) => Kind::Remotes(flip(t)),
             Kind::Publications(t) => Kind::Publications(flip(t)),
             Kind::Distributions(t) => Kind::Distributions(flip(t)),
@@ -402,7 +408,13 @@ impl Kind {
     fn source(&self) -> Option<Source> {
         let name = Some("name__icontains");
         Some(match self {
-            Kind::Repos(t) => (t.repositories().into(), vec![("ordering", "name".into())], name),
+            Kind::Repos(t, snapshots) => {
+                let mut q = vec![("ordering", "name".into())];
+                if !snapshots {
+                    q.push(("pulp_label_select", format!("!{}", crate::cv::LABEL_CV)));
+                }
+                (t.repositories().into(), q, name)
+            }
             Kind::Remotes(t) => (t.remotes().into(), vec![("ordering", "name".into())], name),
             Kind::Versions(Some((repo, _))) => (format!("{repo}versions/"), vec![("ordering", "-number".into())], None),
             Kind::Versions(None) => ("repository_versions/".into(), vec![("ordering", "-pulp_created".into())], None),
@@ -451,7 +463,7 @@ impl Kind {
                 col("user", 10, |v| s(v, "username")),
                 col("flags", 16, |v| s(v, "flags")),
             ],
-            Kind::Repos(_) => vec![
+            Kind::Repos(..) => vec![
                 col("name", 30, |v| s(v, "name")),
                 col("latest", 7, |v| {
                     v["latest_version_href"].as_str().and_then(|h| h.trim_end_matches('/').rsplit('/').next()).unwrap_or("").into()
@@ -606,7 +618,7 @@ impl Kind {
         use Act::*;
         match self {
             Kind::Profiles => vec![Connect, TestProfile, Create, Edit, Delete, StoreSecret, ExportCv, ImportCv],
-            Kind::Repos(_) => {
+            Kind::Repos(..) => {
                 vec![Versions, Content, Sync, SyncHistory, Upload, Publish, Distribute, CopyContent, Create, Edit, Delete, Inspect]
             }
             Kind::Remotes(_) | Kind::Roles => vec![Create, Edit, Delete, Inspect],
@@ -877,7 +889,10 @@ mod tests {
         assert!(Act::CvAddComponent.mutates(&Kind::ContentViews, true) && !Act::CvAddComponent.mutates(&Kind::ContentViews, false));
         assert!(Act::CvRemoveComponent.mutates(&Kind::ContentViews, true) && !Act::CvRemoveComponent.mutates(&Kind::ContentViews, false));
         assert_eq!((Act::CvAddComponent.key(), Act::CvRemoveComponent.key()), ('a', 'x'));
-        assert_eq!(Kind::Repos(RepoType::Rpm).item_actions(&json!({ "composite": true })), Kind::Repos(RepoType::Rpm).actions());
+        assert_eq!(
+            Kind::Repos(RepoType::Rpm, false).item_actions(&json!({ "composite": true })),
+            Kind::Repos(RepoType::Rpm, false).actions()
+        );
     }
 
     #[tokio::test]
@@ -944,6 +959,16 @@ mod tests {
     }
 
     #[test]
+    fn repos_screen_hides_content_view_snapshots_until_toggled() {
+        let k = Kind::Repos(RepoType::Rpm, false);
+        let label = |k: &Kind| k.source().unwrap().1.into_iter().find(|(q, _)| *q == "pulp_label_select").map(|(_, v)| v);
+        assert_eq!(label(&k).as_deref(), Some("!pulp_tui_cv"));
+        assert_eq!(k.toggle(), Some(Kind::Repos(RepoType::Rpm, true)));
+        assert_eq!(label(&Kind::Repos(RepoType::Rpm, true)), None);
+        assert!(Kind::Repos(RepoType::File, true).title().ends_with(" — snapshots shown"));
+    }
+
+    #[test]
     fn logs_screen_is_local_and_toggles_polling() {
         let k = Kind::Logs { polls: false };
         assert!(!k.needs_connection());
@@ -977,8 +1002,8 @@ mod tests {
 
     #[test]
     fn read_only_classification() {
-        assert!(Act::Delete.mutates(&Kind::Repos(RepoType::Rpm), false));
-        assert!(!Act::Inspect.mutates(&Kind::Repos(RepoType::Rpm), false));
+        assert!(Act::Delete.mutates(&Kind::Repos(RepoType::Rpm, false), false));
+        assert!(!Act::Inspect.mutates(&Kind::Repos(RepoType::Rpm, false), false));
         assert!(!Act::Create.mutates(&Kind::ContentViews, false), "local CV definitions");
         assert!(Act::Create.mutates(&Kind::ContentViews, true), "shared CV definitions");
         assert!(Act::ToggleProtected.mutates(&Kind::Environments, true));

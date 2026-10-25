@@ -35,7 +35,7 @@
 | `s` / `S` | sort by next column / reverse (current page) |
 | `n` / `p` | next / previous page (100 items per page) |
 | `Space` | mark item (compare, bulk remove or add content) |
-| `t` | toggle RPM/File, content type, tracked/server tasks, or task polling in Logs |
+| `t` | toggle RPM/File, content type, tracked/server tasks, task polling in Logs, or Content View snapshots in Repositories |
 | `r` | refresh |
 | `Esc` | cancel a loading request, clear marks, or go back |
 
@@ -43,8 +43,15 @@ In forms (they open in move mode): `j k`/`Tab`/`↑↓` change the field, `i` or
 a text field (the box shows `-- EDIT --`), `Enter` then goes to the next field (submits on
 the last), and `Esc` stops editing. `h l`/`←→`/`Space` change a choice, `Space` toggles a
 checkbox. `Ctrl-S` submits from either mode (also from an open picker, after it takes the
-selection), `Ctrl-U` clears the field while editing, and `Esc` in move mode cancels. A form
-with a single text, secret or number field opens in edit mode. In confirmations:
+selection), and `Esc` in move mode cancels. A form with a single text, secret or number
+field opens in edit mode.
+
+While editing a text field (forms and the search input), the cursor moves inside the text:
+`← →`/`Ctrl-B Ctrl-F` one character, `Alt-B Alt-F`/`Ctrl-← Ctrl-→` one word, `Home End`/`Ctrl-A Ctrl-E`
+to the start or end. `Backspace`/`Delete` delete one character, `Ctrl-W` the word before the
+cursor, `Ctrl-U`/`Ctrl-K` everything before/after the cursor.
+
+Lists scroll with 5 rows of margin above and below the highlighted row (as vim `scrolloff=5`). In confirmations:
 `y`/`Enter` confirms, `n`/`Esc` cancels; destructive operations require typing the shown
 name, and so do rollbacks and promotions on a production profile. A dialog that a finished
 background job opens never replaces the open one: it waits until that one closes (the footer
@@ -116,6 +123,10 @@ switch, switch without copy, or Esc. See "Shared database" for both.
 Columns: name, latest version, default remote, retention, description. Details explain
 retention and mark Content View snapshot repositories.
 
+The list does not show Content View snapshot repositories (`pulp-tui-cv-<view>-<repo>`, label
+`pulp_tui_cv`). Press **t** to show or hide them; the title shows `snapshots shown` when they
+are visible.
+
 | Key | Action |
 |---|---|
 | v | versions of the repository |
@@ -179,7 +190,7 @@ Views" below.
 | Key | Action |
 |---|---|
 | c / e / d | create / edit description / delete (removes the view's distributions and snapshot repositories, never source repositories). On a composite, Edit also sets auto publish and the pin of each component, and Delete removes only its distributions. |
-| a | add repositories: a multi-select picker of RPM and File repositories (those already in the view are not listed) and filter rules; the rules apply to each selected repository, so mixed RPM and File selections need empty rules. On a composite: add components (see below). |
+| a | add repositories: a multi-select picker of RPM and File repositories (those already in the view and Content View snapshot repositories are not listed) and filter rules; the rules apply to each selected repository, so mixed RPM and File selections need empty rules. On a composite: add components (see below). |
 | F | edit the filter rules of one repository (not offered on a composite) |
 | x | remove a repository from the definition (published versions are unchanged). On a composite: remove a component. |
 | f | sync repositories: a multi-select picker of the view's repositories (all marked) and one sync policy (RPM values when the view has an RPM repository, else File values; File repositories treat any mirror policy as mirror). Each repository syncs from its own default remote; one without is skipped. Mirror policies show a warning first. The tasks show in Tasks; the result lists each repository: new version, no change, failed or skipped. Sync does not publish. Not offered on a composite. |
@@ -198,6 +209,12 @@ anything is sent to Pulp. Preview, compare and the drift check do not lock. Sync
 repositories does not lock the view; it writes one audit entry (`cv.sync`) when the syncs are
 submitted, with how many were submitted, failed or skipped (the per-repository result of the
 finished tasks is shown in the result view, not in the entry).
+
+A snapshot repository of a view is never a source of a view. Publish refuses a view that has
+one (for example, added before this check existed):
+`pulp-tui-cv-web-os is a snapshot repository of content view web; remove it from outer and add its source`.
+Remove it (**x**) and add the source repository of the other view. To use the content of
+another view, make a composite view.
 
 Each promoted repository is served at
 `https://<pulp>/pulp/content/<lc label>/<view>/<repo>/`, where `<lc label>` is
@@ -623,6 +640,46 @@ which SQLite creates next to it. Put the file in a directory of a group that has
 operators, make the directory group-writable with the setgid bit (`chmod 2770`, so new
 files get that group), and after `db migrate` make the file group-writable (`chmod 660`).
 SQLite gives the `-wal` and `-shm` files the permissions of the database file.
+
+## Protect Content View objects (Pulp RBAC)
+
+pulp-tui refuses to change Content View objects by hand (retention, sync, upload, copy,
+content changes, delete). Other Pulp clients (`pulp` CLI, scripts, the API) do not know these
+rules. A user with write access to a snapshot repository can break published versions:
+
+| Change by another client | Result |
+|---|---|
+| add or remove content | no effect on published versions; the next publish replaces it |
+| set `retain_repo_versions` | Pulp deletes old versions and their publications: older Content View versions and rollback stop working |
+| delete the repository or a distribution | the environments of that view stop serving that repository |
+| point a distribution to another publication | the environment serves wrong content; the drift check (**D**) reports it |
+
+Only Pulp RBAC stops this. Set up the roles so that only pulp-tui operators can change these
+objects:
+
+1. **pulp-tui operators** get global roles (no object): `rpm.admin`, and for File
+   `file.filerepository_owner`, `file.fileremote_owner`, `file.filepublication_owner`,
+   `file.filedistribution_owner` (pulp_file has no `file.admin` role). Operators of one shared
+   database change the objects of each other, so object-level roles are not sufficient for
+   them.
+2. **Other users** get only roles that do not give write access to objects of other users:
+   * to see everything: `rpm.viewer`, and `file.filerepository_viewer`,
+     `file.fileremote_viewer`, `file.filepublication_viewer`, `file.filedistribution_viewer`;
+   * the creator roles of what they make, for example `rpm.rpmrepository_creator`,
+     `rpm.rpmremote_creator`, `rpm.rpmpublication_creator`, `rpm.rpmdistribution_creator`, and
+     the `file.file…_creator` roles. Pulp gives the creator the owner role of each new object
+     (for example `rpm.rpmrepository_owner`) on that object only.
+3. **Do not give** `rpm.admin` or a global `*_owner` role to other users. A global owner role
+   gives write access to all objects of that type, also the snapshot repositories and the
+   Content View distributions.
+
+Assign roles on **Users** (or **Groups**): **R**, then **c** with the role name and an empty
+object. Groups are easier to keep correct, for example a `pulp-tui-operators` group with the
+operator roles.
+
+RBAC does not stop superusers (`is_superuser`): they can always change everything. Keep their
+number small. RBAC protects only the Pulp API; it has no effect on who can download served
+content (use content guards for that).
 
 ## Command line
 

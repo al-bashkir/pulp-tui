@@ -42,7 +42,10 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
     };
     let mut out = vec![];
     for (path, fields, label, value, note) in specs {
-        let query = [("fields", fields.to_string()), ("ordering", label.to_string())];
+        let mut query = vec![("fields", fields.to_string()), ("ordering", label.to_string())];
+        if matches!(source, Source::Repos(None)) {
+            query.push(("pulp_label_select", format!("!{}", crate::cv::LABEL_CV))); // a snapshot is never a source
+        }
         let rows: Vec<Value> = ctx.client.list_all(&ctx.client.api(path), &query, CAP).await?;
         out.extend(rows.iter().map(|r| PickItem { label: text(r, label), value: text(r, value), note: note.into() }));
     }
@@ -225,6 +228,7 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path(format!("/pulp/api/v3/repositories/{kind}/{kind}/")))
                 .and(query_param("fields", "name,pulp_href"))
+                .and(query_param("pulp_label_select", "!pulp_tui_cv"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "count": 1, "next": null, "results": [{ "name": name, "pulp_href": format!("/h/{kind}/") }]
                 })))

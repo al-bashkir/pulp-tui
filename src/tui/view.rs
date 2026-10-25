@@ -159,7 +159,9 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         let widths: Vec<Constraint> =
             std::iter::once(Constraint::Length(1)).chain(cols.iter().map(|c| Constraint::Min(c.width.min(40)))).collect();
         let table = Table::new(rows, widths).header(header).block(block).row_highlight_style(sel()).highlight_symbol("▶");
-        let mut st = TableState::default().with_selected(Some(l.selected));
+        let rows = table_area.height.saturating_sub(3) as usize; // borders and header
+        l.top.set(scroll_top(l.top.get(), l.selected, rows, l.items.len()));
+        let mut st = TableState::default().with_selected(Some(l.selected)).with_offset(l.top.get());
         f.render_stateful_widget(table, table_area, &mut st);
     }
     if detail_area.width > 0 {
@@ -167,6 +169,26 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         let text: Vec<Line> = lines.into_iter().map(Line::raw).collect();
         f.render_widget(Paragraph::new(text).block(Block::bordered().title(" Details ")).wrap(Wrap { trim: false }), detail_area);
     }
+}
+
+/// Rows kept visible above and below the highlighted one (vim `scrolloff`).
+const SCROLLOFF: usize = 5;
+
+/// First visible row of a list with `rows` visible rows; `top` is the one of the last frame.
+/// The view moves only when the highlight comes nearer than SCROLLOFF rows to an edge.
+fn scroll_top(top: usize, sel: usize, rows: usize, len: usize) -> usize {
+    let rows = rows.max(1);
+    let so = SCROLLOFF.min(rows.saturating_sub(1) / 2);
+    let top = top.min(sel.saturating_sub(so)).max((sel + so + 1).saturating_sub(rows));
+    top.min(len.saturating_sub(rows))
+}
+
+/// `text` with the edit cursor `▏` at char index `cur`.
+fn with_cursor(text: &str, cur: usize) -> String {
+    let mut out: String = text.chars().take(cur).collect();
+    out.push('▏');
+    out.extend(text.chars().skip(cur));
+    out
 }
 
 fn detail_lines(kind: &Kind, v: &serde_json::Value) -> Vec<String> {
@@ -182,7 +204,7 @@ fn detail_lines(kind: &Kind, v: &serde_json::Value) -> Vec<String> {
             });
             out.push(String::new());
         }
-        Kind::Repos(_) => {
+        Kind::Repos(..) => {
             out.push(match v["retain_repo_versions"].as_u64() {
                 Some(n) => format!("Retention: keeps the latest {n} versions (older are deleted by Pulp)"),
                 None => "Retention: all versions are kept".into(),
@@ -248,7 +270,7 @@ fn modal_hint(m: &Modal) -> String {
         Modal::Confirm { .. } => "y/Enter: confirm  n/Esc: cancel  j/k g/G Ctrl-D/U: scroll".into(),
         Modal::Text { watch: Some(_), .. } => "live: refreshes until the task ends  j/k g/G Ctrl-D/U: scroll  Esc: close".into(),
         Modal::Text { .. } => "j/k g/G Ctrl-D/U: scroll  Esc: close".into(),
-        Modal::Input { .. } => "-- EDIT --  Enter: done  Ctrl-U: clear  Esc: cancel".into(),
+        Modal::Input { .. } => "-- EDIT --  Enter: done  ←→ Ctrl-A/E: move  Ctrl-W/U/K: delete  Esc: cancel".into(),
         Modal::Palette { filtering: true, .. } => "-- FILTER --  Ctrl-J/K: move  Enter: run  Esc: stop filtering".into(),
         Modal::Palette { .. } => "j/k g/G: move  /: filter  Enter: run  Esc: close".into(),
     }
@@ -348,10 +370,10 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
                 r,
             );
         }
-        Modal::Input { title, input, .. } => {
+        Modal::Input { title, input, cursor, .. } => {
             let r = centered(area, 70, 3);
             f.render_widget(Clear, r);
-            f.render_widget(Paragraph::new(format!("{input}▏")).block(Block::bordered().title(format!(" {title} "))), r);
+            f.render_widget(Paragraph::new(with_cursor(input, *cursor)).block(Block::bordered().title(format!(" {title} "))), r);
         }
         Modal::Palette { input, selected, filtering } => {
             let entries = app.palette_entries(input);
@@ -382,9 +404,14 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
     for (i, fld) in form.fields.iter().enumerate() {
         let focused = i == form.focus;
         let req = if fld.required { "*" } else { " " };
-        let cursor = if focused && form.editing { "▏" } else { "" };
         let label = format!("{}{req}{:<w$}", if focused { "▶" } else { " " }, fld.label, w = label_w);
-        let value = format!("{}{cursor}", fld.display());
+        let value = if focused && form.editing {
+            // A secret shows at most 12 bullets; its cursor stays inside them.
+            let cur = if fld.kind == FieldKind::Secret { form.cursor.min(12) } else { form.cursor };
+            with_cursor(&fld.display(), cur)
+        } else {
+            fld.display()
+        };
         lines.push(Line::from(vec![Span::raw(label), if focused { Span::styled(value, sel()) } else { Span::raw(value) }]));
     }
     lines.push(Line::raw(""));
@@ -438,7 +465,8 @@ fn draw_picker(f: &mut Frame, form: &Form, p: &Picker, form_area: Rect, area: Re
             vec![Line::styled("no match", Style::default().fg(Color::DarkGray))]
         } else {
             let pad = if vis.iter().any(|i| !i.note.is_empty()) { 5 } else { 0 };
-            let top = p.selected.saturating_sub(rows.saturating_sub(1));
+            p.top.set(scroll_top(p.top.get(), p.selected, rows, vis.len()));
+            let top = p.top.get();
             vis.iter()
                 .enumerate()
                 .skip(top)
@@ -493,13 +521,15 @@ pub fn help_lines() -> Vec<String> {
         "  ↑↓ j k  PgUp PgDn Ctrl-D Ctrl-U  g G  move   h  screen list     Enter  action menu (shortcut letters shown)",
         "  /   server-side search  s/S sort column / reverse   n/p next/previous page",
         "  Space  mark item (multi-select: compare, remove/add content)",
-        "  t   toggle RPM/File, content type, tracked/server tasks, or task polling in Logs",
+        "  t   toggle RPM/File, content type, tracked/server tasks, task polling in Logs, or CV snapshots in Repositories",
         "  r   refresh   Esc  cancel loading request / clear marks / go back",
         "",
         "Forms",
         "  j k Tab ↑↓   move between fields      i/Enter  edit a text field (-- EDIT --)",
         "  h l ←→ Space change a choice / toggle  Ctrl-S  submit (both modes)    Esc  cancel (move mode)",
-        "  In -- EDIT --: Enter goes to the next field (submits on the last), Esc stops editing, Ctrl-U clears",
+        "  In -- EDIT --: Enter goes to the next field (submits on the last), Esc stops editing",
+        "    ←→ Ctrl-B/F  char    Alt-B/F Ctrl-←→  word    Home End Ctrl-A/E  line start/end",
+        "    Backspace Delete  delete char    Ctrl-W  delete word    Ctrl-U/K  delete to line start/end",
         "  A form with one text field opens in -- EDIT --.",
         "",
         "Pickers and palette",
@@ -620,7 +650,9 @@ mod tests {
         assert!(modal_hint(&pal(true)).starts_with("-- FILTER --"));
         let h = modal_hint(&pal(false));
         assert!(h.contains("/: filter") && !h.contains("-- FILTER --"), "{h}");
-        assert!(modal_hint(&Modal::Input { title: String::new(), input: String::new(), on_done: None }).starts_with("-- EDIT --"));
+        assert!(
+            modal_hint(&Modal::Input { title: String::new(), input: String::new(), cursor: 0, on_done: None }).starts_with("-- EDIT --")
+        );
         assert!(modal_hint(&Modal::Text { title: String::new(), lines: vec![], scroll: 0, watch: None }).contains("Ctrl-D/U"));
         let mut form = Form::new("t", vec![Field::text("a", "A")]);
         form.editing = true;
@@ -673,5 +705,31 @@ mod tests {
         form.picker.as_mut().unwrap().error = Some("boom".into());
         let s = screen(&form);
         assert!(s.contains("Could not load choices: boom") && s.contains("Enter: use typed text"), "{s}");
+    }
+
+    #[test]
+    fn scroll_top_keeps_five_rows_around_the_highlight() {
+        // 20 rows visible, 100 items. Down: the view moves when the highlight is 5 rows from the bottom.
+        assert_eq!(scroll_top(0, 14, 20, 100), 0);
+        assert_eq!(scroll_top(0, 15, 20, 100), 1);
+        // Up: the view stays until the highlight is 5 rows from the top.
+        assert_eq!(scroll_top(30, 40, 20, 100), 30);
+        assert_eq!(scroll_top(30, 35, 20, 100), 30);
+        assert_eq!(scroll_top(30, 34, 20, 100), 29);
+        // Ends: no empty rows after the last item; a short list never scrolls.
+        assert_eq!(scroll_top(90, 99, 20, 100), 80);
+        assert_eq!(scroll_top(0, 9, 20, 10), 0);
+        // A small view keeps a smaller margin.
+        assert_eq!(scroll_top(0, 3, 4, 100), 1);
+        assert_eq!(scroll_top(0, 0, 0, 100), 0);
+    }
+
+    #[test]
+    fn edit_cursor_is_drawn_at_its_position() {
+        assert_eq!(with_cursor("abc", 1), "a▏bc");
+        assert_eq!(with_cursor("", 0), "▏");
+        let mut form = Form::new("t", vec![Field::text("a", "A").value("hello")]);
+        form.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert!(screen(&form).contains("▏hello"));
     }
 }

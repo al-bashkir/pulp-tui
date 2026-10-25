@@ -2,7 +2,7 @@
 //! disk operation runs as a background job that sends back a closure applied here.
 
 use super::actions::ap;
-use super::form::{FieldKind, Form, FormEvent, PickItem, Source, move_key};
+use super::form::{FieldKind, Form, FormEvent, PickItem, Source, edit_line, move_key};
 use super::kinds::{self, Act, Kind};
 use super::tasks::TaskCenter;
 use super::view::help_lines;
@@ -13,6 +13,7 @@ use crate::pulp::{Capabilities, PulpClient};
 use crate::store::{NotMigrated, Store};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
@@ -158,6 +159,8 @@ pub struct ListState {
     pub error: Option<String>,
     pub generation: u64,
     pub marked: BTreeSet<String>,
+    /// First visible row; kept by the view between frames (scrolloff).
+    pub top: Cell<usize>,
 }
 
 impl ListState {
@@ -174,6 +177,7 @@ impl ListState {
             error: None,
             generation: 0,
             marked: BTreeSet::new(),
+            top: Cell::new(0),
         }
     }
     pub fn current(&self) -> Option<&Value> {
@@ -191,7 +195,7 @@ pub enum Modal {
     Form { form: Form, submit: Submit },
     Confirm { title: String, lines: Vec<String>, typed: Option<String>, input: String, on_yes: Option<OnYes>, danger: bool, scroll: usize },
     Text { title: String, lines: Vec<String>, scroll: usize, watch: Option<String> },
-    Input { title: String, input: String, on_done: Option<OnInput> },
+    Input { title: String, input: String, cursor: usize, on_done: Option<OnInput> },
     Palette { input: String, selected: usize, filtering: bool },
 }
 
@@ -966,7 +970,8 @@ impl App {
     }
 
     pub fn input(&mut self, title: impl Into<String>, initial: &str, on_done: impl FnOnce(&mut App, String) + 'static) {
-        self.show(Modal::Input { title: title.into(), input: initial.into(), on_done: Some(Box::new(on_done)) });
+        let cursor = initial.chars().count();
+        self.show(Modal::Input { title: title.into(), input: initial.into(), cursor, on_done: Some(Box::new(on_done)) });
     }
 
     // ---- keys ----------------------------------------------------------------------
@@ -1263,25 +1268,17 @@ impl App {
                 }
                 self.modal = Some(Modal::Text { title, lines, scroll, watch });
             }
-            Modal::Input { title, mut input, mut on_done } => match k.code {
+            Modal::Input { title, mut input, mut cursor, mut on_done } => match k.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => {
                     if let Some(f) = on_done.take() {
                         f(self, input.trim().to_string());
                     }
                 }
-                KeyCode::Backspace => {
-                    input.pop();
-                    self.modal = Some(Modal::Input { title, input, on_done });
+                _ => {
+                    edit_line(&mut input, &mut cursor, k);
+                    self.modal = Some(Modal::Input { title, input, cursor, on_done });
                 }
-                KeyCode::Char('u') if ctrl => {
-                    self.modal = Some(Modal::Input { title, input: String::new(), on_done });
-                }
-                KeyCode::Char(c) if !ctrl => {
-                    input.push(c);
-                    self.modal = Some(Modal::Input { title, input, on_done });
-                }
-                _ => self.modal = Some(Modal::Input { title, input, on_done }),
             },
             Modal::Palette { mut input, mut selected, mut filtering } => {
                 let entries = self.palette_entries(&input);
@@ -2147,5 +2144,11 @@ mod tests {
         app.handle_key(ch('c'));
         let Some(Modal::Input { input, .. }) = &app.modal else { panic!() };
         assert_eq!(input, "abc", "Ctrl letters type nothing");
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(ch('X'));
+        app.handle_key(ctrl('a'));
+        app.handle_key(ch('>'));
+        let Some(Modal::Input { input, .. }) = &app.modal else { panic!() };
+        assert_eq!(input, ">abXc", "keys edit at the cursor");
     }
 }

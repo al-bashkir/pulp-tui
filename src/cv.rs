@@ -346,6 +346,9 @@ impl CvService {
         for r in &repos {
             let repo: Repository =
                 self.client.get(&r.repo_href, &[]).await.with_context(|| format!("source repository {}", r.repo_name))?;
+            if let Some(owner) = repo.pulp_labels.get(LABEL_CV) {
+                bail!("{} is a snapshot repository of content view {owner}; remove it from {} and add its source", r.repo_name, cv.name);
+            }
             let sv = repo.latest_version_href.ok_or_else(|| anyhow!("{} has no versions", r.repo_name))?;
             sources.push(sv);
         }
@@ -1225,6 +1228,28 @@ mod tests {
         assert_eq!(e.to_string(), "repository pulp-tui-cv-web-os is owned by another pulp-tui database (other)");
         assert_none(&server, "POST").await;
         assert_none(&server, "PATCH").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_refuses_a_snapshot_repository_as_source() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let cv = svc.store.create_cv("k", "outer", "").await.unwrap();
+        let r = CvRepo { repo_href: DERIVED.into(), repo_name: "pulp-tui-cv-web-os".into(), repo_type: RepoType::Rpm, filters: vec![] };
+        svc.store.set_cv_repo(cv, &r).await.unwrap();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(DERIVED))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": DERIVED, "name": "pulp-tui-cv-web-os",
+                "latest_version_href": format!("{DERIVED}versions/1/"), "pulp_labels": { LABEL_CV: "web" } })))
+            .mount(&server)
+            .await;
+        let e = svc.publish(cv, "", &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "pulp-tui-cv-web-os is a snapshot repository of content view web; remove it from outer and add its source"
+        );
+        assert!(svc.store.versions(cv).await.unwrap().is_empty(), "refused before any write");
+        assert_none(&server, "POST").await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

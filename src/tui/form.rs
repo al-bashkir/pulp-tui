@@ -2,13 +2,14 @@
 
 use crate::pulp::RepoType;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Where a picker gets its options (loaded by the app, never by the form).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Source {
-    /// `None` = RPM and File repositories.
+    /// `None` = RPM and File repositories that can be Content View sources (no CV snapshots).
     Repos(Option<RepoType>),
     Remotes(RepoType),
     Distributions(RepoType),
@@ -57,6 +58,8 @@ pub struct Picker {
     pub error: Option<String>,
     /// Filter mode: letters type into the filter. Move mode: letters are keys (`j k g G /`).
     pub filtering: bool,
+    /// First visible row; kept by the view between frames (scrolloff).
+    pub top: Cell<usize>,
 }
 
 /// New highlight (0..len) for a movement key in a list of `len` rows; `None` when `k` is not one.
@@ -75,6 +78,80 @@ pub fn move_key(k: KeyEvent, filtering: bool, selected: usize, len: usize) -> Op
         _ => return None,
     };
     Some(to.min(len.saturating_sub(1)))
+}
+
+/// Readline keys on one line; `cur` is a char index. Returns false when `k` is not an edit key.
+/// ← → C-b C-f: char, Alt-b Alt-f C-← C-→: word, Home End C-a C-e: line, C-w C-u C-k: delete word back / to start / to end.
+pub fn edit_line(s: &mut String, cur: &mut usize, k: KeyEvent) -> bool {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let c = (*cur).min(len);
+    let byte = |i: usize| s.char_indices().nth(i).map_or(s.len(), |(b, _)| b);
+    // Start of the word before / end of the word after the cursor.
+    let back = || {
+        let mut i = c;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        i
+    };
+    let fwd = || {
+        let mut i = c;
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < len && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    *cur = match k.code {
+        KeyCode::Left if ctrl => back(),
+        KeyCode::Right if ctrl => fwd(),
+        KeyCode::Left => c.saturating_sub(1),
+        KeyCode::Right => (c + 1).min(len),
+        KeyCode::Char('b') if alt => back(),
+        KeyCode::Char('f') if alt => fwd(),
+        KeyCode::Char('b') if ctrl => c.saturating_sub(1),
+        KeyCode::Char('f') if ctrl => (c + 1).min(len),
+        KeyCode::Home | KeyCode::Char('a') if k.code == KeyCode::Home || ctrl => 0,
+        KeyCode::End | KeyCode::Char('e') if k.code == KeyCode::End || ctrl => len,
+        KeyCode::Backspace if c > 0 => {
+            s.replace_range(byte(c - 1)..byte(c), "");
+            c - 1
+        }
+        KeyCode::Backspace => c,
+        KeyCode::Delete => {
+            if c < len {
+                s.replace_range(byte(c)..byte(c + 1), "");
+            }
+            c
+        }
+        KeyCode::Char('w') if ctrl => {
+            let b = back();
+            s.replace_range(byte(b)..byte(c), "");
+            b
+        }
+        KeyCode::Char('u') if ctrl => {
+            s.replace_range(..byte(c), "");
+            0
+        }
+        KeyCode::Char('k') if ctrl => {
+            s.truncate(byte(c));
+            c
+        }
+        KeyCode::Char(ch) if !ctrl && !alt => {
+            s.insert(byte(c), ch);
+            c + 1
+        }
+        _ => return false,
+    };
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +254,8 @@ pub struct Form {
     pub picker: Option<Picker>,
     /// Edit mode: keys type into the focused Text, Secret or Number field. Else move mode.
     pub editing: bool,
+    /// Char index of the edit cursor in the focused field.
+    pub cursor: usize,
 }
 
 pub enum FormEvent {
@@ -200,6 +279,7 @@ impl Form {
     pub fn new(title: impl Into<String>, fields: Vec<Field>) -> Self {
         // A lone text field starts in edit mode: nothing else could take the keys, and an early `i` would be lost.
         let editing = matches!(fields.as_slice(), [f] if matches!(f.kind, FieldKind::Text | FieldKind::Secret | FieldKind::Number));
+        let cursor = fields.first().map_or(0, |f| f.value.chars().count());
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             title: title.into(),
@@ -209,6 +289,7 @@ impl Form {
             notes: vec![],
             picker: None,
             editing,
+            cursor,
         }
     }
     pub fn note(mut self, n: impl Into<String>) -> Self {
@@ -306,7 +387,7 @@ impl Form {
             BTreeSet::new()
         };
         let load = f.options.is_none();
-        self.picker = Some(Picker { field, filter, selected: 0, marked, error: None, filtering });
+        self.picker = Some(Picker { field, filter, selected: 0, marked, error: None, filtering, top: Cell::new(0) });
         self.preselect();
         if load { FormEvent::Load(field) } else { FormEvent::None }
     }
@@ -468,16 +549,19 @@ impl Form {
             (false, KeyCode::Esc) => return FormEvent::Cancel,
             (true, KeyCode::Esc) => self.editing = false,
             (true, KeyCode::Enter) => return self.advance(),
-            (true, KeyCode::Backspace) => {
-                f.value.pop();
-            }
-            (true, KeyCode::Char('u')) if ctrl => f.value.clear(),
+            // A number takes digits, and `-` only in front.
             (true, KeyCode::Char(c))
-                if !ctrl && (f.kind != FieldKind::Number || c.is_ascii_digit() || (c == '-' && f.value.is_empty())) =>
-            {
-                f.value.push(c)
+                if !ctrl
+                    && f.kind == FieldKind::Number
+                    && !c.is_ascii_digit()
+                    && !(c == '-' && self.cursor == 0 && !f.value.starts_with('-')) => {}
+            (true, _) => {
+                edit_line(&mut f.value, &mut self.cursor, k);
             }
-            (false, KeyCode::Enter | KeyCode::Char('i')) if text && !ctrl => self.editing = true,
+            (false, KeyCode::Enter | KeyCode::Char('i')) if text && !ctrl => {
+                self.editing = true;
+                self.cursor = f.value.chars().count();
+            }
             (false, KeyCode::Enter) => self.focus = next,
             (false, KeyCode::Char(' ')) if f.kind == FieldKind::Bool => {
                 f.value = if f.value == "true" { "false".into() } else { "true".into() }
@@ -1058,5 +1142,52 @@ mod tests {
         assert_eq!(f.display(), "[ /r/base/ ▾ ]");
         f.shown = "base".into();
         assert_eq!(f.display(), "[ base ▾ ]");
+    }
+
+    #[test]
+    fn edit_line_moves_and_deletes_inside_the_text() {
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        let (mut s, mut c) = ("héllo wörld".to_string(), 11);
+        let mut press = |k| assert!(edit_line(&mut s, &mut c, k));
+        press(key(KeyCode::Left));
+        press(ch('X'));
+        press(ctrl('a'));
+        press(ch('>'));
+        press(alt('f'));
+        press(key(KeyCode::Delete));
+        assert_eq!((s.as_str(), c), (">héllowörlXd", 6));
+        let (mut s, mut c) = ("one two three".to_string(), 13);
+        edit_line(&mut s, &mut c, ctrl('w'));
+        assert_eq!((s.as_str(), c), ("one two ", 8));
+        edit_line(&mut s, &mut c, alt('b'));
+        edit_line(&mut s, &mut c, ctrl('k'));
+        assert_eq!((s.as_str(), c), ("one ", 4));
+        edit_line(&mut s, &mut c, ctrl('b'));
+        edit_line(&mut s, &mut c, ctrl('u'));
+        assert_eq!((s.as_str(), c), (" ", 0));
+        edit_line(&mut s, &mut c, key(KeyCode::Backspace));
+        edit_line(&mut s, &mut c, ctrl('e'));
+        assert_eq!((s.as_str(), c), (" ", 1));
+        assert!(!edit_line(&mut s, &mut c, ctrl('d')), "Ctrl-D is not an edit key");
+    }
+
+    #[test]
+    fn editing_starts_at_the_end_and_types_at_the_cursor() {
+        let mut f = Form::new("t", vec![Field::text("a", "A").value("bc"), Field::new("n", "N", FieldKind::Number)]);
+        f.handle_key(ch('i'));
+        f.handle_key(key(KeyCode::Home));
+        f.handle_key(ch('a'));
+        f.handle_key(key(KeyCode::End));
+        f.handle_key(ch('d'));
+        assert_eq!(f.fields[0].value, "abcd");
+        f.handle_key(key(KeyCode::Tab));
+        f.handle_key(ch('i'));
+        for c in "12-x".chars() {
+            f.handle_key(ch(c));
+        }
+        f.handle_key(key(KeyCode::Home));
+        f.handle_key(ch('-'));
+        f.handle_key(ch('-'));
+        assert_eq!(f.fields[1].value, "-12", "a number takes digits and one leading -");
     }
 }
