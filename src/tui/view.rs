@@ -395,7 +395,10 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
 
 fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
     let label_w = form.fields.iter().map(|x| x.label.chars().count()).max().unwrap_or(10) + 2;
-    let h = form.fields.len() + form.notes.len() + 6;
+    // Wrapped note height (as in the Confirm modal), so the fields and the error line below stay visible.
+    let inner_w = 100.min(area.width.saturating_sub(2)).saturating_sub(2).max(1) as usize;
+    let notes: usize = form.notes.iter().map(|n| n.chars().count().max(1).div_ceil(inner_w)).sum();
+    let h = form.fields.len() + notes + 6;
     let r = centered(area, 100, h as u16);
     let mut lines: Vec<Line> = form.notes.iter().map(|n| Line::styled(n.clone(), Style::default().fg(Color::Yellow))).collect();
     if !form.notes.is_empty() {

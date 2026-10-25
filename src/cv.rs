@@ -16,7 +16,7 @@
 use crate::filters::Selector;
 use crate::pulp::models::{Distribution, Package, RepoVersion, Repository, Task};
 use crate::pulp::ops::{self, OnTask};
-use crate::pulp::{Mutation, PulpClient, RepoType};
+use crate::pulp::{Mutation, PulpClient, PulpError, RepoType};
 use crate::store::{
     BindingRepo, Component, ContentView, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, LOCK_RENEW_SECS, LOCK_TTL_SECS,
     LockHolder, Store, UsedVersion, validate_label,
@@ -444,6 +444,9 @@ impl CvService {
         if v.state == "deleted" {
             bail!("version {} was deleted", v.number);
         }
+        if v.state == "deleting" {
+            bail!("version {} is being deleted; delete it again to finish", v.number);
+        }
         self.alive()?;
         self.store.finish_version(v.id, "publishing", None).await?;
         let res = async {
@@ -563,6 +566,12 @@ impl CvService {
                     ops::wait_task(c, &h, on).await
                 }
             };
+            // A failed or canceled copy is not re-attached: the next Resume sends it again (it starts from an empty base).
+            if let Err(PulpError::TaskFailed { .. }) = &task {
+                vr.pending_task = None;
+                self.alive()?;
+                self.store.save_version_repo(vr).await?;
+            }
             let task: Task = task?;
             // No new version is created when the content equals the latest version.
             let version = match task.created_matching("/versions/") {
@@ -633,6 +642,8 @@ impl CvService {
                 errors.push(format!("{}: {e:#}", vr.repo().repo_name));
             }
         }
+        // `failed` means no repository of the version is served; unbind errors below only make it `partial`.
+        let bind_failed = errors.len();
         // Repositories no longer part of the view stop serving (distribution kept for rollback).
         let aliases = self.store.aliases().await?;
         for b in self.store.binding_repos(env_id, cv_id).await? {
@@ -659,7 +670,7 @@ impl CvService {
         }
         let state = if errors.is_empty() {
             "active"
-        } else if errors.len() < vrs.len() {
+        } else if bind_failed < vrs.len() {
             "partial"
         } else {
             "failed"
@@ -967,8 +978,15 @@ impl CvService {
         if !used.is_empty() {
             bail!("version {} is bound to {}", v.number, used.join(", "));
         }
+        // Marked before the composite check: a composite publish that starts later refuses a version that is not
+        // `published` (`Store::begin`), and one that started earlier is found below. A failed delete stays `deleting`.
+        self.alive()?;
+        if !self.store.set_version_state(version_id, &v.state, "deleting").await? {
+            bail!("version {} changed meanwhile; refresh and try again", v.number);
+        }
         let users = self.store.composite_users(version_id).await?;
         if !users.is_empty() {
+            self.store.set_version_state(version_id, "deleting", &v.state).await?;
             bail!("version {} is used by {}", v.number, users.join(", "));
         }
         let mut shared: HashSet<String> = HashSet::new();
@@ -1020,7 +1038,8 @@ impl CvService {
         }
         self.alive()?;
         self.store.finish_version(version_id, "deleted", None).await?;
-        self.audit("cv.version.delete", &format!("cv {} version {}", v.cv_id, v.number)).await;
+        let name = self.store.content_view(v.cv_id).await?.name;
+        self.audit("cv.version.delete", &format!("{name} version {}", v.number)).await;
         Ok(())
     }
 
@@ -1219,6 +1238,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_copy_task_is_sent_again_by_the_next_resume() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, mut vr) = rpm_version(&svc).await;
+        vr.pending_task = Some("/pulp/api/v3/tasks/1/".into());
+        svc.store.save_version_repo(&vr).await.unwrap();
+        serve_owner(&server, DERIVED, svc.store.db_id()).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pulp/api/v3/tasks/1/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "canceled", "name": "copy" })),
+            )
+            .mount(&server)
+            .await;
+        let e = svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert!(e.to_string().starts_with("task canceled"), "{e}");
+        let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
+        assert_eq!(saved.pending_task, None, "Resume copies again instead of waiting on the dead task");
+        assert_none(&server, "POST").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn resume_does_not_copy_into_a_repository_of_another_database() {
         let server = wiremock::MockServer::start().await;
         let svc = mock_service(&server).await;
@@ -1297,6 +1339,41 @@ mod tests {
         assert!(e.to_string().ends_with(&want), "{e}");
         assert_none(&server, "PATCH").await;
         assert_eq!(svc.store.binding_repos(lib, cv).await.unwrap()[0].publication, old.publication, "still recorded as served");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_unbind_alone_makes_the_promotion_partial() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let v = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
+        let publication = svc.store.version_repos(v.id).await.unwrap()[0].publication.clone();
+        let lib = svc.store.ensure_library("k").await.unwrap();
+        // "os" is already served as wanted: the bind sends nothing.
+        let os = json!({ "pulp_href": "/pulp/api/v3/distributions/rpm/rpm/6/", "name": distribution_name("web", LIBRARY, "os"),
+            "base_path": "library/web/os", "publication": publication,
+            "pulp_labels": { LABEL_CV: "web", LABEL_ENV: LIBRARY, LABEL_DB: svc.store.db_id() } });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pulp/api/v3/distributions/rpm/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [os] })))
+            .mount(&server)
+            .await;
+        // "old" is no longer part of the version, and its distribution belongs to another database.
+        let old = BindingRepo {
+            env_id: lib,
+            cv_id: cv,
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/9/".into(),
+            repo_name: "old".into(),
+            repo_type: RepoType::Rpm,
+            distribution: DIST.into(),
+            base_path: "library/web/old".into(),
+            publication: Some("/pulp/api/v3/publications/rpm/rpm/3/".into()),
+        };
+        svc.store.save_binding_repo(&old).await.unwrap();
+        serve_owner(&server, DIST, "other").await;
+        let e = svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert!(e.to_string().starts_with("web in Library: partial: unbind old"), "{e}");
+        assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().state, "partial", "os is served: not failed");
     }
 
     /// Scope "k": Library, Dev (label "dev"), view "web" with a published version bound to Dev.
@@ -1572,6 +1649,16 @@ mod tests {
         let err = |r: Result<()>| r.unwrap_err().to_string();
 
         assert_eq!(err(svc.delete_version(v1.id, &|_| {}, &ops::no_progress).await), "version 1 is used by rocky9 v1");
+        assert_eq!(svc.store.version(v1.id).await.unwrap().state, "published", "a refused delete keeps the state");
+        // While a delete of v1 runs, a composite publish does not borrow it and Resume does not publish it again.
+        assert!(svc.store.set_version_state(v1.id, "published", "deleting").await.unwrap());
+        let e = svc.store.begin_composite_version(c, "", &[v1.id], &rows).await.unwrap_err();
+        assert_eq!(e.to_string(), "version v1 of os is no longer published");
+        assert_eq!(
+            err(svc.resume(v1.id, &|_| {}, &ops::no_progress).await.map(drop)),
+            "version 1 is being deleted; delete it again to finish"
+        );
+        assert!(svc.store.set_version_state(v1.id, "deleting", "published").await.unwrap());
         let e = err(svc.delete_view(os, &|_| {}, &ops::no_progress).await);
         assert!(e.starts_with("content view os is used by rocky9 (component), rocky9 v1"), "{e}");
         svc.delete_version(cv1.id, &|_| {}, &ops::no_progress).await.unwrap();

@@ -185,10 +185,7 @@ impl PulpClient {
                 sem: Semaphore::new(settings.max_concurrent_requests.max(1)),
                 read_only: p.read_only,
                 max_bytes: settings.max_response_mb.max(1) * 1024 * 1024,
-                poll: (
-                    Duration::from_millis(settings.poll_min_ms.max(100)),
-                    Duration::from_millis(settings.poll_max_ms.max(settings.poll_min_ms.max(100))),
-                ),
+                poll: settings.poll_bounds(),
                 upload_chunk: (settings.upload_chunk_mb.max(1) * 1024 * 1024) as usize,
                 profile: profile_name.into(),
             }),

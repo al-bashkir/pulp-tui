@@ -200,7 +200,10 @@ pub fn log_lines(row: &Value) -> Vec<String> {
 
 fn inspect(app: &mut App, kind: &Kind, item: Value) {
     let href = s(&item, "pulp_href");
-    let title = s(&item, "name");
+    let title = match kind {
+        Kind::CvVersions { name, .. } => format!("{name} v{}", s(&item, "number")),
+        _ => s(&item, "name"),
+    };
     let title = if title.is_empty() { short(&href) } else { title };
     // Lists may exclude heavy fields; fetch the complete object for inspection.
     if !href.is_empty() && kind.needs_connection() && !matches!(kind, Kind::Tasks) {
@@ -487,11 +490,11 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
                     return Err(format!("profile {name} exists"));
                 }
                 let before = app.cfg.database_for(&name);
-                app.cfg.profiles.insert(name.clone(), profile_from_form(f, app.cfg.database.as_ref(), &app.local_db)?);
-                if app.cfg.default_profile.is_none() {
-                    app.cfg.default_profile = Some(name.clone());
-                }
-                save_config(app, &app.cfg)?;
+                let mut next = app.cfg.clone();
+                next.profiles.insert(name.clone(), profile_from_form(f, app.cfg.database.as_ref(), &app.local_db)?);
+                next.default_profile.get_or_insert_with(|| name.clone());
+                save_config(app, &next)?;
+                app.cfg = next;
                 app.ok(format!("profile {name} saved"));
                 if app.cfg.database_for(&name) != before {
                     check_database(app, &name);
@@ -534,12 +537,14 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
             ];
             let n = name.clone();
             app.confirm_danger(format!("Delete profile {name}"), lines, &name, move |app| {
-                app.cfg.profiles.remove(&n);
-                if app.cfg.default_profile.as_deref() == Some(n.as_str()) {
-                    app.cfg.default_profile = None;
+                let mut next = app.cfg.clone();
+                next.profiles.remove(&n);
+                if next.default_profile.as_deref() == Some(n.as_str()) {
+                    next.default_profile = None;
                 }
-                if let Err(e) = save_config(app, &app.cfg) {
-                    app.error(e);
+                match save_config(app, &next) {
+                    Ok(()) => app.cfg = next,
+                    Err(e) => app.error(e),
                 }
                 app.reload();
             });
@@ -1555,7 +1560,11 @@ pub fn load_dashboard(app: &mut App) {
         app.dashboard = lines;
         return;
     }
-    app.job("load dashboard", move |ctx: Ctx| async move {
+    // A refresh replaces a load still in flight.
+    for id in app.jobs.iter().filter(|j| j.label == "load dashboard").map(|j| j.id).collect::<Vec<_>>() {
+        app.abort_job(id);
+    }
+    app.load_job("load dashboard", move |ctx: Ctx| async move {
         let c = &ctx.client;
         let caps = crate::pulp::Capabilities::detect(c).await?;
         let count = |path: String, q: Vec<(&'static str, String)>| {

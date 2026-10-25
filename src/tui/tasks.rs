@@ -19,9 +19,16 @@ pub struct Tracked {
     driven_until: Option<Instant>,
 }
 
+/// State of a task the server does not have (purged, or a reference of another server); final.
+pub const GONE: &str = "gone";
+
+pub fn is_final_state(state: &str) -> bool {
+    crate::pulp::models::TASK_FINAL_STATES.contains(&state) || state == GONE
+}
+
 impl Tracked {
     pub fn is_final(&self) -> bool {
-        crate::pulp::models::TASK_FINAL_STATES.contains(&self.state.as_str())
+        is_final_state(&self.state)
     }
 
     /// Phase and numeric progress only when Pulp reports totals; never invented.
@@ -47,7 +54,8 @@ pub struct TaskCenter {
 }
 
 impl TaskCenter {
-    pub fn new(min: Duration, max: Duration) -> Self {
+    /// `(min, max)` polling interval, as `Settings::poll_bounds` gives it.
+    pub fn new((min, max): (Duration, Duration)) -> Self {
         Self { items: vec![], min, max, max_in_flight: 3 }
     }
 
@@ -104,6 +112,15 @@ impl TaskCenter {
         }
     }
 
+    /// The server answered 404 for this task: mark it final so it is no longer polled.
+    pub fn gone(&mut self, href: &str) {
+        if let Some(t) = self.items.iter_mut().find(|t| t.href == href) {
+            t.in_flight = false;
+            t.state = GONE.into();
+            t.error = Some("not found on the server (purged?)".into());
+        }
+    }
+
     /// Tasks due for a poll now (bounded); marks them in flight.
     pub fn due(&mut self) -> Vec<String> {
         let now = Instant::now();
@@ -144,7 +161,7 @@ mod tests {
 
     #[test]
     fn polling_is_bounded_and_adaptive() {
-        let mut tc = TaskCenter::new(Duration::from_millis(0), Duration::from_millis(50));
+        let mut tc = TaskCenter::new((Duration::from_millis(0), Duration::from_millis(50)));
         for i in 0..5 {
             tc.track(&format!("/t/{i}/"), "x", "waiting");
         }
@@ -161,6 +178,9 @@ mod tests {
         assert_eq!(tc.dismiss_finished(), 1);
         tc.poll_failed("/t/2/", "network".into());
         assert_eq!(tc.items.iter().find(|t| t.href == "/t/2/").unwrap().error.as_deref(), Some("network"));
+        tc.gone("/t/2/");
+        assert_eq!(tc.active(), 3, "a task the server does not have is final");
+        assert_eq!(tc.dismiss_finished(), 1);
     }
 
     #[test]

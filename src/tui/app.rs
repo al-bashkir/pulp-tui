@@ -41,7 +41,7 @@ pub enum Msg {
     Task(Task),
     TaskPolled {
         href: String,
-        result: Result<Task, String>,
+        result: Result<Task, crate::pulp::PulpError>,
     },
 }
 
@@ -251,8 +251,7 @@ pub struct App {
 impl App {
     pub fn new(cfg: Config, cfg_path: PathBuf, store: Arc<Store>, cv_store: Result<Arc<Store>, String>) -> Self {
         let (tx, rx) = unbounded_channel();
-        let s = &cfg.settings;
-        let tasks = TaskCenter::new(Duration::from_millis(s.poll_min_ms.max(100)), Duration::from_millis(s.poll_max_ms.max(s.poll_min_ms)));
+        let tasks = TaskCenter::new(cfg.settings.poll_bounds());
         Self {
             cfg,
             cfg_path,
@@ -442,12 +441,29 @@ impl App {
         F: FnOnce(Ctx) -> Fut,
         Fut: Future<Output = anyhow::Result<Apply>> + Send + 'static,
     {
+        self.server_job(label.into(), false, f);
+    }
+
+    /// A `job` that only reads: quit and Connect do not warn about it.
+    pub fn load_job<F, Fut>(&mut self, label: impl Into<String>, f: F)
+    where
+        F: FnOnce(Ctx) -> Fut,
+        Fut: Future<Output = anyhow::Result<Apply>> + Send + 'static,
+    {
+        self.server_job(label.into(), true, f);
+    }
+
+    fn server_job<F, Fut>(&mut self, label: String, is_load: bool, f: F)
+    where
+        F: FnOnce(Ctx) -> Fut,
+        Fut: Future<Output = anyhow::Result<Apply>> + Send + 'static,
+    {
         let Some(mut ctx) = self.ctx() else {
             self.error("not connected to a Pulp server (open Servers and select a profile)");
             return;
         };
         ctx.job = self.next_id;
-        self.spawn(label.into(), false, f(ctx));
+        self.spawn(label, is_load, f(ctx));
     }
 
     /// Run a job that needs no server connection (profile tests, keyring, files).
@@ -508,13 +524,17 @@ impl App {
             }
             Msg::Task(t) => self.task_update(t, true),
             Msg::TaskPolled { href, result } => match result {
+                // A poll sent before a Connect answers for the previous server.
+                _ if !self.tasks.items.iter().any(|t| t.href == href) => {}
                 Ok(t) => self.task_update(t, false),
-                Err(e) => self.tasks.poll_failed(&href, e),
+                Err(e) if e.is_not_found() => self.task_gone(&href),
+                Err(e) => self.tasks.poll_failed(&href, e.to_string()),
             },
         }
         if self.list.kind == Kind::Tasks && self.screen == Screen::List(Kind::Tasks) {
-            self.list.items = self.task_items();
-            self.list.count = self.list.items.len() as u64;
+            let items = self.task_items();
+            let n = items.len() as u64;
+            self.set_items(items, n);
         }
         if let Some(Modal::Text { watch: Some(h), .. }) = &self.modal {
             let new = self.watch_lines(h);
@@ -566,6 +586,20 @@ impl App {
         self.task_items().iter().find(|r| r["pulp_href"] == href).map(super::actions::task_lines).unwrap_or_default()
     }
 
+    /// The server has no such task: final, and stored as such so the next start does not re-attach it.
+    fn task_gone(&mut self, href: &str) {
+        self.tasks.gone(href);
+        let label = self.tasks.items.iter().find(|x| x.href == href).map(|x| x.label.clone()).unwrap_or_default();
+        self.notify(Level::Warn, format!("task not found on the server (purged?): {label}"));
+        if let Some(p) = self.profile.clone() {
+            let (st, href) = (self.store.clone(), href.to_string());
+            self.spawn("persist task state".into(), true, async move {
+                st.finish_task(&p, &href, super::tasks::GONE).await?;
+                ap(|_| {})
+            });
+        }
+    }
+
     fn task_update(&mut self, t: Task, driven: bool) {
         let href = t.pulp_href.clone();
         let state = t.state.clone();
@@ -613,7 +647,7 @@ impl App {
         for href in self.tasks.due() {
             let (c, tx) = (ctx.client.clone(), self.tx.clone());
             tokio::spawn(async move {
-                let result = c.get::<Task>(&href, &[]).await.map_err(|e| e.to_string());
+                let result = c.get::<Task>(&href, &[]).await;
                 let _ = tx.send(Msg::TaskPolled { href, result });
             });
         }
@@ -650,10 +684,7 @@ impl App {
         self.conn = None;
         self.profile = Some(name.to_string());
         self.connecting = true;
-        self.tasks = TaskCenter::new(
-            Duration::from_millis(self.cfg.settings.poll_min_ms.max(100)),
-            Duration::from_millis(self.cfg.settings.poll_max_ms),
-        );
+        self.tasks = TaskCenter::new(self.cfg.settings.poll_bounds());
         self.dashboard.clear();
         self.history.clear();
         let db = self.cfg.database_for(name);
@@ -720,7 +751,7 @@ impl App {
                 let mut n = 0;
                 for r in refs.iter().rev() {
                     app.tasks.track(&r.href, &r.label, &r.state);
-                    n += (!crate::pulp::models::TASK_FINAL_STATES.contains(&r.state.as_str())) as usize;
+                    n += (!super::tasks::is_final_state(&r.state)) as usize;
                 }
                 if n > 0 {
                     app.notify(Level::Info, format!("re-attached to {n} unfinished task(s) from a previous session"));
@@ -764,11 +795,11 @@ impl App {
         match self.screen.clone() {
             Screen::Dashboard => super::actions::load_dashboard(self),
             Screen::List(Kind::Tasks) => {
-                self.list.items = self.task_items();
-                self.list.count = self.list.items.len() as u64;
+                let items = self.task_items();
+                let n = items.len() as u64;
+                self.set_items(items, n);
                 self.list.loading = false;
                 self.list.error = None;
-                self.list.selected = self.list.selected.min(self.list.items.len().saturating_sub(1));
             }
             Screen::List(k) => {
                 // Cancel a still-running load of the same list; a newer generation wins.
@@ -849,7 +880,9 @@ impl App {
     /// Replace the rows of the list. A cursor below the first row stays on the same item when rows move
     /// (new rows at the top of Logs); on the first row it keeps following the top.
     fn set_items(&mut self, items: Vec<Value>, count: u64) {
-        let keep = if self.list.selected > 0 { self.list.current().map(item_key).filter(|k| !k.is_empty()) } else { None };
+        // New tasks are inserted at the top: on Tasks the first row is followed too, so Cancel keeps its target.
+        let follow = self.list.selected > 0 || self.list.kind == Kind::Tasks;
+        let keep = if follow { self.list.current().map(item_key).filter(|k| !k.is_empty()) } else { None };
         self.list.items = items;
         self.list.count = count;
         self.apply_sort();
@@ -1145,7 +1178,7 @@ impl App {
     }
 
     pub fn available_actions(&self, item: &Value) -> Vec<Act> {
-        let ro = self.conn.as_ref().is_some_and(|c| c.client.read_only());
+        let ro = self.read_only();
         let shared = self.shared();
         self.list
             .kind
@@ -1169,7 +1202,7 @@ impl App {
         if items.is_empty() {
             return;
         }
-        let ro = self.conn.as_ref().is_some_and(|c| c.client.read_only());
+        let ro = self.read_only();
         let title = if ro { "Actions (read-only mode)".to_string() } else { "Actions".to_string() };
         self.modal = Some(Modal::Menu { title, items, selected: 0, item });
     }
@@ -1830,6 +1863,27 @@ mod tests {
         assert!(text_lines(&app).contains(&"  [running] Associating Content 3/9".to_string()), "{:?}", text_lines(&app));
         app.handle_msg(Msg::TaskPolled { href: "/t/1/".into(), result: Ok(task("completed")) });
         assert!(text_lines(&app).contains(&"state: completed".to_string()), "{:?}", text_lines(&app));
+    }
+
+    #[tokio::test]
+    async fn task_rows_keep_the_selection_and_ignore_other_servers() {
+        let mut app = app_on(Kind::Tasks).await;
+        let task =
+            |h: &str| serde_json::from_value::<Task>(serde_json::json!({ "pulp_href": h, "state": "running", "name": "t" })).unwrap();
+        app.track_task("/t/1/", "a");
+        app.reload();
+        assert_eq!(app.list.current().unwrap()["pulp_href"], "/t/1/");
+        // A workflow reports a new task: it goes on top, and the cursor stays on /t/1/ (Cancel keeps its target).
+        app.handle_msg(Msg::Task(task("/t/2/")));
+        assert_eq!((app.list.items.len(), app.list.current().unwrap()["pulp_href"].as_str()), (2, Some("/t/1/")));
+        // A poll answer sent to the previous server before a Connect is dropped.
+        app.handle_msg(Msg::TaskPolled { href: "/t/9/".into(), result: Ok(task("/t/9/")) });
+        assert_eq!(app.tasks.items.len(), 2);
+        // A task the server does not have is final: no more polls, not re-attached at the next start.
+        let gone = crate::pulp::PulpError::Api { status: 404, message: String::new() };
+        app.handle_msg(Msg::TaskPolled { href: "/t/1/".into(), result: Err(gone) });
+        assert_eq!(app.tasks.items.iter().find(|t| t.href == "/t/1/").unwrap().state, super::super::tasks::GONE);
+        assert_eq!(app.tasks.active(), 1);
     }
 
     #[tokio::test]

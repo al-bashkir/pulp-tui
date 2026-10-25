@@ -87,6 +87,11 @@ fn owned(labels: &std::collections::BTreeMap<String, String>, src: &str) -> bool
     labels.get(LABEL_REPLICA).map(String::as_str) == Some(src)
 }
 
+/// The `pulp_labels` of an object read as JSON.
+fn labels_of(o: &Value) -> std::collections::BTreeMap<String, String> {
+    serde_json::from_value(o["pulp_labels"].clone()).unwrap_or_default()
+}
+
 /// Dry run: what the fallback would do for each upstream distribution.
 pub async fn plan(
     src: &PulpClient,
@@ -148,11 +153,9 @@ pub async fn plan(
                 .results
                 .into_iter()
                 .next();
-            let remote_labels: std::collections::BTreeMap<String, String> =
-                remote.as_ref().and_then(|r| serde_json::from_value(r["pulp_labels"].clone()).ok()).unwrap_or_default();
             let foreign = [
                 repo.as_ref().filter(|r| !owned(&r.pulp_labels, src_name)).map(|_| "repository"),
-                remote.as_ref().filter(|_| !owned(&remote_labels, src_name)).map(|_| "remote"),
+                remote.as_ref().filter(|r| !owned(&labels_of(r), src_name)).map(|_| "remote"),
                 dist.as_ref().filter(|x| !owned(&x.pulp_labels, src_name)).map(|_| "distribution"),
             ];
             if let Some(kind) = foreign.into_iter().flatten().next() {
@@ -202,7 +205,10 @@ pub async fn run(
 async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror: bool, on: OnTask<'_>) -> Result<String> {
     let t = it.t;
     let labels = json!({ LABEL_REPLICA: src_profile });
+    // Checked again here: an object with this name may have been created since the dry run.
+    let foreign = |kind: &str| anyhow!("a local {kind} named {} exists and is not managed by this replication", it.name);
     let remote = match ops::find_by_name::<Value>(c, &c.api(t.remotes()), &it.name).await? {
+        Some(r) if !owned(&labels_of(&r), src_profile) => return Err(foreign("remote")),
         Some(r) => {
             let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
             if r["url"].as_str() != Some(it.remote_url.as_str()) {
@@ -222,6 +228,7 @@ async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror:
         }
     };
     let repo = match ops::find_by_name::<Repository>(c, &c.api(t.repositories()), &it.name).await? {
+        Some(r) if !owned(&r.pulp_labels, src_profile) => return Err(foreign("repository")),
         Some(r) => r.pulp_href,
         None => {
             ops::create(
@@ -262,5 +269,30 @@ mod tests {
         assert!(guard_self("http://a:8080", "http://a:8080/").is_err());
         assert!(guard_self("http://a:8080", "http://b:8080").is_ok());
         assert_eq!(short_version("/r/versions/4/"), "version 4");
+    }
+
+    #[tokio::test]
+    async fn run_refuses_a_remote_created_after_the_dry_run() {
+        let server = wiremock::MockServer::start().await;
+        let p = crate::config::Profile { url: server.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
+        let c = PulpClient::new("dst", &p, &crate::config::Settings::default()).unwrap();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pulp/api/v3/remotes/rpm/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null,
+                "results": [{ "pulp_href": "/pulp/api/v3/remotes/rpm/rpm/1/", "name": "os", "url": "https://other/", "pulp_labels": {} }] })))
+            .mount(&server)
+            .await;
+        let it = PlanItem {
+            t: RepoType::Rpm,
+            name: "os".into(),
+            base_path: "os".into(),
+            remote_url: "https://up/os/".into(),
+            action: PlanAction::Create,
+            note: String::new(),
+        };
+        let e = replicate_one(&c, "up", &it, true, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), "a local remote named os exists and is not managed by this replication");
+        let sent = server.received_requests().await.unwrap();
+        assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed: {sent:?}");
     }
 }

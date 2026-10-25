@@ -1,6 +1,6 @@
 //! Content View, CV version and lifecycle environment actions.
 
-use super::actions::{ap, caps, confirm_mirror, pretty, sync_policies};
+use super::actions::{ap, caps, confirm_mirror, sync_policies};
 use super::app::{App, Ctx, Level, NO_PROFILE, unavailable};
 use super::form::{Field, FieldKind, Form, PickItem, Source};
 use super::kinds::{Act, Kind, s};
@@ -20,7 +20,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         app.error(NO_PROFILE);
         return;
     };
-    let Some((_, scope)) = cv_target(app, &profile) else { return };
+    let Some(scope) = cv_scope(app, &profile) else { return };
     match app.list.kind.clone() {
         Kind::ContentViews => cv_action(app, &scope, act, item),
         Kind::CvVersions { cv, name } => version_action(app, &scope, cv, name, act, item),
@@ -40,11 +40,11 @@ pub fn cv_store(app: &mut App) -> Option<Arc<Store>> {
     }
 }
 
-/// The Content View store and the scope of profile `name` (`App::scope`); on failure, an error notice and `None`.
-pub fn cv_target(app: &mut App, name: &str) -> Option<(Arc<Store>, String)> {
-    let st = cv_store(app)?;
+/// The scope of profile `name` (`App::scope`) while the Content View store is available; else an error notice and `None`.
+fn cv_scope(app: &mut App, name: &str) -> Option<String> {
+    cv_store(app)?;
     match app.scope(name) {
-        Ok(scope) => Some((st, scope)),
+        Ok(scope) => Some(scope),
         Err(e) => {
             app.error(e);
             None
@@ -602,9 +602,9 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             }
             ap(move |app| app.text(format!("Verification of {name}"), lines))
         }),
-        Act::Delete => {
+        Act::Delete => app.load_job(format!("read what deleting {name} removes"), move |ctx| async move {
             // A composite owns distributions only: its versions borrow the components' objects.
-            let lines = if item["composite"] == true {
+            let mut lines = if item["composite"] == true {
                 vec![
                     format!("Delete composite content view {name}: its distributions in every environment (consumers lose these URLs)."),
                     "Component views and their snapshots are NOT touched.".into(),
@@ -617,16 +617,33 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                     "Source repositories are NOT touched.".into(),
                 ]
             };
-            app.confirm_danger(format!("Delete content view {name}"), lines, &name.clone(), move |app| {
-                app.job(format!("delete content view {name}"), move |ctx| async move {
-                    ctx.cv()?.locked(id, "delete").await?.delete_view(id, &ctx.log(), &ctx.on_task()).await?;
-                    ap(move |app| {
-                        app.ok(format!("content view {name} deleted"));
-                        app.reload();
-                    })
+            let svc = ctx.cv()?;
+            let envs = svc.store.environments(&svc.scope).await?;
+            let mut protected: Vec<String> = vec![];
+            lines.push(String::new());
+            let served: Vec<_> = svc.store.all_binding_repos(id).await?.into_iter().filter(|b| b.publication.is_some()).collect();
+            lines.push(if served.is_empty() { "Nothing is served now.".into() } else { "Served now:".into() });
+            for b in served {
+                let Some(e) = envs.iter().find(|e| e.id == b.env_id) else { continue };
+                lines.push(format!("  {:<12} /{}{}", e.name, b.base_path, if e.protected { "  (protected)" } else { "" }));
+                if e.protected && !protected.contains(&e.name) {
+                    protected.push(e.name.clone());
+                }
+            }
+            // Like a promotion to a protected environment, the environment is typed too.
+            let typed = std::iter::once(name.clone()).chain(protected).collect::<Vec<_>>().join(" ");
+            ap(move |app| {
+                app.confirm_danger(format!("Delete content view {name}"), lines, &typed, move |app| {
+                    app.job(format!("delete content view {name}"), move |ctx| async move {
+                        ctx.cv()?.locked(id, "delete").await?.delete_view(id, &ctx.log(), &ctx.on_task()).await?;
+                        ap(move |app| {
+                            app.ok(format!("content view {name} deleted"));
+                            app.reload();
+                        })
+                    });
                 });
-            });
-        }
+            })
+        }),
         Act::BreakLock => app.job(format!("read lock of {name}"), move |ctx| async move {
             let Some(h) = ctx.cv()?.store.lock_holder(id).await? else {
                 return ap(move |app| app.ok(format!("{name} is not locked")));
@@ -832,7 +849,6 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                 })
             });
         }
-        Act::Inspect => app.text(format!("{name} v{number}"), pretty(&item)),
         _ => {}
     }
 }
@@ -1565,17 +1581,42 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_a_composite_does_not_promise_snapshot_removal() {
-        let mut app = test_app().await;
-        cv_action(&mut app, "lab", Act::Delete, json!({ "id": 1, "name": "rocky9", "composite": true }));
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let c = st.create_composite("lab", "rocky9", "").await.unwrap();
+        cv_action(&mut app, "lab", Act::Delete, json!({ "id": c, "name": "rocky9", "composite": true }));
+        drain(&mut app, &mut rx).await;
         assert_eq!(
             confirm_lines(&mut app),
             [
                 "Delete composite content view rocky9: its distributions in every environment (consumers lose these URLs).",
-                "Component views and their snapshots are NOT touched."
+                "Component views and their snapshots are NOT touched.",
+                "",
+                "Nothing is served now."
             ]
         );
-        cv_action(&mut app, "lab", Act::Delete, json!({ "id": 1, "name": "web", "composite": false }));
-        assert!(confirm_lines(&mut app).iter().any(|l| l.contains("its snapshot repositories (with their versions and publications)")));
+        // The impact lists what is served; a served protected environment must be typed too.
+        let lib = st.ensure_library("lab").await.unwrap();
+        let prod = st.create_env("lab", "Prod", lib, true).await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let row = crate::store::BindingRepo {
+            env_id: prod,
+            cv_id: web,
+            repo_href: format!("{REPOS}rpm/rpm/1/"),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: "/d/1/".into(),
+            base_path: "prod/web/os".into(),
+            publication: Some("/p/1/".into()),
+        };
+        st.save_binding_repo(&row).await.unwrap();
+        cv_action(&mut app, "lab", Act::Delete, json!({ "id": web, "name": "web", "composite": false }));
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, .. }) = app.modal.take() else { panic!("no confirmation") };
+        assert!(lines.iter().any(|l| l.contains("its snapshot repositories (with their versions and publications)")));
+        assert_eq!(lines.last().unwrap(), &format!("  {:<12} /prod/web/os  (protected)", "Prod"));
+        assert_eq!(typed.as_deref(), Some("web Prod"));
 
         let version = |components: Value| json!({ "id": 5, "number": 2, "state": "published", "components": components });
         version_action(&mut app, "lab", 1, "rocky9".into(), Act::Delete, version(json!(["os v1"])));

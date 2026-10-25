@@ -88,6 +88,10 @@ pub fn parse_rule(s: &str, t: RepoType) -> Result<FilterRule, String> {
             if v.is_empty() {
                 return Err(format!("empty evr in {w}"));
             }
+            // `evr=>1` would compare with ">1"; a non-numeric epoch would silently become 0.
+            if !v.starts_with(|c: char| c.is_ascii_alphanumeric()) || v.split_once(':').is_some_and(|(e, _)| e.parse::<u64>().is_err()) {
+                return Err(format!("bad evr value in {w}"));
+            }
             r.evr = Some((op.into(), v.into()));
         } else {
             return Err(format!("unknown criterion {w:?} (use name=, arch=, evr<op>, path=)"));
@@ -306,6 +310,9 @@ mod tests {
         assert!(parse_rule("drop name=x", RepoType::Rpm).is_err());
         assert!(parse_rule("include", RepoType::Rpm).is_err());
         assert!(parse_rule("include evr~1", RepoType::Rpm).is_err());
+        assert_eq!(parse_rule("include name=kernel evr=>5.14", RepoType::Rpm).unwrap_err(), "bad evr value in evr=>5.14");
+        assert!(parse_rule("include evr>=x:1.0", RepoType::Rpm).is_err(), "epoch must be a number");
+        assert!(parse_rule("include evr>=1:1.0-1", RepoType::Rpm).is_ok());
         assert!(parse_rules("", RepoType::File).unwrap().is_empty());
     }
 

@@ -1,6 +1,6 @@
 //! Users, groups, roles (Pulp RBAC) and replication actions.
 
-use super::actions::{ap, submit};
+use super::actions::{ap, caps, submit};
 use super::app::{App, Level};
 use super::form::{Field, FieldKind, Form, Source};
 use super::kinds::{Act, Kind, s};
@@ -296,7 +296,7 @@ fn role_action(app: &mut App, act: Act, item: Value) {
 fn upstream_action(app: &mut App, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
-    let caps = app.conn.as_ref().map(|c| c.caps.clone());
+    let caps = caps(app);
     let dst_origin = app.profile.as_ref().and_then(|p| app.cfg.profiles.get(p)).map(|p| p.origin()).unwrap_or_default();
     match act {
         Act::Create | Act::Edit => {

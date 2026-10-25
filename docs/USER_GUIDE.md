@@ -189,7 +189,7 @@ Views" below.
 
 | Key | Action |
 |---|---|
-| c / e / d | create / edit description / delete (removes the view's distributions and snapshot repositories, never source repositories). On a composite, Edit also sets auto publish and the pin of each component, and Delete removes only its distributions. |
+| c / e / d | create / edit description / delete (removes the view's distributions and snapshot repositories, never source repositories; the dialog lists every served path, and a served protected environment must be typed after the view name, for example `web Prod`). On a composite, Edit also sets auto publish and the pin of each component, and Delete removes only its distributions. |
 | a | add repositories: a multi-select picker of RPM and File repositories (those already in the view and Content View snapshot repositories are not listed) and filter rules; the rules apply to each selected repository, so mixed RPM and File selections need empty rules. On a composite: add components (see below). |
 | F | edit the filter rules of one repository (not offered on a composite) |
 | x | remove a repository from the definition (published versions are unchanged). On a composite: remove a component. |
@@ -234,8 +234,9 @@ exclude path=isos/*            # File repositories
 
 A unit is selected when (no include rule exists or one matches) and no exclude rule
 matches. All criteria of one rule must match. `evr` supports `= < <= > >=` with rpm
-version comparison; `epoch:` is optional; without a release only epoch and version are
-compared.
+version comparison; `epoch:` is optional (a number); without a release only epoch and
+version are compared. The value must start with a letter or digit, so a typo such as
+`evr=>5.14` is refused instead of meaning `= >5.14`.
 
 #### Composite Content Views
 
@@ -371,8 +372,9 @@ a row: for a request the full request and response bodies, for the others the me
 while a job runs) is hidden by default; `t` shows or hides it.
 
 Secrets are redacted: the `Authorization` header is never recorded, JSON values of
-`password`, `token`, `secret`, `client_key` and keys that end in `_password`, `_token`
-or `_secret` (for example `proxy_password` and `sles_auth_token`) show as `•••`, and
+`password`, `token`, `secret`, `client_key`, `authorization`, `headers` (of a remote) and
+keys that end in `_password`, `_token` or `_secret` (for example `proxy_password` and
+`sles_auth_token`), in any letter case, show as `•••`, and
 uploads show only their size. A body is cut at 64 KiB.
 The log keeps the last 1000 rows in memory for this session only. When it is full, the
 hidden polling rows are dropped first. It is never written to disk and is gone when you
@@ -396,7 +398,8 @@ Secrets are references:
 Auth methods: `basic` (username + secret), `bearer` (secret is the token), `none`
 (anonymous or identity from the mTLS client certificate). TLS options: `ca_cert`
 (PEM bundle added to the system roots), `client_cert` + `client_key` (mTLS). `proxy`,
-`timeout_secs`, `read_only`, `production`.
+`timeout_secs`, `read_only`, `production`. Credentials never go into `url`, and `proxy`
+may not hold a password: set an authenticated proxy in `HTTPS_PROXY` instead.
 
 A profile can have its own Content View database. It takes the same fields as the
 top-level `[database]` (see "Shared database"):

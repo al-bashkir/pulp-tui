@@ -43,7 +43,9 @@ Pulp tasks are the source of truth. The Task Center stores task references in th
 polls each unfinished task on its own schedule: the interval starts at `poll_min_ms`,
 grows by 1.5x while nothing changes, resets on progress, and has ±20 % jitter. At most
 three polls run at the same time. A task that a workflow already waits on is not polled
-twice. After a restart, unfinished references are polled again ("re-attached").
+twice. After a restart, unfinished references are polled again ("re-attached"). A task that
+the server answers with 404 (purged) gets the final state `gone`. A poll answer for a task
+that is not tracked (sent to the previous server before a Connect) is dropped.
 
 Task groups (native replication) are final when no task is waiting or running and the
 group says all tasks were dispatched, a task failed, or the replication finalizer
@@ -73,7 +75,8 @@ idle group whose counts stay the same for three polls is also treated as final.
   4. reuse or create the publication of that version.
   Every step writes a checkpoint. The href of a submitted copy task is stored before
   waiting, so an interrupted publish **re-attaches to the same task** and does not submit
-  it again.
+  it again. A copy task that failed or was canceled is cleared from the checkpoint, so the
+  next *Resume* submits the copy again (it starts from an empty base).
 * RPM filters select packages by name glob, architecture glob and EVR comparison
   (`rpmvercmp` port, tested with rpm's own cases). An advisory is kept only when every
   package it references that exists in the source is selected. Other metadata (comps,
@@ -124,7 +127,13 @@ idle group whose counts stay the same for three polls is also treated as final.
   non-deleted composite version used one of its versions, and when another view still
   serves a publication of one of its derived repositories, because deleting the
   repository would delete that publication. Deleting a version is refused while a
-  composite version uses it or a composite pins it.
+  composite version uses it or a composite pins it. Before that check the version is set to
+  `deleting` (`Store::set_version_state`, conditional on its old state), because a composite
+  publish takes the composite's lock only: a composite publish that starts later refuses a
+  version that is not `published`, and one that started earlier is found by the check (on
+  PostgreSQL `Store::begin` holds the row `FOR SHARE`, so the mark waits for its commit). A
+  refused delete restores the old state; a delete that fails later stays `deleting`, and
+  *Delete* again finishes it (*Resume* refuses it).
 * **Composite Content Views**: a composite (`content_views.composite`) has components
   (`cv_components`: the component view and a pinned version, or none for `latest`) instead
   of repositories and filters. No nesting: `set_component` refuses a composite as a
@@ -177,8 +186,10 @@ failed publish keeps its checkpoints; *Resume* continues from them.
   upstream RPM/File distribution it creates or updates a remote (pointing at the published
   upstream URL), a repository and a pinned distribution with the same name and base path,
   labeled `pulp_tui_replica=<source profile>`. A dry run shows CREATE / SYNC / SKIP per
-  item. Objects without this label are conflicts and are skipped. The fallback never
-  deletes anything and does not copy content guards, labels or other Pulp metadata.
+  item. Objects without this label are conflicts and are skipped. The run checks the label
+  of an existing remote and repository again, so an object created after the dry run is
+  refused, not changed. The fallback never deletes anything and does not copy content
+  guards, labels or other Pulp metadata.
 * Guards: source and destination must be different servers; upstream distributions whose
   content URL is on the destination's content origin are skipped as loops.
 
@@ -261,7 +272,8 @@ Export format 2 carries composites, components by view name, the auto publish fl
 pin as a version number. Versions are not exported, so import turns every pin into `latest`
 and returns a warning that names it (the CLI prints it as `warning: ...`, the TUI shows one
 warning notice); a missing component, or a composite used as component, is skipped with a
-warning. Import still reads format 1; an older pulp-tui refuses format 2 (its check is
+warning. Import checks every name, label and filter rule before its first write, so a bad
+entry leaves nothing behind. Import still reads format 1; an older pulp-tui refuses format 2 (its check is
 `format != 1`). `db copy` copies composites, components with pins, the recorded component
 versions and the borrowed rows, with every id remapped. The links between composites,
 components and versions are written after all views and versions, so a composite that
@@ -371,7 +383,8 @@ It contains no secrets and no Pulp state.
   (chain and host name); only a Unix socket or a loopback host is exempt. The URL may not
   contain a password, and errors show the URL without it.
 * Secrets are references in the config (`env:VAR`, `file:/path`, `keyring`). The config
-  parser rejects unknown keys such as `password`. Secret files that are readable by group
+  parser rejects unknown keys such as `password`, a profile `url` with user info, and a
+  `proxy` with a password (use `HTTPS_PROXY` for an authenticated proxy). Secret files that are readable by group
   or others cause a warning in the log. The `[database]` secret and the secret of a
   profile's own `database` use the same references.
 * The `Authorization` header is marked sensitive. The log file (never the terminal)
@@ -379,7 +392,7 @@ It contains no secrets and no Pulp state.
   never pre-filled in forms and are displayed masked.
 * The Logs screen (`src/session_log.rs`) keeps the last 1000 requests, actions and notices
   of the session in memory, with request and response bodies cut at 64 KiB. Secret JSON
-  keys are redacted before a body is stored, the `Authorization` header is never recorded
+  keys (any letter case, also a remote's `headers`) are redacted before a body is stored, the `Authorization` header is never recorded
   and upload bodies are replaced by their size. The log is never written to disk.
 * Read-only profiles block every mutating request in the client before it is sent, and
   the UI hides mutating actions.

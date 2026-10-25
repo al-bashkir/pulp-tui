@@ -727,8 +727,14 @@ pub async fn load(
         Kind::ContentViews => {
             let store = store?;
             let envs = store.environments(scope).await?;
+            let audit = store.audit_log(scope, 200).await?;
             let mut out = vec![];
             for cv in store.content_views(scope).await? {
+                // `cv.*` entries start with the view name; `os` must not get the entries of `os-base`.
+                let about = |a: &&crate::store::AuditEntry| {
+                    a.action.starts_with("cv.")
+                        && a.detail.strip_prefix(cv.name.as_str()).is_some_and(|r| r.is_empty() || r.starts_with([' ', ':']))
+                };
                 let versions = store.versions(cv.id).await?;
                 let numbers: std::collections::HashMap<i64, i64> = versions.iter().map(|v| (v.id, v.number)).collect();
                 let bound: Vec<String> = store
@@ -771,7 +777,7 @@ pub async fn load(
                     "versions": versions.iter().filter(|v| v.state != "deleted").map(|v| json!({
                         "number": v.number, "state": v.state, "notes": v.notes, "created_at": v.created_at, "error": v.error
                     })).collect::<Vec<_>>(),
-                    "audit": store.audit_log(scope, 200).await?.into_iter().filter(|a| a.detail.starts_with(&cv.name)).take(10)
+                    "audit": audit.iter().filter(about).take(10)
                         .map(|a| format!("{} {} {}{}", a.at, a.action, a.detail, if a.actor.is_empty() { String::new() } else { format!(" by {}", a.actor) }))
                         .collect::<Vec<_>>(),
                 }));

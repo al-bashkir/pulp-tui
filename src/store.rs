@@ -251,7 +251,7 @@ pub struct CvVersion {
     pub cv_id: i64,
     pub number: i64,
     pub notes: String,
-    /// publishing | published | failed | deleted
+    /// publishing | published | failed | deleting | deleted
     pub state: String,
     pub created_at: String,
     pub finished_at: Option<String>,
@@ -844,13 +844,13 @@ impl Store {
         .fetch_one(&mut *tx)
         .await?;
         let (id, number): (i64, i64) = (r.try_get(0)?, r.try_get(1)?);
-        // After the insert (SQLite holds the write lock): a component version deleted since it was resolved is not borrowed.
+        // After the insert (SQLite holds the write lock; PostgreSQL holds the row with FOR SHARE): a component version that
+        // `delete_version` marked since it was resolved is not borrowed, and a later mark waits for this commit.
+        let share = if self.backend == Backend::Postgres { " FOR SHARE OF v" } else { "" };
+        let sql =
+            format!("SELECT v.state, v.number, c.name FROM cv_versions v JOIN content_views c ON c.id = v.cv_id WHERE v.id = $1{share}");
         for u in used {
-            let r =
-                sqlx::query("SELECT v.state, v.number, c.name FROM cv_versions v JOIN content_views c ON c.id = v.cv_id WHERE v.id = $1")
-                    .bind(u)
-                    .fetch_one(&mut *tx)
-                    .await?;
+            let r = sqlx::query(&sql).bind(u).fetch_one(&mut *tx).await?;
             let (state, n, name): (String, i64, String) = (r.try_get(0)?, r.try_get(1)?, r.try_get(2)?);
             if state != "published" {
                 bail!("version v{n} of {name} is no longer published");
@@ -901,6 +901,18 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Change the state of a version only while it is `from`; `false`: it changed meanwhile.
+    pub async fn set_version_state(&self, id: i64, from: &str, to: &str) -> Result<bool> {
+        let n = sqlx::query("UPDATE cv_versions SET state = $3 WHERE id = $1 AND state = $2")
+            .bind(id)
+            .bind(from)
+            .bind(to)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n == 1)
     }
 
     pub async fn versions(&self, cv_id: i64) -> Result<Vec<CvVersion>> {
@@ -1388,6 +1400,21 @@ impl Store {
     pub async fn import(&self, profile: &str, ex: &Export) -> Result<(usize, usize, Vec<String>)> {
         if !(1..=2).contains(&ex.format) {
             bail!("unsupported export format {}", ex.format);
+        }
+        // Checked before any write: an entry refused halfway would leave the composites created before it empty.
+        for v in &ex.content_views {
+            validate_name(&v.name).with_context(|| format!("content view {:?}", v.name))?;
+            for r in &v.repos {
+                for f in &r.filters {
+                    crate::filters::parse_rule(&f.to_string(), r.repo_type).map_err(|e| anyhow!("{} {}: {e}", v.name, r.repo_name))?;
+                }
+            }
+        }
+        for e in &ex.environments {
+            validate_name(&e.name).with_context(|| format!("environment {:?}", e.name))?;
+            if !e.label.is_empty() {
+                validate_label(&e.label).with_context(|| format!("environment {}", e.name))?;
+            }
         }
         self.ensure_library(profile).await?;
         let mut envs = 0;
@@ -2127,6 +2154,21 @@ mod tests {
         // A clash is reported, not skipped.
         let e = s.import("k", &Export { environments: vec![env("Other", "qa")], ..ex }).await.unwrap_err().to_string();
         assert_eq!(e, "label qa is already used by environment QA");
+    }
+
+    #[tokio::test]
+    async fn import_checks_every_entry_before_it_writes() {
+        let s = Store::open_in_memory().await.unwrap();
+        // A rule without criteria would exclude every package; the composite must not be created without its components.
+        let ex: Export = serde_json::from_value(serde_json::json!({ "format": 2, "environments": [], "content_views": [
+            { "name": "all", "composite": true, "components": [{ "name": "os" }], "repos": [] },
+            { "name": "os", "repos": [{ "repo_href": "/r/1/", "repo_name": "baseos", "repo_type": "rpm", "filters": [{ "action": "exclude" }] }] }
+        ] }))
+        .unwrap();
+        let e = s.import("k", &ex).await.unwrap_err().to_string();
+        assert_eq!(e, "os baseos: rule \"exclude\" has no criteria");
+        assert!(s.content_views("k").await.unwrap().is_empty(), "nothing written");
+        assert!(s.environments("k").await.unwrap().is_empty(), "not even Library");
     }
 
     #[tokio::test]

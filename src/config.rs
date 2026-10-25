@@ -160,6 +160,14 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// Task polling interval bounds (min, max): min at least 100 ms, max at least min.
+    pub fn poll_bounds(&self) -> (std::time::Duration, std::time::Duration) {
+        let min = self.poll_min_ms.max(100);
+        (std::time::Duration::from_millis(min), std::time::Duration::from_millis(self.poll_max_ms.max(min)))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
@@ -236,9 +244,19 @@ impl Default for Profile {
 
 impl Profile {
     pub fn validate(&self) -> Result<()> {
-        let url = url::Url::parse(&self.url).with_context(|| format!("invalid url {:?}", self.url))?;
+        // The url is not echoed: it may hold credentials.
+        let url = url::Url::parse(&self.url).context("invalid url")?;
         if !matches!(url.scheme(), "http" | "https") {
             bail!("url must use http or https");
+        }
+        // Secrets in the config file are references only.
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!("url must not hold credentials; use username and secret");
+        }
+        if let Some(px) = &self.proxy
+            && url::Url::parse(px).is_ok_and(|u| u.password().is_some())
+        {
+            bail!("proxy must not hold a password; set the proxy in HTTPS_PROXY instead");
         }
         if url.path() != "/" || url.query().is_some() {
             bail!("url must be scheme://host[:port] only; put the path into api_root");
@@ -380,14 +398,19 @@ impl Config {
         }
     }
 
-    /// Atomic write (temp file + rename) so a crash never leaves a truncated config.
+    /// Atomic write (temp file + rename) so a crash never leaves a truncated config. A symlink is followed
+    /// (the link stays) and an existing file keeps its permissions.
     pub fn save(&self, path: &Path) -> Result<()> {
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, toml::to_string_pretty(self)?)?;
-        std::fs::rename(&tmp, path)?;
+        if let Ok(m) = std::fs::metadata(&path) {
+            std::fs::set_permissions(&tmp, m.permissions())?;
+        }
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -484,6 +507,17 @@ read_only = true
         p.validate().unwrap();
         p.client_cert = Some("c.pem".into());
         assert!(p.validate().is_err());
+        p.client_cert = None;
+        // Credentials stay out of the config, and errors do not echo the url.
+        p.url = "https://admin:hunter2@h".into();
+        assert_eq!(p.validate().unwrap_err().to_string(), "url must not hold credentials; use username and secret");
+        p.url = "https://admin:hunter2@h:99999".into();
+        assert!(!format!("{:#}", p.validate().unwrap_err()).contains("hunter2"));
+        p.url = "https://h".into();
+        p.proxy = Some("http://u:pw@proxy:3128".into());
+        assert!(p.validate().unwrap_err().to_string().starts_with("proxy must not hold a password"));
+        p.proxy = Some("http://u@proxy:3128".into());
+        p.validate().unwrap();
     }
 
     #[test]
@@ -494,6 +528,22 @@ read_only = true
         cfg.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), cfg);
         assert_eq!(Config::load(&dir.path().join("missing.toml")).unwrap(), Config::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_a_symlink_and_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (real, link) = (dir.path().join("dotfiles.toml"), dir.path().join("config.toml"));
+        Config::default().save(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let cfg: Config = toml::from_str(EXAMPLE).unwrap();
+        cfg.save(&link).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(Config::load(&real).unwrap(), cfg);
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

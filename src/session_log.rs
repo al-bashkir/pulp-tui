@@ -117,7 +117,9 @@ pub fn redact(v: &mut Value) {
     match v {
         Value::Object(m) => {
             for (k, v) in m.iter_mut() {
-                let secret = matches!(k.as_str(), "password" | "token" | "secret" | "client_key")
+                // `headers` of a remote can carry an Authorization value.
+                let k = k.to_ascii_lowercase();
+                let secret = matches!(k.as_str(), "password" | "token" | "secret" | "client_key" | "authorization" | "headers")
                     || ["_password", "_token", "_secret"].iter().any(|s| k.ends_with(s));
                 if secret {
                     *v = Value::String("•••".into());
@@ -212,6 +214,11 @@ mod tests {
         }
         assert_eq!(v["nested"][0]["keep"], "ok");
         assert_eq!(v["password"], "•••");
+
+        // Key case does not matter; a remote's headers can carry a bearer token.
+        let mut v = json!({"Password": "p", "X_Token": "t", "headers": [{"Authorization": "Bearer b"}]});
+        redact(&mut v);
+        assert_eq!(v, json!({"Password": "•••", "X_Token": "•••", "headers": "•••"}));
     }
 
     #[test]
