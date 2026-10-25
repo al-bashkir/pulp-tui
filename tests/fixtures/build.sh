@@ -10,7 +10,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=${FIXTURES_DIR:-$ROOT/target/fixtures}
-STAMP=$OUT/.built-v1
+STAMP=$OUT/.built-v2
 [ -f "$STAMP" ] && { echo "fixtures up to date: $OUT"; exit 0; }
 rm -rf "$OUT"
 mkdir -p "$OUT"/{rpms,files,build,upstream/rpm,upstream/rpm2,upstream/file}
@@ -34,7 +34,7 @@ echo "$name $version-$release" > %{buildroot}/usr/share/$name/version
 EOF
   rpmbuild -bb --quiet --define "_topdir $OUT/build/top" --define "_rpmdir $OUT/rpms" \
     --define '_build_name_fmt %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm' \
-    --undefine source_date_epoch_from_changelog \
+    --undefine source_date_epoch_from_changelog --define '_buildhost pulp-tui-fixtures' \
     "$OUT/build/$name-$version.spec" >/dev/null
 }
 
