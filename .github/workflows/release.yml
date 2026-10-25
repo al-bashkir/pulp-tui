@@ -1,0 +1,61 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  linux:
+    # Static musl binary from the Containerfile build (no system keyring support).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: DOCKER_BUILDKIT=1 docker build -t pulp-tui:release -f Containerfile .
+      - run: docker create --name out pulp-tui:release && docker cp out:/usr/local/bin/pulp-tui .
+      # The tag must be the Cargo.toml version.
+      - run: test "$(./pulp-tui --version)" = "pulp-tui $GITHUB_REF_NAME"
+      - run: tar czf "pulp-tui-$GITHUB_REF_NAME-x86_64-unknown-linux-musl.tar.gz" pulp-tui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: pulp-tui-*.tar.gz
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # build.rs runs git describe
+      # rustup is on the runner: no third-party action touches the released binary.
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo build --release --locked
+      # The tag must be the Cargo.toml version, on a clean tree.
+      - run: test "$(target/release/pulp-tui --version)" = "pulp-tui $GITHUB_REF_NAME"
+      - run: tar czf "pulp-tui-$GITHUB_REF_NAME-aarch64-apple-darwin.tar.gz" -C target/release pulp-tui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: pulp-tui-*.tar.gz
+
+  release:
+    needs: [ci, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: sha256sum pulp-tui-*.tar.gz > SHA256SUMS
+      - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes pulp-tui-*.tar.gz SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}

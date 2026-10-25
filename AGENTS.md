@@ -49,6 +49,12 @@ cargo audit
 Live tests skip unless `PULP_TUI_LIVE=1`. They use unique object names, so they can rerun
 against the same containers; `tests/env/pulp-env.sh down-all` resets everything.
 
+## Release
+
+Set `version` in `Cargo.toml`, run `cargo build` (it updates `Cargo.lock`), commit, then
+`git tag vX.Y.Z && git push origin vX.Y.Z`. `.github/workflows/release.yml` runs CI, builds
+the binaries, and publishes the release. It stops if `pulp-tui --version` is not exactly the tag.
+
 ## Database migrations
 
 Append a new SQL batch to both `MIGRATIONS` (SQLite) and `PG_MIGRATIONS` (PostgreSQL) in
