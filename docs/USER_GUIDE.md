@@ -393,7 +393,7 @@ Secrets are references:
 |---|---|
 | `env:PULP_PASSWORD` | environment variable (CI, containers) |
 | `file:/run/secrets/pulp` | mounted secret file (trailing newline is removed) |
-| `keyring` | system keyring, service `pulp-tui`, user = profile name (store it with **K**) |
+| `keyring` | system keyring, service `pulp-tui`, user = profile name (store it with **K**; see "System keyring") |
 
 Auth methods: `basic` (username + secret), `bearer` (secret is the token), `none`
 (anonymous or identity from the mTLS client certificate). TLS options: `ca_cert`
@@ -425,6 +425,44 @@ form value that is the same as what the profile would use without a block (the i
 `[database]`, or the local file) stores nothing, so an untouched form never adds a
 `database` block. The keyring user of the `keyring` secret of a profile database is
 `[database]:<profile>`; the top-level `[database]` uses the user `[database]`.
+
+### System keyring
+
+pulp-tui does not keep a keyring file. It gives the secret to the keyring of the operating
+system:
+
+| System | Store |
+|---|---|
+| Linux, BSD | Secret Service over D-Bus (`org.freedesktop.secrets`): GNOME Keyring, KDE Wallet (`ksecretd`), KeePassXC |
+| macOS | Keychain |
+| Windows | Credential Manager |
+
+On Linux the secret goes to the `default` collection (unlocked first, which can show a
+password prompt). Each entry has the attributes `service=pulp-tui` and `username=<user>`
+and the label `keyring:<user>@pulp-tui`:
+
+| Secret | Keyring user |
+|---|---|
+| Pulp server of profile `prod` | `prod` |
+| `[profiles.prod.database]` | `[database]:prod` |
+| top-level `[database]` | `[database]` |
+
+* **K** on the Servers screen only writes the keyring. Set `secret = "keyring"` in the
+  config too, else pulp-tui does not read the entry. **K** again replaces the secret.
+* **K** cannot store the top-level `[database]` secret. Create it with the system tool.
+* Builds without the `keyring` feature (`--no-default-features`, the static Linux
+  release binary, the container image) give an error for `keyring`; use `env:` or `file:`.
+* KDE Plasma 6: KWalletManager does not show these entries. It shows only entries with
+  the KWallet attributes `server`, `user` and `type`. The entries are in the wallet
+  (folder `Secret Service`) and pulp-tui reads them; use `secret-tool` to see them.
+
+Linux examples with `secret-tool` (libsecret):
+
+```sh
+secret-tool search --all service pulp-tui          # list entries (prints the secrets)
+secret-tool store --label='keyring:[database]@pulp-tui' service pulp-tui username '[database]'
+secret-tool clear service pulp-tui username prod   # remove the secret of profile prod
+```
 
 ## Shared database
 

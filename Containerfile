@@ -1,7 +1,7 @@
 # Multi-stage build: static musl binary on a small, unprivileged runtime image.
 #   podman build -t pulp-tui -f Containerfile .
 #   podman run --rm -it -v ./config.toml:/config/config.toml:ro,Z -v pulp-tui-data:/data pulp-tui
-FROM docker.io/library/rust:1.90-alpine3.22 AS build
+FROM docker.io/library/rust:1.99-alpine3.22 AS build
 # C toolchain for bundled SQLite and aws-lc (rustls crypto provider).
 RUN apk add --no-cache musl-dev build-base cmake perl
 WORKDIR /src

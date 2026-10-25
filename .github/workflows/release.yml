@@ -18,13 +18,13 @@ jobs:
     # Static musl binary from the Containerfile build (no system keyring support).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: DOCKER_BUILDKIT=1 docker build -t pulp-tui:release -f Containerfile .
       - run: docker create --name out pulp-tui:release && docker cp out:/usr/local/bin/pulp-tui .
       # The tag must be the Cargo.toml version.
       - run: test "$(./pulp-tui --version)" = "pulp-tui $GITHUB_REF_NAME"
       - run: tar czf "pulp-tui-$GITHUB_REF_NAME-x86_64-unknown-linux-musl.tar.gz" pulp-tui
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: pulp-tui-*.tar.gz
@@ -32,7 +32,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # build.rs runs git describe
       # rustup is on the runner: no third-party action touches the released binary.
@@ -41,7 +41,7 @@ jobs:
       # The tag must be the Cargo.toml version, on a clean tree.
       - run: test "$(target/release/pulp-tui --version)" = "pulp-tui $GITHUB_REF_NAME"
       - run: tar czf "pulp-tui-$GITHUB_REF_NAME-aarch64-apple-darwin.tar.gz" -C target/release pulp-tui
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: pulp-tui-*.tar.gz
@@ -52,7 +52,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       - run: sha256sum pulp-tui-*.tar.gz > SHA256SUMS
