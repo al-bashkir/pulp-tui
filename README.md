@@ -22,6 +22,8 @@ Safety: TLS is always verified, secrets are referenced (env, file, keyring) and 
 stored or logged, read-only profiles, a red banner for production servers, impact
 previews and typed confirmations for destructive actions.
 
+![pulp-tui demo: dashboard, sync a repository, browse content and versions, Task Center](docs/demo/demo.gif)
+
 ## Build and run
 
 Requires Rust ≥ 1.88 (edition 2024). Linux and macOS.
