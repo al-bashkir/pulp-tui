@@ -297,8 +297,13 @@ impl Form {
         self
     }
 
+    /// The value without outer spaces; a secret keeps them (they are part of a password).
     pub fn get(&self, key: &str) -> &str {
-        self.fields.iter().find(|f| f.key == key).map(|f| f.value.trim()).unwrap_or("")
+        match self.fields.iter().find(|f| f.key == key) {
+            Some(f) if f.kind == FieldKind::Secret => &f.value,
+            Some(f) => f.value.trim(),
+            None => "",
+        }
     }
     pub fn opt(&self, key: &str) -> Option<&str> {
         Some(self.get(key)).filter(|v| !v.is_empty())
@@ -710,6 +715,8 @@ mod tests {
         });
         assert!(matches!(f.handle_key(key(KeyCode::Enter)), FormEvent::Submit));
         assert_eq!(f.get("pw"), "admin123");
+        f.fields[0].value = " pass ".into();
+        assert_eq!(f.get("pw"), " pass ", "a secret keeps its spaces");
         // Other single fields, and forms with more fields, still open in move mode.
         assert!(!Form::new("t", vec![Field::new("b", "B", FieldKind::Bool)]).editing);
         assert!(!Form::new("t", vec![Field::text("a", "A"), Field::text("b", "B")]).editing);

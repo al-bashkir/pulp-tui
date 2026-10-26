@@ -209,17 +209,6 @@ impl TaskGroup {
             self.tasks.iter().any(|t| t["name"].as_str().is_some_and(|n| n.ends_with("finalize_replication")) && t["state"] == "completed");
         self.active() == 0 && self.done() > 0 && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized)
     }
-    pub fn state(&self) -> &'static str {
-        if !self.is_final() {
-            "running"
-        } else if self.failed > 0 {
-            "failed"
-        } else if self.canceled > 0 {
-            "canceled"
-        } else {
-            "completed"
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -291,18 +280,6 @@ pub struct Distribution {
     pub repository_version: Option<String>,
     #[serde(default)]
     pub pulp_labels: BTreeMap<String, String>,
-}
-
-impl Distribution {
-    /// A distribution bound to a repository follows its latest content; one bound to a
-    /// publication or repository version is pinned to that immutable snapshot.
-    pub fn binding(&self) -> &'static str {
-        match (&self.publication, &self.repository_version, &self.repository) {
-            (Some(_), _, _) | (_, Some(_), _) => "pinned",
-            (None, None, Some(_)) => "latest",
-            _ => "unbound",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]

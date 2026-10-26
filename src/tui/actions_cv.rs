@@ -1417,6 +1417,7 @@ mod tests {
         // After the copy, a pending task is the publication (Deb).
         vr.derived_version = Some("/dv/1/".into());
         st.save_version_repo(&vr).await.unwrap();
+        app.modal = None; // the operator closes the first view (an open one would keep the second waiting)
         version_action(&mut app, "lab", cv, "web".into(), Act::WatchTask, row);
         drain(&mut app, &mut rx).await;
         let Some(Modal::Text { title, .. }) = &app.modal else { panic!("no watch view") };

@@ -1,9 +1,8 @@
-//! File plugin operations: file listing, serving checks and repository modify.
+//! File plugin operations: file listing and serving checks.
 
-use super::client::{Mutation, PulpClient, PulpError, Result};
+use super::client::{PulpClient, PulpError, Result};
 use super::models::*;
-use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 pub async fn files_in(c: &PulpClient, version: &str) -> Result<Vec<FileContent>> {
     c.list_all(
@@ -26,22 +25,18 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String>
     if status != 200 {
         return fail(format!("{probe} returned HTTP {status}"));
     }
-    let served: BTreeSet<(String, String)> = String::from_utf8_lossy(&body)
+    let served: BTreeMap<String, String> = String::from_utf8_lossy(&body)
         .lines()
         .filter_map(|l| {
             let mut it = l.splitn(3, ',');
             Some((it.next()?.to_string(), it.next()?.to_string()))
         })
         .collect();
-    let want: BTreeSet<(String, String)> =
-        files_in(c, version).await?.into_iter().map(|f| (f.relative_path, f.sha256.unwrap_or_default())).collect();
-    if served != want {
+    let want = files_in(c, version).await?;
+    // `sha256` comes from the stored file: `null` for an on_demand file until a client downloads it.
+    let differs = want.iter().any(|f| served.get(&f.relative_path).is_none_or(|d| f.sha256.as_ref().is_some_and(|s| s != d)));
+    if differs || served.len() != want.len() {
         return fail(format!("served manifest differs from snapshot ({} served, {} expected)", served.len(), want.len()));
     }
     Ok(format!("PULP_MANIFEST matches {} files", want.len()))
-}
-
-/// Add content units to a repository.
-pub async fn modify(c: &PulpClient, repo: &str, add: Vec<String>) -> Result<Mutation> {
-    c.post(&format!("{repo}modify/"), &json!({ "add_content_units": add })).await
 }

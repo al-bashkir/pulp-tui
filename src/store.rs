@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions, AnyRow};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -601,16 +601,22 @@ impl Store {
     // ---- content views -----------------------------------------------------------
 
     pub async fn create_cv(&self, profile: &str, name: &str, description: &str) -> Result<i64> {
+        self.insert_cv(profile, name, description, false).await
+    }
+
+    async fn insert_cv(&self, profile: &str, name: &str, description: &str, composite: bool) -> Result<i64> {
         validate_name(name)?;
-        let id =
-            sqlx::query_scalar("INSERT INTO content_views(profile, name, description, created_at) VALUES ($1, $2, $3, $4) RETURNING id")
-                .bind(profile)
-                .bind(name)
-                .bind(description)
-                .bind(now())
-                .fetch_one(&self.pool)
-                .await
-                .with_context(|| format!("content view {name} already exists?"))?;
+        let id = sqlx::query_scalar(
+            "INSERT INTO content_views(profile, name, description, created_at, composite) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(profile)
+        .bind(name)
+        .bind(description)
+        .bind(now())
+        .bind(composite as i64)
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("content view {name} already exists?"))?;
         Ok(id)
     }
 
@@ -648,18 +654,7 @@ impl Store {
     // ---- composite content views -------------------------------------------------
 
     pub async fn create_composite(&self, profile: &str, name: &str, description: &str) -> Result<i64> {
-        validate_name(name)?;
-        let id = sqlx::query_scalar(
-            "INSERT INTO content_views(profile, name, description, created_at, composite) VALUES ($1, $2, $3, $4, 1) RETURNING id",
-        )
-        .bind(profile)
-        .bind(name)
-        .bind(description)
-        .bind(now())
-        .fetch_one(&self.pool)
-        .await
-        .with_context(|| format!("content view {name} already exists?"))?;
-        Ok(id)
+        self.insert_cv(profile, name, description, true).await
     }
 
     pub async fn set_auto_publish(&self, id: i64, on: bool) -> Result<()> {
@@ -823,16 +818,24 @@ impl Store {
 
     /// Start a new numbered version with a frozen copy of the definition.
     pub async fn begin_version(&self, cv_id: i64, notes: &str, repos: &[CvRepo]) -> Result<CvVersion> {
-        self.begin(cv_id, notes, repos, &[], &[]).await
+        let rows: Vec<CvVersionRepo> = repos.iter().map(|r| CvVersionRepo { repo: Some(r.clone()), ..Default::default() }).collect();
+        self.begin_snapshot_version(cv_id, notes, &rows).await
+    }
+
+    /// `begin_version` with the first checkpoints of each row (`source_version`, `signing`) in the same
+    /// transaction, so a publish that stops right after it can resume.
+    pub async fn begin_snapshot_version(&self, cv_id: i64, notes: &str, rows: &[CvVersionRepo]) -> Result<CvVersion> {
+        self.begin(cv_id, notes, &[], rows).await
     }
 
     /// Start a composite version: the component versions it uses (`used`) and their rows (`rows`), stored
     /// as borrowed with every checkpoint column except the task reference.
     pub async fn begin_composite_version(&self, cv_id: i64, notes: &str, used: &[i64], rows: &[CvVersionRepo]) -> Result<CvVersion> {
-        self.begin(cv_id, notes, &[], used, rows).await
+        let rows: Vec<CvVersionRepo> = rows.iter().map(|r| CvVersionRepo { pending_task: None, borrowed: true, ..r.clone() }).collect();
+        self.begin(cv_id, notes, used, &rows).await
     }
 
-    async fn begin(&self, cv_id: i64, notes: &str, repos: &[CvRepo], used: &[i64], rows: &[CvVersionRepo]) -> Result<CvVersion> {
+    async fn begin(&self, cv_id: i64, notes: &str, used: &[i64], rows: &[CvVersionRepo]) -> Result<CvVersion> {
         let at = now();
         let mut tx = self.pool.begin().await?;
         // Number and insert in one statement: the write lock is taken before the number is read.
@@ -858,16 +861,6 @@ impl Store {
                 bail!("version v{n} of {name} is no longer published");
             }
         }
-        for r in repos {
-            sqlx::query("INSERT INTO cv_version_repos(version_id, repo_href, repo_name, repo_type, filters) VALUES ($1, $2, $3, $4, $5)")
-                .bind(id)
-                .bind(&r.repo_href)
-                .bind(&r.repo_name)
-                .bind(type_str(r.repo_type))
-                .bind(serde_json::to_string(&r.filters)?)
-                .execute(&mut *tx)
-                .await?;
-        }
         for u in used {
             sqlx::query("INSERT INTO cv_version_components(version_id, component_version_id) VALUES ($1, $2)")
                 .bind(id)
@@ -876,7 +869,7 @@ impl Store {
                 .await?;
         }
         for r in rows {
-            insert_version_repo(&mut tx, &CvVersionRepo { version_id: id, pending_task: None, borrowed: true, ..r.clone() }).await?;
+            insert_version_repo(&mut tx, &CvVersionRepo { version_id: id, ..r.clone() }).await?;
         }
         tx.commit().await?;
         Ok(CvVersion { id, cv_id, number, notes: notes.into(), state: "publishing".into(), created_at: at, finished_at: None, error: None })
@@ -1008,19 +1001,7 @@ impl Store {
     // ---- environments and bindings -----------------------------------------------
 
     pub async fn ensure_library(&self, profile: &str) -> Result<i64> {
-        sqlx::query(
-            "INSERT INTO environments(profile, name, prior_id, label) VALUES ($1, $2, NULL, $3) ON CONFLICT(profile, name) DO NOTHING",
-        )
-        .bind(profile)
-        .bind(LIBRARY)
-        .bind(default_label(LIBRARY))
-        .execute(&self.pool)
-        .await?;
-        Ok(sqlx::query_scalar("SELECT id FROM environments WHERE profile = $1 AND name = $2")
-            .bind(profile)
-            .bind(LIBRARY)
-            .fetch_one(&self.pool)
-            .await?)
+        library_in(&mut *self.pool.acquire().await?, profile, &default_label(LIBRARY), false).await
     }
 
     pub async fn create_env(&self, profile: &str, name: &str, prior_id: i64, protected: bool) -> Result<i64> {
@@ -1395,9 +1376,9 @@ impl Store {
         }
         let envs = self.environments(profile).await?;
         let name_of = |id: Option<i64>| id.and_then(|i| envs.iter().find(|e| e.id == i)).map(|e| e.name.clone());
+        // Library too (prior ""): its label and flag; an import that finds a Library keeps that one.
         let environments = envs
             .iter()
-            .filter(|e| e.prior_id.is_some())
             .map(|e| ExportEnv {
                 name: e.name.clone(),
                 prior: name_of(e.prior_id).unwrap_or_default(),
@@ -1431,7 +1412,47 @@ impl Store {
                 validate_label(&e.label).with_context(|| format!("environment {}", e.name))?;
             }
         }
-        self.ensure_library(profile).await?;
+        // Clashes in the file and with the target: the writes below would stop halfway on them.
+        let mut views = HashSet::new();
+        if let Some(v) = ex.content_views.iter().find(|v| !views.insert(v.name.as_str())) {
+            bail!("content view {} is in the file twice", v.name);
+        }
+        let existing = self.environments(profile).await?;
+        let label_of = |e: &ExportEnv| if e.label.is_empty() { default_label(&e.name) } else { e.label.clone() };
+        // A Library that this import creates gets the label and the flag of the file's (format 2), else the defaults.
+        let file_library = ex.environments.iter().find(|e| e.name == LIBRARY);
+        let new_library = existing.iter().all(|x| x.name != LIBRARY).then(|| file_library.map_or_else(|| default_label(LIBRARY), label_of));
+        let mut known: HashSet<&str> = existing.iter().map(|e| e.name.as_str()).chain([LIBRARY]).collect();
+        let (mut names, mut labels) = (HashSet::new(), HashSet::new());
+        for e in ex.environments.iter().filter(|e| !known.contains(e.name.as_str())) {
+            if !names.insert(e.name.as_str()) {
+                bail!("environment {} is in the file twice", e.name);
+            }
+            let label = label_of(e);
+            let library = (new_library.as_ref() == Some(&label)).then(|| LIBRARY.to_string());
+            if let Some(used) = library.or(self.label_user(profile, &label, 0).await?) {
+                bail!("label {label} is already used by environment {used}");
+            }
+            if !labels.insert(label.clone()) {
+                bail!("label {label} is in the file twice");
+            }
+        }
+        let mut left: Vec<&ExportEnv> = ex.environments.iter().filter(|e| !known.contains(e.name.as_str())).collect();
+        while !left.is_empty() {
+            let before = left.len();
+            left.retain(|e| {
+                let ready = known.contains(e.prior.as_str());
+                if ready {
+                    known.insert(&e.name);
+                }
+                !ready
+            });
+            if left.len() == before {
+                bail!("environment(s) with unknown prior: {}", left.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", "));
+            }
+        }
+        let library_label = new_library.unwrap_or_else(|| default_label(LIBRARY)); // unused when Library exists
+        library_in(&mut *self.pool.acquire().await?, profile, &library_label, file_library.is_some_and(|l| l.protected)).await?;
         let mut envs = 0;
         // Parents come before children in exports; loop until no progress for safety.
         let mut pending: Vec<&ExportEnv> = ex.environments.iter().collect();
@@ -1530,13 +1551,14 @@ impl Store {
         if let Some(e) = envs.iter().find(|e| e.prior_id.is_some() && have.iter().any(|h| h.label == e.label)) {
             bail!("target already has an environment with label {} for this server; db copy never merges", e.label);
         }
-        let src_library = envs.iter().find(|e| e.prior_id.is_none()).map(|e| e.label.clone());
-        if let (Some(s), Some(t)) = (&src_library, have.iter().find(|h| h.prior_id.is_none()))
-            && t.label != *s
+        let src_library = envs.iter().find(|e| e.prior_id.is_none());
+        if let (Some(s), Some(t)) = (src_library, have.iter().find(|h| h.prior_id.is_none()))
+            && t.label != s.label
         {
-            bail!("target Library has label {}, the source {s}; db copy never merges", t.label);
+            bail!("target Library has label {}, the source {}; db copy never merges", t.label, s.label);
         }
-        let src_library = src_library.unwrap_or_else(|| default_label(LIBRARY));
+        let library_protected = src_library.is_some_and(|l| l.protected);
+        let src_library = src_library.map_or_else(|| default_label(LIBRARY), |l| l.label.clone());
         let mut log = src.audit_log(src_scope, i64::MAX as usize).await?;
         log.reverse(); // oldest first, so the new ids keep the order
         let mut report = CopyReport {
@@ -1549,19 +1571,11 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         // Source ids to target ids; environments come in path order, so a prior is always mapped first.
         let mut env_ids = HashMap::new();
-        sqlx::query(
-            "INSERT INTO environments(profile, name, prior_id, label) VALUES ($1, $2, NULL, $3) ON CONFLICT(profile, name) DO NOTHING",
-        )
-        .bind(dst_scope)
-        .bind(LIBRARY)
-        .bind(&src_library)
-        .execute(&mut *tx)
-        .await?;
-        let library: i64 = sqlx::query_scalar("SELECT id FROM environments WHERE profile = $1 AND name = $2")
-            .bind(dst_scope)
-            .bind(LIBRARY)
-            .fetch_one(&mut *tx)
-            .await?;
+        let library = library_in(&mut tx, dst_scope, &src_library, library_protected).await?;
+        if library_protected {
+            // Also a Library the target had already: the copied views rely on the typed confirmation.
+            sqlx::query("UPDATE environments SET protected = 1 WHERE id = $1").bind(library).execute(&mut *tx).await?;
+        }
         for e in &envs {
             let id = match e.prior_id {
                 None => library,
@@ -1772,6 +1786,25 @@ fn content_view_row(r: &AnyRow) -> Result<ContentView> {
 }
 
 /// A full `cv_version_repos` row, every checkpoint column as `vr` holds it.
+/// The id of the Library of `profile`, created with `label` and `protected` when it is missing (else unchanged).
+async fn library_in(c: &mut AnyConnection, profile: &str, label: &str, protected: bool) -> Result<i64> {
+    sqlx::query(
+        "INSERT INTO environments(profile, name, prior_id, protected, label) VALUES ($1, $2, NULL, $3, $4)
+         ON CONFLICT(profile, name) DO NOTHING",
+    )
+    .bind(profile)
+    .bind(LIBRARY)
+    .bind(protected as i64)
+    .bind(label)
+    .execute(&mut *c)
+    .await?;
+    Ok(sqlx::query_scalar("SELECT id FROM environments WHERE profile = $1 AND name = $2")
+        .bind(profile)
+        .bind(LIBRARY)
+        .fetch_one(&mut *c)
+        .await?)
+}
+
 async fn insert_version_repo(c: &mut AnyConnection, vr: &CvVersionRepo) -> Result<()> {
     let r = vr.repo();
     sqlx::query(
@@ -1798,12 +1831,10 @@ async fn insert_version_repo(c: &mut AnyConnection, vr: &CvVersionRepo) -> Resul
 }
 
 fn cv_repo_row(r: &AnyRow) -> Result<CvRepo> {
-    Ok(CvRepo {
-        repo_href: r.try_get(0)?,
-        repo_name: r.try_get(1)?,
-        repo_type: repo_type(r.try_get(2)?)?,
-        filters: serde_json::from_str(r.try_get(3)?).unwrap_or_default(),
-    })
+    let repo_name: String = r.try_get(1)?;
+    // Never read as "no filters": a publish would then copy everything.
+    let filters = serde_json::from_str(r.try_get(3)?).with_context(|| format!("invalid filter rules of {repo_name}"))?;
+    Ok(CvRepo { repo_href: r.try_get(0)?, repo_name, repo_type: repo_type(r.try_get(2)?)?, filters })
 }
 
 fn version_row(r: &AnyRow) -> Result<CvVersion> {
@@ -1946,8 +1977,9 @@ mod tests {
             // A file at schema 1 (made by this code at version 1): one view, one audit row without an actor.
             let s = Store::open_at_version(&path, 1).await.unwrap();
             assert_eq!(s.schema_version().await.unwrap(), 1);
-            s.create_cv("p", "web", "d").await.unwrap();
-            sqlx::raw_sql("INSERT INTO audit(profile, at, action, detail) VALUES ('p', 't', 'old', 'row')").execute(&s.pool).await.unwrap();
+            let old = "INSERT INTO content_views(profile, name, description, created_at) VALUES ('p', 'web', 'd', 't');
+                       INSERT INTO audit(profile, at, action, detail) VALUES ('p', 't', 'old', 'row')";
+            sqlx::raw_sql(old).execute(&s.pool).await.unwrap();
         }
         let s = Store::open(&path).await.unwrap();
         assert_eq!(s.content_views("p").await.unwrap()[0].name, "web");
@@ -2025,6 +2057,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_publish_begins_with_its_source_versions() {
+        let s = Store::open_in_memory().await.unwrap();
+        let cv = s.create_cv("k", "web", "").await.unwrap();
+        let row = CvVersionRepo {
+            repo: Some(repo("apt", RepoType::Deb)),
+            source_version: Some("/r/1/versions/2/".into()),
+            signing: "none".into(),
+            ..Default::default()
+        };
+        let v = s.begin_snapshot_version(cv, "", std::slice::from_ref(&row)).await.unwrap();
+        assert_eq!(s.version_repos(v.id).await.unwrap(), [CvVersionRepo { version_id: v.id, ..row }], "Resume finds the source");
+    }
+
+    #[tokio::test]
     async fn deb_repository_with_a_version_rule_loads() {
         let s = Store::open_in_memory().await.unwrap();
         let cv = s.create_cv("k", "web", "").await.unwrap();
@@ -2039,6 +2085,10 @@ mod tests {
         assert_eq!(r.repo_type, RepoType::Deb);
         assert_eq!(r.filters, parse_rules("exclude name=*-dbg version<1.0", RepoType::Deb).unwrap());
         assert_eq!(r.filters[0].version, Some(("<".into(), "1.0".into())));
+        // A rule this binary cannot read (edited by hand, or a later action) is an error, never "no filters".
+        sqlx::query("UPDATE cv_repos SET filters = $1").bind(r#"[{"action":"keep-newest"}]"#).execute(&s.pool).await.unwrap();
+        let e = format!("{:#}", s.cv_repos(cv).await.unwrap_err());
+        assert!(e.starts_with("invalid filter rules of apt: "), "{e}");
     }
 
     #[tokio::test]
@@ -2187,6 +2237,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn library_keeps_its_flag_and_label_in_copy_and_export() {
+        let lib_of = |envs: Vec<Environment>| envs.into_iter().find(|e| e.name == LIBRARY).map(|e| (e.label, e.protected));
+        let src = Store::open_in_memory().await.unwrap();
+        let lib = src.ensure_library("k").await.unwrap();
+        src.set_env_label(lib, "base").await.unwrap();
+        src.set_env_protected(lib, true).await.unwrap();
+        let base = Some(("base".to_string(), true));
+        let dst = Store::open_in_memory().await.unwrap();
+        dst.copy_from(&src, "k", "k").await.unwrap();
+        assert_eq!(lib_of(dst.environments("k").await.unwrap()), base);
+        // A target Library with the same label gets the protection too.
+        let dst = Store::open_in_memory().await.unwrap();
+        dst.set_env_label(dst.ensure_library("k").await.unwrap(), "base").await.unwrap();
+        dst.copy_from(&src, "k", "k").await.unwrap();
+        assert_eq!(lib_of(dst.environments("k").await.unwrap()), base);
+
+        let ex = src.export("k").await.unwrap();
+        let dst = Store::open_in_memory().await.unwrap();
+        assert_eq!(dst.import("k", &ex).await.unwrap(), (0, 0, vec![]), "Library is not counted");
+        assert_eq!(lib_of(dst.environments("k").await.unwrap()), base);
+        // An existing Library keeps its own.
+        let dst = Store::open_in_memory().await.unwrap();
+        dst.ensure_library("k").await.unwrap();
+        dst.import("k", &ex).await.unwrap();
+        assert_eq!(lib_of(dst.environments("k").await.unwrap()), Some(("library".to_string(), false)));
+    }
+
+    #[tokio::test]
     async fn import_takes_labels_and_defaults_missing_ones() {
         let s = Store::open_in_memory().await.unwrap();
         let env = |name: &str, label: &str| ExportEnv { name: name.into(), prior: "Library".into(), protected: false, label: label.into() };
@@ -2216,6 +2294,43 @@ mod tests {
         assert_eq!(e, "os baseos: rule \"exclude\" has no criteria");
         assert!(s.content_views("k").await.unwrap().is_empty(), "nothing written");
         assert!(s.environments("k").await.unwrap().is_empty(), "not even Library");
+
+        // Clashes in the file, or with what exists, are found before the first write too.
+        let view = |name: &str| ExportView {
+            name: name.into(),
+            description: String::new(),
+            composite: false,
+            auto_publish: false,
+            components: vec![],
+            repos: vec![],
+        };
+        let env = |name: &str, prior: &str, label: &str| ExportEnv {
+            name: name.into(),
+            prior: prior.into(),
+            protected: false,
+            label: label.into(),
+        };
+        let all = ExportView { composite: true, components: vec![ExportComponent { name: "os".into(), pinned: None }], ..view("all") };
+        let bad = [
+            (vec![all, view("os"), view("os")], vec![], "content view os is in the file twice"),
+            (vec![view("os")], vec![env("QA", "Library", ""), env("QA", "Library", "qa2")], "environment QA is in the file twice"),
+            (vec![view("os")], vec![env("QA", "Library", ""), env("Stage", "Library", "qa")], "label qa is in the file twice"),
+            (vec![view("os")], vec![env("Base", "Library", "library")], "label library is already used by environment Library"),
+            (vec![view("os")], vec![env("Dev", "Library", ""), env("Prod", "Test", "")], "environment(s) with unknown prior: Prod"),
+            (vec![view("os")], vec![env("A", "B", ""), env("B", "A", "")], "environment(s) with unknown prior: A, B"),
+        ];
+        for (content_views, environments, want) in bad {
+            let e = s.import("k", &Export { format: 2, content_views, environments }).await.unwrap_err().to_string();
+            assert_eq!(e, want);
+            assert!(
+                s.content_views("k").await.unwrap().is_empty() && s.environments("k").await.unwrap().is_empty(),
+                "{want}: nothing written"
+            );
+        }
+        s.insert_env("k", "Staging", s.ensure_library("k").await.unwrap(), false, "qa").await.unwrap();
+        let e = s.import("k", &Export { format: 2, content_views: vec![view("os")], environments: vec![env("QA", "Library", "")] }).await;
+        assert_eq!(e.unwrap_err().to_string(), "label qa is already used by environment Staging");
+        assert!(s.content_views("k").await.unwrap().is_empty());
     }
 
     #[tokio::test]

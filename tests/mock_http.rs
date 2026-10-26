@@ -636,3 +636,52 @@ async fn deb_verify_finds_the_package_in_another_distribution() {
     let ok = deb::verify(&c, &base, "/v/").await.unwrap();
     assert_eq!(ok, format!("Release and {file} served with matching digest (1 packages)"));
 }
+
+#[tokio::test]
+async fn rpm_and_file_verify_units_not_downloaded_yet() {
+    // An on_demand unit has no sha256 in the API until its file is downloaded.
+    let good = hex::encode(Sha256::digest(b"rpm bytes"));
+    let page = |results: Value| {
+        ResponseTemplate::new(200).set_body_json(json!({ "count": results.as_array().unwrap().len(), "next": null, "results": results }))
+    };
+    let served = |p: &str, body: &str| {
+        Mock::given(method("GET"))
+            .and(path(format!("/pulp/content/d/{p}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+    };
+    let pkg = |sha: &Value, pkg_id: &str, kind: &str| json!([{ "location_href": "Packages/f/fixture-a.rpm", "sha256": sha, "pkgId": pkg_id, "checksum_type": kind }]);
+    for (api, pkg_id, kind, ok) in [
+        (Value::Null, good.as_str(), "sha256", true),
+        (Value::Null, "00", "sha256", false),
+        (Value::Null, good.as_str(), "sha1", false),
+        (json!(good), "00", "sha1", true),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{API}content/rpm/packages/")))
+            .respond_with(page(pkg(&api, pkg_id, kind)))
+            .mount(&server)
+            .await;
+        served("repodata/repomd.xml", "<repomd/>").mount(&server).await;
+        served("Packages/f/fixture-a.rpm", "rpm bytes").mount(&server).await;
+        let c = client(&server, |_, _| {});
+        let res = pulp_tui::pulp::rpm::verify(&c, &format!("{}/pulp/content/d/", server.uri()), "/v/", "").await;
+        assert_eq!(res.is_ok(), ok, "api {api}, pkgId {pkg_id} ({kind}): {res:?}");
+    }
+
+    let manifest = format!("a.txt,{good},9\nb.txt,{good},9\n");
+    let file = |p: &str, sha: Value| json!({ "pulp_href": format!("/f/{p}/"), "relative_path": p, "sha256": sha });
+    for (files, ok) in [
+        (json!([file("a.txt", json!(good)), file("b.txt", Value::Null)]), true),
+        (json!([file("a.txt", json!("00")), file("b.txt", Value::Null)]), false),
+        (json!([file("a.txt", Value::Null)]), false),
+        (json!([file("a.txt", Value::Null), file("c.txt", Value::Null)]), false),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path(format!("{API}content/file/files/"))).respond_with(page(files.clone())).mount(&server).await;
+        served("PULP_MANIFEST", &manifest).mount(&server).await;
+        let c = client(&server, |_, _| {});
+        let res = pulp_tui::pulp::file::verify(&c, &format!("{}/pulp/content/d/", server.uri()), "/v/").await;
+        assert_eq!(res.is_ok(), ok, "{files}: {res:?}");
+    }
+}

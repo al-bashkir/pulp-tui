@@ -31,7 +31,7 @@
 | `↑ ↓ j k PgUp PgDn Ctrl-D Ctrl-U g G` | move (in the screen list: `j k g G` choose a screen) |
 | `h` / `l` | from the list to the screen list / from the screen list open the screen |
 | `Enter` | action menu of the selected item (shows the shortcut letter of each action; `*` marks actions that change the server) |
-| `/` | server-side search (empty clears) |
+| `/` | search: server-side, or in the list for Content Views and other pulp-tui screens (empty clears; lists the API cannot filter, such as Versions and Publications, say `this list has no search`) |
 | `s` / `S` | sort by next column / reverse (current page) |
 | `n` / `p` | next / previous page (100 items per page) |
 | `Space` | mark item (compare, bulk remove or add content) |
@@ -194,7 +194,8 @@ which also copies the Release, component and architecture records, so apt finds 
 repository version; old versions are unchanged.
 
 ### Publications
-`t` switches RPM/File/Deb. **c** create from repository name and optional version number,
+`t` switches RPM/File/Deb. **c** create from repository name and optional version number
+(Deb: and the optional signing service, as in Repositories),
 **D** distribute (Deb: pins the selected publication, also one with a signing service), **d** delete (names the distributions that serve it, and you type the
 publication id; refused for publications of Content View snapshots).
 
@@ -205,9 +206,11 @@ repository version) or **FOLLOWS LATEST** (repository). **y** copies the content
 a repository: its newest publication, which is not the latest version when that version has
 no publication), **b** re-points to a version (preview first; Deb: with the signing service
 of the publication it serves now), **c**/**e** create/edit
-(name, base path, binding, content guard, labels), **d** delete. A distribution of a
+(name, base path, binding, content guard, labels; Deb: the optional signing service of a
+pinned publication), **d** delete. A distribution of a
 Content View (label `pulp_tui_cv`) cannot be re-pointed or re-bound here (use promote or
-roll back); its base path and labels can be edited, and delete warns.
+roll back) or renamed, and its `pulp_tui_*` labels stay (promote finds it by name and
+labels); its base path and other labels can be edited, and delete warns.
 
 ### Content Views
 Managed by pulp-tui (see `docs/ARCHITECTURE.md`). Columns: composite (`yes` for a
@@ -443,7 +446,8 @@ Tracked tasks with state, progress (only what Pulp reports; no invented percenta
 start time and errors. The top box lists client operations still running. **W** opens a
 live view of the task (state, progress reports, times, error, created resources) that
 refreshes until the task ends; **i** details with all progress reports, **X** cancel on
-the server (confirmation), **z** dismiss finished tasks from the list. `t` switches to all
+the server (confirmation), **z** dismiss finished tasks from the list (above 500 tracked
+tasks, the oldest finished one goes by itself). `t` switches to all
 server tasks (**a** tracks one; **W** tracks it and opens the live view).
 
 ### Logs
@@ -833,7 +837,8 @@ profile (`--profile`, `$PULP_TUI_PROFILE`, `default_profile`): its own `database
 with `profile <name> uses the local file; db migrate is only for an external database`.
 
 The export file has `"format": 2`. It carries composite views, their components (by view
-name) and the auto publish flag. A pin is written as a version number, but versions are not
+name), the auto publish flag, and the label and protection of Library (`prior` empty; an
+import uses them only when it creates Library). A pin is written as a version number, but versions are not
 exported, so `import-cv` (and **I** on Servers) imports every pin as `latest` and prints a
 line for each: `warning: rocky9: component os was pinned to v1; imported as latest` (the TUI
 shows one warning notice). Pin the component again with **e**. A component that the import

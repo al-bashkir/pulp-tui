@@ -253,8 +253,10 @@ impl Profile {
         if !url.username().is_empty() || url.password().is_some() {
             bail!("url must not hold credentials; use username and secret");
         }
+        // reqwest reads a proxy without a scheme as `http://...`.
+        let password = |s: &str| url::Url::parse(s).is_ok_and(|u| u.password().is_some());
         if let Some(px) = &self.proxy
-            && url::Url::parse(px).is_ok_and(|u| u.password().is_some())
+            && (password(px) || password(&format!("http://{px}")))
         {
             bail!("proxy must not hold a password; set the proxy in HTTPS_PROXY instead");
         }
@@ -514,10 +516,14 @@ read_only = true
         p.url = "https://admin:hunter2@h:99999".into();
         assert!(!format!("{:#}", p.validate().unwrap_err()).contains("hunter2"));
         p.url = "https://h".into();
-        p.proxy = Some("http://u:pw@proxy:3128".into());
-        assert!(p.validate().unwrap_err().to_string().starts_with("proxy must not hold a password"));
-        p.proxy = Some("http://u@proxy:3128".into());
-        p.validate().unwrap();
+        for px in ["http://u:pw@proxy:3128", "u:pw@proxy:3128", "1u:pw@proxy:3128"] {
+            p.proxy = Some(px.into());
+            assert!(p.validate().unwrap_err().to_string().starts_with("proxy must not hold a password"), "{px}");
+        }
+        for px in ["http://u@proxy:3128", "proxy:3128", "https://proxy.corp:8443", "socks5://proxy:1080"] {
+            p.proxy = Some(px.into());
+            p.validate().unwrap();
+        }
     }
 
     #[test]

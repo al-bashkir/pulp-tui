@@ -400,6 +400,11 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
             });
         }
         Act::Replicate => {
+            // Also here: an Upstream Pulp made with another tool never passed the check of the form.
+            let origin = url::Url::parse(&s(&item, "base_url")).map(|u| u.origin().ascii_serialization()).unwrap_or_default();
+            if let Err(e) = replication::guard_self(&origin, &dst_origin) {
+                return app.error(e.to_string());
+            }
             let policy = s(&item, "policy");
             let mut lines = vec![
                 format!("Replicate from {} into this server ({dst_origin}).", s(&item, "base_url")),
@@ -560,6 +565,21 @@ mod tests {
         assert_eq!(super::replication_types("rpm+file"), [RepoType::Rpm, RepoType::File]);
         assert_eq!(super::replication_types("rpm"), [RepoType::Rpm]);
         assert_eq!(super::replication_types("file"), [RepoType::File]);
+    }
+
+    #[tokio::test]
+    async fn replicate_refuses_an_upstream_that_is_this_server() {
+        use crate::config::{AuthMethod, Config, Profile};
+        use crate::tui::app::App;
+        let mut cfg = Config::default();
+        cfg.profiles.insert("lab".into(), Profile { url: "https://pulp.example.com".into(), auth: AuthMethod::None, ..Default::default() });
+        let local = std::sync::Arc::new(crate::store::Store::open_in_memory().await.unwrap());
+        let mut app = App::new(cfg, "/dev/null".into(), local, Err(String::new()));
+        app.profile = Some("lab".into());
+        let item = serde_json::json!({ "pulp_href": "/u/1/", "name": "loop", "base_url": "https://pulp.example.com/" });
+        super::upstream_action(&mut app, crate::tui::kinds::Act::Replicate, item);
+        assert!(app.modal.is_none(), "no confirmation");
+        assert!(app.notices.iter().any(|n| n.text.contains("refusing self-replication")));
     }
 
     #[test]

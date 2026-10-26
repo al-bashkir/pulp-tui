@@ -32,18 +32,22 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str, layout: &str) -> 
     }
     let q = [
         ("repository_version", version.to_string()),
-        ("fields", "location_href,sha256".into()),
+        ("fields", "location_href,sha256,pkgId,checksum_type".into()),
         ("ordering", "size_package".into()),
         ("limit", "1".into()),
     ];
     let pkgs: Page<Value> = c.list(&c.api(RepoType::Rpm.content()), &q).await?;
     let Some(p) = pkgs.results.first() else { return Ok("repomd.xml served (no packages)".into()) };
     let loc = p["location_href"].as_str().unwrap_or_default();
+    // `sha256` comes from the stored file: `null` for an on_demand package until a client downloads it.
+    let Some(want) = p["sha256"].as_str().or_else(|| p["pkgId"].as_str().filter(|_| p["checksum_type"] == "sha256")) else {
+        return fail(format!("package {loc} has no SHA256 digest in Pulp"));
+    };
     // Publications use the layout; mirror_complete publications keep upstream paths.
     let candidates: Vec<String> = package_path(layout, loc).into_iter().chain([loc.to_string()]).collect();
     for path in &candidates {
         let (status, body) = c.fetch_content(&format!("{base}{path}"), 64 << 20).await?;
-        if status == 200 && p["sha256"].as_str() == Some(hex::encode(Sha256::digest(&body)).as_str()) {
+        if status == 200 && hex::encode(Sha256::digest(&body)) == want {
             return Ok(format!("repomd.xml and {path} served with matching digest ({} packages)", pkgs.count));
         }
     }

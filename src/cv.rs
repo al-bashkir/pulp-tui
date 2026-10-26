@@ -396,14 +396,18 @@ impl CvService {
             let sv = repo.latest_version_href.ok_or_else(|| anyhow!("{} has no versions", r.repo_name))?;
             sources.push(sv);
         }
+        let rows: Vec<CvVersionRepo> = repos
+            .iter()
+            .zip(sources)
+            .map(|(r, sv)| CvVersionRepo {
+                repo: Some(r.clone()),
+                source_version: Some(sv),
+                signing: signing.into(), // a checkpoint: a resumed publish signs as asked
+                ..Default::default()
+            })
+            .collect();
         self.alive()?;
-        let v = self.store.begin_version(cv_id, notes, &repos).await?;
-        for (mut vr, sv) in self.store.version_repos(v.id).await?.into_iter().zip(sources) {
-            vr.source_version = Some(sv);
-            vr.signing = signing.into(); // a checkpoint: a resumed publish signs as asked
-            self.alive()?;
-            self.store.save_version_repo(&vr).await?;
-        }
+        let v = self.store.begin_snapshot_version(cv_id, notes, &rows).await?;
         self.audit("cv.publish.start", &format!("{} version {}", cv.name, v.number)).await;
         log(format!("{} v{}: publishing {} repositories", cv.name, v.number, repos.len()));
         self.resume(v.id, log, on).await
@@ -617,8 +621,9 @@ impl CvService {
                     self.alive()?;
                     anyhow::Ok(match t {
                         _ if remove => ops::remove_content(c, &derived, units.unwrap_or_default()).await?,
-                        RepoType::Rpm => rpm::copy(c, &sv, &derived, empty.then_some(0), units, false).await?,
-                        RepoType::File => file::modify(c, &derived, units.unwrap_or_default()).await?,
+                        RepoType::Rpm if empty => rpm::copy(c, &sv, &derived, Some(0), None, false).await?,
+                        // `rpm/copy/` would add the newest package of each comps group member that a batch lacks.
+                        RepoType::Rpm | RepoType::File => ops::add_content(c, &derived, units.unwrap_or_default()).await?,
                         RepoType::Deb => deb::copy(c, &sv, &derived, empty.then_some(0), units).await?,
                     })
                 };
@@ -659,7 +664,8 @@ impl CvService {
                 ("signing", deb_signing_patch(&vr.signing, &src, &dst), service)
             }
         };
-        if !patch.is_empty() {
+        let changed = !patch.is_empty();
+        if changed {
             log(format!("{}: {what}: {}", repo.repo_name, patch.keys().cloned().collect::<Vec<_>>().join(", ")));
             self.alive()?;
             let m = match (c.patch(&derived, &Value::Object(patch)).await, service) {
@@ -676,10 +682,12 @@ impl CvService {
         log(format!("{}: publishing {dv}", repo.repo_name));
         self.alive()?;
         vr.publication = Some(match t {
-            RepoType::Rpm | RepoType::File => ops::ensure_publication(c, t, &dv, None, on).await?,
-            // Never reused: a publication signed with the repository's keys stores `signing_service: null`, so
+            // A publication keeps the settings the repository had when it was made: after the PATCH, a reused one
+            // (same version: the content did not change) would serve the old ones.
+            RepoType::Rpm | RepoType::File if !changed => ops::ensure_publication(c, t, &dv, None, on).await?,
+            // Deb: never reused: a publication signed with the repository's keys stores `signing_service: null`, so
             // one of another signing choice cannot be told apart. Checkpointed like the copy.
-            RepoType::Deb => {
+            RepoType::Rpm | RepoType::File | RepoType::Deb => {
                 // With `derived_version` set, `pending_task` is the publication task (the copy step clears it with the version).
                 let post = async { anyhow::Ok(c.post(&c.api(t.publications()), &json!({ "repository_version": dv })).await?) };
                 let task = self.tracked_task(vr, "publish", post, log, on).await?;
@@ -1565,6 +1573,96 @@ mod tests {
         assert_eq!(sent, hrefs);
         let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
         assert_eq!((saved.derived_version.as_deref(), saved.pending_task), (Some(format!("{FILE_DERIVED}versions/3/").as_str()), None));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_publish_settings_get_a_new_publication() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, mut vr) = rpm_version(&svc).await;
+        // The content did not change: the snapshot is the version of the previous publish, with its publication.
+        vr.derived_version = Some(format!("{DERIVED}versions/1/"));
+        let ok = |body: Value| ResponseTemplate::new(200).set_body_json(body);
+        let derived = json!({ "pulp_labels": { LABEL_DB: svc.store.db_id() }, "metadata_signing_service": null });
+        Mock::given(method("GET")).and(path(DERIVED)).respond_with(ok(derived)).mount(&server).await;
+        let source = json!({ "metadata_signing_service": "/pulp/api/v3/signing-services/1/" });
+        Mock::given(method("GET")).and(path(vr.repo().repo_href.as_str())).respond_with(ok(source)).mount(&server).await;
+        Mock::given(method("PATCH")).and(path(DERIVED)).respond_with(ok(json!({}))).mount(&server).await;
+        let task = json!({ "task": "/pulp/api/v3/tasks/1/" });
+        Mock::given(method("POST"))
+            .and(path("/pulp/api/v3/publications/rpm/rpm/"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(task))
+            .mount(&server)
+            .await;
+        let publication = "/pulp/api/v3/publications/rpm/rpm/2/";
+        let done =
+            json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "completed", "name": "publish", "created_resources": [publication] });
+        Mock::given(method("GET")).and(path("/pulp/api/v3/tasks/1/")).respond_with(ok(done)).mount(&server).await;
+        svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap();
+        assert_eq!(vr.publication.as_deref(), Some(publication));
+        let sent = server.received_requests().await.unwrap();
+        assert!(
+            sent.iter().all(|r| r.method.as_str() == "POST" || r.url.path() != "/pulp/api/v3/publications/rpm/rpm/"),
+            "no reuse lookup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_filtered_rpm_snapshot_adds_exactly_the_selection() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, mut vr) = rpm_version(&svc).await;
+        vr.repo.as_mut().unwrap().filters = crate::filters::parse_rules("exclude name=*-debug", RepoType::Rpm).unwrap();
+        let sv = vr.source_version.clone().unwrap();
+        let page = |results: Vec<Value>| {
+            ResponseTemplate::new(200).set_body_json(json!({ "count": results.len(), "next": null, "results": results }))
+        };
+        let h = |kind: &str, n: u32| format!("/pulp/api/v3/content/rpm/{kind}/{n}/");
+        let pkg =
+            |n: u32, name: &str| json!({ "pulp_href": h("packages", n), "name": name, "version": "1", "release": "1", "arch": "x86_64" });
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/content/rpm/packages/"))
+            .respond_with(page(vec![pkg(1, "nginx"), pkg(2, "nginx-debug")]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/pulp/api/v3/content/rpm/advisories/")).respond_with(page(vec![])).mount(&server).await;
+        // The comps group lists both packages; `rpm/copy/` would add the excluded one with it.
+        let source = [h("packages", 1), h("packages", 2), h("packagegroups", 1)];
+        let latest = format!("{DERIVED}versions/1/");
+        for (version, units) in [(sv.as_str(), &source[..]), (latest.as_str(), &[])] {
+            let results = units.iter().map(|u| json!({ "pulp_href": u })).collect();
+            Mock::given(method("GET"))
+                .and(path("/pulp/api/v3/content/"))
+                .and(query_param("repository_version", version))
+                .respond_with(page(results))
+                .mount(&server)
+                .await;
+        }
+        let derived = json!({ "pulp_href": DERIVED, "name": "web-os", "latest_version_href": latest, "pulp_labels": { LABEL_DB: svc.store.db_id() } });
+        Mock::given(method("GET")).and(path(DERIVED)).respond_with(ResponseTemplate::new(200).set_body_json(derived)).mount(&server).await;
+        let task = json!({ "task": "/pulp/api/v3/tasks/1/" });
+        Mock::given(method("POST"))
+            .and(path(format!("{DERIVED}modify/")))
+            .respond_with(ResponseTemplate::new(202).set_body_json(task))
+            .mount(&server)
+            .await;
+        let created = format!("{DERIVED}versions/2/");
+        let done = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "completed", "name": "modify", "created_resources": [created] });
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/tasks/1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(done))
+            .mount(&server)
+            .await;
+        let version = json!({ "pulp_href": created, "number": 2 });
+        Mock::given(method("GET")).and(path(&created)).respond_with(ResponseTemplate::new(200).set_body_json(version)).mount(&server).await;
+        svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err(); // the publish step is not served
+        assert_eq!(modify_bodies(&server).await, [json!({ "add_content_units": [h("packages", 1), h("packagegroups", 1)] })]);
+        let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
+        assert_eq!(saved.derived_version, Some(created));
     }
 
     #[tokio::test(flavor = "multi_thread")]

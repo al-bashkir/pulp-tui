@@ -78,31 +78,35 @@ idle group whose counts stay the same for three polls is also treated as final.
   Then for each repository:
   1. find or create the derived repository `pulp-tui-cv-<view>-<repo>`, labeled
      `pulp_tui_cv=<view>`, with no retention limit;
-  2. copy the selected content into it from an empty base: RPM uses `rpm/copy/` with
-     `dest_base_version: 0` (all content, or an explicit list when filters exist); File
-     uses `modify` with `remove_content_units: ["*"]`; Deb uses `deb/copy/` like RPM, with
-     `structured: true` (the release, component and architecture records of the copied
-     packages come with them) and `dependency_solving: false`;
+  2. fill it with the selected content. Without filters, RPM uses `rpm/copy/` and Deb
+     `deb/copy/` with `dest_base_version: 0` (all content, one request). With filters (File:
+     always), the latest derived version changes only where it differs from the selection:
+     `modify/` removes the units that are no longer selected, then RPM and File add the
+     missing ones with `modify/` (exactly those units) and Deb with `deb/copy/`
+     (`structured: true`: the release, component and architecture records of the copied
+     packages come with them; `dependency_solving: false`);
   3. record the new repository version (or the latest one if the content did not change);
   4. give the derived repository the publish settings of the source (RPM) or the signing
      choice (Deb: `signing_service` and `signing_service_release_overrides`, only the fields
      that differ, and only fields the server has);
-  5. RPM and File: reuse or create the publication of that version. Deb: always create one,
-     because a publication signed with repository keys stores `signing_service: null` and
-     cannot be told apart from an unsigned one.
+  5. RPM and File: reuse or create the publication of that version; after a PATCH of step 4,
+     always create one, because a publication keeps the settings that the repository had
+     when it was made (an unchanged selection records the version of the previous publish).
+     Deb: always create one, because a publication signed with repository keys stores
+     `signing_service: null` and cannot be told apart from an unsigned one.
   Every step writes a checkpoint. The href of a submitted copy task is stored before
   waiting, so an interrupted publish **re-attaches to the same task** and does not submit
   it again. A copy task that failed or was canceled is cleared from the checkpoint, so the
-  next *Resume* submits the copy again (it starts from an empty base). The Deb publication
-  task uses the same checkpoint column (`pending_task`): with no derived version recorded it
+  next *Resume* submits the copy again (it starts from an empty base). A publication task
+  that is always created uses the same checkpoint column (`pending_task`): with no derived version recorded it
   is the copy task, with one it is the publication task (the copy step clears it in the same
   write that records the version).
 * RPM filters select packages by name glob, architecture glob and EVR comparison
   (`rpmvercmp` port, tested with rpm's own cases). An advisory is kept only when every
   package it references that exists in the source is selected. Other metadata (comps,
-  modules, distribution trees, repo metadata files) is copied unchanged. Module artifact
-  packages are copied with their module even when a filter excludes them, because
-  `rpm/copy/` adds module children.
+  modules, distribution trees, repo metadata files) is copied unchanged. A filtered snapshot
+  holds exactly the selection: a package that a filter excludes stays out, also when a module
+  or a comps group lists it (`rpm/copy/` would add it, see COMPATIBILITY.md).
 * Deb filters select binary packages by name glob, architecture glob and dpkg version
   comparison. A filtered snapshot has only the selected packages and the release records
   that the structured copy adds; source packages and upstream index files are dropped (the
@@ -289,7 +293,8 @@ Schema 3 added `environments.label`, the path segment of an environment (unique 
 scope; `validate_label`). The migration sets it to `lower(name)`, which is exactly the
 segment that served paths used before (so `Dev` and `dev` share `dev` and nothing moves),
 and seeds `scope_settings` with the first segment of `binding_repos.base_path` (usually
-`cv`; no longer read). Export (format 2) and `db copy` carry the labels;
+`cv`; no longer read). Export (format 2) and `db copy` carry the labels, also the label and
+the protection of Library (an import that finds a Library keeps it; `db copy` protects it);
 `db copy` refuses a label that another environment uses in the target scope. An external
 database at schema 2 needs `db migrate` after the upgrade.
 Schema 4 added composite Content Views: `content_views.composite` and `auto_publish`
@@ -301,8 +306,10 @@ Export format 2 carries composites, components by view name, the auto publish fl
 pin as a version number. Versions are not exported, so import turns every pin into `latest`
 and returns a warning that names it (the CLI prints it as `warning: ...`, the TUI shows one
 warning notice); a missing component, or a composite used as component, is skipped with a
-warning. Import checks every name, label and filter rule before its first write, so a bad
-entry leaves nothing behind. Import still reads format 1; an older pulp-tui refuses format 2 (its check is
+warning. Import checks every name, label and filter rule before its first write, and also
+names and labels that are in the file twice, labels that the target already uses and
+priors that do not exist, so a bad entry leaves nothing behind (a create by another operator
+at the same time can still stop it halfway). Import still reads format 1; an older pulp-tui refuses format 2 (its check is
 `format != 1`). `db copy` copies composites, components with pins, the recorded component
 versions and the borrowed rows, with every id remapped. The links between composites,
 components and versions are written after all views and versions, so a composite that

@@ -278,6 +278,11 @@ pub async fn remove_content(c: &PulpClient, repo: &str, units: Vec<String>) -> R
     c.post(&format!("{repo}modify/"), &json!({ "remove_content_units": units })).await
 }
 
+/// A new version of `repo` with `units` added (any content type), exactly those: no related units.
+pub async fn add_content(c: &PulpClient, repo: &str, units: Vec<String>) -> Result<Mutation> {
+    c.post(&format!("{repo}modify/"), &json!({ "add_content_units": units })).await
+}
+
 /// Bytes of hrefs in one copy or modify body. Pulp refuses a body above Django's
 /// `DATA_UPLOAD_MAX_MEMORY_SIZE` (default 2,621,440) with HTTP 400; this leaves room for the rest.
 const BATCH_BYTES: usize = 2_000_000;

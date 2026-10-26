@@ -743,9 +743,16 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             app.job(format!("impact of deleting {name}"), move |ctx| async move {
                 let c = &ctx.client;
                 // Fails closed: without the Content View store the snapshot check cannot run.
-                let protected = ctx.cv()?.store.protected_versions(&ctx.scope).await?.iter().filter(|v| v.starts_with(&href)).count();
+                let st = ctx.cv()?.store;
+                let protected = st.protected_versions(&ctx.scope).await?.iter().filter(|v| v.starts_with(&href)).count();
                 if protected > 0 {
                     bail!("refused: {protected} version(s) of {name} are Content View snapshots; delete those Content View versions first");
+                }
+                let mut sources = vec![];
+                for cv in st.content_views(&ctx.scope).await? {
+                    if st.cv_repos(cv.id).await?.iter().any(|r| r.repo_href == href) {
+                        sources.push(cv.name);
+                    }
                 }
                 let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", href.clone())], 100_000).await?;
                 let versions: Page<Value> = c.list(&format!("{href}versions/"), &[("limit", "1".into())]).await?;
@@ -761,6 +768,9 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 } else {
                     lines.push(format!("WARNING: {} distribution(s) serve it and stop serving:", users.len()));
                     lines.extend(users);
+                }
+                if !sources.is_empty() {
+                    lines.push(format!("WARNING: Content View(s) {} use it as a source; their next publish fails.", sources.join(", ")));
                 }
                 ap(move |app| {
                     app.confirm_danger(format!("Delete repository {name}"), lines, &name.clone(), move |app| {
@@ -936,7 +946,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                                         }
                                         sent = Some(match t {
                                             RepoType::Rpm => rpm::copy(&c, &sv, &href, None, units, deps).await?,
-                                            RepoType::File => file::modify(&c, &href, units.unwrap_or_default()).await?,
+                                            RepoType::File => ops::add_content(&c, &href, units.unwrap_or_default()).await?,
                                             RepoType::Deb => deb::copy(&c, &sv, &href, None, units).await?,
                                         });
                                     }
@@ -1147,7 +1157,7 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 let mut b = json!({});
                 let mut files = vec![];
                 for fld in &f.fields {
-                    let val = fld.value.trim().to_string();
+                    let val = f.get(&fld.key).to_string();
                     let secretish = matches!(fld.kind, FieldKind::Secret) || matches!(fld.key.as_str(), "username" | "proxy_username");
                     // Write-only file paths: the body gets the file's content.
                     let file = matches!(fld.key.as_str(), "ca_cert" | "client_cert" | "client_key" | "gpgkey");
@@ -1353,7 +1363,7 @@ fn content_action(app: &mut App, version: String, act: Act) {
                     if let Some(e) = snapshot_refusal(&r) {
                         bail!(e);
                     }
-                    let m = c.post(&format!("{repo}modify/"), &json!({ "remove_content_units": units })).await?;
+                    let m = ops::remove_content(c, &repo, units).await?;
                     ap(move |app| {
                         // Only after success: on a failure the operator keeps the marks.
                         if app.list.kind == kind {
@@ -1380,9 +1390,7 @@ fn content_action(app: &mut App, version: String, act: Act) {
                         bail!(e);
                     }
                     let m = match t {
-                        RepoType::Rpm | RepoType::File => {
-                            c.post(&format!("{}modify/", s(&r, "pulp_href")), &json!({ "add_content_units": units })).await?
-                        }
+                        RepoType::Rpm | RepoType::File => ops::add_content(c, &s(&r, "pulp_href"), units).await?,
                         // modify/ adds no release component records, so apt would not see the packages.
                         RepoType::Deb => deb::copy(c, &version, &s(&r, "pulp_href"), None, Some(units)).await?,
                     };
@@ -1406,15 +1414,15 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     match act {
         Act::Create => {
-            let form = Form::new(
-                format!("New {} publication", t.label()),
-                vec![
-                    Field::pick("repo", "Repository", Source::Repos(Some(t))).required(),
-                    Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
-                ],
-            );
+            let mut fields = vec![
+                Field::pick("repo", "Repository", Source::Repos(Some(t))).required(),
+                Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
+            ];
+            fields.extend(signing_field(app, t));
+            let form = Form::new(format!("New {} publication", t.label()), fields);
             app.form(form, move |app, f| {
                 let (repo, number) = (f.get("repo").to_string(), f.number("number"));
+                let signing = f.opt("signing_service").map(str::to_string);
                 app.job(format!("publish {repo}"), move |ctx| async move {
                     let c = &ctx.client;
                     let r: Value =
@@ -1423,7 +1431,7 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         Some(n) => version_of(&s(&r, "pulp_href"), n),
                         None => r["latest_version_href"].as_str().ok_or_else(|| anyhow!("no versions"))?.to_string(),
                     };
-                    let p = ops::ensure_publication(c, t, &v, None, &ctx.on_task()).await?;
+                    let p = ops::ensure_publication(c, t, &v, signing.as_deref(), &ctx.on_task()).await?;
                     ap(move |app| {
                         app.ok(format!("publication {} of {}", short(&p), short(&v)));
                         app.reload();
@@ -1520,24 +1528,30 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             let v = if edit { item.clone() } else { Value::Null };
             let modes = ["publication of a repository version", "follow repository latest", "none"].map(String::from).to_vec();
             let (owner, bound_to_version) = (cv_owner(&v), v["repository_version"].is_string());
-            let mut form = Form::new(
-                if edit { format!("Edit distribution {name}") } else { format!("New {} distribution", t.label()) },
-                vec![
-                    Field::text("name", "Name").required().value(s(&v, "name")),
-                    Field::text("base_path", "Base path").required().value(s(&v, "base_path")),
-                    Field::new("mode", "Serve", FieldKind::Choice(modes)).value(if v["repository"].is_string() {
-                        "follow repository latest"
-                    } else {
-                        "publication of a repository version"
-                    }),
-                    Field::pick("repo", "Repository", Source::Repos(Some(t)))
-                        .help("required unless Serve = none; empty on edit = keep binding"),
-                    Field::new("number", "Version number", FieldKind::Number).help("empty = latest version"),
-                    Field::pick("content_guard", "Content guard", Source::ContentGuards).value(s(&v, "content_guard")),
-                    Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
-                ],
-            )
-            .note("Changing the base path or binding changes what consumers receive at this URL.");
+            // Promote finds a view's distribution by its name and ownership labels.
+            let ownership =
+                |labels: &Value| [crate::cv::LABEL_CV, crate::cv::LABEL_ENV, crate::cv::LABEL_DB].map(|k| labels.get(k).cloned());
+            let owned_labels = ownership(&v["pulp_labels"]);
+            let mut fields = vec![
+                Field::text("name", "Name").required().value(s(&v, "name")),
+                Field::text("base_path", "Base path").required().value(s(&v, "base_path")),
+                Field::new("mode", "Serve", FieldKind::Choice(modes)).value(if v["repository"].is_string() {
+                    "follow repository latest"
+                } else {
+                    "publication of a repository version"
+                }),
+                Field::pick("repo", "Repository", Source::Repos(Some(t)))
+                    .help("required unless Serve = none; empty on edit = keep binding"),
+                Field::new("number", "Version number", FieldKind::Number).help("empty = latest version"),
+            ];
+            fields.extend(signing_field(app, t));
+            fields.extend([
+                Field::pick("content_guard", "Content guard", Source::ContentGuards).value(s(&v, "content_guard")),
+                Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
+            ]);
+            let mut form =
+                Form::new(if edit { format!("Edit distribution {name}") } else { format!("New {} distribution", t.label()) }, fields)
+                    .note("Changing the base path or binding changes what consumers receive at this URL.");
             if let Some(cv) = &owner {
                 form = form.note(format!(
                     "Content View {cv} owns this distribution: change what it serves with promote or roll back. Later promotions keep a changed base path."
@@ -1558,12 +1572,18 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                     b["pulp_labels"] = parse_labels(f.get("labels"))?;
                 }
                 let (mode, repo, n) = (f.get("mode").to_string(), f.opt("repo").map(str::to_string), f.number("number"));
+                let signing = f.opt("signing_service").map(str::to_string);
                 if repo.is_none() && mode != "none" && !edit {
                     return Err("repository is required".into());
                 }
                 let rebind = mode == "none" || repo.is_some();
                 if let (Some(cv), true) = (&owner, rebind) {
                     return Err(format!("refused: Content View {cv} owns this distribution; promote or roll back the view instead"));
+                }
+                if let Some(cv) = &owner
+                    && (f.changed("name") || (f.changed("labels") && ownership(&b["pulp_labels"]) != owned_labels))
+                {
+                    return Err(format!("refused: Content View {cv} finds this distribution by its name and pulp_tui labels; keep them"));
                 }
                 let href = href.clone();
                 let label = format!("{} distribution {}", if edit { "update" } else { "create" }, f.get("name"));
@@ -1589,7 +1609,7 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                                 Some(n) => version_of(&rh, n),
                                 None => rv["latest_version_href"].as_str().ok_or_else(|| anyhow!("no versions"))?.to_string(),
                             };
-                            b["publication"] = ops::ensure_publication(c, t, &v, None, &on).await?.into();
+                            b["publication"] = ops::ensure_publication(c, t, &v, signing.as_deref(), &on).await?.into();
                             b["repository"] = Value::Null;
                         }
                     }
@@ -2210,6 +2230,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deb_publication_and_distribution_forms_send_the_picked_service() {
+        use crate::tui::app::Modal;
+        let server = deb_distribute_server().await;
+        let r = json!({ "pulp_href": format!("{API}repositories/deb/apt/r/"), "name": "r", "latest_version_href": "/v/" });
+        get(&server, &format!("{API}repositories/deb/apt/"), page(json!([r]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let set = |form: &mut Form, values: &[(&str, &str)]| {
+            for (k, v) in values {
+                form.fields.iter_mut().find(|f| f.key == *k).unwrap().value = v.to_string();
+            }
+        };
+        publication_action(&mut app, RepoType::Deb, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["repo", "number", "signing_service"]);
+        set(&mut form, &[("repo", "r"), ("signing_service", "/ss/1/")]);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        distribution_action(&mut app, RepoType::Deb, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert!(keys(&form).contains(&"signing_service".to_string()));
+        set(&mut form, &[("name", "d"), ("base_path", "d"), ("repo", "r"), ("signing_service", "/ss/2/")]);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let sent = posts_to(&server, &format!("{API}publications/deb/apt/")).await;
+        let service = |s: &str| json!({ "repository_version": "/v/", "signing_service": s });
+        assert_eq!(sent, [service("/ss/1/"), service("/ss/2/")]);
+    }
+
+    #[tokio::test]
+    async fn repository_delete_names_the_content_views_that_use_it() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/rpm/rpm/1/");
+        for p in [format!("{API}publications/rpm/rpm/"), format!("{repo}versions/"), format!("{API}distributions/rpm/rpm/")] {
+            get(&server, &p, page(json!([]))).await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        let st = app.cv_store.clone().unwrap();
+        let cv = st.create_cv("lab", "web", "").await.unwrap();
+        st.set_cv_repo(
+            cv,
+            &crate::store::CvRepo { repo_href: repo.clone(), repo_name: "os".into(), repo_type: RepoType::Rpm, filters: vec![] },
+        )
+        .await
+        .unwrap();
+        repo_action(&mut app, RepoType::Rpm, Act::Delete, json!({ "pulp_href": repo, "name": "os" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = &app.modal else {
+            panic!("no confirm: {:?}", app.notices.iter().map(|n| &n.text).collect::<Vec<_>>())
+        };
+        assert!(lines.contains(&"WARNING: Content View(s) web use it as a source; their next publish fails.".to_string()), "{lines:?}");
+    }
+
+    #[tokio::test]
     async fn deb_version_publish_asks_for_a_signing_service() {
         use crate::tui::app::Modal;
         let server = deb_distribute_server().await;
@@ -2452,6 +2527,13 @@ mod tests {
         form.fields.iter_mut().find(|f| f.key == "mode").unwrap().value = "none".into();
         let e = submit(&mut app, &form).unwrap_err();
         assert!(e.starts_with("refused: Content View web owns this distribution"), "{e}");
+        form.fields.iter_mut().find(|f| f.key == "mode").unwrap().value = "publication of a repository version".into();
+        let keep = "refused: Content View web finds this distribution by its name and pulp_tui labels; keep them";
+        for (key, value) in [("name", "renamed"), ("labels", "pulp_tui_cv=web"), ("labels", "pulp_tui_cv=other,pulp_tui_env=dev")] {
+            let mut edited = form.clone();
+            edited.fields.iter_mut().find(|f| f.key == key).unwrap().value = value.into();
+            assert_eq!(submit(&mut app, &edited).unwrap_err(), keep, "{key}={value}");
+        }
         distribution_action(&mut app, RepoType::Rpm, Act::Delete, item);
         let Some(Modal::Confirm { lines, .. }) = &app.modal else { panic!("no confirm") };
         assert!(lines.iter().any(|l| l.starts_with("WARNING: Content View web serves environment dev here")), "{lines:?}");

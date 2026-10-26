@@ -1,6 +1,6 @@
 # Implementation status
 
-Date: 2026-10-25. Tested against pulpcore 3.123.0, pulp_rpm 3.39.3, pulp_file 3.123.0,
+Date: 2026-10-26. Tested against pulpcore 3.123.0, pulp_rpm 3.39.3, pulp_file 3.123.0,
 pulp_deb 3.11.1 (`quay.io/pulp/pulp:latest`), see [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Verified workflows
@@ -41,9 +41,9 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
 
 ## Test results (last run)
 
-* `cargo test --lib`: 261 passed
-* `cargo test --test mock_http`: 25 passed
-* Live (`tests/run-live.sh`, 2026-10-25): repos 2, cv 4, rbac 1, failures 2,
+* `cargo test --lib`: 287 passed
+* `cargo test --test mock_http`: 27 passed
+* Live (`tests/run-live.sh`, 2026-10-26): repos 2, cv 4, rbac 1, failures 2,
   replication 2, shared_db 6 (PostgreSQL 16, schema 5), deb 2 — all passed
 * `cargo fmt --check`, `cargo clippy --all-targets -D warnings` (default and
   `--no-default-features`): clean
@@ -118,6 +118,7 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
   `DISTRIBUTED_PUBLICATION_RETENTION_PERIOD` (default 3 days). After a rollback, clients
   that use repository metadata get the old content immediately; direct file URLs may
   still work during the grace period.
-* RPM filters keep module artifact packages with their module, even if excluded.
+* An RPM filter that excludes a package of a module or a comps group excludes it: the module
+  or group then lists a package that the snapshot does not have.
 * The derived repository and distribution names are derived from view, environment and
   repository names; renaming a source repository in Pulp does not rename them.

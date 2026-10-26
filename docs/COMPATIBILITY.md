@@ -97,6 +97,18 @@ server gives the final answer; the dashboard shows a warning.
   `compression_type`, `layout`) come from the repository when the publication request does
   not set them (pulp_rpm `viewsets/repository.py`). A Content View publish copies them from
   the source repository to the snapshot repository first.
+* **`sha256` of RPM packages and File content** comes from the stored file (pulpcore
+  `ContentChecksumSerializer`; read in pulp_rpm 3.39.3 and pulp_file 3.123.0), so it is
+  `null` for `on_demand` and `streamed` content until a client downloads it. Verify then
+  takes the RPM digest from `pkgId` when `checksum_type` is `sha256` (else it fails), and
+  compares a File digest of `PULP_MANIFEST` only where the API has one (the paths always).
+* **`rpm/copy/` with a `content` list adds related units** (pulp_rpm 3.39.3
+  `tasks/copy.py`, `find_children_of_content`, also without dependency solving): the
+  packages and modules that a copied advisory lists, the groups of copied comps categories
+  and environments, and the newest package of each group member whose name the request
+  does not have. It does not add the packages of a module. The check runs per request, so a
+  list sent in batches gets other units than one request. A filtered RPM Content View
+  snapshot therefore adds its units with `modify/`, which adds exactly the given units.
 * **Task cancellation** is asynchronous. A task blocked in a network read can end as
   `failed` before the worker processes the cancel request; pulp-tui shows Pulp's final
   state. Cancelling a completed task returns 409 and is shown as such.

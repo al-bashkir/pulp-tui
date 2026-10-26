@@ -579,7 +579,7 @@ impl App {
             self.track_task(href, label);
         }
         let lines = self.watch_lines(href);
-        self.modal = Some(Modal::Text { title: format!("Watch task {label}"), lines, scroll: 0, watch: Some(href.into()) });
+        self.show(Modal::Text { title: format!("Watch task {label}"), lines, scroll: 0, watch: Some(href.into()) });
     }
 
     fn watch_lines(&self, href: &str) -> Vec<String> {
@@ -725,20 +725,16 @@ impl App {
             anyhow::Ok(apply)
         };
         let label = format!("connect {}", self.profile.as_deref().unwrap_or_default());
-        let tx = self.tx.clone();
-        let id = self.next_id;
-        self.next_id += 1;
-        let handle = tokio::spawn(async move {
-            let result = fut.await.map_err(|e| format!("{e:#}"));
-            let result = result.or_else(|e| {
-                Ok::<Apply, String>(Box::new(move |app: &mut App| {
-                    app.connecting = false;
-                    app.error(format!("connection failed: {e}"));
-                }))
-            });
-            let _ = tx.send(Msg::JobDone { id, result });
+        self.spawn(label, true, async move {
+            let e = match fut.await {
+                Ok(apply) => return Ok(apply),
+                Err(e) => format!("{e:#}"),
+            };
+            ap(move |app| {
+                app.connecting = false;
+                app.error(format!("connection failed: {e}"));
+            })
         });
-        self.jobs.push(Job { id, label, progress: String::new(), started: Instant::now(), abort: handle.abort_handle(), is_load: true });
     }
 
     fn reattach_tasks(&mut self) {
@@ -851,27 +847,17 @@ impl App {
                     });
                     anyhow::Ok(apply)
                 };
-                let tx = self.tx.clone();
-                let id = self.next_id;
-                self.next_id += 1;
-                let handle = tokio::spawn(async move {
-                    let result = fut.await.map_err(|e| format!("{e:#}")).or_else(|e| {
-                        Ok::<Apply, String>(Box::new(move |app: &mut App| {
-                            if app.list.generation == generation {
-                                app.list.loading = false;
-                                app.list.error = Some(e);
-                            }
-                        }))
-                    });
-                    let _ = tx.send(Msg::JobDone { id, result });
-                });
-                self.jobs.push(Job {
-                    id,
-                    label: "load list".into(),
-                    progress: String::new(),
-                    started: Instant::now(),
-                    abort: handle.abort_handle(),
-                    is_load: true,
+                self.spawn("load list".into(), true, async move {
+                    let e = match fut.await {
+                        Ok(apply) => return Ok(apply),
+                        Err(e) => format!("{e:#}"),
+                    };
+                    ap(move |app| {
+                        if app.list.generation == generation {
+                            app.list.loading = false;
+                            app.list.error = Some(e);
+                        }
+                    })
                 });
             }
         }
@@ -896,11 +882,7 @@ impl App {
             if let Some(c) = cols.get(col) {
                 let get = c.get;
                 self.list.items.sort_by(|a, b| {
-                    let (x, y) = (get(a), get(b));
-                    let o = match (x.parse::<f64>(), y.parse::<f64>()) {
-                        (Ok(p), Ok(q)) => p.partial_cmp(&q).unwrap_or(std::cmp::Ordering::Equal),
-                        _ => x.to_lowercase().cmp(&y.to_lowercase()),
-                    };
+                    let o = cell_cmp(&get(a), &get(b));
                     if desc { o.reverse() } else { o }
                 });
             }
@@ -1115,6 +1097,8 @@ impl App {
                 self.reload();
             }
             KeyCode::Char('r') => self.reload(),
+            // The server has no filter for it: a search would show every row under "filter: ...".
+            KeyCode::Char('/') if !self.list.kind.searchable() => self.error("this list has no search"),
             KeyCode::Char('/') => {
                 let cur = self.list.filter.clone();
                 self.input("Search (server-side filter; empty clears)", &cur, |app, s| {
@@ -1379,8 +1363,24 @@ impl App {
         out
     }
 
+    /// The connected client's flag; without a connection (connecting, or it failed) the profile's: the
+    /// Content View screens still write to the store then.
     pub fn read_only(&self) -> bool {
-        self.conn.as_ref().is_some_and(|c| c.client.read_only())
+        match &self.conn {
+            Some(c) => c.client.read_only(),
+            None => self.profile.as_ref().and_then(|p| self.cfg.profiles.get(p)).is_some_and(|p| p.read_only),
+        }
+    }
+}
+
+/// Sort order of two cells: numbers first, by value, then text. A total order: `sort_by` panics without one.
+fn cell_cmp(x: &str, y: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering::{Greater, Less};
+    match (x.parse::<f64>(), y.parse::<f64>()) {
+        (Ok(p), Ok(q)) => p.total_cmp(&q),
+        (Ok(_), Err(_)) => Less,
+        (Err(_), Ok(_)) => Greater,
+        _ => x.to_lowercase().cmp(&y.to_lowercase()),
     }
 }
 
@@ -1604,6 +1604,32 @@ mod tests {
         app.cv_store = Ok(app.store.clone());
         app.cfg.profiles.get_mut("lab").unwrap().database = db(&url);
         assert!(!app.shared());
+    }
+
+    #[test]
+    fn mixed_cells_sort_without_a_panic() {
+        // Numbers and text mixed in one column (versions) made a cycle: 9 < 10 < "2.0-1" < "9".
+        let base = ["9", "10", "2.0-1", "1.2-3", "100", "3", "1:2.0", "nan", "inf", "7.1", "Beta", "alpha"];
+        let mut v: Vec<&str> = (0..300).map(|i| base[(i * 7) % base.len()]).collect();
+        v.sort_by(|a, b| cell_cmp(a, b));
+        v.dedup();
+        assert_eq!(v, ["3", "7.1", "9", "10", "100", "inf", "nan", "1.2-3", "1:2.0", "2.0-1", "alpha", "Beta"]);
+    }
+
+    #[tokio::test]
+    async fn read_only_holds_without_a_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = external_store(&dir).await;
+        let local = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut cfg = lab("https://pulp.example.com");
+        cfg.profiles.get_mut("lab").unwrap().read_only = true;
+        let mut app = App::new(cfg, "/dev/null".into(), local, Ok(st));
+        app.profile = Some("lab".into()); // the Pulp connection failed or still runs: no `conn`
+        app.list = ListState::new(Kind::ContentViews);
+        assert!(app.read_only() && app.shared());
+        assert!(!app.available_actions(&Value::Null).contains(&Act::Create));
+        super::super::actions::run(&mut app, Act::Create, Value::Null);
+        assert!(app.modal.is_none() && app.notices.iter().any(|n| n.text.contains("read-only mode")));
     }
 
     #[tokio::test]
@@ -1845,6 +1871,17 @@ mod tests {
             Some(Modal::Text { lines, .. }) => lines.clone(),
             _ => panic!("no text modal"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_watch_from_a_job_waits_for_the_open_dialog() {
+        let mut app = app_on(Kind::Tasks).await;
+        app.input("Search", "half typ", |_, _| {});
+        app.applying = true; // the result of a job (CvVersions W) runs
+        app.watch_task("/t/1/", "copy");
+        app.applying = false;
+        assert!(matches!(&app.modal, Some(Modal::Input { .. })), "the open dialog keeps its text");
+        assert_eq!(app.queued.len(), 1);
     }
 
     #[tokio::test]

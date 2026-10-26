@@ -46,7 +46,11 @@ impl Tracked {
     }
 }
 
+/// Finished tasks beyond this many are dropped, oldest first: every update rebuilds the rows of all tasks.
+const MAX_TRACKED: usize = 500;
+
 pub struct TaskCenter {
+    /// Newest first.
     pub items: Vec<Tracked>,
     min: Duration,
     max: Duration,
@@ -78,6 +82,11 @@ impl TaskCenter {
                 driven_until: None,
             },
         );
+        while self.items.len() > MAX_TRACKED
+            && let Some(i) = self.items.iter().rposition(Tracked::is_final)
+        {
+            self.items.remove(i);
+        }
     }
 
     /// Apply a task snapshot. Returns true when the task just reached a final state.
@@ -181,6 +190,19 @@ mod tests {
         tc.gone("/t/2/");
         assert_eq!(tc.active(), 3, "a task the server does not have is final");
         assert_eq!(tc.dismiss_finished(), 1);
+    }
+
+    #[test]
+    fn finished_tasks_are_dropped_oldest_first_above_the_cap() {
+        let mut tc = TaskCenter::new((Duration::ZERO, Duration::from_millis(50)));
+        tc.track("/t/running/", "x", "running");
+        for i in 0..MAX_TRACKED + 100 {
+            tc.update(task(&format!("/t/{i}/"), "completed"), false);
+        }
+        assert_eq!(tc.items.len(), MAX_TRACKED);
+        assert_eq!(tc.items[0].href, format!("/t/{}/", MAX_TRACKED + 99), "the newest stays");
+        assert!(tc.items.iter().any(|t| t.href == "/t/running/"), "an unfinished task is never dropped");
+        assert!(!tc.items.iter().any(|t| t.href == "/t/0/"));
     }
 
     #[test]

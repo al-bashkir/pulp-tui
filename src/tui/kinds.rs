@@ -403,6 +403,11 @@ impl Kind {
         })
     }
 
+    /// `/` filters this list: on the server, or in the client for lists that are not API-backed.
+    pub fn searchable(&self) -> bool {
+        self.source().is_none_or(|(_, _, search)| search.is_some())
+    }
+
     /// API collection path and extra query for API-backed screens.
     fn source(&self) -> Option<Source> {
         let name = Some("name__icontains");
@@ -852,24 +857,25 @@ pub async fn load(
             let store = store?;
             store.ensure_library(scope).await?;
             let envs = store.environments(scope).await?;
-            let cvs = store.content_views(scope).await?;
-            let mut out = vec![];
-            for e in &envs {
-                let mut bound = vec![];
-                for cv in &cvs {
-                    if let Ok(Some(b)) = store.binding(e.id, cv.id).await
-                        && let Ok(v) = store.version(b.version_id).await
-                    {
-                        bound.push(format!("{}:v{}", cv.name, v.number));
+            // Two queries per view, not two per environment and view.
+            let mut bound: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+            for cv in store.content_views(scope).await? {
+                let numbers: std::collections::HashMap<i64, i64> = store.versions(cv.id).await?.iter().map(|v| (v.id, v.number)).collect();
+                for b in store.bindings_for_cv(cv.id).await? {
+                    if let Some(n) = numbers.get(&b.version_id) {
+                        bound.entry(b.env_id).or_default().push(format!("{}:v{n}", cv.name));
                     }
                 }
-                out.push(json!({
-                    "id": e.id, "name": e.name, "label": e.label, "library": e.name == LIBRARY && e.prior_id.is_none(),
-                    "prior": e.prior_id.and_then(|p| envs.iter().find(|x| x.id == p)).map(|x| x.name.clone()).unwrap_or_default(),
-                    "protected": e.protected, "bound": bound.join(", "),
-                }));
             }
-            out
+            envs.iter()
+                .map(|e| {
+                    json!({
+                        "id": e.id, "name": e.name, "label": e.label, "library": e.name == LIBRARY && e.prior_id.is_none(),
+                        "prior": e.prior_id.and_then(|p| envs.iter().find(|x| x.id == p)).map(|x| x.name.clone()).unwrap_or_default(),
+                        "protected": e.protected, "bound": bound.get(&e.id).map(|b| b.join(", ")).unwrap_or_default(),
+                    })
+                })
+                .collect()
         }
         Kind::Logs { polls } => crate::session_log::rows(*polls),
         _ => vec![],
@@ -974,6 +980,32 @@ mod tests {
         let k = Kind::CvVersions { cv: os, name: "os".into() };
         let (versions, _) = load(&k, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap();
         assert!(versions.iter().all(|v| v["components"] == json!([])));
+    }
+
+    #[test]
+    fn search_only_where_a_filter_applies() {
+        assert!(Kind::Repos(RepoType::Rpm, false).searchable(), "server-side name filter");
+        assert!(Kind::ContentViews.searchable(), "filtered in the client");
+        assert!(!Kind::Versions(Some(("/r/".into(), "r".into()))).searchable(), "the API has no filter for it");
+    }
+
+    #[tokio::test]
+    async fn environment_rows_name_the_bound_views() {
+        let (st, cfg) = (Store::open_in_memory().await.unwrap(), Config::default());
+        let lib = st.ensure_library("lab").await.unwrap();
+        let dev = st.create_env("lab", "Dev", lib, false).await.unwrap();
+        let (os, web) = (st.create_cv("lab", "os", "").await.unwrap(), st.create_cv("lab", "web", "").await.unwrap());
+        let (o1, o2, w1) = (
+            st.begin_version(os, "", &[]).await.unwrap(),
+            st.begin_version(os, "", &[]).await.unwrap(),
+            st.begin_version(web, "", &[]).await.unwrap(),
+        );
+        st.set_binding(lib, os, o2.id, "active").await.unwrap();
+        st.set_binding(dev, os, o1.id, "active").await.unwrap();
+        st.set_binding(lib, web, w1.id, "partial").await.unwrap();
+        let (rows, _) = load(&Kind::Environments, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap();
+        let bound: Vec<(String, String)> = rows.iter().map(|r| (s(r, "name"), s(r, "bound"))).collect();
+        assert_eq!(bound, [("Library".to_string(), "os:v2, web:v1".to_string()), ("Dev".to_string(), "os:v1".to_string())]);
     }
 
     #[tokio::test]
