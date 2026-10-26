@@ -5,6 +5,7 @@
 #
 #   tests/run-live.sh            all scenarios
 #   tests/run-live.sh repos cv   selected scenarios (repos cv rbac failures replication shared_db deb)
+#   tests/run-live.sh real       real Debian main and Rocky 9 upstreams (needs internet; not in "all")
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,7 +26,8 @@ for s in $scenarios; do
   [ "$s" = replication ] && $ENV up pulp2
   [ "$s" = shared_db ] && $ENV pg-up
   [ "$s" = deb ] && $ENV deb-signing-up pulp1
+  real=; [ "$s" = real ] && real=1
   echo "== live scenario: $s"
-  PULP_TUI_LIVE=1 cargo test --test "live_$s" -- --test-threads=1
+  PULP_TUI_LIVE=1 PULP_TUI_REAL=$real cargo test --test "live_$s" -- --test-threads=1
 done
 echo "all requested scenarios passed"

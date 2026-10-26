@@ -12,6 +12,8 @@ Automated against real Pulp containers (`tests/run-live.sh`):
 | RPM: local repo, upload, remote, sync, inspect version, publish, distribute, fetch served metadata and package, update, publish, roll back, verify | `live_repos::rpm_lifecycle` |
 | File: local repo, single and chunked upload, remove content, sync from manifest, publish, distribute, fetch served files, update, roll back, verify | `live_repos::file_lifecycle` |
 | Deb: remote with distribution `fixture`, mirror sync (4 packages), structured copy with `exclude name=*-dbg` (3 packages and the Release records), publish, distribute, served `Packages` index without the excluded package and package digest; a publication with the test signing service `pulp-tui-deb-test` is reused for that service only (the repository default gets another one) and serves `Release`, `Release.gpg` and `InRelease` | `live_deb::deb_mirror_copy_publish_verify` |
+| File: a file uploaded as `reports/q1,2024.txt` (a comma in the path) is published, served and verified (`PULP_MANIFEST matches 1 files`) | `live_repos::file_path_with_a_comma_is_served_and_verified` |
+| Deb: a package removed together with its release records (`deb::with_release_records`, `modify/`) is not in the served `Packages` index of the new publication; the other packages are | `live_deb::a_removed_deb_package_is_no_longer_served` |
 | Deb Content View: `exclude name=*-dbg`, preview (`+ fixture-alpha_1.0-1_amd64`, no `fixture-beta-dbg`), publish signed with the test service (Library verifies), promote to Dev (signature served, excluded package not in `Packages`), publish again with `none` (Library serves `Release` without `Release.gpg`/`InRelease`, Dev still signed), a version begun with the service in its checkpoint and finished by Resume (signed again), a composite with this view as its only component (publishes, verifies, serves the signature) | `live_deb::deb_content_view` |
 | Content Views: RPM + File snapshot with filters, preview, numbered versions, Library, Dev, Prod path rule, rollback, served-content verification, retention protection, advisory filtering, partial failure and retry, resume of an interrupted publish (re-attach to the submitted task), cleanup | `live_cv::content_view_lifecycle` |
 | Lifecycle environment relabel: a File view promoted to Dev serves at `dev/<view>/docs/`; Edit label `dev2` moves the distribution in place (PATCH `base_path`, task awaited), the new URL answers 200 and the old one 404, the stored row and the drift check follow, and a second promotion of the same version keeps the new path | `live_cv::environment_relabel_moves_served_paths` |
@@ -27,6 +29,15 @@ Automated against real Pulp containers (`tests/run-live.sh`):
 | A database per profile: `prod` with its own PostgreSQL schema next to `lab` with `url = "local"` and a top-level `[database]` that is never opened; `database_for` gives the keyring user `[database]:prod`; a fresh schema is `NotMigrated` and an open does not migrate it; after `migrate` the store is external and cached (the same `Arc`), `lab` gets the local `Arc`; rows of the server key are not in the local store; `copy_from` another store copies a view under that key and records the source database ID as an alias | `live_shared_db::profile_database_next_to_a_local_profile` |
 | Schema 2 → 3 on PostgreSQL with rows as the previous version wrote them: `Library`, `Dev` and `dev` get the labels `library`, `dev`, `dev`; the served path `acme/dev/web/os` stays; a used label is refused | `live_shared_db::postgres_migration_3_keeps_served_paths` |
 
+Against real upstream repositories (`tests/run-live.sh real`; needs internet; on-demand syncs,
+so only metadata and the probed packages are downloaded):
+
+| Scenario | Test |
+|---|---|
+| Debian `trixie` `main` `amd64` (68,825 packages, listed in about 18 s at 5000 per page): Content View with `include name=hello; include name=nginx*` publishes and verifies (Release and the smallest package digest, streamed on demand); v2 with `include name=hello` only verifies and its `Packages` index has no `nginx`; a package removed with its release records is not in the served index (HTTP 200) | `live_real::debian_main_real` |
+| Rocky 9 BaseOS (3,336 packages, listed in about 4 s): Content View with `include name=kernel*` publishes and verifies; after a `checksum_type: sha512` PATCH, `ensure_publication` still returns the old publication and `create_publication` (the operator's Publish) makes a new one with `sha512` | `live_real::rocky9_baseos_real` |
+| Rocky 9 AppStream (10,743 packages): one page of `content/rpm/packages/` takes about 0.5 s at 500 rows and 2.1 s at 5000 rows; the full listing takes about 7 s (one run, warm database) | `live_real::rocky9_appstream_page_cost` |
+
 Manually in the TUI (tmux, real servers): dashboard, repository create/search/upload,
 remote create, mirror sync with warning, Task Center progress, distribute, versions,
 compare, rollback with preview and verification, environments (protected Prod with typed
@@ -41,13 +52,15 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
 
 ## Test results (last run)
 
-* `cargo test --lib`: 287 passed
-* `cargo test --test mock_http`: 27 passed
-* Live (`tests/run-live.sh`, 2026-10-26): repos 2, cv 4, rbac 1, failures 2,
-  replication 2, shared_db 6 (PostgreSQL 16, schema 5), deb 2 — all passed
+* `cargo test --lib`: 309 passed
+* `cargo test --test mock_http`: 30 passed
+* Live (`tests/run-live.sh repos cv rbac failures replication shared_db deb real`,
+  2026-10-26, on new containers after `tests/env/pulp-env.sh down-all`): repos 3, cv 4,
+  rbac 1, failures 2, replication 2, shared_db 6 (PostgreSQL 16, schema 5), deb 3,
+  real 3 (614 s) — all passed
 * `cargo fmt --check`, `cargo clippy --all-targets -D warnings` (default and
   `--no-default-features`): clean
-* `podman build -f Containerfile .`: built (30.5 MB image; no keyring; it contains the
+* `podman build -f Containerfile .`: built (30.8 MB image; no keyring; it contains the
   PostgreSQL driver; `pulp-tui --version` runs)
 * `cargo audit` (494 crates): no vulnerabilities; 3 "unmaintained" warnings, unchanged
   (RUSTSEC-2026-0370/0371/0372: `zvariant`, `zvariant_derive`, `zbus_names`), all
