@@ -11,15 +11,15 @@ pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<DebPackage
     c.list_all(&c.api("content/deb/packages/"), &[("repository_version", version.into()), ("fields", FIELDS.into())], 2_000_000).await
 }
 
-/// `Filename:` of the stanza of `p` in a `Packages` index.
-fn served_path(index: &str, p: &DebPackage) -> Option<String> {
+/// `Filename:` and `SHA256:` of the stanza of `p` in a `Packages` index.
+fn served_entry(index: &str, p: &DebPackage) -> Option<(String, Option<String>)> {
     let field =
         |stanza: &str, name: &str| stanza.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(':')).map(|v| v.trim().to_string());
     index.split("\n\n").find_map(|s| {
         let is_p = field(s, "Package").as_deref() == Some(&p.package)
             && field(s, "Version").as_deref() == Some(&p.version)
             && field(s, "Architecture").as_deref() == Some(&p.architecture);
-        if is_p { field(s, "Filename") } else { None }
+        if is_p { Some((field(s, "Filename")?, field(s, "SHA256"))) } else { None }
     })
 }
 
@@ -60,13 +60,18 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String>
     for (d, comp) in comps {
         let index = format!("dists/{d}/{comp}/binary-{}/Packages", p.architecture);
         let (status, body) = c.fetch_content(&format!("{base}{index}"), 64 << 20).await?;
-        let path = if status == 200 { served_path(&String::from_utf8_lossy(&body), p) } else { None };
-        let Some(path) = path else {
+        let entry = if status == 200 { served_entry(&String::from_utf8_lossy(&body), p) } else { None };
+        let Some((path, listed)) = entry else {
             tried.push(index);
             continue;
         };
+        // The API has no sha256 for an on_demand package until its file is downloaded; the index has the one apt checks.
+        let Some(want) = listed.or_else(|| p.sha256.clone()) else { return fail(format!("package {path} has no SHA256 in {index}")) };
+        if p.sha256.as_ref().is_some_and(|s| *s != want) {
+            return fail(format!("package {path}: {index} lists another SHA256 than Pulp has"));
+        }
         let (status, body) = c.fetch_content(&format!("{base}{path}"), 64 << 20).await?;
-        if status == 200 && p.sha256.as_deref() == Some(hex::encode(Sha256::digest(&body)).as_str()) {
+        if status == 200 && hex::encode(Sha256::digest(&body)) == want {
             return Ok(format!("Release and {path} served with matching digest ({} packages)", pkgs.count));
         }
         return fail(format!("package {path} not served with the expected digest"));

@@ -584,6 +584,30 @@ async fn deb_verify_checks_release_index_and_package_digest() {
 }
 
 #[tokio::test]
+async fn deb_verify_checks_the_digest_of_the_index_for_packages_not_downloaded_yet() {
+    // An on_demand package has no sha256 in the API until its file is downloaded; the index has the one apt checks.
+    let pkg = |sha: Value| json!([{ "pulp_href": "/p/1/", "package": "fixture-beta", "version": "1.0-1", "architecture": "amd64", "relative_path": "pool/x.deb", "sha256": sha }]);
+    let good = hex::encode(Sha256::digest(b"deb bytes"));
+    let index = |sha: &str| {
+        format!(
+            "Package: fixture-beta\nVersion: 1.0-1\nArchitecture: amd64\nFilename: pool/main/f/fixture-beta_1.0-1_amd64.deb\nSHA256: {sha}\n"
+        )
+    };
+    for (api, listed, ok) in [(Value::Null, good.as_str(), true), (Value::Null, "00", false), (json!("00"), good.as_str(), false)] {
+        let (server, base) = deb_server(pkg(api.clone())).await;
+        Mock::given(method("GET"))
+            .and(path("/pulp/content/d/dists/stable/main/binary-amd64/Packages"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(index(listed)))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let c = client(&server, |_, _| {});
+        let res = deb::verify(&c, &base, "/v/").await;
+        assert_eq!(res.is_ok(), ok, "api {api}, index {listed}: {res:?}");
+    }
+}
+
+#[tokio::test]
 async fn deb_verify_finds_the_package_in_another_distribution() {
     // A remote of `stable stable-updates`: the smallest package is only in the second distribution.
     let gamma = json!([{ "pulp_href": "/p/3/", "package": "fixture-gamma", "version": "1.0-1", "architecture": "amd64",

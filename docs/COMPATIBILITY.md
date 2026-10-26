@@ -110,6 +110,10 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
 
 * The package name field of `content/deb/packages/` is `package` (not `name`). The other
   fields pulp-tui reads are `version`, `architecture`, `relative_path` and `sha256`.
+* `sha256` comes from the stored file (pulpcore `ContentArtifactChecksumField`), so it is
+  `null` for an `on_demand` package until a client downloads it. Verify therefore takes the
+  digest from the `SHA256:` line of the served `Packages` index (what apt checks), and fails
+  when the API has a digest that is different.
 * `deb/copy/` with `structured: true` also copies the records that a structured publication
   needs: the package-release-component (PRC) units of the copied packages, their release
   components, release architectures and releases (`tasks/copy.py`,
