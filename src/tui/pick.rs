@@ -73,7 +73,8 @@ async fn role_objects(ctx: &Ctx, role: &str) -> anyhow::Result<Vec<PickItem>> {
     let roles: Vec<Value> = ctx.client.list_all(&ctx.client.api("roles/"), &[("name", role.to_string())], 100).await?;
     let permissions: Vec<String> = roles.first().and_then(|r| serde_json::from_value(r["permissions"].clone()).ok()).unwrap_or_default();
     let path = role_collection(&permissions).ok_or_else(unknown)?;
-    let rows: Vec<Value> = ctx.client.list_all(&ctx.client.api(path), &[], CAP).await?;
+    // Pulp drops unknown names in `fields`: a publication (no `name`) still returns its `pulp_href`.
+    let rows: Vec<Value> = ctx.client.list_all(&ctx.client.api(path), &[("fields", NAME_HREF.into())], CAP).await?;
     Ok(rows
         .iter()
         .map(|r| {
@@ -290,5 +291,25 @@ mod tests {
         assert_eq!(items.iter().map(|i| i.note.as_str()).collect::<Vec<_>>(), ["rpm", "file"]);
         let asked: Vec<_> = server.received_requests().await.unwrap().iter().map(|r| r.url.path().to_string()).collect();
         assert!(asked.iter().all(|p| !p.contains("/deb/")), "{asked:?}");
+    }
+
+    #[tokio::test]
+    async fn role_objects_ask_only_for_name_and_href() {
+        let server = MockServer::start().await;
+        let page = |results: Value| ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": results }));
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/roles/"))
+            .respond_with(page(json!([{ "name": "rpm.viewer", "permissions": ["rpm.view_rpmrepository"] }])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
+            .and(query_param("fields", "name,pulp_href"))
+            .respond_with(page(json!([{ "name": "os", "pulp_href": "/h/os/" }])))
+            .mount(&server)
+            .await;
+        let ctx = ctx_for(&server, Capabilities::default()).await;
+        let items = load_options(&ctx, &Source::RoleObjects, "rpm.viewer").await.unwrap();
+        assert_eq!(items.iter().map(|i| (i.label.as_str(), i.value.as_str())).collect::<Vec<_>>(), [("os", "/h/os/")]);
     }
 }

@@ -58,7 +58,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 (None, _) if app.connecting => "| connecting... ".into(),
                 (None, _) => "| NOT CONNECTED ".into(),
             }));
-            if p.read_only {
+            if app.read_only() {
                 spans.push(Span::styled(" READ-ONLY ", Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)));
             }
             if prod {
@@ -134,6 +134,15 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
     }
     if !l.marked.is_empty() {
         info.push(format!("{} marked", l.marked.len()));
+    }
+    // Without rows the body shows these.
+    if !l.items.is_empty() {
+        if let Some(e) = &l.error {
+            info.push(format!("error: {e}"));
+        }
+        if l.loading {
+            info.push("loading".into());
+        }
     }
     let title = format!(" {}  [{}] ", l.kind.title(), info.join(", "));
     let border = if app.focus == Focus::List { Style::default().fg(Color::Cyan) } else { Style::default() };
@@ -227,7 +236,10 @@ fn detail_lines(kind: &Kind, v: &serde_json::Value) -> Vec<String> {
         Kind::Logs { .. } => return log_lines(v),
         _ => {}
     }
-    out.extend(pretty(v));
+    // Rows stay unredacted for the actions; only the shown copy is masked.
+    let mut v = v.clone();
+    crate::session_log::redact(&mut v);
+    out.extend(pretty(&v));
     out
 }
 
@@ -637,6 +649,69 @@ mod tests {
         let last = entries.len() - 1;
         let s = draw(last);
         assert!(s.contains(&format!("▶ {}", entries[last].0)) && !s.contains(&entries[0].0), "{s}");
+    }
+
+    #[tokio::test]
+    async fn read_only_banner_follows_the_connection() {
+        use crate::config::{AuthMethod, Config, Profile};
+        let st = std::sync::Arc::new(crate::store::Store::open_in_memory().await.unwrap());
+        let p = Profile { url: "https://pulp.example.com".into(), auth: AuthMethod::None, ..Default::default() };
+        let mut cfg = Config::default();
+        cfg.profiles.insert("lab".into(), p.clone());
+        let conn = |read_only| {
+            let client = crate::pulp::PulpClient::new("lab", &Profile { read_only, ..p.clone() }, &cfg.settings).unwrap();
+            crate::tui::app::Conn { client, caps: Default::default(), scope: "lab".into() }
+        };
+        let (rw, ro) = (conn(false), conn(true));
+        let mut app = App::new(cfg, "/dev/null".into(), st.clone(), Ok(st));
+        app.profile = Some("lab".into());
+        app.conn = Some(rw);
+        app.cfg.profiles.get_mut("lab").unwrap().read_only = true; // edited after Connect: applies on the next one
+        let shown = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(140, 30)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            t.backend().to_string().contains("READ-ONLY")
+        };
+        assert!(!shown(&app));
+        app.conn = Some(ro);
+        assert!(shown(&app));
+    }
+
+    #[tokio::test]
+    async fn list_title_shows_a_refresh_error_over_old_rows() {
+        let st = std::sync::Arc::new(crate::store::Store::open_in_memory().await.unwrap());
+        let mut app = App::new(crate::config::Config::default(), "/dev/null".into(), st.clone(), Ok(st));
+        app.screen = Screen::List(Kind::Profiles);
+        app.list.items = vec![serde_json::json!({"name": "old-row"})];
+        app.list.error = Some("server error [502]".into());
+        let screen = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(140, 30)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            t.backend().to_string()
+        };
+        let s = screen(&app);
+        assert!(s.contains("error: server error [502]") && s.contains("old-row"), "{s}");
+        app.list.error = None;
+        app.list.loading = true;
+        let s = screen(&app);
+        assert!(s.contains("loading") && s.contains("old-row"), "{s}");
+    }
+
+    #[tokio::test]
+    async fn details_pane_masks_remote_headers_and_tokens() {
+        use crate::pulp::RepoType;
+        let st = std::sync::Arc::new(crate::store::Store::open_in_memory().await.unwrap());
+        let mut app = App::new(crate::config::Config::default(), "/dev/null".into(), st.clone(), Ok(st));
+        app.screen = Screen::List(Kind::Remotes(RepoType::Rpm));
+        app.list.kind = Kind::Remotes(RepoType::Rpm);
+        app.list.items = vec![serde_json::json!({
+            "name": "r1", "headers": [{"Authorization": "Bearer abc"}], "sles_auth_token": "tok"
+        })];
+        // The Details pane needs 110 columns beside the 22 of the screen list.
+        let mut t = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        t.draw(|f| draw(f, &app)).unwrap();
+        let s = t.backend().to_string();
+        assert!(s.contains("Details") && s.contains("•••") && !s.contains("Bearer abc") && !s.contains("\"tok\""), "{s}");
     }
 
     #[test]

@@ -2,12 +2,14 @@
 
 use super::client::{Mutation, Page, PulpClient, PulpError, Result};
 use super::models::*;
+use super::ops::CONTENT_PAGE;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<Package>> {
     let fields = "pulp_href,name,epoch,version,release,arch,location_href,sha256";
-    c.list_all(&c.api(RepoType::Rpm.content()), &[("repository_version", version.into()), ("fields", fields.into())], 2_000_000).await
+    let q = [("repository_version", version.into()), ("fields", fields.into()), ("limit", CONTENT_PAGE.into())];
+    c.list_all(&c.api(RepoType::Rpm.content()), &q, 2_000_000).await
 }
 
 /// Path of a package inside a published RPM repository for the publication `layout`.

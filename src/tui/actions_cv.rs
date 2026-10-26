@@ -373,7 +373,11 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             .note("Filter rules apply to every selected repository, so they need repositories of one type.");
             app.form(form, move |app, f| {
                 let repos = new_cv_repos(&f.picked("repos"), f.get("filters"))?;
+                let name = name.clone();
                 local(app, "add repositories", async move |st| {
+                    let mut all = st.cv_repos(id).await?;
+                    all.extend(repos.iter().cloned());
+                    check_repo_clash(&[(name, all)])?;
                     for r in &repos {
                         st.set_cv_repo(id, r).await?;
                     }
@@ -433,11 +437,14 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                 vec![Field::pick("components", "Content Views", Source::ContentViews).multi().required().exclude(present)],
             );
             app.form(form, move |app, f| {
-                let picked = f
+                let picked: Vec<Component> = f
                     .picked("components")
                     .into_iter()
                     .filter_map(|i| Some(Component { cv_id: i.value.parse().ok()?, name: i.label, pinned: None }))
                     .collect();
+                if picked.is_empty() {
+                    return Err("pick Content Views from the list".into());
+                }
                 let Some(st) = cv_store(app) else { return Ok(()) };
                 let name = name.clone();
                 app.spawn("read versions".into(), true, async move {
@@ -1623,6 +1630,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_components_refuses_a_typed_name() {
+        let (mut app, _rx, st) = composite_app().await;
+        let (_, _, _, item) = rocky(&st).await;
+        cv_action(&mut app, "lab", Act::CvAddComponent, item);
+        let (mut form, mut submit) = open_form(&mut app);
+        set(&mut form, "components", "tools");
+        assert_eq!(submit(&mut app, &form), Err("pick Content Views from the list".into()));
+        assert!(app.jobs.is_empty());
+    }
+
+    #[tokio::test]
     async fn remove_component_keeps_the_others_and_says_so() {
         let (mut app, mut rx, st) = composite_app().await;
         let (c, os, extras, item) = rocky(&st).await;
@@ -1640,6 +1658,23 @@ mod tests {
         cv_action(&mut app, "lab", Act::CvRemoveComponent, json!({ "id": c, "name": "rocky9", "composite": true, "components": [] }));
         assert!(app.modal.is_none());
         assert_eq!(last_notice(&app), (Level::Error, "composite has no components"));
+    }
+
+    #[tokio::test]
+    async fn add_repositories_refuses_a_path_clash() {
+        let (mut app, mut rx, st) = composite_app().await;
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        st.set_cv_repo(web, &cv_repo("a b", "rpm", "1")).await.unwrap();
+        cv_action(&mut app, "lab", Act::CvAddRepo, json!({ "id": web, "name": "web", "repos": [] }));
+        let (mut form, mut submit) = open_form(&mut app);
+        form.fields[0].options = Some(vec![item("a-b", "rpm")]);
+        set(&mut form, "repos", &item("a-b", "rpm").value);
+        submit(&mut app, &form).unwrap();
+        drain(&mut app, &mut rx).await;
+        let (level, text) = last_notice(&app);
+        assert_eq!(level, Level::Error);
+        assert!(text.contains("same path segment a-b"), "{text}");
+        assert_eq!(st.cv_repos(web).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

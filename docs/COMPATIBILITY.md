@@ -102,6 +102,10 @@ server gives the final answer; the dashboard shows a warning.
   `null` for `on_demand` and `streamed` content until a client downloads it. Verify then
   takes the RPM digest from `pkgId` when `checksum_type` is `sha256` (else it fails), and
   compares a File digest of `PULP_MANIFEST` only where the API has one (the paths always).
+* **`PULP_MANIFEST` lines are not quoted** (pulp_file 3.123.0 `manifest.py`): a line is
+  `relative_path,sha256,size`, written with `",".join(...)` and read with
+  `rsplit(",", maxsplit=2)`. A path can contain commas. Verify reads each line from the
+  right too.
 * **`rpm/copy/` with a `content` list adds related units** (pulp_rpm 3.39.3
   `tasks/copy.py`, `find_children_of_content`, also without dependency solving): the
   packages and modules that a copied advisory lists, the groups of copied comps categories
@@ -131,10 +135,14 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
   components, release architectures and releases (`tasks/copy.py`,
   `find_structured_publish_content`). pulp-tui always sends `structured: true`.
 * A structured publication lists every PRC in the version and loads its package by id; it does
-  not check that the package is in the version (`tasks/publishing.py`). Removing a package with
-  `modify/` leaves its PRCs, and pulp_deb does not remove them, so the package would still be
-  published. pulp-tui removes the PRCs of a package together with it. It keeps releases,
-  release components and release architectures, which all packages of a release share.
+  not check that the package is in the version (`tasks/publishing.py`). The `modify/` endpoint
+  of an APT repository runs `signed_add_and_remove` (`tasks/signing.py`). Its
+  `_prepare_package_removals` adds the PRCs (and source PRCs) of each removed package in the
+  base version to the removal. Seen live: removing a package alone took its PRC count from 1
+  to 0. pulp-tui still sends the binary-package PRCs of a removed package itself (Content View
+  snapshots and Remove content), so a pulp_deb version without that step (not checked) does not
+  keep publishing the package. pulp-tui keeps releases, release components and release
+  architectures, which all packages of a release share.
 * `dependency_solving: true` is not implemented: the task fails with
   `FeatureNotImplementedError`. pulp-tui always sends `false`.
 * `dest_base_version: 0` starts the new version from the empty version 0 of the destination

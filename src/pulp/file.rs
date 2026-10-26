@@ -2,15 +2,12 @@
 
 use super::client::{PulpClient, PulpError, Result};
 use super::models::*;
+use super::ops::CONTENT_PAGE;
 use std::collections::BTreeMap;
 
 pub async fn files_in(c: &PulpClient, version: &str) -> Result<Vec<FileContent>> {
-    c.list_all(
-        &c.api(RepoType::File.content()),
-        &[("repository_version", version.into()), ("fields", "pulp_href,relative_path,sha256".into())],
-        2_000_000,
-    )
-    .await
+    let q = [("repository_version", version.into()), ("fields", "pulp_href,relative_path,sha256".into()), ("limit", CONTENT_PAGE.into())];
+    c.list_all(&c.api(RepoType::File.content()), &q, 2_000_000).await
 }
 
 pub fn key(f: &FileContent) -> String {
@@ -28,8 +25,10 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String>
     let served: BTreeMap<String, String> = String::from_utf8_lossy(&body)
         .lines()
         .filter_map(|l| {
-            let mut it = l.splitn(3, ',');
-            Some((it.next()?.to_string(), it.next()?.to_string()))
+            // pulp_file writes `path,sha256,size` unquoted and reads it from the right.
+            let mut it = l.rsplitn(3, ',');
+            let (_size, digest) = (it.next()?, it.next()?);
+            Some((it.next()?.to_string(), digest.to_string()))
         })
         .collect();
     let want = files_in(c, version).await?;

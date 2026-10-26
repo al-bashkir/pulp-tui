@@ -153,3 +153,26 @@ async fn file_lifecycle() {
 
     cleanup(&c, &[&dist, &repo, &local, &remote]).await;
 }
+
+#[tokio::test]
+async fn file_path_with_a_comma_is_served_and_verified() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::File;
+    let name = unique("it-comma");
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("q1.txt");
+    // Unique bytes, so a rerun does not find the content unit of an earlier run.
+    std::fs::write(&path, format!("{name}\n")).unwrap();
+    ops::upload(&c, t, &path, Some("reports/q1,2024.txt"), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
+    let version = latest(&c, &repo).await;
+    let publication = ops::ensure_publication(&c, t, &version, None, &no_progress).await.unwrap();
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
+    let base = dist_url(&c, &dist).await;
+    let msg = ops::verify_served(&c, t, &base, &version, "").await;
+    cleanup(&c, &[&dist, &publication, &repo]).await;
+    assert_eq!(msg.unwrap(), "PULP_MANIFEST matches 1 files");
+}

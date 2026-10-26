@@ -198,7 +198,7 @@ pub fn log_lines(row: &Value) -> Vec<String> {
     }
 }
 
-fn inspect(app: &mut App, kind: &Kind, item: Value) {
+fn inspect(app: &mut App, kind: &Kind, mut item: Value) {
     let href = s(&item, "pulp_href");
     let title = match kind {
         Kind::CvVersions { name, .. } => format!("{name} v{}", s(&item, "number")),
@@ -208,14 +208,18 @@ fn inspect(app: &mut App, kind: &Kind, item: Value) {
     // Lists may exclude heavy fields; fetch the complete object for inspection.
     if !href.is_empty() && kind.needs_connection() && !matches!(kind, Kind::Tasks) {
         app.job(format!("inspect {title}"), move |ctx| async move {
-            let v: Value = ctx.client.get(&href, &[]).await?;
+            let mut v: Value = ctx.client.get(&href, &[]).await?;
+            // Remote headers and tokens are readable on GET.
+            crate::session_log::redact(&mut v);
             ap(move |app| app.text(format!("Inspect {title}"), pretty(&v)))
         });
     } else {
-        let mut lines = pretty(&item);
-        if let Kind::Tasks = kind {
-            lines = task_lines(&item);
-        }
+        let lines = if let Kind::Tasks = kind {
+            task_lines(&item)
+        } else {
+            crate::session_log::redact(&mut item);
+            pretty(&item)
+        };
         app.text(format!("Inspect {title}"), lines);
     }
 }
@@ -669,9 +673,6 @@ fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>) -> 
     if let Some(r) = v["remote"].as_str() {
         form = form.note(format!("current remote: {r} (leave Remote empty to keep it)"));
     }
-    if v["pulp_labels"].get(crate::cv::LABEL_CV).is_some() {
-        form = form.note("This repository is owned by a Content View: retention must stay empty (snapshots would be pruned).");
-    }
     form
 }
 
@@ -704,7 +705,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
     if let Some(e) = snapshot_refusal(&item)
-        && matches!(act, Act::Sync | Act::Upload | Act::CopyContent)
+        && matches!(act, Act::Sync | Act::Upload | Act::CopyContent | Act::Edit)
     {
         app.error(e);
         return;
@@ -721,12 +722,8 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         Act::Create | Act::Edit => {
             let edit = act == Act::Edit;
             let form = repo_form(t, caps(app).as_deref(), edit.then_some(&item));
-            let owned_by_cv = item["pulp_labels"].get(crate::cv::LABEL_CV).is_some();
             app.form(form, move |app, f| {
                 let mut body = repo_body(f, edit)?;
-                if owned_by_cv && !body["retain_repo_versions"].is_null() && body.get("retain_repo_versions").is_some() {
-                    return Err("refused: retention on a Content View snapshot repository would prune referenced versions".into());
-                }
                 let remote = f.opt("remote").map(str::to_string);
                 let href = href.clone();
                 let label = format!("{} repository {}", if edit { "update" } else { "create" }, f.get("name"));
@@ -989,7 +986,7 @@ fn publish_form(app: &mut App, t: RepoType, title: String, go: impl Fn(&mut App,
 
 fn publish(app: &mut App, t: RepoType, name: &str, version: String, signing_service: Option<String>) {
     app.job(format!("publish {name} {}", short(&version)), move |ctx| async move {
-        let p = ops::ensure_publication(&ctx.client, t, &version, signing_service.as_deref(), &ctx.on_task()).await?;
+        let p = ops::create_publication(&ctx.client, t, &version, signing_service.as_deref(), &ctx.on_task()).await?;
         ap(move |app| app.ok(format!("publication {} for {}", short(&p), short(&version))))
     });
 }
@@ -1029,6 +1026,9 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
                 let repo = repo.ok_or_else(|| anyhow!("no repository"))?;
                 match existing {
                     Some(d) => {
+                        if s(&d, "base_path") != bp {
+                            bail!("distribution {dist} serves {} instead of {bp}", s(&d, "base_path"));
+                        }
                         let h = s(&d, "pulp_href");
                         let mut b = json!({ "repository": repo, "publication": null });
                         // Pulp keeps a field that a PATCH leaves out, and refuses two bindings (HTTP 400).
@@ -1223,13 +1223,10 @@ fn version_action(app: &mut App, act: Act, item: Value) {
     let repo = repo_of_version(&href);
     match act {
         Act::Content => app.push(Kind::Content { version: href, ctype: 0 }),
-        Act::Publish => publish_form(app, t, format!("Publish version {number}"), move |app, sv| {
-            let (href, number) = (href.clone(), number.clone());
-            app.job(format!("publish {}", short(&href)), move |ctx| async move {
-                let p = ops::ensure_publication(&ctx.client, t, &href, sv.as_deref(), &ctx.on_task()).await?;
-                ap(move |app| app.ok(format!("publication {} for version {number}", short(&p))))
-            })
-        }),
+        Act::Publish => {
+            let name = app.last_repo.as_ref().filter(|r| r.1 == repo).map(|r| r.2.clone()).unwrap_or_else(|| short(&repo));
+            publish_form(app, t, format!("Publish version {number}"), move |app, sv| publish(app, t, &name, href.clone(), sv));
+        }
         Act::Distribute => {
             let name = app.last_repo.as_ref().filter(|r| r.1 == repo).map(|r| r.2.clone()).unwrap_or_else(|| short(&repo));
             distribute_form(app, t, name, Some(href), None, None);
@@ -1251,6 +1248,10 @@ fn version_action(app: &mut App, act: Act, item: Value) {
                 app.error("mark exactly one other version with Space, then compare");
                 return;
             };
+            if RepoType::from_href(other) != Some(t) {
+                app.error("compare needs two versions of one repository type");
+                return;
+            }
             let other = other.clone();
             app.job("compare versions", move |ctx| async move {
                 // Always show older -> newer.
@@ -1363,6 +1364,13 @@ fn content_action(app: &mut App, version: String, act: Act) {
                     if let Some(e) = snapshot_refusal(&r) {
                         bail!(e);
                     }
+                    let units = match t {
+                        RepoType::Deb => {
+                            let latest = r["latest_version_href"].as_str().ok_or_else(|| anyhow!("repository has no versions"))?;
+                            deb::with_release_records(c, latest, units).await?
+                        }
+                        RepoType::Rpm | RepoType::File => units,
+                    };
                     let m = ops::remove_content(c, &repo, units).await?;
                     ap(move |app| {
                         // Only after success: on a failure the operator keeps the marks.
@@ -1431,7 +1439,7 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         Some(n) => version_of(&s(&r, "pulp_href"), n),
                         None => r["latest_version_href"].as_str().ok_or_else(|| anyhow!("no versions"))?.to_string(),
                     };
-                    let p = ops::ensure_publication(c, t, &v, signing.as_deref(), &ctx.on_task()).await?;
+                    let p = ops::create_publication(c, t, &v, signing.as_deref(), &ctx.on_task()).await?;
                     ap(move |app| {
                         app.ok(format!("publication {} of {}", short(&p), short(&v)));
                         app.reload();
@@ -1442,12 +1450,7 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         }
         Act::Distribute => {
             let v = s(&item, "repository_version");
-            // Deb: this publication can have a signing service that a reuse by version would not find.
-            let p = match t {
-                RepoType::Rpm | RepoType::File => None,
-                RepoType::Deb => Some(href),
-            };
-            distribute_form(app, t, short(&repo_of_version(&v)), Some(v), None, p);
+            distribute_form(app, t, short(&repo_of_version(&v)), Some(v), None, Some(href));
         }
         Act::Delete => {
             let (id, version) = (short(&href), s(&item, "repository_version"));
@@ -2118,6 +2121,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deb_remove_content_takes_the_release_records_along() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/deb/apt/r/");
+        let latest = format!("{repo}versions/2/");
+        let (p1, p2) = (format!("{API}content/deb/packages/1/"), format!("{API}content/deb/packages/2/"));
+        get(&server, &repo, json!({ "pulp_href": repo, "name": "r", "latest_version_href": latest })).await;
+        let prcs = page(json!([{ "pulp_href": "/prc/1/", "package": p1 }, { "pulp_href": "/prc/2/", "package": p2 }]));
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}content/deb/package_release_components/")))
+            .and(query_param("repository_version", latest.as_str()))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(prcs))
+            .mount(&server)
+            .await;
+        let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") }));
+        wiremock::Mock::given(method("POST")).and(path(format!("{repo}modify/"))).respond_with(accepted).mount(&server).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.marked = [p1.clone()].into();
+        // The browsed version is older: the removal starts from the latest one.
+        content_action(&mut app, format!("{repo}versions/1/"), Act::RemoveContent);
+        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &format!("{repo}modify/")).await, [json!({ "remove_content_units": [p1, "/prc/1/"] })]);
+    }
+
+    #[tokio::test]
     async fn only_a_deb_publish_asks_for_a_signing_service() {
         use crate::tui::app::Modal;
         use wiremock::matchers::{method, path};
@@ -2301,7 +2332,7 @@ mod tests {
             [json!({ "repository_version": v, "signing_service": "/ss/1/" })]
         );
         assert!(
-            app.notices.iter().any(|n| n.text == "publication 9 for version 1"),
+            app.notices.iter().any(|n| n.text == format!("publication 9 for {}", short(&v))),
             "{:?}",
             app.notices.iter().map(|n| &n.text).collect::<Vec<_>>()
         );
@@ -2365,6 +2396,63 @@ mod tests {
         let sent = server.received_requests().await.unwrap();
         let patch: Value = sent.iter().find(|r| r.method.as_str() == "PATCH").unwrap().body_json().unwrap();
         assert_eq!(patch["publication"], json!(format!("{pubs}9/")));
+    }
+
+    #[tokio::test]
+    async fn operator_publish_always_makes_a_new_publication() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let (pubs, r) = (format!("{API}publications/rpm/rpm/"), format!("{API}repositories/rpm/rpm/r/"));
+        let v = format!("{r}versions/1/");
+        get(&server, &pubs, page(json!([{ "pulp_href": format!("{pubs}1/"), "repository_version": v }]))).await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(pubs.clone()))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{pubs}9/") })))
+            .mount(&server)
+            .await;
+        let repo = json!({ "pulp_href": r, "name": "r", "latest_version_href": v });
+        get(&server, &format!("{API}repositories/rpm/rpm/"), page(json!([repo]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+
+        repo_action(&mut app, RepoType::Rpm, Act::Publish, repo);
+        settle(&mut app, &mut rx).await;
+        version_action(&mut app, Act::Publish, json!({ "pulp_href": v, "number": 1 }));
+        settle(&mut app, &mut rx).await;
+        publication_action(&mut app, RepoType::Rpm, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        form.fields[0].value = "r".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &pubs).await, vec![json!({ "repository_version": v }); 3], "publication 1 is not reused");
+    }
+
+    #[tokio::test]
+    async fn publications_distribute_serves_the_selected_rpm_publication() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let (pubs, dists) = (format!("{API}publications/rpm/rpm/"), format!("{API}distributions/rpm/rpm/"));
+        for p in [&pubs, &dists, &format!("{API}distributions/")] {
+            get(&server, p, page(json!([]))).await;
+        }
+        wiremock::Mock::given(method("POST"))
+            .and(path(dists.clone()))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{dists}9/") })))
+            .mount(&server)
+            .await;
+        get(&server, &format!("{dists}9/"), json!({ "pulp_href": format!("{dists}9/"), "base_url": "http://h/d/" })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let selected = format!("{pubs}5/");
+        let item = json!({ "pulp_href": selected, "repository_version": format!("{API}repositories/rpm/rpm/r/versions/1/") });
+        publication_action(&mut app, RepoType::Rpm, Act::Distribute, item);
+        let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no form") };
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let sent = server.received_requests().await.unwrap();
+        assert!(!sent.iter().any(|r| r.method.as_str() == "GET" && r.url.path() == pubs), "no lookup by version");
+        let pinned: Vec<Value> = posts_to(&server, &dists).await.iter().map(|d| d["publication"].clone()).collect();
+        assert_eq!(pinned, [json!(selected)]);
     }
 
     #[tokio::test]
@@ -2555,5 +2643,76 @@ mod tests {
         let served = served_now(c, RepoType::Rpm, &json!({ "repository": repo })).await.unwrap().unwrap();
         assert_eq!((served.0, s(&served.1, "layout").as_str()), (format!("{repo}versions/2/"), "flat"));
         assert_eq!(served_now(c, RepoType::Rpm, &json!({ "name": "unbound" })).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn inspect_masks_remote_tokens() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let href = format!("{API}remotes/rpm/rpm/1/");
+        let remote =
+            json!({ "pulp_href": href, "name": "r", "url": "u", "headers": [{ "Authorization": "Bearer abc" }], "sles_auth_token": "tok" });
+        get(&server, &href, remote.clone()).await;
+        let (mut app, mut rx) = connected(&server).await;
+        inspect(&mut app, &Kind::Remotes(RepoType::Rpm), remote.clone());
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no text") };
+        assert!(!lines.iter().any(|l| l.contains("abc") || l.contains("\"tok\"")) && lines.iter().any(|l| l.contains("•••")), "{lines:?}");
+        // A row without an href is shown without a GET: it is masked too.
+        app.modal = None;
+        inspect(
+            &mut app,
+            &Kind::Remotes(RepoType::Rpm),
+            json!({ "name": "r", "headers": [{ "Authorization": "Bearer abc" }], "sles_auth_token": "tok" }),
+        );
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no text") };
+        assert!(!lines.iter().any(|l| l.contains("abc") || l.contains("\"tok\"")), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_repositories_refuse_edit_and_create_is_not_affected() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (mut app, _rx) = connected(&server).await;
+        let item = json!({ "pulp_href": format!("{API}repositories/rpm/rpm/1/"), "name": "pulp-tui-cv-web-os", "pulp_labels": { "pulp_tui_cv": "web" } });
+        repo_action(&mut app, RepoType::Rpm, Act::Edit, item.clone());
+        assert!(app.modal.is_none(), "Edit opened a form");
+        assert!(app.notices.back().is_some_and(|n| n.text.starts_with("refused:")), "{:?}", app.notices.back().map(|n| &n.text));
+        // Create starts from the selected row, but makes a new repository without the label.
+        repo_action(&mut app, RepoType::Rpm, Act::Create, item);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        form.fields.iter_mut().find(|f| f.key == "name").unwrap().value = "new".into();
+        form.fields.iter_mut().find(|f| f.key == "retain_repo_versions").unwrap().value = "1".into();
+        assert_eq!(submit(&mut app, &form), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn compare_refuses_versions_of_another_type() {
+        let server = wiremock::MockServer::start().await;
+        let (mut app, _rx) = connected(&server).await;
+        app.list.marked = [format!("{API}repositories/file/file/f/versions/1/")].into();
+        version_action(&mut app, Act::Compare, json!({ "pulp_href": format!("{API}repositories/rpm/rpm/r/versions/2/"), "number": 2 }));
+        assert!(app.jobs.is_empty(), "a compare job started");
+        assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("compare needs two versions of one repository type"));
+    }
+
+    #[tokio::test]
+    async fn follow_mode_refuses_another_base_path() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let d = json!({ "pulp_href": format!("{API}distributions/rpm/rpm/1/"), "name": "r", "base_path": "old", "pulp_labels": {} });
+        get(&server, &format!("{API}distributions/rpm/rpm/"), page(json!([d]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let repo = json!({ "pulp_href": format!("{API}repositories/rpm/rpm/r/"), "name": "r", "latest_version_href": "/v/" });
+        repo_action(&mut app, RepoType::Rpm, Act::Distribute, repo);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        form.fields.iter_mut().find(|f| f.key == "mode").unwrap().value = "follow repository latest".into();
+        form.fields.iter_mut().find(|f| f.key == "base_path").unwrap().value = "new".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let e = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        assert!(e.contains("serves old instead of new"), "{e}");
+        let sent = server.received_requests().await.unwrap();
+        assert!(!sent.iter().any(|r| r.method.as_str() == "PATCH"), "a PATCH was sent");
     }
 }

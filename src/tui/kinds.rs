@@ -832,8 +832,7 @@ pub async fn load(
                     .collect();
                 let repos: Vec<Value> = store
                     .version_repos(v.id)
-                    .await
-                    .unwrap_or_default()
+                    .await?
                     .into_iter()
                     .map(|r| {
                         json!({
@@ -1021,6 +1020,22 @@ mod tests {
         assert_eq!(state().await, "publishing");
         st.renew_lock(cv, "t1", now - crate::store::LOCK_TTL_SECS - 1).await.unwrap();
         assert_eq!(state().await, "interrupted", "lock expired");
+    }
+
+    #[tokio::test]
+    async fn cv_versions_report_unreadable_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cv.db");
+        let (st, cfg) = (Store::open(&path).await.unwrap(), Config::default());
+        let cv = st.create_cv("lab", "os", "").await.unwrap();
+        let repo = crate::store::CvRepo { repo_href: "/r/1/".into(), repo_name: "os".into(), repo_type: RepoType::Rpm, filters: vec![] };
+        st.begin_version(cv, "", &[repo]).await.unwrap();
+        let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+        let other = sqlx::sqlite::SqlitePool::connect_with(opts).await.unwrap();
+        sqlx::query("UPDATE cv_version_repos SET filters = 'x'").execute(&other).await.unwrap();
+        let k = Kind::CvVersions { cv, name: "os".into() };
+        let e = format!("{:#}", load(&k, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap_err());
+        assert!(e.contains("invalid filter rules"), "{e}");
     }
 
     #[test]

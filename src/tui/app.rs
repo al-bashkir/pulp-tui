@@ -4,9 +4,9 @@
 use super::actions::ap;
 use super::form::{FieldKind, Form, FormEvent, PickItem, Source, edit_line, move_key};
 use super::kinds::{self, Act, Kind};
-use super::tasks::TaskCenter;
+use super::tasks::{TaskCenter, Tracked};
 use super::view::help_lines;
-use crate::config::{Config, Database, Settings};
+use crate::config::{Config, Database};
 use crate::cv::CvService;
 use crate::pulp::models::Task;
 use crate::pulp::{Capabilities, PulpClient};
@@ -77,7 +77,6 @@ pub struct Ctx {
     pub scope: String,
     /// Operator name for locks and the audit log.
     pub actor: String,
-    pub settings: Settings,
     pub job: u64,
     tx: UnboundedSender<Msg>,
 }
@@ -187,6 +186,15 @@ impl ListState {
 
 pub fn item_key(v: &Value) -> String {
     v.get("pulp_href").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| v.get("id").map(|x| x.to_string()).unwrap_or_default())
+}
+
+/// Task Center row of a tracked task.
+fn task_row(t: &Tracked) -> Value {
+    serde_json::json!({
+        "pulp_href": t.href, "label": t.label, "state": t.state, "progress": t.progress(),
+        "started": t.task.as_ref().and_then(|x| x.started_at.clone()).unwrap_or_default(),
+        "error": t.error, "task": t.task,
+    })
 }
 
 /// `Text.watch`: href of a task whose lines follow the Task Center (rebuilt on each task message).
@@ -317,7 +325,6 @@ impl App {
             cv_store: self.cv_store.clone(),
             scope: c.scope.clone(),
             actor: crate::store::actor(c.caps.user.as_ref().map(|u| u.username.as_str())),
-            settings: self.cfg.settings.clone(),
             job: 0,
             tx: self.tx.clone(),
         })
@@ -493,6 +500,13 @@ impl App {
         }
     }
 
+    /// Cancel the running list loads.
+    fn abort_loads(&mut self) {
+        for id in self.jobs.iter().filter(|j| j.is_load && j.label.starts_with("load ")).map(|j| j.id).collect::<Vec<_>>() {
+            self.abort_job(id);
+        }
+    }
+
     fn abort_all(&mut self) {
         for j in std::mem::take(&mut self.jobs) {
             j.abort.abort();
@@ -521,7 +535,10 @@ impl App {
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                     j.progress = text;
                 }
+                return; // no task changed: the task rows and a watch stay as they are
             }
+            // Sent by a job of the previous server that the Connect aborted.
+            Msg::Task(_) if self.connecting => {}
             Msg::Task(t) => self.task_update(t, true),
             Msg::TaskPolled { href, result } => match result {
                 // A poll sent before a Connect answers for the previous server.
@@ -546,17 +563,7 @@ impl App {
 
     /// Task Center rows from the in-memory tracker (no I/O).
     pub fn task_items(&self) -> Vec<Value> {
-        self.tasks
-            .items
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "pulp_href": t.href, "label": t.label, "state": t.state, "progress": t.progress(),
-                    "started": t.task.as_ref().and_then(|x| x.started_at.clone()).unwrap_or_default(),
-                    "error": t.error, "task": t.task,
-                })
-            })
-            .collect()
+        self.tasks.items.iter().map(task_row).collect()
     }
 
     // ---- tasks ---------------------------------------------------------------------
@@ -583,7 +590,7 @@ impl App {
     }
 
     fn watch_lines(&self, href: &str) -> Vec<String> {
-        self.task_items().iter().find(|r| r["pulp_href"] == href).map(super::actions::task_lines).unwrap_or_default()
+        self.tasks.items.iter().find(|t| t.href == href).map(|t| super::actions::task_lines(&task_row(t))).unwrap_or_default()
     }
 
     /// The server has no such task: final, and stored as such so the next start does not re-attach it.
@@ -799,9 +806,7 @@ impl App {
             }
             Screen::List(k) => {
                 // Cancel a still-running load of the same list; a newer generation wins.
-                for id in self.jobs.iter().filter(|j| j.is_load && j.label.starts_with("load ")).map(|j| j.id).collect::<Vec<_>>() {
-                    self.abort_job(id);
-                }
+                self.abort_loads();
                 self.list.generation += 1;
                 self.list.loading = true;
                 self.list.error = None;
@@ -841,6 +846,17 @@ impl App {
                     let apply: Apply = Box::new(move |app: &mut App| {
                         if app.list.generation != generation {
                             return; // stale response
+                        }
+                        // Rows were deleted after paging: show the last page that still has rows.
+                        // Only on the list's own screen: the Dashboard keeps the list but reloads itself.
+                        if items.is_empty()
+                            && app.list.offset > 0
+                            && app.list.offset >= count
+                            && app.screen == Screen::List(app.list.kind.clone())
+                        {
+                            app.list.offset = count.saturating_sub(1) / PAGE * PAGE;
+                            app.reload();
+                            return;
                         }
                         app.list.loading = false;
                         app.set_items(items, count);
@@ -920,18 +936,20 @@ impl App {
     /// Load the options of a pick field in the background. The answer, also a load error, goes into the popup.
     pub fn load_pick(&mut self, form_id: u64, field: usize, source: Source, role: String) {
         if self.conn.is_none() {
-            return self.apply_pick(form_id, field, Err("not connected".into()));
+            return self.apply_pick(form_id, field, &role, Err("not connected".into()));
         }
-        self.job("load choices", move |ctx| async move {
+        // Not named "load ...": list reloads cancel those.
+        self.load_job("read choices", move |ctx| async move {
             let result = super::pick::load_options(&ctx, &source, &role).await.map_err(|e| format!("{e:#}"));
-            super::actions::ap(move |app| app.apply_pick(form_id, field, result))
+            super::actions::ap(move |app| app.apply_pick(form_id, field, &role, result))
         });
     }
 
-    /// Hand loaded options to the form, if that form is still the open one.
-    pub fn apply_pick(&mut self, form_id: u64, field: usize, result: Result<Vec<PickItem>, String>) {
+    /// Hand loaded options to the form, if that form is still the open one and its role (if any) did not change.
+    pub fn apply_pick(&mut self, form_id: u64, field: usize, role: &str, result: Result<Vec<PickItem>, String>) {
         if let Some(Modal::Form { form, .. }) = &mut self.modal
             && form.id == form_id
+            && form.get("role") == role
         {
             form.set_options(field, result);
         }
@@ -1139,9 +1157,7 @@ impl App {
             }
             KeyCode::Esc => {
                 if self.list.loading {
-                    for id in self.jobs.iter().filter(|j| j.is_load && j.label.starts_with("load ")).map(|j| j.id).collect::<Vec<_>>() {
-                        self.abort_job(id);
-                    }
+                    self.abort_loads();
                     self.list.loading = false;
                     self.list.error = Some("request cancelled".into());
                 } else if !self.list.marked.is_empty() {
@@ -1331,7 +1347,13 @@ impl App {
     /// Command palette: screens, server profiles and global commands, filtered by text.
     pub fn palette_entries(&self, filter: &str) -> Vec<PaletteEntry> {
         let mut out: Vec<PaletteEntry> = vec![];
-        out.push(("Go: Dashboard".into(), Box::new(|a: &mut App| a.open(Screen::Dashboard))));
+        out.push((
+            "Go: Dashboard".into(),
+            Box::new(|a: &mut App| {
+                a.history.clear();
+                a.open(Screen::Dashboard);
+            }),
+        ));
         for (label, k) in kinds::NAV {
             let k = k.clone();
             out.push((
@@ -1843,14 +1865,32 @@ mod tests {
         let id = form.id;
         app.form(form, |_, _| Ok(()));
         app.modal = None; // closed with Esc meanwhile
-        app.apply_pick(id, 0, Ok(vec![]));
+        app.apply_pick(id, 0, "", Ok(vec![]));
         assert!(app.modal.is_none());
         // A different open form is not touched.
         let other = Form::new("t", vec![Field::pick("repo", "Repository", Source::Roles)]);
         app.form(other, |_, _| Ok(()));
-        app.apply_pick(id, 0, Ok(vec![PickItem { label: "x".into(), value: "x".into(), note: String::new() }]));
+        app.apply_pick(id, 0, "", Ok(vec![PickItem { label: "x".into(), value: "x".into(), note: String::new() }]));
         let Some(Modal::Form { form, .. }) = &app.modal else { panic!() };
         assert!(form.fields[0].options.is_none());
+    }
+
+    #[tokio::test]
+    async fn object_options_for_an_old_role_are_dropped() {
+        let mut app = app_on(Kind::Profiles).await;
+        let fields = vec![Field::pick("role", "Role", Source::Roles).value("r1"), Field::pick("obj", "Object", Source::RoleObjects)];
+        let form = Form::new("t", fields);
+        let id = form.id;
+        app.form(form, |_, _| Ok(()));
+        let Some(Modal::Form { form, .. }) = &mut app.modal else { panic!() };
+        form.fields[0].value = "r2".into(); // the role changed while the objects of r1 loaded
+        let item = || vec![PickItem { label: "x".into(), value: "x".into(), note: String::new() }];
+        app.apply_pick(id, 1, "r1", Ok(item()));
+        let Some(Modal::Form { form, .. }) = &app.modal else { panic!() };
+        assert!(form.fields[1].options.is_none());
+        app.apply_pick(id, 1, "r2", Ok(item()));
+        let Some(Modal::Form { form, .. }) = &app.modal else { panic!() };
+        assert!(form.fields[1].options.is_some());
     }
 
     async fn app_on(kind: Kind) -> App {
@@ -1975,6 +2015,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_messages_during_connect_are_dropped() {
+        let mut app = app_on(Kind::Profiles).await;
+        let mut rx = app.rx.take().unwrap();
+        app.connecting = true;
+        let task = serde_json::json!({ "pulp_href": "/t/9/", "state": "running", "name": "publish" });
+        app.handle_msg(Msg::Task(serde_json::from_value(task).unwrap()));
+        settle(&mut app, &mut rx).await;
+        assert!(app.tasks.items.is_empty());
+        assert!(app.store.tasks("lab", 10).await.unwrap().is_empty(), "nothing stored for the new profile");
+    }
+
+    #[tokio::test]
     async fn notices_and_actions_are_logged_and_their_rows_open_as_text() {
         let mut app = app_on(Kind::Profiles).await;
         app.notify(Level::Warn, "notice-row-needle");
@@ -2029,6 +2081,121 @@ mod tests {
         app.list.selected = 1;
         app.set_items(vec![serde_json::json!({}), serde_json::json!({}), serde_json::json!({})], 3);
         assert_eq!(app.list.selected, 1);
+    }
+
+    /// `app_on` RPM Repositories, connected to `server` (a Pulp with the RPM plugin).
+    async fn on_rpm_repos(server: &wiremock::MockServer) -> App {
+        let mut app = app_on(Kind::Repos(crate::pulp::RepoType::Rpm, false)).await;
+        let p = Profile { url: server.uri(), auth: AuthMethod::None, ..Default::default() };
+        let client = PulpClient::new("lab", &p, &app.cfg.settings).unwrap();
+        let caps = Capabilities { versions: [("rpm".into(), "3.39.3".into())].into(), ..Default::default() };
+        app.conn = Some(Conn { client, caps: Arc::new(caps), scope: "lab".into() });
+        app
+    }
+
+    #[tokio::test]
+    async fn a_list_result_for_another_screen_is_dropped() {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let repo = serde_json::json!({ "pulp_href": "/pulp/api/v3/repositories/rpm/rpm/1/", "name": "os" });
+        let body = serde_json::json!({ "count": 1, "next": null, "results": [repo] });
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut app = on_rpm_repos(&server).await;
+        let mut rx = app.rx.take().unwrap();
+        app.reload();
+        // Tasks opens before the load answers; it does not cancel loads.
+        for h in ["/t/1/", "/t/2/", "/t/3/"] {
+            app.tasks.track(h, "t", "running");
+        }
+        app.open(Screen::List(Kind::Tasks));
+        app.list.selected = 2;
+        settle(&mut app, &mut rx).await;
+        // The repositories never replace the rows, so the cursor stays on its task (the rows are rebuilt after each message).
+        assert_eq!(app.list.kind, Kind::Tasks);
+        assert_eq!(app.list.items, app.task_items());
+        assert_eq!(app.list.current().unwrap()["pulp_href"], "/t/1/");
+    }
+
+    #[tokio::test]
+    async fn a_page_past_the_end_goes_back_to_the_last_page() {
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let repos: Vec<Value> = (0..100).map(|i| serde_json::json!({ "pulp_href": format!("/r/{i}/"), "name": format!("r{i}") })).collect();
+        // The rows on the last page were deleted meanwhile.
+        for (offset, results) in [("100", vec![]), ("0", repos)] {
+            let body = serde_json::json!({ "count": 100, "next": null, "results": results });
+            wiremock::Mock::given(method("GET"))
+                .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
+                .and(query_param("offset", offset))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        let mut app = on_rpm_repos(&server).await;
+        let mut rx = app.rx.take().unwrap();
+        app.list.offset = 100;
+        app.reload();
+        settle(&mut app, &mut rx).await;
+        assert_eq!((app.list.offset, app.list.items.len(), app.list.loading), (0, 100, false));
+    }
+
+    #[tokio::test]
+    async fn a_page_past_the_end_goes_back_only_on_its_own_screen() {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let body = serde_json::json!({ "count": 100, "next": null, "results": [] });
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut app = on_rpm_repos(&server).await;
+        let mut rx = app.rx.take().unwrap();
+        app.list.offset = 100;
+        app.reload();
+        let m = rx.recv().await.unwrap();
+        // The operator opens the Dashboard before the list result is handled.
+        app.open(Screen::Dashboard);
+        let dashboard = app.jobs.last().unwrap().id;
+        app.handle_msg(m);
+        let jobs: Vec<u64> = app.jobs.iter().map(|j| j.id).collect();
+        let list_gets =
+            server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/pulp/api/v3/repositories/rpm/rpm/").count();
+        assert_eq!((jobs, app.list.loading, list_gets), (vec![dashboard], false, 1));
+    }
+
+    #[tokio::test]
+    async fn an_empty_first_page_does_not_reload() {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let body = serde_json::json!({ "count": 0, "next": null, "results": [] });
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut app = on_rpm_repos(&server).await;
+        let mut rx = app.rx.take().unwrap();
+        app.reload();
+        // One message, not `settle`: a reload here would repeat without end.
+        let m = rx.recv().await.unwrap();
+        app.handle_msg(m);
+        let gets = server.received_requests().await.unwrap().len();
+        assert_eq!((app.list.offset, app.jobs.len(), app.list.loading, gets), (0, 0, false, 1));
+    }
+
+    #[tokio::test]
+    async fn picker_loads_are_load_jobs() {
+        let server = wiremock::MockServer::start().await;
+        let mut app = on_rpm_repos(&server).await;
+        app.load_pick(1, 0, Source::Roles, String::new());
+        // Not "load ...": a list reload must not abort it.
+        let job = app.jobs.last().unwrap();
+        assert!(job.is_load && !job.label.starts_with("load "), "{} is_load={}", job.label, job.is_load);
     }
 
     #[tokio::test]
@@ -2111,6 +2278,19 @@ mod tests {
         assert!(app.modal.is_none());
         app.handle_key(ctrl('p'));
         assert!(palette(&app).2, "Ctrl-P opens in filter mode too");
+    }
+
+    #[tokio::test]
+    async fn palette_dashboard_clears_the_history() {
+        let mut app = app_on(Kind::Profiles).await;
+        app.open(Screen::List(Kind::Repos(crate::pulp::RepoType::Rpm, false)));
+        app.push(Kind::Versions(Some(("/r/1/".into(), "os".into()))));
+        let (label, go) = app.palette_entries("go: dashboard").into_iter().next().unwrap();
+        assert_eq!(label, "Go: Dashboard");
+        go(&mut app);
+        assert!(app.history.is_empty());
+        app.back();
+        assert_eq!(app.screen, Screen::Dashboard);
     }
 
     #[tokio::test]

@@ -179,6 +179,23 @@ async fn task_polling_survives_a_short_outage_and_never_calls_an_unread_task_fai
 }
 
 #[tokio::test]
+async fn task_group_polling_survives_a_short_outage() {
+    let server = MockServer::start().await;
+    let href = format!("{API}task-groups/1/");
+    // More 503s than the client retries for one GET (4 attempts).
+    Mock::given(method("GET")).and(path(&href)).respond_with(ResponseTemplate::new(503)).up_to_n_times(5).mount(&server).await;
+    let done = json!({ "pulp_href": href, "all_tasks_dispatched": true, "completed": 1, "tasks": [] });
+    Mock::given(method("GET")).and(path(&href)).respond_with(ResponseTemplate::new(200).set_body_json(done)).mount(&server).await;
+    let c = client(&server, |_, _| {});
+    assert!(ops::wait_task_group(&c, &href, &|_| {}).await.is_ok());
+
+    let denied = format!("{API}task-groups/2/");
+    Mock::given(method("GET")).and(path(&denied)).respond_with(ResponseTemplate::new(403)).expect(1).mount(&server).await;
+    let e = ops::wait_task_group(&c, &denied, &|_| {}).await.unwrap_err();
+    assert_eq!(e.status(), Some(403), "{e}");
+}
+
+#[tokio::test]
 async fn task_polling_until_completion_or_failure() {
     let server = MockServer::start().await;
     let running = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "running", "name": "sync" });
@@ -684,4 +701,49 @@ async fn rpm_and_file_verify_units_not_downloaded_yet() {
         let res = pulp_tui::pulp::file::verify(&c, &format!("{}/pulp/content/d/", server.uri()), "/v/").await;
         assert_eq!(res.is_ok(), ok, "{files}: {res:?}");
     }
+}
+
+#[tokio::test]
+async fn file_verify_reads_paths_with_commas() {
+    let good = hex::encode(Sha256::digest(b"file bytes"));
+    let page = |results: Value| {
+        ResponseTemplate::new(200).set_body_json(json!({ "count": results.as_array().unwrap().len(), "next": null, "results": results }))
+    };
+    let served = |p: &str, body: &str| {
+        Mock::given(method("GET"))
+            .and(path(format!("/pulp/content/d/{p}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+    };
+    let file = |p: &str| json!({ "pulp_href": format!("/f/{p}/"), "relative_path": p, "sha256": good });
+    for (manifest, ok) in
+        [(format!("q1,2024.txt,{good},9\na,b,c.txt,{good},9\n"), true), (format!("q1,2024.txt,00,9\na,b,c.txt,{good},9\n"), false)]
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{API}content/file/files/")))
+            .respond_with(page(json!([file("q1,2024.txt"), file("a,b,c.txt")])))
+            .mount(&server)
+            .await;
+        served("PULP_MANIFEST", &manifest).mount(&server).await;
+        let c = client(&server, |_, _| {});
+        let res = pulp_tui::pulp::file::verify(&c, &format!("{}/pulp/content/d/", server.uri()), "/v/").await;
+        assert_eq!(res.is_ok(), ok, "{manifest}: {res:?}");
+    }
+}
+
+#[tokio::test]
+async fn version_content_is_listed_in_large_pages() {
+    let server = MockServer::start().await;
+    for p in ["content/rpm/packages/", "content/file/files/", "content/deb/packages/"] {
+        Mock::given(method("GET"))
+            .and(path(format!("{API}{p}")))
+            .and(query_param("limit", "5000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 0, "next": null, "results": [] })))
+            .mount(&server)
+            .await;
+    }
+    let c = client(&server, |_, _| {});
+    assert_eq!(pulp_tui::pulp::rpm::packages_in(&c, "/v/").await.unwrap().len(), 0);
+    assert_eq!(pulp_tui::pulp::file::files_in(&c, "/v/").await.unwrap().len(), 0);
+    assert_eq!(deb::packages_in(&c, "/v/").await.unwrap().len(), 0);
 }

@@ -16,7 +16,7 @@ pub type OnTask<'a> = &'a (dyn Fn(&Task) + Send + Sync);
 
 pub fn no_progress(_: &Task) {}
 
-/// How long `wait_task` keeps polling through transient read errors (each GET is also retried by the client).
+/// How long `wait_task` and `wait_task_group` keep polling through transient read errors (each GET is also retried by the client).
 const POLL_OUTAGE: Duration = Duration::from_secs(120);
 
 /// Poll a task until it reaches a final state. The interval grows while nothing changes
@@ -74,8 +74,17 @@ pub async fn wait_task_group(c: &PulpClient, href: &str, on: &(dyn Fn(&TaskGroup
     let mut interval = min;
     let mut stable = 0;
     let mut last = None;
+    let mut failing: Option<std::time::Instant> = None;
     loop {
-        let g: TaskGroup = c.get(href, &[]).await?;
+        let g: TaskGroup = match c.get(href, &[]).await {
+            Ok(g) => g,
+            Err(e) if retryable(&e) && failing.get_or_insert_with(std::time::Instant::now).elapsed() < POLL_OUTAGE => {
+                tokio::time::sleep(max).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        failing = None;
         on(&g);
         let key = (g.active(), g.done());
         stable = if g.active() == 0 && g.done() > 0 && last == Some(key) { stable + 1 } else { 0 };
@@ -128,8 +137,9 @@ pub async fn sync(c: &PulpClient, t: RepoType, repo: &str, remote: Option<&str>,
     c.post(&format!("{repo}sync/"), &body).await
 }
 
-/// Reuse a publication of the version made with the same signing service (publishing is
-/// deterministic). `signing_service` is sent only when set: Deb is the only type that takes it.
+/// Reuse a publication of the version made with the same signing service, else create one.
+/// A reused publication keeps the repository settings of the time it was made; the operator's
+/// Publish uses `create_publication` instead.
 pub async fn ensure_publication(
     c: &PulpClient,
     t: RepoType,
@@ -141,6 +151,18 @@ pub async fn ensure_publication(
     if let Some(pubn) = all.into_iter().find(|p| p.signing_service.as_deref() == signing_service) {
         return Ok(pubn.pulp_href);
     }
+    create_publication(c, t, version, signing_service, on).await
+}
+
+/// A new publication of `version`, made with the repository settings of now. `signing_service` is sent
+/// only when set: Deb is the only type that takes it.
+pub async fn create_publication(
+    c: &PulpClient,
+    t: RepoType,
+    version: &str,
+    signing_service: Option<&str>,
+    on: OnTask<'_>,
+) -> Result<String> {
     let mut body = json!({ "repository_version": version });
     if let Some(s) = signing_service {
         body["signing_service"] = s.into();
@@ -264,11 +286,13 @@ pub fn label_owner(labels: &BTreeMap<String, String>, key: &str, id: &str, alias
     }
 }
 
+/// Large pages: with offset paging, 127,000 units took about 4 minutes at 500 per page.
+pub const CONTENT_PAGE: &str = "5000";
+
 /// Hrefs of all content units (any type) of a version. The generic endpoint returns no
 /// type field; callers classify by href path (`/content/rpm/packages/`, ...).
 pub async fn content_in(c: &PulpClient, version: &str) -> Result<Vec<String>> {
-    // Large pages: with offset paging, 127,000 units took about 4 minutes at 500 per page.
-    let q = [("repository_version", version.to_string()), ("fields", "pulp_href".into()), ("limit", "5000".into())];
+    let q = [("repository_version", version.to_string()), ("fields", "pulp_href".into()), ("limit", CONTENT_PAGE.into())];
     let v: Vec<Value> = c.list_all(&c.api("content/"), &q, 2_000_000).await?;
     Ok(v.into_iter().filter_map(|x| x["pulp_href"].as_str().map(str::to_string)).collect())
 }

@@ -225,17 +225,10 @@ impl PulpClient {
     /// Only hrefs on this server's API root are accepted. Next-page links are absolute
     /// URLs and must point to the same origin.
     fn url_for(&self, href: &str) -> Result<url::Url> {
-        let url = if href.starts_with("http://") || href.starts_with("https://") {
-            let u = url::Url::parse(href).map_err(|_| PulpError::BadHref(href.into()))?;
-            if u.origin() != self.inner.base.origin() {
-                return Err(PulpError::BadHref(href.into()));
-            }
-            u
-        } else {
-            self.inner.base.join(href).map_err(|_| PulpError::BadHref(href.into()))?
-        };
+        let url = self.inner.base.join(href).map_err(|_| PulpError::BadHref(href.into()))?;
+        // `join` also resolves `//host` and `\\host` to another host.
         // Checked after URL normalization so `..` segments cannot escape the API root.
-        if !url.path().starts_with(&self.inner.api_root) || href.contains("/../") {
+        if url.origin() != self.inner.base.origin() || !url.path().starts_with(&self.inner.api_root) || href.contains("/../") {
             return Err(PulpError::BadHref(href.into()));
         }
         Ok(url)
@@ -629,6 +622,9 @@ mod tests {
         assert!(c.url_for("https://evil.example.com/pulp/api/v3/tasks/").is_err());
         assert!(c.url_for("/admin/").is_err());
         assert!(c.url_for("/pulp/api/v3/../../admin/").is_err());
+        assert!(c.url_for("//evil.example.com/pulp/api/v3/tasks/").is_err());
+        assert!(c.url_for("\\\\evil.example.com/pulp/api/v3/tasks/").is_err());
+        assert!(c.url_for("http://pulp.example.com/pulp/api/v3/tasks/").is_err()); // other scheme, other origin
         let d = client(Some("rhel"));
         assert_eq!(d.api("tasks/"), "/pulp/rhel/api/v3/tasks/");
     }

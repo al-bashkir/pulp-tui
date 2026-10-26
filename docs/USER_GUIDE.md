@@ -136,14 +136,14 @@ are visible.
 | f | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File and Deb: additive, mirror). Mirror policies show a warning first. |
 | H | sync history (tasks that touched this repository) |
 | u | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed or cancelled (Esc) chunked uploads are deleted. Not offered for Deb repositories (upload of `.deb` files is not supported). |
-| P | publish the latest version (reuses an existing publication). Deb asks for an optional signing service (empty = the repository's own keys); a publication is reused only when its signing service is the same. The field is not asked when the server's Deb publications have no `signing_service`. |
-| D | distribute: pin the latest version (publication) or follow the repository latest. Deb asks for the same optional signing service as **P**, for the pinned publication. |
+| P | publish the latest version: always creates a new publication, with the repository settings at that moment. Deb asks for an optional signing service (empty = the repository's own keys). The field is not asked when the server's Deb publications have no `signing_service`. |
+| D | distribute: pin the latest version (publication) or follow the repository latest. Deb asks for the same optional signing service as **P**, for the pinned publication; a publication of the version is reused only when its signing service is the same. |
 | C | copy content from another repository (filter rules; RPM can copy dependencies; a Deb copy is structured: it also copies the Release, component and architecture records of the packages, and never solves dependencies) |
 | c / e / d | create / edit / delete (delete names every distribution that serves the repository, a version or a publication of it; refused while it holds Content View snapshots) |
 | i | full JSON |
 
-Edit sends only changed fields. Retention cannot be set on Content View snapshot
-repositories. Sync, upload, copy and content add/remove are refused on snapshot repositories.
+Edit sends only changed fields. Edit, sync, upload, copy and content add/remove are refused
+on Content View snapshot repositories (a change of retention would prune their snapshots).
 
 Deb repositories use the same keys. Sync a Deb repository from a Deb remote, publish it
 (**P**) and distribute it (**D**) as for the other types. A Deb distribution is served
@@ -173,7 +173,7 @@ Deb remote fields (each is shown only when the server has it):
 
 ### Repository Versions
 From a repository (**v**) or for all repositories. Columns: number, created, present /
-added / removed counts. Actions: **o** content, **P** publish this version, **D**
+added / removed counts. Actions: **o** content, **P** publish this version (always a new publication), **D**
 distribute it (Deb: both ask for the optional signing service, as in Repositories), **b**
 point a distribution to it (rollback, with preview; Deb: the new publication keeps the
 signing service of the publication that the distribution serves now), **m** compare
@@ -195,8 +195,9 @@ repository version; old versions are unchanged.
 
 ### Publications
 `t` switches RPM/File/Deb. **c** create from repository name and optional version number
-(Deb: and the optional signing service, as in Repositories),
-**D** distribute (Deb: pins the selected publication, also one with a signing service), **d** delete (names the distributions that serve it, and you type the
+(Deb: and the optional signing service, as in Repositories): always a new publication, with the
+repository settings at that moment. **D** distribute: serves exactly the selected publication.
+**d** delete (names the distributions that serve it, and you type the
 publication id; refused for publications of Content View snapshots).
 
 ### Distributions

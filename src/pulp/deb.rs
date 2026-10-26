@@ -2,6 +2,7 @@
 
 use super::client::{Mutation, Page, PulpClient, PulpError, Result};
 use super::models::*;
+use super::ops::CONTENT_PAGE;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -9,7 +10,8 @@ use std::collections::HashSet;
 const FIELDS: &str = "pulp_href,package,version,architecture,relative_path,sha256";
 
 pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<DebPackage>> {
-    c.list_all(&c.api("content/deb/packages/"), &[("repository_version", version.into()), ("fields", FIELDS.into())], 2_000_000).await
+    let q = [("repository_version", version.into()), ("fields", FIELDS.into()), ("limit", CONTENT_PAGE.into())];
+    c.list_all(&c.api("content/deb/packages/"), &q, 2_000_000).await
 }
 
 /// `Filename:` and `SHA256:` of the stanza of `p` in a `Packages` index.
@@ -82,12 +84,25 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String>
 
 /// Hrefs of the release records (`PackageReleaseComponent`) in `version` whose package is in `packages`.
 pub async fn release_records_of(c: &PulpClient, version: &str, packages: &HashSet<&str>) -> Result<HashSet<String>> {
-    let q = [("repository_version", version.to_string()), ("fields", "pulp_href,package".into()), ("limit", "5000".into())];
+    let q = [("repository_version", version.to_string()), ("fields", "pulp_href,package".into()), ("limit", CONTENT_PAGE.into())];
     let v: Vec<Value> = c.list_all(&c.api("content/deb/package_release_components/"), &q, 2_000_000).await?;
     Ok(v.iter()
         .filter(|r| r["package"].as_str().is_some_and(|p| packages.contains(p)))
         .filter_map(|r| r["pulp_href"].as_str().map(str::to_string))
         .collect())
+}
+
+/// `units`, then the binary-package release records (PRCs) in `version` of the packages among them.
+/// A structured publication publishes every PRC of a version, also one whose package is gone. This is a
+/// fallback: pulp_deb 3.11.1 `modify/` removes these records itself (`_prepare_package_removals`); older
+/// versions were not checked (COMPATIBILITY.md).
+pub async fn with_release_records(c: &PulpClient, version: &str, units: Vec<String>) -> Result<Vec<String>> {
+    let packages: HashSet<&str> = units.iter().map(String::as_str).collect();
+    let mut records: Vec<String> =
+        release_records_of(c, version, &packages).await?.into_iter().filter(|r| !packages.contains(r.as_str())).collect();
+    // Sorted: the set has no order, and a request body should not change from run to run.
+    records.sort();
+    Ok(units.into_iter().chain(records).collect())
 }
 
 /// Release, release component and release architecture records: shared by all packages of a release.

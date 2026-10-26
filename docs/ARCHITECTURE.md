@@ -42,8 +42,8 @@ dropped. Esc aborts the client-side job (the HTTP request); it never cancels a P
 * Responses larger than `max_response_mb` are rejected.
 * The client records each attempt (method, URL, status, duration, redacted bodies) in the
   in-memory session log, so a retried read shows as several rows.
-* Hrefs from the server (including `next` links) must stay on the same origin and below
-  the configured API root.
+* Every href (from the server, an import file or the database, including `next` links) must
+  stay on the same origin and below the configured API root.
 
 ### Task tracking
 
@@ -431,7 +431,8 @@ It contains no secrets and no Pulp state.
   profile's own `database` use the same references.
 * The `Authorization` header is marked sensitive. The log file (never the terminal)
   records method, path and status only. Write-only fields (remote passwords, keys) are
-  never pre-filled in forms and are displayed masked.
+  never pre-filled in forms and are displayed masked. Inspect and the Details pane mask the same keys as the
+  Logs screen (a remote's `headers` and tokens are readable on GET).
 * The Logs screen (`src/session_log.rs`) keeps the last 1000 requests, actions and notices
   of the session in memory, with request and response bodies cut at 64 KiB. Secret JSON
   keys (any letter case, also a remote's `headers`) are redacted before a body is stored, the `Authorization` header is never recorded

@@ -85,6 +85,40 @@ async fn deb_mirror_copy_publish_verify() {
     cleanup(&c, &[&dist, &signed_dist, &repo, &copy, &remote]).await;
 }
 
+/// A package removed together with its release records is not in the next publication.
+#[tokio::test]
+async fn a_removed_deb_package_is_no_longer_served() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Deb;
+    let name = unique("it-deb-rm");
+    let url = format!("{}/deb/", upstream());
+    let body = json!({ "name": name, "url": url, "policy": "immediate", "distributions": "fixture" });
+    let remote = create(&c, t.remotes(), body, "/remotes/").await;
+    let repo = create(&c, t.repositories(), json!({ "name": name, "remote": remote }), "/repositories/").await;
+    let m = ops::sync(&c, t, &repo, None, "mirror").await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let v1 = latest(&c, &repo).await;
+    let pkgs = deb::packages_in(&c, &v1).await.unwrap();
+    let href = pkgs.into_iter().find(|p| p.package == "fixture-beta-dbg").expect("fixture-beta-dbg").pulp_href;
+    let units = deb::with_release_records(&c, &v1, vec![href]).await.unwrap();
+    let m = ops::remove_content(&c, &repo, units).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+
+    let publication = ops::ensure_publication(&c, t, &latest(&c, &repo).await, None, &no_progress).await.unwrap();
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
+    let d: Value = c.get(&dist, &[]).await.unwrap();
+    let base = d["base_url"].as_str().unwrap();
+    let (status, index) = served(&c, &format!("{base}dists/fixture/main/binary-amd64/Packages")).await;
+    let index = String::from_utf8_lossy(&index);
+    assert_eq!(status, 200, "{index}");
+    assert!(index.contains("Package: fixture-beta\n"), "{index}");
+    assert!(!index.contains("fixture-beta-dbg"), "the removed package is not served: {index}");
+    cleanup(&c, &[&dist, &repo, &remote]).await;
+}
+
 fn quiet(_: String) {}
 
 /// What the distribution of `cv` in `env` serves at (ends with `/`).
