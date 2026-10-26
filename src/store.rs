@@ -994,6 +994,17 @@ impl Store {
         .await?)
     }
 
+    /// Versions of the derived repository `repo` that a non-deleted Content View version uses, in any scope.
+    pub async fn used_versions(&self, repo: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT vr.derived_version FROM cv_version_repos vr JOIN cv_versions v ON v.id = vr.version_id
+             WHERE vr.derived_repo = $1 AND v.state != 'deleted' AND vr.derived_version IS NOT NULL",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     // ---- environments and bindings -----------------------------------------------
 
     pub async fn ensure_library(&self, profile: &str) -> Result<i64> {

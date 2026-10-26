@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-/// Terminal management for Pulp 3 servers (RPM and File repositories, Content Views,
+/// Terminal management for Pulp 3 servers (RPM, File and Deb repositories, Content Views,
 /// lifecycle environments, replication, users and tasks).
 #[derive(Parser)]
 #[command(version = env!("PULP_TUI_VERSION"), about)]

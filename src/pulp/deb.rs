@@ -4,6 +4,7 @@ use super::client::{Mutation, Page, PulpClient, PulpError, Result};
 use super::models::*;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 const FIELDS: &str = "pulp_href,package,version,architecture,relative_path,sha256";
 
@@ -77,6 +78,21 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String>
         return fail(format!("package {path} not served with the expected digest"));
     }
     fail(format!("package {} not listed in any Packages index (tried {})", p.key(), tried.join(", ")))
+}
+
+/// Hrefs of the release records (`PackageReleaseComponent`) in `version` whose package is in `packages`.
+pub async fn release_records_of(c: &PulpClient, version: &str, packages: &HashSet<&str>) -> Result<HashSet<String>> {
+    let q = [("repository_version", version.to_string()), ("fields", "pulp_href,package".into()), ("limit", "5000".into())];
+    let v: Vec<Value> = c.list_all(&c.api("content/deb/package_release_components/"), &q, 2_000_000).await?;
+    Ok(v.iter()
+        .filter(|r| r["package"].as_str().is_some_and(|p| packages.contains(p)))
+        .filter_map(|r| r["pulp_href"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// Release, release component and release architecture records: shared by all packages of a release.
+pub fn is_release_record(href: &str) -> bool {
+    ["/content/deb/releases/", "/content/deb/release_components/", "/content/deb/release_architectures/"].iter().any(|p| href.contains(p))
 }
 
 /// Copy content of a repository version into `dest_repo` (Deb copy API). `content` limits the

@@ -582,41 +582,43 @@ impl CvService {
         let derived = vr.derived_repo.clone().unwrap_or_default();
         if vr.derived_version.is_none() {
             let sv = vr.source_version.clone().ok_or_else(|| anyhow!("missing source version"))?;
-            // A pending task is a copy batch already sent; the batches before it are in its version.
-            let resumed = match vr.pending_task {
+            // A pending task is a step already sent; the steps before it are in its version.
+            let mut task = match vr.pending_task {
                 Some(_) => Some(self.tracked_task(vr, "copy", std::future::ready(Err(anyhow!("no copy task"))), log, on).await?),
                 None => None,
             };
             log(format!("{}: selecting content from {sv}", repo.repo_name));
             let sel = self.select(&repo, &sv, false).await?;
-            let batches: Vec<Option<Vec<String>>> = match (sel.hrefs, resumed.is_some()) {
-                // Without filters one request copies everything: the pending task was that request.
-                (None, true) => vec![],
-                (None, false) => vec![None],
-                (Some(all), true) => {
-                    let r: Repository = c.get(&derived, &[]).await?;
-                    let latest = r.latest_version_href.ok_or_else(|| anyhow!("derived repository has no version"))?;
-                    let present: HashSet<String> = ops::content_in(c, &latest).await?.into_iter().collect();
-                    let rest: Vec<String> = all.into_iter().filter(|h| !present.contains(h)).collect();
-                    if rest.is_empty() { vec![] } else { ops::batches(&rest).into_iter().map(|b| Some(b.to_vec())).collect() }
+            // (remove, units); `None` copies everything onto an empty version in one request.
+            let steps: Vec<(bool, Option<Vec<String>>)> = match sel.hrefs {
+                // Without filters the pending task was that request.
+                None if task.is_some() => vec![],
+                None => vec![(false, None)],
+                // A unit that leaves one version and comes back in a later one makes Pulp's delete of the
+                // earlier version very slow (hours), so the latest version is changed only where it differs.
+                Some(all) => {
+                    let (remove, add) = self.changes(t, &derived, all).await?;
+                    let batches = |remove: bool, l: &[String]| -> Vec<(bool, Option<Vec<String>>)> {
+                        ops::batches(l).into_iter().filter(|b| !b.is_empty()).map(|b| (remove, Some(b.to_vec()))).collect()
+                    };
+                    [batches(true, &remove), batches(false, &add)].concat()
                 }
-                (Some(all), false) => ops::batches(&all).into_iter().map(|b| Some(b.to_vec())).collect(),
             };
-            let (n, fresh) = (batches.len(), resumed.is_none());
-            let mut task = resumed;
-            for (i, units) in batches.into_iter().enumerate() {
-                // The first batch starts from an empty version; the others add to the latest one.
-                let empty = fresh && i == 0;
-                // In memory only: until the next batch is saved, the row keeps the last one for Resume.
+            let n = steps.len();
+            for (i, (remove, units)) in steps.into_iter().enumerate() {
+                // In memory only: until the next step is saved, the row keeps the last one for Resume.
                 vr.pending_task = None;
-                if n > 1 {
-                    log(format!("{}: copy batch {}/{n}", repo.repo_name, i + 1));
+                if let Some(u) = &units {
+                    let what = if remove { "removing" } else { "copying" };
+                    log(format!("{}: {what} {} units ({}/{n})", repo.repo_name, u.len(), i + 1));
                 }
+                let empty = units.is_none();
                 let copy = async {
                     self.alive()?;
                     anyhow::Ok(match t {
+                        _ if remove => ops::remove_content(c, &derived, units.unwrap_or_default()).await?,
                         RepoType::Rpm => rpm::copy(c, &sv, &derived, empty.then_some(0), units, false).await?,
-                        RepoType::File => file::modify(c, &derived, empty, units.unwrap_or_default()).await?,
+                        RepoType::File => file::modify(c, &derived, units.unwrap_or_default()).await?,
                         RepoType::Deb => deb::copy(c, &sv, &derived, empty.then_some(0), units).await?,
                     })
                 };
@@ -632,10 +634,13 @@ impl CvService {
             };
             let rv: RepoVersion = c.get(&version, &[]).await?;
             vr.content_count = Some(rv.content_summary.present.values().map(|x| x.count as i64).sum());
-            vr.derived_version = Some(version);
+            vr.derived_version = Some(version.clone());
             vr.pending_task = None;
             self.alive()?;
             self.store.save_version_repo(vr).await?;
+            if let Err(e) = self.drop_unused_versions(&derived, &version, log, on).await {
+                log(format!("{}: cleanup of unused versions stopped: {e:#}", repo.repo_name));
+            }
         }
         let dv = vr.derived_version.clone().unwrap_or_default();
         // `service`: the signing service that the PATCH sets (Deb only).
@@ -689,9 +694,55 @@ impl CvService {
         Ok(())
     }
 
+    /// The units to remove from the latest version of `derived`, and to add to it, so that it holds `all`. A Deb
+    /// snapshot also keeps the release records of its packages (Pulp publishes every package record in a version,
+    /// also one whose package was removed) and the release, component and architecture records.
+    async fn changes(&self, t: RepoType, derived: &str, all: Vec<String>) -> Result<(Vec<String>, Vec<String>)> {
+        let c = &self.client;
+        let r: Repository = c.get(derived, &[]).await?;
+        let latest = r.latest_version_href.ok_or_else(|| anyhow!("derived repository has no version"))?;
+        let present = ops::content_in(c, &latest).await?;
+        let keep: HashSet<&str> = all.iter().map(String::as_str).collect();
+        // shortcut: release records of packages already in the snapshot are not refreshed from the source (a
+        // changed Release comes with the next copied package); copy them too if a source changes them alone.
+        let records = match t {
+            RepoType::Deb => deb::release_records_of(c, &latest, &keep).await?,
+            _ => HashSet::new(),
+        };
+        let is_deb = matches!(t, RepoType::Deb);
+        let remove = present
+            .iter()
+            .filter(|h| !keep.contains(h.as_str()) && !records.contains(*h) && !(is_deb && deb::is_release_record(h)))
+            .cloned()
+            .collect();
+        let present: HashSet<String> = present.into_iter().collect();
+        Ok((remove, all.into_iter().filter(|h| !present.contains(h)).collect()))
+    }
+
+    /// Delete the versions of a derived repository that no Content View version uses: the earlier steps
+    /// of a copy, and those of a publish that stopped between steps. Pulp merges each one into the
+    /// next version (the snapshot does not change) and refuses a version that a distribution serves.
+    /// Best effort: the snapshot is already recorded, and the next publish tries again.
+    async fn drop_unused_versions(&self, derived: &str, latest: &str, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
+        let used: HashSet<String> = self.store.used_versions(derived).await?.into_iter().collect();
+        let versions: Vec<RepoVersion> =
+            self.client.list_all(&format!("{derived}versions/"), &[("fields", "pulp_href,number".into())], 100_000).await?;
+        for v in versions.iter().filter(|v| v.number > 0 && v.pulp_href != latest && !used.contains(&v.pulp_href)) {
+            self.alive()?;
+            match self.client.delete(&v.pulp_href).await {
+                Ok(m) => {
+                    ops::settle(&self.client, m, on).await?;
+                    log(format!("deleted unused version {}", v.pulp_href));
+                }
+                Err(e) => log(format!("keeping {}: {e}", v.pulp_href)),
+            }
+        }
+        Ok(())
+    }
+
     /// The task of one checkpointed step of `vr` (the copy, or a Deb publication): re-attach to `vr.pending_task`,
     /// else run `submit` and record the task before waiting. A failed or canceled task is not re-attached: it is
-    /// cleared, so the next Resume sends it again (a copy starts from an empty base).
+    /// cleared, so the next Resume sends that step again.
     async fn tracked_task(
         &self,
         vr: &mut CvVersionRepo,
@@ -1487,16 +1538,28 @@ mod tests {
         sent.iter().filter(|r| r.method.as_str() == "POST").map(|r| r.body_json().unwrap()).collect()
     }
 
+    /// The content of any version is `hrefs`.
+    async fn serve_content(server: &wiremock::MockServer, hrefs: &[String]) {
+        let results: Vec<Value> = hrefs.iter().map(|h| json!({ "pulp_href": h })).collect();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pulp/api/v3/content/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": results.len(), "next": null, "results": results })),
+            )
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_large_selection_is_copied_in_batches() {
         let server = wiremock::MockServer::start().await;
         let svc = mock_service(&server).await;
         let (mut vr, hrefs) = file_copy(&server, &svc, 30_000).await;
+        serve_content(&server, &[]).await;
         svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err(); // the publish step is not served
         let bodies = modify_bodies(&server).await;
         assert_eq!(bodies.len(), 2, "30,000 hrefs of 73 bytes do not fit in one body");
-        assert_eq!(bodies[0]["remove_content_units"], json!(["*"]), "the first batch starts from an empty version");
-        assert!(bodies[1].get("remove_content_units").is_none(), "the next batch adds to it");
+        assert!(bodies.iter().all(|b| b.get("remove_content_units").is_none()), "each batch adds to the latest version");
         let sent: Vec<String> =
             bodies.iter().flat_map(|b| serde_json::from_value::<Vec<String>>(b["add_content_units"].clone()).unwrap()).collect();
         assert_eq!(sent, hrefs);
@@ -1505,20 +1568,107 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn resume_sends_only_the_batches_not_in_the_version() {
+    async fn a_snapshot_changes_the_latest_version_only_where_it_differs() {
+        // Pulp's delete of a version is very slow when its removed units come back in the next one.
+        let stale: Vec<String> = (0..2).map(|i| format!("/pulp/api/v3/content/file/files/stale{i}/")).collect();
+        for changed in [true, false] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let (mut vr, hrefs) = file_copy(&server, &svc, 30_000).await;
+            let present = if changed { [&stale[..], &hrefs[10_000..]].concat() } else { hrefs.clone() };
+            serve_content(&server, &present).await;
+            svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err(); // the publish step is not served
+            let bodies = modify_bodies(&server).await;
+            let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
+            assert_eq!(saved.derived_version, Some(format!("{FILE_DERIVED}versions/3/")));
+            if changed {
+                assert_eq!(bodies, [json!({ "remove_content_units": stale }), json!({ "add_content_units": hrefs[..10_000] })]);
+            } else {
+                assert!(bodies.is_empty(), "nothing is sent when the latest version is the selection: {bodies:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deb_snapshot_removes_the_release_records_of_its_removed_packages() {
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let h = |kind: &str, n: u32| format!("/pulp/api/v3/content/deb/{kind}/{n}/");
+        let latest = format!("{DEB_DERIVED}versions/4/");
+        let derived = json!({ "pulp_href": DEB_DERIVED, "name": "web-apt", "latest_version_href": latest });
+        Mock::given(method("GET"))
+            .and(path(DEB_DERIVED))
+            .respond_with(ResponseTemplate::new(200).set_body_json(derived))
+            .mount(&server)
+            .await;
+        let present = [
+            h("packages", 1),
+            h("packages", 2),
+            h("package_release_components", 1),
+            h("package_release_components", 2),
+            h("releases", 1),
+            h("release_components", 1),
+            h("release_architectures", 1),
+            h("release_files", 1),
+        ];
+        serve_content(&server, &present).await;
+        let prc = |n: u32| json!({ "pulp_href": h("package_release_components", n), "package": h("packages", n) });
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/content/deb/package_release_components/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 2, "next": null, "results": [prc(1), prc(2)] })))
+            .mount(&server)
+            .await;
+        let (remove, add) = svc.changes(RepoType::Deb, DEB_DERIVED, vec![h("packages", 1), h("packages", 3)]).await.unwrap();
+        assert_eq!(remove, [h("packages", 2), h("package_release_components", 2), h("release_files", 1)]);
+        assert_eq!(add, [h("packages", 3)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn versions_no_content_view_uses_are_deleted_after_the_copy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (mut vr, _) = file_copy(&server, &svc, 3).await;
+        serve_content(&server, &[]).await;
+        let v = |n: u64| format!("{FILE_DERIVED}versions/{n}/");
+        // Version 1 is the snapshot of another Content View version; version 2 is a batch nobody uses.
+        let cv = svc.store.version(vr.version_id).await.unwrap().cv_id;
+        let other = svc.store.begin_version(cv, "", &[vr.repo().clone()]).await.unwrap();
+        let mut row = svc.store.version_repos(other.id).await.unwrap().remove(0);
+        (row.derived_repo, row.derived_version) = (Some(FILE_DERIVED.into()), Some(v(1)));
+        svc.store.save_version_repo(&row).await.unwrap();
+        let versions: Vec<Value> = (0..4).map(|n| json!({ "pulp_href": v(n), "number": n })).collect();
+        let page = json!({ "count": 4, "next": null, "results": versions });
+        let list = format!("{FILE_DERIVED}versions/");
+        Mock::given(method("GET")).and(path(list)).respond_with(ResponseTemplate::new(200).set_body_json(page)).mount(&server).await;
+        let task = json!({ "task": "/pulp/api/v3/tasks/2/" });
+        Mock::given(method("DELETE")).and(path(v(2))).respond_with(ResponseTemplate::new(202).set_body_json(task)).mount(&server).await;
+        let done = json!({ "pulp_href": "/pulp/api/v3/tasks/2/", "state": "completed", "name": "delete" });
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/tasks/2/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(done))
+            .mount(&server)
+            .await;
+        let lines = Mutex::new(vec![]);
+        svc.publish_repo("web", &mut vr, &|s| lines.lock().unwrap().push(s), &ops::no_progress).await.unwrap_err(); // publish not served
+        let sent = server.received_requests().await.unwrap();
+        let deleted: Vec<_> = sent.iter().filter(|r| r.method.as_str() == "DELETE").map(|r| r.url.path().to_string()).collect();
+        assert_eq!(deleted, [v(2)], "not version 0, the one another view version uses, or the new snapshot");
+        assert!(lines.lock().unwrap().contains(&format!("deleted unused version {}", v(2))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_sends_only_the_batches_not_in_the_version() {
         let server = wiremock::MockServer::start().await;
         let svc = mock_service(&server).await;
         let (mut vr, hrefs) = file_copy(&server, &svc, 30_000).await;
         // The first batch was sent and completed before the client stopped; its version has those units.
         vr.pending_task = Some("/pulp/api/v3/tasks/1/".into());
         svc.store.save_version_repo(&vr).await.unwrap();
-        let present: Vec<Value> = hrefs[..20_000].iter().map(|h| json!({ "pulp_href": h })).collect();
-        wiremock::Mock::given(method("GET"))
-            .and(path("/pulp/api/v3/content/"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 20_000, "next": null, "results": present })))
-            .mount(&server)
-            .await;
+        serve_content(&server, &hrefs[..20_000]).await;
         svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err(); // the publish step is not served
         let bodies = modify_bodies(&server).await;
         assert_eq!(bodies.len(), 1, "only the rest is sent");

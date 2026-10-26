@@ -936,7 +936,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                                         }
                                         sent = Some(match t {
                                             RepoType::Rpm => rpm::copy(&c, &sv, &href, None, units, deps).await?,
-                                            RepoType::File => file::modify(&c, &href, false, units.unwrap_or_default()).await?,
+                                            RepoType::File => file::modify(&c, &href, units.unwrap_or_default()).await?,
                                             RepoType::Deb => deb::copy(&c, &sv, &href, None, units).await?,
                                         });
                                     }

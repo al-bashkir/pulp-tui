@@ -118,6 +118,11 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
   needs: the package-release-component (PRC) units of the copied packages, their release
   components, release architectures and releases (`tasks/copy.py`,
   `find_structured_publish_content`). pulp-tui always sends `structured: true`.
+* A structured publication lists every PRC in the version and loads its package by id; it does
+  not check that the package is in the version (`tasks/publishing.py`). Removing a package with
+  `modify/` leaves its PRCs, and pulp_deb does not remove them, so the package would still be
+  published. pulp-tui removes the PRCs of a package together with it. It keeps releases,
+  release components and release architectures, which all packages of a release share.
 * `dependency_solving: true` is not implemented: the task fails with
   `FeatureNotImplementedError`. pulp-tui always sends `false`.
 * `dest_base_version: 0` starts the new version from the empty version 0 of the destination
@@ -155,13 +160,25 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
   | 35,000 | 2,625,297 | 400 HTML `Bad Request (400)` (body refused) |
   | 60,000 | 4,500,297 | 400 HTML `Bad Request (400)` (body refused) |
 
-  `rpm/copy/` and `modify/` have the same limit. So pulp-tui sends a selection in batches of
+  `rpm/copy/` and `modify/` have the same limit. So pulp-tui sends a list in batches of
   at most 2,000,000 bytes of hrefs (`ops::batches`, sized by the longest href), one task
-  after the other: the first batch of a Content View snapshot starts from an empty version
-  (`dest_base_version: 0`, or `remove_content_units: ["*"]` for File), the others add to the
-  latest version. Each batch makes a version of the derived repository; the last one is the
-  snapshot. A resumed publish lists the content of the latest derived version and sends only
-  the hrefs it lacks.
+  after the other. A filtered Content View snapshot changes the latest derived version only
+  where it differs from the selection: first `modify/` removes the units that are no longer
+  selected, then the copy adds the missing ones. Each batch makes a version of the derived
+  repository; the last one is the snapshot, and an unchanged selection makes no version. A
+  resumed publish does the same from the latest derived version. After the copy, pulp-tui
+  deletes the derived versions that no Content View version uses (except version 0).
+  pulpcore's `delete_version` merges a deleted version's changes into the next newer
+  version, so the content of the other versions does not change, and it refuses a version
+  that a distribution serves directly or through a publication (`protected_versions`).
+* That merge (`RepositoryVersion._squash`) locks rows with nested `IN` subqueries for the
+  units that the deleted version removed and the next version adds again. In a live test
+  (pulpcore with PostgreSQL 16), PostgreSQL planned it from statistics older than the new
+  versions and ran one delete for more than 8 hours at full CPU; with current statistics the
+  same query is a hash join. A snapshot that starts from an empty version and is completed by
+  later batches makes exactly that case (every unit leaves and comes back), so pulp-tui never
+  builds a snapshot that way. A copy without filters is one request on `dest_base_version: 0`:
+  inside one version, pulpcore undoes the removal of a unit that is added again.
 
 ## Shared database (PostgreSQL)
 

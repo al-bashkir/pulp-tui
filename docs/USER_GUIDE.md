@@ -309,11 +309,16 @@ previous version). A composite uses the publications of its component versions, 
 Publish does not ask.
 
 **Large selections.** Pulp refuses a request body above 2.5 MiB (Django
-`DATA_UPLOAD_MAX_MEMORY_SIZE`), which is about 35,000 package hrefs. So pulp-tui sends a large
-selection in batches, one after the other; the job's progress shows `copy batch 2/3`. Each batch
-makes one version of the snapshot repository, and the last one is the snapshot, so the
-snapshot repository can have more versions than the view. When a publish stops between
-batches, Resume sends only the batches that are not in the snapshot repository yet. Copy
+`DATA_UPLOAD_MAX_MEMORY_SIZE`), which is about 35,000 package hrefs. A filtered snapshot starts
+from the latest version of the snapshot repository: pulp-tui removes what the rules no longer
+select, then copies what is missing, each list in batches, one after the other. The job's
+progress shows each step, for example `main: copying 25316 units (2/3)`. An unchanged selection
+sends nothing and uses the latest version again. Each batch makes one version of the snapshot
+repository, and the last one is the snapshot. After the copy, pulp-tui deletes the versions of
+the snapshot repository that no Content View version uses (Pulp merges each one into the next
+version, so the snapshot does not change); version 0 stays, and a version that fails to delete
+is logged and tried again by the next publish. When a publish stops between batches, Resume
+continues from the latest version of the snapshot repository. Copy
 content (`C` on a repository) also sends batches; Tasks shows the last one. A repository
 without filter rules sends no list of hrefs.
 

@@ -41,11 +41,7 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String>
     Ok(format!("PULP_MANIFEST matches {} files", want.len()))
 }
 
-/// Add content units to a repository; `replace_all` first removes all existing units.
-pub async fn modify(c: &PulpClient, repo: &str, replace_all: bool, add: Vec<String>) -> Result<Mutation> {
-    let mut body = json!({ "add_content_units": add });
-    if replace_all {
-        body["remove_content_units"] = json!(["*"]);
-    }
-    c.post(&format!("{repo}modify/"), &body).await
+/// Add content units to a repository.
+pub async fn modify(c: &PulpClient, repo: &str, add: Vec<String>) -> Result<Mutation> {
+    c.post(&format!("{repo}modify/"), &json!({ "add_content_units": add })).await
 }

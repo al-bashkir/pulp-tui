@@ -267,9 +267,15 @@ pub fn label_owner(labels: &BTreeMap<String, String>, key: &str, id: &str, alias
 /// Hrefs of all content units (any type) of a version. The generic endpoint returns no
 /// type field; callers classify by href path (`/content/rpm/packages/`, ...).
 pub async fn content_in(c: &PulpClient, version: &str) -> Result<Vec<String>> {
-    let v: Vec<Value> =
-        c.list_all(&c.api("content/"), &[("repository_version", version.into()), ("fields", "pulp_href".into())], 2_000_000).await?;
+    // Large pages: with offset paging, 127,000 units took about 4 minutes at 500 per page.
+    let q = [("repository_version", version.to_string()), ("fields", "pulp_href".into()), ("limit", "5000".into())];
+    let v: Vec<Value> = c.list_all(&c.api("content/"), &q, 2_000_000).await?;
     Ok(v.into_iter().filter_map(|x| x["pulp_href"].as_str().map(str::to_string)).collect())
+}
+
+/// A new version of `repo` without `units` (any content type).
+pub async fn remove_content(c: &PulpClient, repo: &str, units: Vec<String>) -> Result<Mutation> {
+    c.post(&format!("{repo}modify/"), &json!({ "remove_content_units": units })).await
 }
 
 /// Bytes of hrefs in one copy or modify body. Pulp refuses a body above Django's
