@@ -121,7 +121,8 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
 
     let cols = l.kind.columns();
     let mut info = vec![];
-    if l.count > l.items.len() as u64 {
+    let paged = l.count > l.items.len() as u64;
+    if paged {
         info.push(format!("{}-{} of {}", l.offset + 1, l.offset + l.items.len() as u64, l.count));
     } else {
         info.push(format!("{} items", l.items.len()));
@@ -130,7 +131,9 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         info.push(format!("filter: {}", l.filter));
     }
     if let Some((c, d)) = l.sort {
-        info.push(format!("sort: {}{}", cols.get(c).map(|c| c.title).unwrap_or(""), if d { " desc" } else { "" }));
+        // `apply_sort` orders the loaded rows only.
+        let page = if paged { " (this page)" } else { "" };
+        info.push(format!("sort: {}{}{page}", cols.get(c).map(|c| c.title).unwrap_or(""), if d { " desc" } else { "" }));
     }
     if !l.marked.is_empty() {
         info.push(format!("{} marked", l.marked.len()));
@@ -537,7 +540,7 @@ pub fn help_lines() -> Vec<String> {
         "",
         "Lists",
         "  ↑↓ j k  PgUp PgDn Ctrl-D Ctrl-U  g G  move   h  screen list     Enter  action menu (shortcut letters shown)",
-        "  /   server-side search  s/S sort column / reverse   n/p next/previous page",
+        "  /   server-side search  s/S sort the loaded page by column / reverse   n/p next/previous page",
         "  Space  mark item (multi-select: compare, remove/add content)",
         "  t   toggle RPM/File/Deb, content type, tracked/server tasks, task polling in Logs, or CV snapshots in Repositories",
         "  r   refresh   Esc  cancel loading request / clear marks / go back",
@@ -695,6 +698,27 @@ mod tests {
         app.list.loading = true;
         let s = screen(&app);
         assert!(s.contains("loading") && s.contains("old-row"), "{s}");
+    }
+
+    #[tokio::test]
+    async fn list_title_says_a_sort_covers_only_the_loaded_page() {
+        let st = std::sync::Arc::new(crate::store::Store::open_in_memory().await.unwrap());
+        let mut app = App::new(crate::config::Config::default(), "/dev/null".into(), st.clone(), Ok(st));
+        app.screen = Screen::List(Kind::Profiles);
+        app.list.kind = Kind::Profiles;
+        app.list.items = vec![serde_json::json!({"name": "a"}), serde_json::json!({"name": "b"})];
+        app.list.sort = Some((1, true));
+        let screen = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(140, 30)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            t.backend().to_string()
+        };
+        app.list.count = 2;
+        let s = screen(&app);
+        assert!(s.contains("sort: name desc]"), "{s}");
+        app.list.count = 250;
+        let s = screen(&app);
+        assert!(s.contains("1-2 of 250") && s.contains("sort: name desc (this page)]"), "{s}");
     }
 
     #[tokio::test]
