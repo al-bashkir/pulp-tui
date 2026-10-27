@@ -733,6 +733,38 @@ fn repo_body(f: &Form, edit: bool) -> Result<Value, String> {
     Ok(b)
 }
 
+/// Repository Create, or Edit of `item`.
+fn repo_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
+    let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
+    let current = item["remote"].as_str().filter(|_| edit).map(str::to_string);
+    let caps = caps(app);
+    let open = move |app: &mut App, remote: String| {
+        let form = repo_form(t, caps.as_deref(), edit.then_some(&item), &remote);
+        app.form(form, move |app, f| {
+            let mut body = repo_body(f, edit)?;
+            let remote = body["remote"].as_str().map(str::to_string);
+            let href = href.clone();
+            let label = format!("{} repository {}", if edit { "update" } else { "create" }, f.get("name"));
+            submit(app, label, move |c| async move {
+                if let Some(r) = remote {
+                    body["remote"] = href_by_name(&c, t.remotes(), &r).await?.into();
+                }
+                Ok(if edit { c.patch(&href, &body).await? } else { c.post(&c.api(t.repositories()), &body).await? })
+            });
+            Ok(())
+        });
+    };
+    match current {
+        // The picker holds names: read the current remote's name so the field shows it, as Sync does.
+        Some(r) => app.job(format!("remote of {name}"), move |ctx| async move {
+            let v = ctx.client.get::<Value>(&r, &[("fields", "name".into())]).await;
+            let current = v.map(|v| s(&v, "name")).unwrap_or_default();
+            ap(move |app| open(app, current))
+        }),
+        None => open(app, String::new()),
+    }
+}
+
 fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
@@ -751,36 +783,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             Some(v) => app.push(Kind::Content { version: v.into(), ctype: 0 }),
             None => app.error("repository has no versions"),
         },
-        Act::Create | Act::Edit => {
-            let edit = act == Act::Edit;
-            let current = item["remote"].as_str().filter(|_| edit).map(str::to_string);
-            let caps = caps(app);
-            let open = move |app: &mut App, remote: String| {
-                let form = repo_form(t, caps.as_deref(), edit.then_some(&item), &remote);
-                app.form(form, move |app, f| {
-                    let mut body = repo_body(f, edit)?;
-                    let remote = body["remote"].as_str().map(str::to_string);
-                    let href = href.clone();
-                    let label = format!("{} repository {}", if edit { "update" } else { "create" }, f.get("name"));
-                    submit(app, label, move |c| async move {
-                        if let Some(r) = remote {
-                            body["remote"] = href_by_name(&c, t.remotes(), &r).await?.into();
-                        }
-                        Ok(if edit { c.patch(&href, &body).await? } else { c.post(&c.api(t.repositories()), &body).await? })
-                    });
-                    Ok(())
-                });
-            };
-            match current {
-                // The picker holds names: read the current remote's name so the field shows it, as Sync does.
-                Some(r) => app.job(format!("remote of {name}"), move |ctx| async move {
-                    let v = ctx.client.get::<Value>(&r, &[("fields", "name".into())]).await;
-                    let current = v.map(|v| s(&v, "name")).unwrap_or_default();
-                    ap(move |app| open(app, current))
-                }),
-                None => open(app, String::new()),
-            }
-        }
+        Act::Create | Act::Edit => repo_edit(app, t, act == Act::Edit, item),
         Act::Delete => {
             app.job(format!("impact of deleting {name}"), move |ctx| async move {
                 let c = &ctx.client;
@@ -1171,6 +1174,39 @@ fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> V
     }
 }
 
+/// JSON body from a remote form, and the (field, file path) pairs whose file content goes into it.
+fn remote_body(f: &Form, edit: bool) -> Result<(Value, Vec<(String, String)>), String> {
+    let mut b = json!({});
+    let mut files = vec![];
+    for fld in &f.fields {
+        let val = f.get(&fld.key).to_string();
+        let secretish = matches!(fld.kind, FieldKind::Secret) || matches!(fld.key.as_str(), "username" | "proxy_username");
+        // Write-only file paths: the body gets the file's content.
+        let file = matches!(fld.key.as_str(), "ca_cert" | "client_cert" | "client_key" | "gpgkey");
+        if (!edit || secretish || file) && val.is_empty() {
+            continue; // write-only: empty keeps the server value
+        }
+        if edit && !fld.changed() && !secretish && !file {
+            continue;
+        }
+        match (fld.key.as_str(), &fld.kind) {
+            ("labels", _) => b["pulp_labels"] = parse_labels(&val)?,
+            // The server accepts null for all of them (allow_null).
+            _ if (secretish || file) && val == "-" => b[fld.key.as_str()] = Value::Null,
+            _ if file => files.push((fld.key.clone(), val)),
+            (_, FieldKind::Bool) => b[fld.key.as_str()] = (val == "true").into(),
+            (_, FieldKind::Number) if val.is_empty() => b[fld.key.as_str()] = Value::Null,
+            (_, FieldKind::Number) => {
+                b[fld.key.as_str()] = val.parse::<i64>().map_err(|_| format!("{} must be a number", fld.label))?.into()
+            }
+            _ if val.is_empty() => b[fld.key.as_str()] = Value::Null,
+            _ => b[fld.key.as_str()] = val.into(),
+        }
+    }
+    url::Url::parse(f.get("url")).map_err(|e| format!("invalid URL: {e}"))?;
+    Ok((b, files))
+}
+
 fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
@@ -1216,34 +1252,7 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             fields.extend(remote_extra_fields(t, caps.as_deref(), &v));
             let form = Form::new(if edit { format!("Edit remote {name}") } else { format!("New {} remote", t.label()) }, fields);
             app.form(form, move |app, f| {
-                let mut b = json!({});
-                let mut files = vec![];
-                for fld in &f.fields {
-                    let val = f.get(&fld.key).to_string();
-                    let secretish = matches!(fld.kind, FieldKind::Secret) || matches!(fld.key.as_str(), "username" | "proxy_username");
-                    // Write-only file paths: the body gets the file's content.
-                    let file = matches!(fld.key.as_str(), "ca_cert" | "client_cert" | "client_key" | "gpgkey");
-                    if (!edit || secretish || file) && val.is_empty() {
-                        continue; // write-only: empty keeps the server value
-                    }
-                    if edit && !fld.changed() && !secretish && !file {
-                        continue;
-                    }
-                    match (fld.key.as_str(), &fld.kind) {
-                        ("labels", _) => b["pulp_labels"] = parse_labels(&val)?,
-                        // The server accepts null for all of them (allow_null).
-                        _ if (secretish || file) && val == "-" => b[fld.key.as_str()] = Value::Null,
-                        _ if file => files.push((fld.key.clone(), val)),
-                        (_, FieldKind::Bool) => b[fld.key.as_str()] = (val == "true").into(),
-                        (_, FieldKind::Number) if val.is_empty() => b[fld.key.as_str()] = Value::Null,
-                        (_, FieldKind::Number) => {
-                            b[fld.key.as_str()] = val.parse::<i64>().map_err(|_| format!("{} must be a number", fld.label))?.into()
-                        }
-                        _ if val.is_empty() => b[fld.key.as_str()] = Value::Null,
-                        _ => b[fld.key.as_str()] = val.into(),
-                    }
-                }
-                url::Url::parse(f.get("url")).map_err(|e| format!("invalid URL: {e}"))?;
+                let (mut b, files) = remote_body(f, edit)?;
                 let href = href.clone();
                 submit(app, format!("{} remote {}", if edit { "update" } else { "create" }, f.get("name")), move |c| async move {
                     for (k, path) in files {
