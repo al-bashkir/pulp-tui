@@ -119,16 +119,25 @@ pub async fn distributions(c: &PulpClient, t: RepoType) -> Result<Vec<Distributi
     c.list_all(&c.api(t.distributions()), &[], 100_000).await
 }
 
+/// `/…/repositories/rpm/rpm/<id>/versions/3/` -> repository href.
+pub fn repo_of_version(v: &str) -> String {
+    v.split("versions/").next().unwrap_or(v).to_string()
+}
+
+/// `/…/versions/3/` -> 3.
+pub fn version_number(v: &str) -> u64 {
+    v.trim_end_matches('/').rsplit('/').next().and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
 /// The distributions that make Pulp refuse to delete `version`, each with the reason: pulpcore
 /// `Repository.protected_versions`. `pubs`: the publications of its repository (the list has only
 /// complete ones). File, RPM and Deb distributions serve from publications.
 pub fn protecting<'a>(version: &str, pubs: &[Publication], ds: &'a [Distribution]) -> Vec<(&'a Distribution, &'static str)> {
-    let repo = version.split("versions/").next().unwrap_or(version);
-    let number = |v: &&str| v.trim_end_matches('/').rsplit('/').next().and_then(|n| n.parse::<u64>().ok());
-    let newest = pubs.iter().filter_map(|p| p.repository_version.as_deref()).max_by_key(number);
+    let repo = repo_of_version(version);
+    let newest = pubs.iter().filter_map(|p| p.repository_version.as_deref()).max_by_key(|v| version_number(v));
     let own: Vec<&Publication> = pubs.iter().filter(|p| p.repository_version.as_deref() == Some(version)).collect();
     let reason = |d: &Distribution| {
-        let follows = d.repository.as_deref() == Some(repo);
+        let follows = d.repository.as_deref() == Some(repo.as_str());
         if d.repository_version.as_deref() == Some(version) {
             Some("pinned to this version")
         } else if own.iter().any(|p| d.publication.as_ref() == Some(&p.pulp_href)) {
@@ -152,8 +161,7 @@ pub async fn version_protection(
     t: RepoType,
     version: &str,
 ) -> Result<(Vec<Publication>, Vec<(Distribution, &'static str)>)> {
-    let repo = version.split("versions/").next().unwrap_or(version);
-    let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", repo.into())], 100_000).await?;
+    let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", repo_of_version(version))], 100_000).await?;
     let ds = distributions(c, t).await?;
     let by = protecting(version, &pubs, &ds).into_iter().map(|(d, why)| (d.clone(), why)).collect();
     Ok((pubs.into_iter().filter(|p| p.repository_version.as_deref() == Some(version)).collect(), by))

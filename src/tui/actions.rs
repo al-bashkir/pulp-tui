@@ -8,7 +8,7 @@ use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile, database_keyr
 use crate::filters::{Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
 use crate::pulp::models::{Distribution, Publication, Task};
-use crate::pulp::ops;
+use crate::pulp::ops::{self, repo_of_version, version_number};
 use crate::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::Store;
 use anyhow::{Context, anyhow, bail};
@@ -89,18 +89,8 @@ pub async fn href_by_name(c: &PulpClient, collection: &str, name: &str) -> anyho
         .ok_or_else(|| anyhow!("no object named {name:?} in {collection}"))
 }
 
-/// `/…/repositories/rpm/rpm/<id>/versions/3/` -> repository href.
-pub fn repo_of_version(v: &str) -> String {
-    v.split("versions/").next().unwrap_or(v).to_string()
-}
-
 fn version_of(repo: &str, number: i64) -> String {
     format!("{repo}versions/{number}/")
-}
-
-/// `/…/versions/3/` -> 3.
-fn version_number(v: &str) -> u64 {
-    v.trim_end_matches('/').rsplit('/').next().and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
 /// The Content View whose label a Pulp object carries: it changes through the Content View actions only.
