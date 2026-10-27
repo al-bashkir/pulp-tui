@@ -119,6 +119,13 @@ server gives the final answer; the dashboard shows a warning.
 * `all_tasks_dispatched` of replication task groups stays false in 3.123; see
   `docs/ARCHITECTURE.md` for how completion is detected.
 * `api_root` of an Upstream Pulp is relative and needs a trailing slash (`pulp/`).
+* **Clearing remote fields.** pulpcore `RemoteNetworkConfigSerializer` (`ca_cert`,
+  `client_cert`, `client_key`, `username`, `password`, `proxy_username`,
+  `proxy_password`), pulp_rpm `sles_auth_token` and pulp_deb `gpgkey` have
+  `allow_null=True`, and the repository `remote` is nullable (3.123.0 OpenAPI). A PATCH
+  with `null` unsets the value (`hidden_fields` shows `is_set: false`; checked live for a
+  File remote and repository). The remote and repository Edit forms send `null` for `-`
+  and for a cleared Remote.
 
 ## pulp_deb
 

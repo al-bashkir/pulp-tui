@@ -655,12 +655,13 @@ fn repo_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec
     fields
 }
 
-fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>) -> Form {
+/// `remote` is the name of the repository's default remote ("" = none, or not readable).
+fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>, remote: &str) -> Form {
     let v = item.cloned().unwrap_or(Value::Null);
     let mut fields = vec![
         Field::text("name", "Name").required().value(s(&v, "name")),
         Field::text("description", "Description").value(s(&v, "description")),
-        Field::pick("remote", "Remote", Source::Remotes(t)).help("default remote for sync; empty = none").value(""),
+        Field::pick("remote", "Remote", Source::Remotes(t)).help("default remote for sync; empty = none").value(remote),
         Field::new("retain_repo_versions", "Retain versions", FieldKind::Number)
             .value(s(&v, "retain_repo_versions"))
             .help("empty = keep all versions"),
@@ -670,17 +671,20 @@ fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>) -> 
     fields.extend(repo_extra_fields(t, caps, &v));
     let mut form =
         Form::new(if item.is_some() { format!("Edit {} repository", t.label()) } else { format!("New {} repository", t.label()) }, fields);
-    if let Some(r) = v["remote"].as_str() {
-        form = form.note(format!("current remote: {r} (leave Remote empty to keep it)"));
+    if let Some(r) = v["remote"].as_str()
+        && remote.is_empty()
+    {
+        form = form.note(format!("current remote {r} could not be read; an empty Remote keeps it"));
     }
     form
 }
 
 /// JSON body from a repository form; on edit only changed fields are sent.
+/// `remote` holds the remote's name (the caller sends its href), or null when cleared on edit.
 fn repo_body(f: &Form, edit: bool) -> Result<Value, String> {
     let mut b = json!({});
     for fld in &f.fields {
-        if edit && !fld.changed() || fld.key == "remote" {
+        if edit && !fld.changed() {
             continue;
         }
         let v = fld.value.trim();
@@ -721,20 +725,33 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         },
         Act::Create | Act::Edit => {
             let edit = act == Act::Edit;
-            let form = repo_form(t, caps(app).as_deref(), edit.then_some(&item));
-            app.form(form, move |app, f| {
-                let mut body = repo_body(f, edit)?;
-                let remote = f.opt("remote").map(str::to_string);
-                let href = href.clone();
-                let label = format!("{} repository {}", if edit { "update" } else { "create" }, f.get("name"));
-                submit(app, label, move |c| async move {
-                    if let Some(r) = remote {
-                        body["remote"] = href_by_name(&c, t.remotes(), &r).await?.into();
-                    }
-                    Ok(if edit { c.patch(&href, &body).await? } else { c.post(&c.api(t.repositories()), &body).await? })
+            let current = item["remote"].as_str().filter(|_| edit).map(str::to_string);
+            let caps = caps(app);
+            let open = move |app: &mut App, remote: String| {
+                let form = repo_form(t, caps.as_deref(), edit.then_some(&item), &remote);
+                app.form(form, move |app, f| {
+                    let mut body = repo_body(f, edit)?;
+                    let remote = body["remote"].as_str().map(str::to_string);
+                    let href = href.clone();
+                    let label = format!("{} repository {}", if edit { "update" } else { "create" }, f.get("name"));
+                    submit(app, label, move |c| async move {
+                        if let Some(r) = remote {
+                            body["remote"] = href_by_name(&c, t.remotes(), &r).await?.into();
+                        }
+                        Ok(if edit { c.patch(&href, &body).await? } else { c.post(&c.api(t.repositories()), &body).await? })
+                    });
+                    Ok(())
                 });
-                Ok(())
-            });
+            };
+            match current {
+                // The picker holds names: read the current remote's name so the field shows it, as Sync does.
+                Some(r) => app.job(format!("remote of {name}"), move |ctx| async move {
+                    let v = ctx.client.get::<Value>(&r, &[("fields", "name".into())]).await;
+                    let current = v.map(|v| s(&v, "name")).unwrap_or_default();
+                    ap(move |app| open(app, current))
+                }),
+                None => open(app, String::new()),
+            }
         }
         Act::Delete => {
             app.job(format!("impact of deleting {name}"), move |ctx| async move {
@@ -1072,6 +1089,9 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
 
 // ---- remotes -------------------------------------------------------------------------
 
+/// Help of a remote field whose value the edit form cannot show (write-only, or a file path).
+const WRITE_ONLY: &str = "empty = unchanged, - = clear";
+
 fn remote_url_help(t: RepoType) -> &'static str {
     match t {
         RepoType::Rpm => "yum repository base URL",
@@ -1083,10 +1103,11 @@ fn remote_url_help(t: RepoType) -> &'static str {
 /// Remote form fields that only some plugins have; `v` is the remote being edited (`Null` on create).
 fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec<Field> {
     let has = |f: &str| caps.is_none_or(|c| c.has_field(t.remote_schema(), f));
+    let write_only = if v.is_null() { "" } else { WRITE_ONLY };
     match t {
         RepoType::Rpm => {
             if has("sles_auth_token") {
-                vec![Field::new("sles_auth_token", "SLES auth token", FieldKind::Secret)]
+                vec![Field::new("sles_auth_token", "SLES auth token", FieldKind::Secret).help(write_only)]
             } else {
                 vec![]
             }
@@ -1103,7 +1124,7 @@ fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> V
                 flag("sync_udebs", "Sync udebs"),
                 flag("sync_installer", "Sync installer files"),
                 flag("ignore_missing_package_indices", "Ignore missing package indices"),
-                Field::text("gpgkey", "GPG public key (file path)").help(if v.is_null() { "" } else { "empty = unchanged" }),
+                Field::text("gpgkey", "GPG public key (file path)").help(write_only),
             ];
             all.into_iter().filter(|f| has(&f.key)).collect()
         }
@@ -1118,6 +1139,7 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             let edit = act == Act::Edit;
             let v = if edit { item.clone() } else { Value::Null };
             let caps = caps(app);
+            let write_only = if edit { WRITE_ONLY } else { "" };
             let policies = caps
                 .as_ref()
                 .and_then(|c| c.enum_values("Policy692Enum").map(|e| e.to_vec()))
@@ -1135,14 +1157,14 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 } else {
                     "true"
                 }),
-                Field::text("ca_cert", "CA cert (PEM file path)").help(if edit { "empty = unchanged" } else { "" }),
-                Field::text("client_cert", "Client cert (PEM file path)"),
-                Field::text("client_key", "Client key (PEM file path)"),
-                Field::text("username", "Username").help("write-only; empty = unchanged"),
-                Field::new("password", "Password", FieldKind::Secret),
+                Field::text("ca_cert", "CA cert (PEM file path)").help(write_only),
+                Field::text("client_cert", "Client cert (PEM file path)").help(write_only),
+                Field::text("client_key", "Client key (PEM file path)").help(write_only),
+                Field::text("username", "Username").help(write_only),
+                Field::new("password", "Password", FieldKind::Secret).help(write_only),
                 Field::text("proxy_url", "Proxy URL").value(s(&v, "proxy_url")),
-                Field::text("proxy_username", "Proxy username"),
-                Field::new("proxy_password", "Proxy password", FieldKind::Secret),
+                Field::text("proxy_username", "Proxy username").help(write_only),
+                Field::new("proxy_password", "Proxy password", FieldKind::Secret).help(write_only),
                 Field::new("download_concurrency", "Download concurrency", FieldKind::Number).value(s(&v, "download_concurrency")),
                 Field::new("rate_limit", "Rate limit (req/s)", FieldKind::Number).value(s(&v, "rate_limit")),
                 // A float on the server: `s()` would show `3600.0`, which is not a whole number.
@@ -1169,6 +1191,8 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                     }
                     match (fld.key.as_str(), &fld.kind) {
                         ("labels", _) => b["pulp_labels"] = parse_labels(&val)?,
+                        // The server accepts null for all of them (allow_null).
+                        _ if (secretish || file) && val == "-" => b[fld.key.as_str()] = Value::Null,
                         _ if file => files.push((fld.key.clone(), val)),
                         (_, FieldKind::Bool) => b[fld.key.as_str()] = (val == "true").into(),
                         (_, FieldKind::Number) if val.is_empty() => b[fld.key.as_str()] = Value::Null,
@@ -1825,17 +1849,39 @@ mod tests {
     #[test]
     fn repo_body_sends_only_changes_on_edit() {
         let item = json!({ "name": "os", "description": "d", "retain_repo_versions": 5, "autopublish": false, "pulp_labels": {"a": "b"} });
-        let mut f = repo_form(RepoType::File, None, Some(&item));
+        let mut f = repo_form(RepoType::File, None, Some(&item), "");
         assert_eq!(repo_body(&f, true).unwrap(), json!({}));
         f.fields.iter_mut().find(|x| x.key == "retain_repo_versions").unwrap().value.clear();
         f.fields.iter_mut().find(|x| x.key == "autopublish").unwrap().value = "true".into();
         assert_eq!(repo_body(&f, true).unwrap(), json!({ "retain_repo_versions": null, "autopublish": true }));
-        let new = repo_form(RepoType::Rpm, None, None);
+        let new = repo_form(RepoType::Rpm, None, None, "");
         let mut new = new;
         new.fields[0].value = "x".into();
         let b = repo_body(&new, false).unwrap();
         assert_eq!(b["name"], "x");
         assert!(b.get("description").is_none() && b["retain_repo_versions"].is_null());
+    }
+
+    #[test]
+    fn repo_body_sets_or_clears_the_remote() {
+        let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+        let item = json!({ "name": "os", "remote": "/r/1/" });
+        let mut f = repo_form(RepoType::Rpm, None, Some(&item), "epel");
+        assert_eq!((f.get("remote"), f.notes.len()), ("epel", 0));
+        assert_eq!(repo_body(&f, true).unwrap(), json!({}), "unchanged: not sent");
+        set(&mut f, "remote", "updates");
+        assert_eq!(repo_body(&f, true).unwrap(), json!({ "remote": "updates" }), "the name; the caller sends its href");
+        set(&mut f, "remote", "");
+        assert_eq!(repo_body(&f, true).unwrap(), json!({ "remote": null }), "cleared");
+        // A remote that could not be read: the field is empty, and empty keeps it.
+        let f = repo_form(RepoType::Rpm, None, Some(&item), "");
+        assert_eq!(repo_body(&f, true).unwrap(), json!({}));
+        assert!(f.notes.iter().any(|n| n.contains("/r/1/") && n.contains("empty Remote keeps it")), "{:?}", f.notes);
+        let mut new = repo_form(RepoType::Rpm, None, None, "");
+        set(&mut new, "name", "x");
+        assert!(repo_body(&new, false).unwrap().get("remote").is_none(), "create: empty is not sent");
+        set(&mut new, "remote", "epel");
+        assert_eq!(repo_body(&new, false).unwrap()["remote"], "epel");
     }
 
     #[test]
@@ -2579,6 +2625,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repo_edit_shows_and_clears_the_default_remote() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{body_json, method, path};
+        let server = wiremock::MockServer::start().await;
+        let (remote, repo) = (format!("{API}remotes/rpm/rpm/1/"), format!("{API}repositories/rpm/rpm/r/"));
+        get(&server, &remote, json!({ "name": "epel" })).await;
+        wiremock::Mock::given(method("PATCH"))
+            .and(path(repo.clone()))
+            .and(body_json(json!({ "remote": null })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": repo })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        repo_action(&mut app, RepoType::Rpm, Act::Edit, json!({ "pulp_href": repo, "name": "os", "remote": remote }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.get("remote"), "epel");
+        form.fields.iter_mut().find(|f| f.key == "remote").unwrap().value.clear();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.notices.iter().any(|n| n.text == "update repository os: done"), "{:?}", app.notices.back().map(|n| &n.text));
+    }
+
+    #[tokio::test]
     async fn binding_edit_of_a_version_bound_distribution_clears_the_version() {
         use crate::tui::app::Modal;
         use wiremock::matchers::{body_json, method, path};
@@ -2667,6 +2738,39 @@ mod tests {
         );
         let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no text") };
         assert!(!lines.iter().any(|l| l.contains("abc") || l.contains("\"tok\"")), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn remote_edit_clears_write_only_fields_with_a_dash() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{body_json, method, path};
+        let server = wiremock::MockServer::start().await;
+        let href = format!("{API}remotes/rpm/rpm/1/");
+        // `-` sends null (on a file field too, it is not a path), empty is not sent, a value is sent.
+        wiremock::Mock::given(method("PATCH"))
+            .and(path(href.clone()))
+            .and(body_json(json!({ "username": null, "ca_cert": null, "sles_auth_token": null, "proxy_username": "bob" })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": href })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        remote_action(
+            &mut app,
+            RepoType::Rpm,
+            Act::Edit,
+            json!({ "pulp_href": href, "name": "r", "url": "https://h/", "policy": "immediate" }),
+        );
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
+        for k in ["ca_cert", "client_key", "username", "password", "proxy_password", "sles_auth_token"] {
+            assert_eq!(form.fields.iter().find(|f| f.key == k).unwrap().help, "empty = unchanged, - = clear", "{k}");
+        }
+        for (k, v) in [("username", "-"), ("ca_cert", "-"), ("sles_auth_token", "-"), ("proxy_username", "bob")] {
+            form.fields.iter_mut().find(|f| f.key == k).unwrap().value = v.into();
+        }
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.notices.iter().any(|n| n.text == "update remote r: done"), "{:?}", app.notices.back().map(|n| &n.text));
     }
 
     #[tokio::test]

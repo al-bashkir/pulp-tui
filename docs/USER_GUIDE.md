@@ -142,7 +142,8 @@ are visible.
 | c / e / d | create / edit / delete (delete names every distribution that serves the repository, a version or a publication of it; refused while it holds Content View snapshots) |
 | i | full JSON |
 
-Edit sends only changed fields. Edit, sync, upload, copy and content add/remove are refused
+Edit sends only changed fields. Remote shows the default remote by name; clear it to remove
+the default remote. Edit, sync, upload, copy and content add/remove are refused
 on Content View snapshot repositories (a change of retention would prune their snapshots).
 
 Deb repositories use the same keys. Sync a Deb repository from a Deb remote, publish it
@@ -156,9 +157,10 @@ and File only.
 ### Remotes
 `t` switches RPM/File/Deb. Create/edit: URL (File: URL of `PULP_MANIFEST`; Deb: the Debian
 archive base URL, the directory that holds `dists/`), download policy, TLS validation,
-CA/client certificate and key (file paths; content is uploaded), username and password
-(write-only: empty keeps the server value), proxy, concurrency, rate limit, labels, SLES
-token (RPM). Delete lists repositories that use the remote.
+CA/client certificate and key (file paths; content is uploaded), username and password,
+proxy, concurrency, rate limit, labels, SLES token (RPM). The edit form cannot show the
+certificates, key, credentials and token: empty keeps the server value, `-` clears it.
+Delete lists repositories that use the remote.
 
 Deb remote fields (each is shown only when the server has it):
 
@@ -169,7 +171,7 @@ Deb remote fields (each is shown only when the server has it):
 | Architectures | space-separated, for example `amd64 arm64`; empty = all |
 | Sync source packages / udebs / installer files | on or off (default off) |
 | Ignore missing package indices | on or off; keeps a sync going when a `Packages` index is missing upstream |
-| GPG public key | path of a local file; its content is uploaded and Pulp uses it to check the `Release` signature. Write-only: empty on edit keeps the server value |
+| GPG public key | path of a local file; its content is uploaded and Pulp uses it to check the `Release` signature. On edit, empty keeps the server value and `-` clears it |
 
 ### Repository Versions
 From a repository (**v**) or for all repositories. Columns: number, created, present /
