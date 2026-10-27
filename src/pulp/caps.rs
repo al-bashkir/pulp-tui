@@ -33,6 +33,7 @@ pub enum Feature {
     File,
     Deb,
     RpmCopy,
+    DebCopy,
     ChunkedUpload,
     NativeReplication,
     ReplicationPolicy,
@@ -47,6 +48,7 @@ impl Feature {
             Feature::File => "pulp_file plugin",
             Feature::Deb => "pulp_deb plugin",
             Feature::RpmCopy => "RPM copy API (rpm/copy/)",
+            Feature::DebCopy => "Deb copy API (deb/copy/)",
             Feature::ChunkedUpload => "chunked uploads API (uploads/)",
             Feature::NativeReplication => "Upstream Pulp replication (upstream-pulps/, pulpcore >= 3.23, tech preview)",
             Feature::ReplicationPolicy => "Upstream Pulp `policy` field",
@@ -141,6 +143,7 @@ impl Capabilities {
             Feature::File => self.versions.contains_key("file"),
             Feature::Deb => self.versions.contains_key("deb"),
             Feature::RpmCopy => self.versions.contains_key("rpm") && self.has_endpoint("rpm/copy/"),
+            Feature::DebCopy => self.versions.contains_key("deb") && self.has_endpoint("deb/copy/"),
             Feature::ChunkedUpload => self.has_endpoint("uploads/") && self.has_endpoint("{upload_href}"),
             Feature::NativeReplication => {
                 self.at_least("core", (3, 23, 0))
@@ -194,6 +197,7 @@ mod tests {
         assert_eq!(c.require(Feature::Deb).unwrap_err().to_string(), "not supported by this server: pulp_deb plugin");
         c.versions.insert("deb".into(), "3.8.0".into());
         assert!(c.supports(Feature::Deb));
+        assert!(c.supports(Feature::DebCopy), "no OpenAPI: optimistic");
         c.versions.insert("core".into(), "3.40.0".into());
         c.load_openapi(&json!({
             "paths": {"/pulp/api/v3/upstream-pulps/": {}, "{upstream_pulp_href}replicate/": {}, "/pulp/{pulp_domain}/api/v3/rpm/copy/": {}},
@@ -202,6 +206,11 @@ mod tests {
         assert!(c.supports(Feature::NativeReplication));
         assert!(!c.supports(Feature::ReplicationPolicy));
         assert!(c.supports(Feature::RpmCopy));
+        assert_eq!(c.require(Feature::DebCopy).unwrap_err().to_string(), "not supported by this server: Deb copy API (deb/copy/)");
+        c.paths.insert("deb/copy/".into());
+        assert!(c.supports(Feature::DebCopy));
+        c.versions.remove("deb");
+        assert!(!c.supports(Feature::DebCopy), "the plugin too");
         assert!(!c.supports(Feature::Users));
         assert_eq!(c.enum_values("SyncPolicyEnum").unwrap().len(), 2);
     }

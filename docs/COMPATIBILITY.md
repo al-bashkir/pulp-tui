@@ -26,8 +26,9 @@ something the server does not have.
 | File screens | `status/` component `file` | same for pulp_file |
 | Deb screens | `status/` component `deb` | same for pulp_deb |
 | Deb Content View signing (`signing_service`, `signing_service_release_overrides`) | the field is in the JSON of the derived repository | the field is not sent; a chosen signing service stops the publish with "not supported by this server" |
-| RPM copy (Content Views, copy action) | OpenAPI path `rpm/copy/` | action fails with a precise error |
-| Chunked upload | OpenAPI `uploads/` | — (large uploads need it) |
+| RPM copy (Content Views, copy action) | `status/` component `rpm` and OpenAPI path `rpm/copy/` | the copy action shows "not supported by this server" before its form; a Content View publish gets the server's error |
+| Deb copy (copy action, Add to repository, Content Views) | `status/` component `deb` and OpenAPI path `deb/copy/` | same as RPM copy |
+| Chunked upload | OpenAPI `uploads/` and `{upload_href}` | an upload larger than one chunk (`upload_chunk_mb`) shows "not supported by this server" before it sends anything; smaller files do not need it |
 | Native replication | pulpcore ≥ 3.23 and OpenAPI `upstream-pulps/`, `{upstream_pulp_href}replicate/` | Replication screen points to the fallback |
 | Replication deletion policy | OpenAPI field `UpstreamPulp.policy` | field hidden |
 | Distribution filter for replication | field `q_select`, else `pulp_label_select` | matching field shown |

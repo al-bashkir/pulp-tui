@@ -9,7 +9,7 @@ use crate::filters::{Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
 use crate::pulp::models::{Distribution, Publication, Task};
 use crate::pulp::ops;
-use crate::pulp::{Capabilities, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
+use crate::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::Store;
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
@@ -151,6 +151,13 @@ async fn served_now(c: &PulpClient, t: RepoType, d: &Value) -> anyhow::Result<Op
 
 pub(super) fn caps(app: &App) -> Option<std::sync::Arc<Capabilities>> {
     app.conn.as_ref().map(|c| c.caps.clone())
+}
+
+/// The connected server lacks `f`: report "not supported by this server: ..." and return true.
+fn unsupported(app: &mut App, f: Feature) -> bool {
+    let Some(Err(e)) = caps(app).map(|c| c.require(f)) else { return false };
+    app.error(e.to_string());
+    true
 }
 
 /// The sync policies of a repository type: the server's `SyncPolicyEnum` for RPM, if it has one.
@@ -911,6 +918,10 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                     let rel = f.opt("relative_path").map(str::to_string);
                     let href = href.clone();
                     app.job(format!("upload {}", path.display()), move |ctx| async move {
+                        // As in `ops::upload`: only a file larger than one chunk uses uploads/.
+                        if tokio::fs::metadata(&path).await?.len() as usize > ctx.client.upload_chunk() {
+                            ctx.caps.require(Feature::ChunkedUpload)?;
+                        }
                         let p2 = ctx.clone();
                         let progress = move |d: u64, total: u64| {
                             p2.progress(format!("{:.1}/{:.1} MiB", d as f64 / 1048576.0, total as f64 / 1048576.0))
@@ -936,6 +947,15 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             distribute_form(app, t, name.clone(), item["latest_version_href"].as_str().map(str::to_string), Some(href), None)
         }
         Act::CopyContent => {
+            // File copies through modify/.
+            let api = match t {
+                RepoType::Rpm => Some(Feature::RpmCopy),
+                RepoType::Deb => Some(Feature::DebCopy),
+                RepoType::File => None,
+            };
+            if api.is_some_and(|f| unsupported(app, f)) {
+                return;
+            }
             let mut fields = vec![
                 Field::pick("source", "Source repository", Source::Repos(Some(t))).required(),
                 Field::text("filters", "Filter rules").help(filter_help(t)),
@@ -1428,6 +1448,9 @@ fn content_action(app: &mut App, version: String, act: Act) {
             });
         }
         Act::AddToRepo => {
+            if t == RepoType::Deb && unsupported(app, Feature::DebCopy) {
+                return;
+            }
             let form = Form::new(
                 format!("Add {} unit(s) to another {} repository", units.len(), t.label()),
                 vec![Field::pick("target", "Target repository", Source::Repos(Some(t))).required()],
@@ -1805,6 +1828,7 @@ pub fn load_dashboard(app: &mut App) {
             (File, "File"),
             (Deb, "Deb"),
             (RpmCopy, "RPM copy API"),
+            (DebCopy, "Deb copy API"),
             (ChunkedUpload, "chunked uploads"),
             (NativeReplication, "native replication (tech preview)"),
             (Users, "users/groups/roles API"),
@@ -2087,6 +2111,7 @@ mod tests {
             .mount(&server)
             .await;
         let (mut app, mut rx) = connected(&server).await;
+        app.conn.as_mut().unwrap().caps = Arc::new(plugins());
         for (rules, want) in [("exclude name=*-dbg", Some(json!([format!("{API}content/deb/packages/fixture-beta/")]))), ("", None)] {
             repo_action(&mut app, RepoType::Deb, Act::CopyContent, json!({ "pulp_href": dst, "name": "dst" }));
             let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
@@ -2136,6 +2161,7 @@ mod tests {
             .mount(&server)
             .await;
         let (mut app, mut rx) = connected(&server).await;
+        app.conn.as_mut().unwrap().caps = Arc::new(plugins());
         repo_action(&mut app, RepoType::Deb, Act::CopyContent, json!({ "pulp_href": dst, "name": "dst" }));
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
         form.fields[0].value = "src".into();
@@ -2161,6 +2187,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_and_upload_need_the_server_api_before_the_operator_types() {
+        use crate::tui::app::{Conn, Modal};
+        let server = wiremock::MockServer::start().await;
+        let (mut app, mut rx) = connected(&server).await;
+        // The plugins are there, but not rpm/copy/, deb/copy/ and uploads/.
+        let mut caps = plugins();
+        caps.paths.insert("repositories/rpm/rpm/".into());
+        let mut settings = app.cfg.settings.clone();
+        settings.upload_chunk_mb = 1;
+        let client = PulpClient::new("lab", &app.cfg.profiles["lab"], &settings).unwrap();
+        app.conn = Some(Conn { client, caps: Arc::new(caps), scope: "lab".into() });
+        let repo = |coll: &str| json!({ "pulp_href": format!("{API}repositories/{coll}/r/"), "name": "r" });
+        let last_error = |app: &App| app.notices.iter().rfind(|n| n.level == Level::Error).map(|n| n.text.clone()).unwrap_or_default();
+
+        repo_action(&mut app, RepoType::Rpm, Act::CopyContent, repo("rpm/rpm"));
+        assert!(app.modal.is_none(), "no form");
+        assert_eq!(last_error(&app), "not supported by this server: RPM copy API (rpm/copy/)");
+        repo_action(&mut app, RepoType::Deb, Act::CopyContent, repo("deb/apt"));
+        assert!(app.modal.is_none(), "no form");
+        assert_eq!(last_error(&app), "not supported by this server: Deb copy API (deb/copy/)");
+        app.notices.clear();
+        content_action(&mut app, format!("{API}repositories/deb/apt/r/versions/1/"), Act::AddToRepo);
+        assert!(app.modal.is_none(), "no form");
+        assert_eq!(last_error(&app), "not supported by this server: Deb copy API (deb/copy/)");
+        // File copies through modify/.
+        repo_action(&mut app, RepoType::File, Act::CopyContent, repo("file/file"));
+        assert!(matches!(app.modal.take(), Some(Modal::Form { .. })));
+
+        // Only a file larger than one chunk needs uploads/: refused before any request.
+        let dir = tempfile::tempdir().unwrap();
+        let upload = |app: &mut App, size: usize| {
+            let f = dir.path().join(format!("{size}.rpm"));
+            std::fs::write(&f, vec![0u8; size]).unwrap();
+            repo_action(app, RepoType::Rpm, Act::Upload, repo("rpm/rpm"));
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no upload form") };
+            form.fields[0].value = f.display().to_string();
+            submit(app, &form).unwrap();
+        };
+        upload(&mut app, 1024 * 1024 + 1);
+        settle(&mut app, &mut rx).await;
+        assert!(last_error(&app).ends_with(": not supported by this server: chunked uploads API (uploads/)"), "{}", last_error(&app));
+        assert!(server.received_requests().await.unwrap().is_empty(), "no request reached the server");
+        upload(&mut app, 1024 * 1024);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(server.received_requests().await.unwrap()[0].url.path(), format!("{API}content/rpm/packages/"), "one chunk: no check");
+    }
+
+    #[tokio::test]
     async fn deb_content_is_added_with_a_structured_copy() {
         use crate::tui::app::Modal;
         let server = wiremock::MockServer::start().await;
@@ -2169,6 +2243,7 @@ mod tests {
         let done = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": ["/r/dst/versions/3/"] });
         get(&server, &format!("{API}tasks/1/"), done).await;
         let (mut app, mut rx) = connected(&server).await;
+        app.conn.as_mut().unwrap().caps = Arc::new(plugins());
         for (t, coll) in [(RepoType::Deb, "deb/apt"), (RepoType::Rpm, "rpm/rpm")] {
             let dst = format!("{API}repositories/{coll}/dst/");
             get(&server, &format!("{API}repositories/{coll}/"), page(json!([{ "pulp_href": dst, "name": "dst" }]))).await;
@@ -2624,6 +2699,15 @@ mod tests {
         app.conn = Some(super::super::app::Conn { client, caps: Default::default(), scope: "lab".into() });
         let rx = app.rx.take().unwrap();
         (app, rx)
+    }
+
+    /// Capabilities of a server with the RPM, File and Deb plugins whose OpenAPI is not read (every endpoint counts as there).
+    fn plugins() -> Capabilities {
+        let mut caps = Capabilities::default();
+        for p in ["rpm", "file", "deb"] {
+            caps.versions.insert(p.into(), "1.0.0".into());
+        }
+        caps
     }
 
     async fn settle(app: &mut App, rx: &mut tokio::sync::mpsc::UnboundedReceiver<super::super::app::Msg>) {
