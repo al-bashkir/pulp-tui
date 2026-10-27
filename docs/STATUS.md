@@ -60,9 +60,11 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
   replication 2, shared_db 6 (PostgreSQL 16, schema 5), deb 3, real 3 (657 s) — all passed
 * `cargo fmt --check`, `cargo clippy --all-targets -D warnings` (default and
   `--no-default-features`): clean
-* `podman build -f Containerfile .` (2026-10-26; dependencies and Containerfile unchanged
-  since): built (30.8 MB image; no keyring; it contains the PostgreSQL driver;
-  `pulp-tui --version` runs)
+* `podman build -f Containerfile .` (2026-10-27): built (31.0 MB image; no keyring; it
+  contains the PostgreSQL driver; `pulp-tui --version` runs)
+* `podman build --build-arg CARGO_FLAGS= -f Containerfile .` (2026-10-27, the release
+  build of the Linux binary): static-pie x86_64 binary with keyring; it reads the Secret
+  Service of the host over D-Bus. The aarch64 binary is built only by the release workflow
 * `cargo audit` (2026-10-26, 494 crates; `Cargo.lock` unchanged since): no vulnerabilities; 3 "unmaintained" warnings, unchanged
   (RUSTSEC-2026-0370/0371/0372: `zvariant`, `zvariant_derive`, `zbus_names`), all
   reached only through the optional `keyring` feature (Secret Service over D-Bus). Builds
