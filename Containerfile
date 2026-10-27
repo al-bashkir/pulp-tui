@@ -9,9 +9,11 @@ COPY Cargo.toml Cargo.lock rustfmt.toml build.rs ./
 COPY src src
 COPY examples examples
 # No system keyring in containers: secrets come from env:VAR or file:/run/secrets/...
+# The release build passes CARGO_FLAGS= to keep the keyring in the static binary.
+ARG CARGO_FLAGS=--no-default-features
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked --no-default-features \
+    cargo build --release --locked $CARGO_FLAGS \
  && cp target/release/pulp-tui /pulp-tui
 
 FROM docker.io/library/alpine:3.22

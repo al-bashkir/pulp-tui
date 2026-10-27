@@ -44,8 +44,8 @@ PULP_PASSWORD=… ./target/release/pulp-tui --profile lab
 
 `--no-default-features` builds without system keyring support (for headless use).
 
-Prebuilt binaries are on the GitHub Releases page: Linux x86_64 (static, without keyring
-support) and macOS arm64.
+Prebuilt binaries are on the GitHub Releases page: Linux x86_64 and aarch64 (static, with
+keyring support) and macOS arm64.
 
 ## Container
 

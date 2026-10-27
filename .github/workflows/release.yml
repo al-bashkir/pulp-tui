@@ -15,18 +15,21 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   linux:
-    # Static musl binary from the Containerfile build (no system keyring support).
-    runs-on: ubuntu-latest
+    # Static musl binary with keyring (Secret Service, pure Rust) from the Containerfile build.
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - run: DOCKER_BUILDKIT=1 docker build -t pulp-tui:release -f Containerfile .
+      - run: DOCKER_BUILDKIT=1 docker build --build-arg CARGO_FLAGS= -t pulp-tui:release -f Containerfile .
       - run: docker create --name out pulp-tui:release && docker cp out:/usr/local/bin/pulp-tui .
       # The tag must be the Cargo.toml version.
       - run: test "$(./pulp-tui --version)" = "pulp-tui $GITHUB_REF_NAME"
-      - run: tar czf "pulp-tui-$GITHUB_REF_NAME-x86_64-unknown-linux-musl.tar.gz" pulp-tui
+      - run: tar czf "pulp-tui-$GITHUB_REF_NAME-$(uname -m)-unknown-linux-musl.tar.gz" pulp-tui
       - uses: actions/upload-artifact@v7
         with:
-          name: linux
+          name: linux-${{ matrix.runner }}
           path: pulp-tui-*.tar.gz
 
   macos:

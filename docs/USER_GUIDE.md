@@ -545,8 +545,8 @@ and the label `keyring:<user>@pulp-tui`:
 * **K** on the Servers screen only writes the keyring. Set `secret = "keyring"` in the
   config too, else pulp-tui does not read the entry. **K** again replaces the secret.
 * **K** cannot store the top-level `[database]` secret. Create it with the system tool.
-* Builds without the `keyring` feature (`--no-default-features`, the static Linux
-  release binary, the container image) give an error for `keyring`; use `env:` or `file:`.
+* Builds without the `keyring` feature (`--no-default-features`, the container image)
+  give an error for `keyring`; use `env:` or `file:`.
 * KDE Plasma 6: KWalletManager does not show these entries. It shows only entries with
   the KWallet attributes `server`, `user` and `type`. The entries are in the wallet
   (folder `Secret Service`) and pulp-tui reads them; use `secret-tool` to see them.
