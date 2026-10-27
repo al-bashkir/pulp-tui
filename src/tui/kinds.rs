@@ -655,6 +655,10 @@ impl Kind {
             }
             Kind::Remotes(_) | Kind::Roles => vec![Create, Edit, Delete, Inspect],
             Kind::Versions(_) => vec![Content, Publish, Distribute, Rollback, Compare, Delete, Inspect],
+            // A structured Deb copy brings the release records of binary packages only; other units would arrive alone.
+            Kind::Content { version, ctype } if RepoType::from_href(version) == Some(RepoType::Deb) && *ctype != 0 => {
+                vec![Inspect, RemoveContent]
+            }
             Kind::Content { .. } => vec![Inspect, RemoveContent, AddToRepo],
             Kind::Publications(_) => vec![Create, Distribute, Delete, Inspect],
             Kind::Distributions(_) => vec![CopyUrl, Verify, Rollback, Create, Edit, Delete, Inspect],
@@ -1070,6 +1074,18 @@ mod tests {
         assert_eq!(content(0).columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["p", "1.0-1", "amd64", "0123456789ab"]);
         let pubs = Kind::Publications(RepoType::Deb).columns();
         assert!(pubs.iter().all(|c| c.title != "distributions"), "the Deb publication has no distributions field");
+    }
+
+    #[test]
+    fn deb_content_adds_to_another_repository_only_binary_packages() {
+        let content = |t: &str, ctype| Kind::Content { version: format!("/pulp/api/v3/repositories/{t}/1/versions/1/"), ctype };
+        assert!(content("deb/apt", 0).actions().contains(&Act::AddToRepo));
+        for ctype in 1..content_types(RepoType::Deb).len() {
+            let acts = content("deb/apt", ctype).actions();
+            assert!(!acts.contains(&Act::AddToRepo), "{}", content_types(RepoType::Deb)[ctype].0);
+            assert!(acts.contains(&Act::RemoveContent));
+        }
+        assert!(content("rpm/rpm", 1).actions().contains(&Act::AddToRepo), "RPM advisories go through modify/");
     }
 
     #[test]

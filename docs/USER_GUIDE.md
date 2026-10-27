@@ -190,7 +190,8 @@ codename, suite, version), release components, source packages. `/`
 searches package names (on the RPM and Deb packages lists) or file paths. **i** shows all metadata of a unit (requires,
 provides, files, advisory package lists, …). **x** removes the marked (or selected)
 units from the repository; **a** adds them to another repository (Deb: a structured copy,
-which also copies the Release, component and architecture records, so apt finds the packages). Both create a new
+which also copies the Release, component and architecture records, so apt finds the packages;
+only on the Deb packages list, because other Deb units would arrive without their records). Both create a new
 repository version; old versions are unchanged.
 
 ### Publications
