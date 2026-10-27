@@ -105,6 +105,14 @@ impl RepoType {
             RepoType::Deb => "content/deb/packages/",
         }
     }
+    /// Content types of a repository: the Content screen lists them, a version compare covers them.
+    pub fn content_types(self) -> &'static [ContentType] {
+        match self {
+            RepoType::Rpm => RPM_TYPES,
+            RepoType::File => FILE_TYPES,
+            RepoType::Deb => DEB_TYPES,
+        }
+    }
     /// Detect the type from any rpm/file/deb href (repository, remote, version, publication...).
     pub fn from_href(href: &str) -> Option<Self> {
         if href.contains("/rpm/rpm/") || href.contains("/rpm/packages/") {
@@ -118,6 +126,99 @@ impl RepoType {
         }
     }
 }
+
+/// One content type: label and API path, and the `fields` that the human-readable `key` of a unit reads.
+pub struct ContentType {
+    pub label: &'static str,
+    pub path: &'static str,
+    pub fields: &'static str,
+    pub key: fn(&Value) -> String,
+}
+
+fn text(v: &Value, k: &str) -> String {
+    match &v[k] {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        x => x.to_string(),
+    }
+}
+
+/// `key` of a unit read as `T`; the raw JSON when it does not parse, so a compare never drops a unit.
+fn typed<'a, T: Deserialize<'a>>(v: &'a Value, key: impl Fn(T) -> String) -> String {
+    T::deserialize(v).map_or_else(|_| v.to_string(), key)
+}
+
+const RPM_TYPES: &[ContentType] = &[
+    ContentType {
+        label: "packages",
+        path: "content/rpm/packages/",
+        fields: "pulp_href,name,epoch,version,release,arch",
+        key: |v| format!("package {}", typed(v, |p: Package| p.nevra())),
+    },
+    ContentType { label: "advisories", path: "content/rpm/advisories/", fields: "id", key: |v| format!("advisory {}", text(v, "id")) },
+    ContentType {
+        label: "modulemds",
+        path: "content/rpm/modulemds/",
+        fields: "name,stream,version,context,arch",
+        key: |v| format!("modulemd {}", ["name", "stream", "version", "context", "arch"].map(|k| text(v, k)).join(":")),
+    },
+    ContentType {
+        label: "package groups",
+        path: "content/rpm/packagegroups/",
+        fields: "id",
+        key: |v| format!("package group {}", text(v, "id")),
+    },
+    ContentType {
+        label: "distribution trees",
+        path: "content/rpm/distribution_trees/",
+        fields: "release_name,release_version,arch,build_timestamp",
+        key: |v| {
+            let [n, ver, arch, ts] = ["release_name", "release_version", "arch", "build_timestamp"].map(|k| text(v, k));
+            format!("distribution tree {n} {ver} {arch} (build {ts})")
+        },
+    },
+    ContentType {
+        label: "repo metadata files",
+        path: "content/rpm/repo_metadata_files/",
+        fields: "data_type,checksum",
+        key: |v| format!("repo metadata file {}  ({:.12})", text(v, "data_type"), text(v, "checksum")),
+    },
+];
+
+const FILE_TYPES: &[ContentType] = &[ContentType {
+    label: "files",
+    path: "content/file/files/",
+    fields: "pulp_href,relative_path,sha256",
+    key: |v| format!("file {}", typed(v, |f: FileContent| super::file::key(&f))),
+}];
+
+const DEB_TYPES: &[ContentType] = &[
+    ContentType {
+        label: "packages",
+        path: "content/deb/packages/",
+        fields: "pulp_href,package,version,architecture",
+        key: |v| format!("package {}", typed(v, |p: DebPackage| p.key())),
+    },
+    ContentType {
+        label: "releases",
+        path: "content/deb/releases/",
+        fields: "distribution,codename,suite",
+        key: |v| format!("release {} (codename {}, suite {})", text(v, "distribution"), text(v, "codename"), text(v, "suite")),
+    },
+    ContentType {
+        label: "release components",
+        path: "content/deb/release_components/",
+        fields: "distribution,component",
+        key: |v| format!("release component {}/{}", text(v, "distribution"), text(v, "component")),
+    },
+    // pulp_deb 3.11 answers HTTP 500 to `fields` without `artifacts` (its serializer sets that field read-only).
+    ContentType {
+        label: "source packages",
+        path: "content/deb/source_packages/",
+        fields: "source,version,artifacts",
+        key: |v| format!("source package {}_{}", text(v, "source"), text(v, "version")),
+    },
+];
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ProgressReport {
@@ -391,6 +492,47 @@ mod tests {
         assert_eq!(RepoType::Deb.repositories(), "repositories/deb/apt/");
         assert_eq!(RepoType::Deb.content(), "content/deb/packages/");
         assert_eq!([RepoType::Rpm, RepoType::File, RepoType::Deb].map(RepoType::uploads), [true, true, false]);
+    }
+
+    #[test]
+    fn content_type_keys_name_the_type_and_the_unit() {
+        use serde_json::json;
+        use std::collections::BTreeSet;
+        // Each sample has exactly the `fields` that the compare asks for, as Pulp returns them.
+        let key = |t: RepoType, label: &str, v: Value| {
+            let ct = t.content_types().iter().find(|c| c.label == label).unwrap();
+            let asked: BTreeSet<&str> = ct.fields.split(',').collect();
+            assert_eq!(v.as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>(), asked, "{label}");
+            (ct.key)(&v)
+        };
+        let labels = |t: RepoType| t.content_types().iter().map(|c| c.label).collect::<Vec<_>>();
+        assert_eq!(
+            labels(RepoType::Rpm),
+            ["packages", "advisories", "modulemds", "package groups", "distribution trees", "repo metadata files"]
+        );
+        assert_eq!((labels(RepoType::File), labels(RepoType::Deb).len()), (vec!["files"], 4));
+        let pkg = json!({ "pulp_href": "/p/", "name": "bash", "epoch": "0", "version": "5.2", "release": "1.el9", "arch": "x86_64" });
+        assert_eq!(key(RepoType::Rpm, "packages", pkg), "package bash-5.2-1.el9.x86_64");
+        assert_eq!(key(RepoType::Rpm, "advisories", json!({ "id": "RHSA-2024:0001" })), "advisory RHSA-2024:0001");
+        let md = json!({ "name": "nodejs", "stream": "18", "version": "9040020240108", "context": "rhel9", "arch": "x86_64" });
+        assert_eq!(key(RepoType::Rpm, "modulemds", md), "modulemd nodejs:18:9040020240108:rhel9:x86_64");
+        assert_eq!(key(RepoType::Rpm, "package groups", json!({ "id": "core" })), "package group core");
+        let tree = json!({ "release_name": "Rocky Linux", "release_version": "9.4", "arch": "x86_64", "build_timestamp": 1714730227.0 });
+        assert_eq!(key(RepoType::Rpm, "distribution trees", tree), "distribution tree Rocky Linux 9.4 x86_64 (build 1714730227.0)");
+        let md_file = json!({ "data_type": "productid", "checksum": "0123456789abcdef" });
+        assert_eq!(key(RepoType::Rpm, "repo metadata files", md_file), "repo metadata file productid  (0123456789ab)");
+        let f = json!({ "pulp_href": "/f/", "relative_path": "docs/readme.txt", "sha256": "0123456789abcdef" });
+        assert_eq!(key(RepoType::File, "files", f), "file docs/readme.txt  (0123456789ab)");
+        let deb = json!({ "pulp_href": "/d/", "package": "hello", "version": "2.10-3", "architecture": "amd64" });
+        assert_eq!(key(RepoType::Deb, "packages", deb), "package hello_2.10-3_amd64");
+        let rel = json!({ "distribution": "bookworm", "codename": "bookworm", "suite": "stable" });
+        assert_eq!(key(RepoType::Deb, "releases", rel), "release bookworm (codename bookworm, suite stable)");
+        let comp = json!({ "distribution": "bookworm", "component": "main" });
+        assert_eq!(key(RepoType::Deb, "release components", comp), "release component bookworm/main");
+        let src = json!({ "source": "hello", "version": "2.10-3", "artifacts": { "hello_2.10-3.dsc": "/a/" } });
+        assert_eq!(key(RepoType::Deb, "source packages", src), "source package hello_2.10-3");
+        // A unit that does not parse still shows (as its JSON), so a compare never drops it.
+        assert_eq!((RepoType::Rpm.content_types()[0].key)(&json!({ "name": "x" })), r#"package {"name":"x"}"#);
     }
 
     #[test]

@@ -162,6 +162,10 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
   snapshots and Remove content), so a pulp_deb version without that step (not checked) does not
   keep publishing the package. pulp-tui keeps releases, release components and release
   architectures, which all packages of a release share.
+* `content/deb/source_packages/` answers HTTP 500 (`KeyError: 'artifacts'`) to a `fields`
+  value without `artifacts`, even for an empty page: `DscFileSerializer.__init__` sets
+  `self.fields["artifacts"].read_only` (`serializers/content_serializers.py`). The version
+  compare asks for `source,version,artifacts`. Seen live in `live_deb`.
 * `dependency_solving: true` is not implemented: the task fails with
   `FeatureNotImplementedError`. pulp-tui always sends `false`.
 * `dest_base_version: 0` starts the new version from the empty version 0 of the destination

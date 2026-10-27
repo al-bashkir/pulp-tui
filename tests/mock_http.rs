@@ -734,9 +734,9 @@ async fn file_verify_reads_paths_with_commas() {
 #[tokio::test]
 async fn version_content_is_listed_in_large_pages() {
     let server = MockServer::start().await;
-    for p in ["content/rpm/packages/", "content/file/files/", "content/deb/packages/"] {
+    for ct in RepoType::ALL.iter().flat_map(|t| t.content_types()) {
         Mock::given(method("GET"))
-            .and(path(format!("{API}{p}")))
+            .and(path(format!("{API}{}", ct.path)))
             .and(query_param("limit", "5000"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 0, "next": null, "results": [] })))
             .mount(&server)
@@ -746,4 +746,7 @@ async fn version_content_is_listed_in_large_pages() {
     assert_eq!(pulp_tui::pulp::rpm::packages_in(&c, "/v/").await.unwrap().len(), 0);
     assert_eq!(pulp_tui::pulp::file::files_in(&c, "/v/").await.unwrap().len(), 0);
     assert_eq!(deb::packages_in(&c, "/v/").await.unwrap().len(), 0);
+    for t in RepoType::ALL {
+        assert!(ops::all_content_keys(&c, t, "/v/").await.unwrap().is_empty(), "{t:?}");
+    }
 }

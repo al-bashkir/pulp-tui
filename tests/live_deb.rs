@@ -35,6 +35,11 @@ async fn deb_mirror_copy_publish_verify() {
     let keys = ops::content_keys(&c, t, Some(&v1)).await.unwrap();
     assert_eq!(keys.len(), 4, "{keys:?}");
     assert!(keys.contains("fixture-beta-dbg_2.0-1_amd64"), "{keys:?}");
+    // Versions -> Compare also lists the release records (and asks for source packages: none here).
+    let all = ops::all_content_keys(&c, t, &v1).await.unwrap();
+    let records: Vec<&String> = all.iter().filter(|k| !k.starts_with("package ")).collect();
+    assert_eq!(records, ["release component fixture/main", "release fixture (codename fixture, suite fixture)"]);
+    assert!(all.contains("package fixture-beta-dbg_2.0-1_amd64") && all.len() == 6, "{all:?}");
 
     // A second repository gets the packages that pass the filter; the structured copy brings
     // the release and component records with them.

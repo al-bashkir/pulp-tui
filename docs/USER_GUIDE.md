@@ -179,8 +179,9 @@ added / removed counts. Actions: **o** content, **P** publish this version (alwa
 distribute it (Deb: both ask for the optional signing service, as in Repositories), **b**
 point a distribution to it (rollback, with preview; Deb: the new publication keeps the
 signing service of the publication that the distribution serves now), **m** compare
-with the marked version (`Space` on one, `m` on the other; shows added/removed NEVRAs or
-files, older → newer), **d** delete (names the distributions that serve the version or its
+with the marked version (`Space` on one, `m` on the other; shows added/removed units of every
+content type that the Content browser lists, each line starts with its type, such as
+`+ advisory RHSA-2024:0001`; older → newer), **d** delete (names the distributions that serve the version or its
 publications, and you type the version id; refused for Content View snapshots; never needed
 for rollback).
 

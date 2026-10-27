@@ -1280,8 +1280,8 @@ fn version_action(app: &mut App, act: Act, item: Value) {
             app.job("compare versions", move |ctx| async move {
                 // Always show older -> newer.
                 let (a, b) = if version_number(&other) <= version_number(&href) { (other, href) } else { (href, other) };
-                let ka = ops::content_keys(&ctx.client, t, Some(&a)).await?;
-                let kb = ops::content_keys(&ctx.client, t, Some(&b)).await?;
+                let ka = ops::all_content_keys(&ctx.client, t, &a).await?;
+                let kb = ops::all_content_keys(&ctx.client, t, &b).await?;
                 let lines = ops::diff(&ka, &kb).lines(&short(&a), &short(&b));
                 ap(move |app| app.text("Version comparison", lines))
             });

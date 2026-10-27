@@ -362,7 +362,8 @@ pub fn batches(hrefs: &[String]) -> Vec<&[String]> {
     out
 }
 
-/// Human-readable identity of each unit in a version (NEVRA or path+digest) for diffs.
+/// Human-readable identity of each package or file in a version (NEVRA or path+digest) for diffs.
+/// Same keys as a Content View selection, which compares against them; `all_content_keys` has every type.
 pub async fn content_keys(c: &PulpClient, t: RepoType, version: Option<&str>) -> Result<BTreeSet<String>> {
     let Some(v) = version else { return Ok(BTreeSet::new()) };
     Ok(match t {
@@ -370,6 +371,18 @@ pub async fn content_keys(c: &PulpClient, t: RepoType, version: Option<&str>) ->
         RepoType::File => file::files_in(c, v).await?.iter().map(file::key).collect(),
         RepoType::Deb => deb::packages_in(c, v).await?.iter().map(DebPackage::key).collect(),
     })
+}
+
+/// Keys of every unit of a version, of each content type of `t`, prefixed with the type
+/// (`advisory FIXTURE-2026:0001`): for the Versions compare. Fetches only the fields of the keys.
+pub async fn all_content_keys(c: &PulpClient, t: RepoType, version: &str) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for ct in t.content_types() {
+        let q = [("repository_version", version.to_string()), ("fields", ct.fields.into()), ("limit", CONTENT_PAGE.into())];
+        let units: Vec<Value> = c.list_all(&c.api(ct.path), &q, 2_000_000).await?;
+        out.extend(units.iter().map(ct.key));
+    }
+    Ok(out)
 }
 
 /// Fetch what a distribution actually serves and compare it with a repository version:

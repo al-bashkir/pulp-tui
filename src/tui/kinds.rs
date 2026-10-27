@@ -16,7 +16,7 @@ pub enum Kind {
     Remotes(RepoType),
     /// Versions of one repository (href, name) or of all repositories.
     Versions(Option<(String, String)>),
-    /// Content of a repository version; `ctype` indexes `content_types`.
+    /// Content of a repository version; `ctype` indexes `RepoType::content_types`.
     Content {
         version: String,
         ctype: usize,
@@ -74,27 +74,6 @@ pub const NAV: &[(&str, Kind)] = &[
 
 /// API collection path, extra query and search parameter of a screen.
 type Source = (String, Vec<(&'static str, String)>, Option<&'static str>);
-
-/// (label, API path) of the content types in the content browser.
-pub fn content_types(t: RepoType) -> &'static [(&'static str, &'static str)] {
-    match t {
-        RepoType::Rpm => &[
-            ("packages", "content/rpm/packages/"),
-            ("advisories", "content/rpm/advisories/"),
-            ("modulemds", "content/rpm/modulemds/"),
-            ("package groups", "content/rpm/packagegroups/"),
-            ("distribution trees", "content/rpm/distribution_trees/"),
-            ("repo metadata files", "content/rpm/repo_metadata_files/"),
-        ],
-        RepoType::File => &[("files", "content/file/files/")],
-        RepoType::Deb => &[
-            ("packages", "content/deb/packages/"),
-            ("releases", "content/deb/releases/"),
-            ("release components", "content/deb/release_components/"),
-            ("source packages", "content/deb/source_packages/"),
-        ],
-    }
-}
 
 pub struct Col {
     pub title: &'static str,
@@ -338,7 +317,7 @@ impl Kind {
             Kind::Versions(Some((_, n))) => format!("Versions of {n}"),
             Kind::Versions(None) => "Repository Versions (all repositories)".into(),
             Kind::Content { version, ctype } => {
-                let label = RepoType::from_href(version).and_then(|t| content_types(t).get(*ctype)).map_or("?", |c| c.0);
+                let label = RepoType::from_href(version).and_then(|t| t.content_types().get(*ctype)).map_or("?", |c| c.label);
                 format!("Content {label} of {}  [t: type]", short(version))
             }
             Kind::Publications(t) => format!("{} Publications  [t: toggle type]", t.label()),
@@ -393,7 +372,7 @@ impl Kind {
             Kind::Publications(t) => Kind::Publications(t.next()),
             Kind::Distributions(t) => Kind::Distributions(t.next()),
             Kind::Content { version, ctype } => {
-                let n = content_types(RepoType::from_href(version)?).len();
+                let n = RepoType::from_href(version)?.content_types().len();
                 Kind::Content { version: version.clone(), ctype: (ctype + 1) % n }
             }
             Kind::Tasks => Kind::ServerTasks,
@@ -424,7 +403,7 @@ impl Kind {
             Kind::Versions(None) => ("repository_versions/".into(), vec![("ordering", "-pulp_created".into())], None),
             Kind::Content { version, ctype } => {
                 let t = RepoType::from_href(version)?;
-                let (_, path) = content_types(t)[*ctype];
+                let path = t.content_types()[*ctype].path;
                 // Search field, ordering, and whether to drop the heavy package fields (RPM packages only).
                 let (search, ordering, exclude_fields) = match (t, *ctype) {
                     (RepoType::Rpm, 0) => (Some("name__contains"), Some("name"), true),
@@ -1060,7 +1039,7 @@ mod tests {
         let names = |k: &Kind| k.columns().iter().map(|c| c.title).collect::<Vec<_>>();
         let content = |ctype| Kind::Content { version: "/pulp/api/v3/repositories/deb/apt/1/versions/1/".into(), ctype };
         assert_eq!(
-            content_types(RepoType::Deb).iter().map(|c| c.1).collect::<Vec<_>>(),
+            RepoType::Deb.content_types().iter().map(|c| c.path).collect::<Vec<_>>(),
             ["content/deb/packages/", "content/deb/releases/", "content/deb/release_components/", "content/deb/source_packages/"]
         );
         assert_eq!(names(&content(0)), ["package", "version", "architecture", "sha256"]);
@@ -1080,9 +1059,9 @@ mod tests {
     fn deb_content_adds_to_another_repository_only_binary_packages() {
         let content = |t: &str, ctype| Kind::Content { version: format!("/pulp/api/v3/repositories/{t}/1/versions/1/"), ctype };
         assert!(content("deb/apt", 0).actions().contains(&Act::AddToRepo));
-        for ctype in 1..content_types(RepoType::Deb).len() {
+        for ctype in 1..RepoType::Deb.content_types().len() {
             let acts = content("deb/apt", ctype).actions();
-            assert!(!acts.contains(&Act::AddToRepo), "{}", content_types(RepoType::Deb)[ctype].0);
+            assert!(!acts.contains(&Act::AddToRepo), "{}", RepoType::Deb.content_types()[ctype].label);
             assert!(acts.contains(&Act::RemoveContent));
         }
         assert!(content("rpm/rpm", 1).actions().contains(&Act::AddToRepo), "RPM advisories go through modify/");

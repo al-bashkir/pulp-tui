@@ -42,6 +42,19 @@ async fn rpm_lifecycle() {
     assert!(names.contains(&"fixture-alpha-1.0-1.noarch".to_string()));
     let rv: RepoVersion = c.get(&v1, &[]).await.unwrap();
     assert_eq!(rv.content_summary.present["rpm.advisory"].count, 1);
+    // Versions -> Compare covers every content type: the sync (v0 -> v1) also added the advisory.
+    let v0 = format!("{repo}versions/0/");
+    let d = ops::diff(&ops::all_content_keys(&c, t, &v0).await.unwrap(), &ops::all_content_keys(&c, t, &v1).await.unwrap());
+    assert_eq!(
+        d.added,
+        [
+            "advisory FIXTURE-2026:0001",
+            "package fixture-alpha-1.0-1.noarch",
+            "package fixture-beta-2.0-1.noarch",
+            "package fixture-beta-debuginfo-2.0-1.noarch"
+        ]
+    );
+    assert!(d.removed.is_empty());
 
     // Publish exact version and distribute it.
     let pub1 = ops::ensure_publication(&c, t, &v1, None, &no_progress).await.unwrap();
