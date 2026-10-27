@@ -119,6 +119,46 @@ pub async fn distributions(c: &PulpClient, t: RepoType) -> Result<Vec<Distributi
     c.list_all(&c.api(t.distributions()), &[], 100_000).await
 }
 
+/// The distributions that make Pulp refuse to delete `version`, each with the reason: pulpcore
+/// `Repository.protected_versions`. `pubs`: the publications of its repository (the list has only
+/// complete ones). File, RPM and Deb distributions serve from publications.
+pub fn protecting<'a>(version: &str, pubs: &[Publication], ds: &'a [Distribution]) -> Vec<(&'a Distribution, &'static str)> {
+    let repo = version.split("versions/").next().unwrap_or(version);
+    let number = |v: &&str| v.trim_end_matches('/').rsplit('/').next().and_then(|n| n.parse::<u64>().ok());
+    let newest = pubs.iter().filter_map(|p| p.repository_version.as_deref()).max_by_key(number);
+    let own: Vec<&Publication> = pubs.iter().filter(|p| p.repository_version.as_deref() == Some(version)).collect();
+    let reason = |d: &Distribution| {
+        let follows = d.repository.as_deref() == Some(repo);
+        if d.repository_version.as_deref() == Some(version) {
+            Some("pinned to this version")
+        } else if own.iter().any(|p| d.publication.as_ref() == Some(&p.pulp_href)) {
+            Some("pinned to a publication of this version")
+        } else if follows && d.checkpoint && own.iter().any(|p| p.checkpoint) {
+            Some("checkpoint distribution; this version has a checkpoint publication")
+        } else if follows && !d.checkpoint && newest == Some(version) {
+            Some("follows the repository; this is its newest published version")
+        } else {
+            None
+        }
+    };
+    ds.iter().filter_map(|d| reason(d).map(|why| (d, why))).collect()
+}
+
+/// The publications of `version` (Pulp deletes them with it) and the distributions that protect it.
+/// shortcut: lists only `t.publications()`, so Deb verbatim publications are missed; list the generic
+/// `publications/` once pulp-tui creates verbatim publications.
+pub async fn version_protection(
+    c: &PulpClient,
+    t: RepoType,
+    version: &str,
+) -> Result<(Vec<Publication>, Vec<(Distribution, &'static str)>)> {
+    let repo = version.split("versions/").next().unwrap_or(version);
+    let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", repo.into())], 100_000).await?;
+    let ds = distributions(c, t).await?;
+    let by = protecting(version, &pubs, &ds).into_iter().map(|(d, why)| (d.clone(), why)).collect();
+    Ok((pubs.into_iter().filter(|p| p.repository_version.as_deref() == Some(version)).collect(), by))
+}
+
 pub async fn find_by_name<T: serde::de::DeserializeOwned>(c: &PulpClient, collection: &str, name: &str) -> Result<Option<T>> {
     let p: Page<T> = c.list(collection, &[("name", name.into()), ("limit", "1".into())]).await?;
     Ok(p.results.into_iter().next())
@@ -489,6 +529,43 @@ mod tests {
         assert_eq!(label_owner(&l(None), "pulp_tui_db", "me", &aliases), Ok(true));
         assert_eq!(label_owner(&l(Some("old")), "pulp_tui_db", "me", &aliases), Ok(true));
         assert_eq!(label_owner(&l(Some("other")), "pulp_tui_db", "me", &aliases), Err("other".into()));
+    }
+
+    #[test]
+    fn protected_version_rules() {
+        let v = |n: u32| format!("/r/1/versions/{n}/");
+        let pubs: Vec<Publication> = serde_json::from_value(json!([
+            { "pulp_href": "/p/1/", "repository_version": v(1) },
+            { "pulp_href": "/p/2/", "repository_version": v(2), "checkpoint": true },
+            { "pulp_href": "/p/10/", "repository_version": v(10) },
+            { "pulp_href": "/p/9/", "repository_version": v(9) },
+        ]))
+        .unwrap();
+        let d = |name: &str, bind: Value| -> Distribution {
+            let mut d = json!({ "pulp_href": format!("/d/{name}/"), "name": name, "base_path": name });
+            d.as_object_mut().unwrap().extend(bind.as_object().unwrap().clone());
+            serde_json::from_value(d).unwrap()
+        };
+        let why = |version: &str, ds: &[Distribution]| -> Vec<(String, &str)> {
+            protecting(version, &pubs, ds).into_iter().map(|(d, w)| (d.name.clone(), w)).collect()
+        };
+        let pinned = [d("ver", json!({ "repository_version": v(3) })), d("pub", json!({ "publication": "/p/1/" }))];
+        assert_eq!(why(&v(3), &pinned), [("ver".into(), "pinned to this version")]);
+        assert_eq!(why(&v(1), &pinned), [("pub".into(), "pinned to a publication of this version")]);
+        assert!(why(&v(4), &pinned).is_empty(), "nothing serves v4");
+
+        // A checkpoint distribution protects every version with a checkpoint publication.
+        let cp = [d("cp", json!({ "repository": "/r/1/", "checkpoint": true }))];
+        assert_eq!(why(&v(2), &cp), [("cp".into(), "checkpoint distribution; this version has a checkpoint publication")]);
+        assert!(why(&v(1), &cp).is_empty(), "v1 has no checkpoint publication");
+
+        // A distribution that follows the repository protects its newest published version (by number: v10 > v9).
+        let follow = [d("follow", json!({ "repository": "/r/1/" })), d("other", json!({ "repository": "/r/2/" }))];
+        assert_eq!(why(&v(10), &follow), [("follow".into(), "follows the repository; this is its newest published version")]);
+        assert!(why(&v(9), &follow).is_empty(), "an older published version");
+        assert!(why(&v(11), &follow).is_empty(), "the latest version without a publication");
+        assert!(why(&v(10), &cp).is_empty(), "a checkpoint distribution does not protect the newest published version");
+        assert!(protecting(&v(1), &[], &follow).is_empty(), "no publication at all");
     }
 
     #[test]

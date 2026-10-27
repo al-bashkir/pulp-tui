@@ -263,6 +263,9 @@ pub struct Publication {
     pub pulp_created: Option<String>,
     #[serde(default)]
     pub signing_service: Option<String>,
+    /// Newer pulpcore (checkpoint publications); older servers lack the field.
+    #[serde(default)]
+    pub checkpoint: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -278,6 +281,9 @@ pub struct Distribution {
     /// Newer pulpcore: serve one repository version directly (used by native replication).
     #[serde(default)]
     pub repository_version: Option<String>,
+    /// Newer pulpcore: serves the checkpoint publications of `repository`.
+    #[serde(default)]
+    pub checkpoint: bool,
     #[serde(default)]
     pub pulp_labels: BTreeMap<String, String>,
 }

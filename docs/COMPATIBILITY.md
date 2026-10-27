@@ -78,6 +78,18 @@ server gives the final answer; the dashboard shows a warning.
   the component serves it too. `delete_version` keeps a publication (and its repository
   version) that any binding of the server still serves, and `delete_view` refuses to delete
   the derived repository of a publication that another view still serves.
+* **Protected repository versions.** pulpcore 3.123.0 refuses to delete a repository
+  version with HTTP 400 ("currently being used to distribute content";
+  `RepositoryVersionViewSet.destroy`, `Repository.protected_versions()`) when a
+  distribution has `repository_version` = the version, or `publication` = one of its
+  publications, or follows the repository (`repository`) and: with `checkpoint: true`, the
+  version has a checkpoint publication; with `checkpoint: false`, the version is the
+  highest-numbered version that has a complete publication (File, RPM and Deb distributions
+  serve from publications). So the latest version without a publication can be deleted,
+  and an older published version that nothing pins can be deleted too. The version delete
+  preview applies the same rules (`ops::protecting`) and does not offer the delete for a
+  protected version. `checkpoint` on publications and distributions is new in pulpcore
+  (migration 0131); older servers lack it and pulp-tui reads it as `false`.
 * **mirror_complete** RPM syncs create their own publication with upstream package paths.
   Served-content checks therefore try the layout path and the original `location_href`.
   The RPM publication response has no `distributions` field (the File one has), and the

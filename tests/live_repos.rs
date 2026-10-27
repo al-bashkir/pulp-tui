@@ -154,6 +154,58 @@ async fn file_lifecycle() {
     cleanup(&c, &[&dist, &repo, &local, &remote]).await;
 }
 
+/// The version delete preview predicts Pulp's `protected_versions` refusal (HTTP 400).
+#[tokio::test]
+async fn served_versions_are_protected_from_delete() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::File;
+    let name = unique("it-protect");
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut v = vec![];
+    for i in 1..=3 {
+        let path = dir.path().join(format!("{i}.txt"));
+        // Unique bytes, so a rerun does not find the content unit of an earlier run.
+        std::fs::write(&path, format!("{name} {i}\n")).unwrap();
+        ops::upload(&c, t, &path, Some(&format!("{i}.txt")), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
+        let version = latest(&c, &repo).await;
+        ops::ensure_publication(&c, t, &version, None, &no_progress).await.unwrap();
+        v.push(version);
+    }
+    let pub2 = ops::ensure_publication(&c, t, &v[1], None, &no_progress).await.unwrap();
+    let pin = ops::ensure_distribution(&c, t, &format!("{name}-pin"), &format!("{name}-pin"), Some(&pub2), &json!({}), None, &no_progress)
+        .await
+        .unwrap();
+    let follow = json!({ "name": format!("{name}-follow"), "base_path": format!("{name}-follow"), "repository": repo });
+    let follow = create(&c, t.distributions(), follow, "/distributions/").await;
+
+    let why = |by: Vec<(pulp_tui::pulp::models::Distribution, &'static str)>| -> Vec<(String, &str)> {
+        by.into_iter().map(|(d, why)| (d.name, why)).collect()
+    };
+    let (pubs, by) = ops::version_protection(&c, t, &v[1]).await.unwrap();
+    assert_eq!((pubs.len(), why(by)), (1, vec![(format!("{name}-pin"), "pinned to a publication of this version")]));
+    let (_, by) = ops::version_protection(&c, t, &v[2]).await.unwrap();
+    assert_eq!(why(by), [(format!("{name}-follow"), "follows the repository; this is its newest published version")]);
+    // Pulp agrees: both deletes are refused before any task starts.
+    for version in &v[1..] {
+        let err = c.delete(version).await.unwrap_err();
+        assert!(err.status() == Some(400) && err.to_string().contains("currently being used to distribute content"), "{err}");
+    }
+
+    // v1 is published, but nothing serves it: not protected, and the delete completes.
+    let (pubs, by) = ops::version_protection(&c, t, &v[0]).await.unwrap();
+    assert_eq!((pubs.len(), by.len()), (1, 0));
+    let m = c.delete(&v[0]).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    assert!(c.get::<Value>(&v[0], &[]).await.unwrap_err().is_not_found());
+    assert!(c.get::<Value>(&pubs[0].pulp_href, &[]).await.unwrap_err().is_not_found(), "its publication is deleted too");
+
+    cleanup(&c, &[&pin, &follow, &repo]).await;
+}
+
 #[tokio::test]
 async fn file_path_with_a_comma_is_served_and_verified() {
     if !live_enabled() {

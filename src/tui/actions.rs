@@ -1292,24 +1292,19 @@ fn version_action(app: &mut App, act: Act, item: Value) {
             if ctx.cv()?.store.protected_versions(&ctx.scope).await?.contains(&href) {
                 bail!("refused: this version is a snapshot of a Content View version (delete the CV version instead)");
             }
-            // Pulp deletes the publications of the version; distributions that serve them are unbound.
-            let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository_version", href.clone())], 10_000).await?;
-            let ds = ops::distributions(c, t).await?;
-            let pinned = served_by(&ds, |d| {
-                d.repository_version.as_ref() == Some(&href) || pubs.iter().any(|p| d.publication.as_ref() == Some(&p.pulp_href))
-            });
-            let follow = if pubs.is_empty() { vec![] } else { served_by(&ds, |d| d.repository.as_ref() == Some(&repo)) };
+            let (pubs, by) = ops::version_protection(c, t, &href).await?;
             let id = short(&href);
-            let mut lines = vec![format!("Delete repository version {number} ({id}) and its {} publication(s).", pubs.len())];
-            if !pinned.is_empty() {
-                lines.push(format!("WARNING: {} distribution(s) serve it and stop serving:", pinned.len()));
-                lines.extend(pinned);
+            if !by.is_empty() {
+                // Pulp refuses the delete (HTTP 400): no typed confirm.
+                let mut lines = vec![format!("Pulp refuses to delete version {number} ({id}): these distributions use it.")];
+                lines.extend(by.iter().map(|(d, why)| format!("  {} ({}): {why}", d.name, d.base_url.as_deref().unwrap_or(&d.base_path))));
+                lines.push("First re-point them to another version (Rollback or Distribute), or edit or delete them.".into());
+                return ap(move |app| app.text(format!("Cannot delete version {number}"), lines));
             }
-            if !follow.is_empty() {
-                lines.push("These follow the repository and switch to its newest remaining publication:".into());
-                lines.extend(follow);
-            }
-            lines.push("Deleting versions is never needed for rollback: re-point a distribution instead.".into());
+            let lines = vec![
+                format!("Delete repository version {number} ({id}) and its {} publication(s).", pubs.len()),
+                "No distribution uses it. Deleting versions is never needed for rollback: re-point a distribution instead.".into(),
+            ];
             ap(move |app| {
                 app.confirm_danger(format!("Delete version {number}"), lines, &id, move |app| {
                     submit(app, format!("delete version {number}"), move |c| async move { Ok(c.delete(&href).await?) })
@@ -2604,6 +2599,50 @@ mod tests {
         assert!(app.modal.is_none());
         let e = &app.notices.back().unwrap().text;
         assert!(e.contains("refused: Content View web serves publication 0190aaaa-bbbb in Library"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn version_delete_names_the_distributions_that_protect_it() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/file/file/r/");
+        let p1 = format!("{API}publications/file/file/p1/");
+        let pubs = page(json!([
+            { "pulp_href": p1, "repository_version": format!("{repo}versions/1/") },
+            { "pulp_href": format!("{API}publications/file/file/p2/"), "repository_version": format!("{repo}versions/2/") },
+        ]));
+        get(&server, &format!("{API}publications/file/file/"), pubs).await;
+        let dists = page(json!([
+            { "pulp_href": "/d/1/", "name": "pinned", "base_path": "pinned", "base_url": "http://h/pinned/", "publication": p1 },
+            { "pulp_href": "/d/2/", "name": "follower", "base_path": "follower", "repository": repo },
+        ]));
+        get(&server, &format!("{API}distributions/file/file/"), dists).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let delete = |n: u32| json!({ "pulp_href": format!("{repo}versions/{n}/"), "number": n });
+
+        // Pulp refuses these deletes (HTTP 400): no typed confirm, the operator learns what to re-point.
+        version_action(&mut app, Act::Delete, delete(1));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no refusal dialog") };
+        assert_eq!(title, "Cannot delete version 1");
+        assert!(lines.contains(&"  pinned (http://h/pinned/): pinned to a publication of this version".to_string()), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("follower")), "v2 is the newest published version: {lines:?}");
+        assert!(lines.iter().any(|l| l.contains("re-point")), "{lines:?}");
+        version_action(&mut app, Act::Delete, delete(2));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no refusal") };
+        assert!(
+            lines.contains(&"  follower (follower): follows the repository; this is its newest published version".to_string()),
+            "{lines:?}"
+        );
+
+        // v3 has no publication and nothing pins it: Pulp deletes it.
+        version_action(&mut app, Act::Delete, delete(3));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed.as_deref(), Some("r@v3"));
+        assert_eq!(lines[0], "Delete repository version 3 (r@v3) and its 0 publication(s).");
+        assert!(!lines.iter().any(|l| l.contains("stop serving") || l.contains("switch")), "{lines:?}");
     }
 
     #[tokio::test]
