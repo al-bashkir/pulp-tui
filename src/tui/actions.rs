@@ -1934,6 +1934,24 @@ mod tests {
     }
 
     #[test]
+    fn remote_body_on_create_sends_only_the_filled_fields() {
+        let f = Form::new(
+            "t",
+            vec![
+                Field::text("name", "Name").value("r"),
+                Field::text("url", "URL").value("https://h/repo/"),
+                Field::new("tls_validation", "Validate TLS", FieldKind::Bool).value("false"),
+                Field::text("proxy_url", "Proxy URL"),
+                Field::new("download_concurrency", "Download concurrency", FieldKind::Number),
+                Field::text("ca_cert", "CA cert (PEM file path)"),
+            ],
+        );
+        let (b, files) = remote_body(&f, false).unwrap();
+        assert_eq!(b, json!({ "name": "r", "url": "https://h/repo/", "tls_validation": false }));
+        assert!(files.is_empty());
+    }
+
+    #[test]
     fn profile_form_database_round_trip() {
         let local = std::path::Path::new("/data/pulp-tui.db");
         let p = Profile { url: "https://h".into(), auth: AuthMethod::None, ..Default::default() };
@@ -2681,6 +2699,7 @@ mod tests {
         assert_eq!(repo_of_version("/p/repositories/rpm/rpm/1/versions/3/"), "/p/repositories/rpm/rpm/1/");
         assert_eq!(version_of("/p/r/1/", 2), "/p/r/1/versions/2/");
         assert_eq!(version_number("/p/r/1/versions/12/"), 12);
+        assert_eq!(version_number("/p/r/1/versions/latest/"), 0, "not a version: sorts first");
     }
 
     const API: &str = "/pulp/api/v3/";
