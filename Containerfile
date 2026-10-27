@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked $CARGO_FLAGS \
  && cp target/release/pulp-tui /pulp-tui
 
-FROM docker.io/library/alpine:3.22
+FROM docker.io/library/alpine:3.24
 RUN apk add --no-cache ca-certificates \
  && adduser -D -H -u 10001 pulptui \
  && mkdir -p /data /config && chown 10001 /data
