@@ -786,6 +786,13 @@ impl App {
         self.reload();
     }
 
+    /// Show `k` in place of the current list; Esc still returns to the screen before it.
+    pub fn replace(&mut self, k: Kind) {
+        self.list = ListState::new(k.clone());
+        self.screen = Screen::List(k);
+        self.reload();
+    }
+
     pub fn back(&mut self) {
         if let Some((s, l)) = self.history.pop() {
             self.screen = s;
@@ -1149,9 +1156,7 @@ impl App {
                     if self.history.is_empty() {
                         self.open(Screen::List(next));
                     } else {
-                        self.list = ListState::new(next.clone());
-                        self.screen = Screen::List(next);
-                        self.reload();
+                        self.replace(next);
                     }
                 }
             }

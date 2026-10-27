@@ -125,6 +125,12 @@ server gives the final answer; the dashboard shows a warning.
   does not have. It does not add the packages of a module. The check runs per request, so a
   list sent in batches gets other units than one request. A filtered RPM Content View
   snapshot therefore adds its units with `modify/`, which adds exactly the given units.
+* **A content change that changes nothing creates no version** (pulpcore 3.123
+  `RepositoryVersion.__exit__` deletes it, and its `CreatedResource` with it): the
+  `modify/` task completes with an empty `created_resources`, for example when the units to
+  remove are not in the latest version. After Remove or Add to repository, pulp-tui reads
+  the new version from `created_resources` and says "no new version" when it is empty
+  (checked on pulp1 with a File repository).
 * **Task cancellation** is asynchronous. A task blocked in a network read can end as
   `failed` before the worker processes the cancel request; pulp-tui shows Pulp's final
   state. Cancelling a completed task returns 409 and is shown as such.

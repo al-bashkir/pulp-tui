@@ -195,7 +195,8 @@ provides, files, advisory package lists, …). **x** removes the marked (or sele
 units from the repository; **a** adds them to another repository (Deb: a structured copy,
 which also copies the Release, component and architecture records, so apt finds the packages;
 only on the Deb packages list, because other Deb units would arrive without their records). Both create a new
-repository version; old versions are unchanged.
+repository version; old versions are unchanged. When the task ends, a notice gives the new version number. After
+**x**, a Content screen that still shows the old version switches to the new one; the marks stay when the task fails.
 
 ### Publications
 `t` switches RPM/File/Deb. **c** create from repository name and optional version number

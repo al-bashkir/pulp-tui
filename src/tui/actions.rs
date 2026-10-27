@@ -1,7 +1,7 @@
 //! Actions behind the menus: forms, previews, confirmations and background jobs.
 //! Content View and administration actions live in `actions_cv` / `actions_admin`.
 
-use super::app::{App, Apply, Ctx, Level, item_key};
+use super::app::{App, Apply, Ctx, Level, Screen, item_key};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, s, short};
 use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile, database_keyring_user};
@@ -9,7 +9,7 @@ use crate::filters::{Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
 use crate::pulp::models::{Distribution, Publication, Task};
 use crate::pulp::ops;
-use crate::pulp::{Capabilities, Mutation, PulpClient, RepoType, deb, file, rpm};
+use crate::pulp::{Capabilities, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::Store;
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
@@ -48,6 +48,37 @@ fn submitted(app: &mut App, m: Mutation, label: &str) {
             app.ok(format!("{label}: done"));
             app.reload();
         }
+    }
+}
+
+/// `submitted`, then wait for the task in a second job and give the finished task to `done`.
+fn follow(app: &mut App, m: Mutation, label: String, done: impl FnOnce(&mut App, Task) + Send + 'static) {
+    let Mutation::Task(h) = &m else { return submitted(app, m, &label) };
+    let h = h.clone();
+    submitted(app, m, &label);
+    app.job(label, move |ctx| async move {
+        let on = ctx.on_task();
+        match ops::wait_task(&ctx.client, &h, &on).await {
+            Ok(t) => ap(move |app| done(app, t)),
+            // The Task Center already reports it with Pulp's message.
+            Err(PulpError::TaskFailed { .. }) => ap(|_| {}),
+            Err(e) => Err(e.into()),
+        }
+    });
+}
+
+/// A Remove task ended: a Content screen that still shows the browsed version moves to the new one.
+fn content_removed(app: &mut App, old: &str, n: usize, t: &Task) {
+    let Some(new) = t.created_matching("/versions/") else {
+        return app.ok(format!("removed {n} unit(s): no new version (the latest version did not have them)"));
+    };
+    let v = version_number(&new);
+    match &app.screen {
+        Screen::List(Kind::Content { version, ctype }) if version == old => {
+            app.replace(Kind::Content { version: new, ctype: *ctype });
+            app.ok(format!("removed {n} unit(s): now showing version {v}"));
+        }
+        _ => app.ok(format!("removed {n} unit(s): new version {v}")),
     }
 }
 
@@ -1376,7 +1407,7 @@ fn content_action(app: &mut App, version: String, act: Act) {
                 "The current and older versions are immutable and keep the content.".into(),
             ];
             app.confirm("Remove content", lines, move |app| {
-                let (label, kind) = (format!("remove {} unit(s)", units.len()), app.list.kind.clone());
+                let (n, label) = (units.len(), format!("remove {} unit(s)", units.len()));
                 app.job(label.clone(), move |ctx| async move {
                     let c = &ctx.client;
                     let r: Value = c.get(&repo, &[]).await?;
@@ -1391,13 +1422,8 @@ fn content_action(app: &mut App, version: String, act: Act) {
                         RepoType::Rpm | RepoType::File => units,
                     };
                     let m = ops::remove_content(c, &repo, units).await?;
-                    ap(move |app| {
-                        // Only after success: on a failure the operator keeps the marks.
-                        if app.list.kind == kind {
-                            app.list.marked.clear();
-                        }
-                        submitted(app, m, &label)
-                    })
+                    // Only a success shows the new version (without marks): on a failure the operator keeps them.
+                    ap(move |app| follow(app, m, label, move |app, t| content_removed(app, &version, n, &t)))
                 });
             });
         }
@@ -1408,7 +1434,7 @@ fn content_action(app: &mut App, version: String, act: Act) {
             );
             app.form(form, move |app, f| {
                 let (target, units, kind, version) = (f.get("target").to_string(), units.clone(), app.list.kind.clone(), version.clone());
-                let label = format!("add {} unit(s) to {target}", units.len());
+                let (n, label) = (units.len(), format!("add {} unit(s) to {target}", units.len()));
                 app.job(label.clone(), move |ctx| async move {
                     let c = &ctx.client;
                     let r: Value =
@@ -1422,10 +1448,16 @@ fn content_action(app: &mut App, version: String, act: Act) {
                         RepoType::Deb => deb::copy(c, &version, &s(&r, "pulp_href"), None, Some(units)).await?,
                     };
                     ap(move |app| {
-                        if app.list.kind == kind {
-                            app.list.marked.clear();
-                        }
-                        submitted(app, m, &label)
+                        follow(app, m, label, move |app, t| {
+                            // Only after success: on a failure the operator keeps the marks.
+                            if app.list.kind == kind {
+                                app.list.marked.clear();
+                            }
+                            let v = t
+                                .created_matching("/versions/")
+                                .map_or("no new version (it has them already)".into(), |v| format!("version {}", version_number(&v)));
+                            app.ok(format!("added {n} unit(s) to {target}: {v}"));
+                        })
                     })
                 });
                 Ok(())
@@ -2134,6 +2166,8 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") }));
         wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(accepted).mount(&server).await;
+        let done = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": ["/r/dst/versions/3/"] });
+        get(&server, &format!("{API}tasks/1/"), done).await;
         let (mut app, mut rx) = connected(&server).await;
         for (t, coll) in [(RepoType::Deb, "deb/apt"), (RepoType::Rpm, "rpm/rpm")] {
             let dst = format!("{API}repositories/{coll}/dst/");
@@ -2145,6 +2179,8 @@ mod tests {
             form.fields[0].value = "dst".into();
             submit(&mut app, &form).unwrap();
             settle(&mut app, &mut rx).await;
+            assert_eq!(app.notices.back().unwrap().text, "added 1 unit(s) to dst: version 3", "told when the task ends");
+            assert!(app.list.marked.is_empty());
             let sent = server.received_requests().await.unwrap();
             let post = sent.iter().rfind(|r| r.method.as_str() == "POST").unwrap();
             let body: Value = post.body_json().unwrap();
@@ -2187,6 +2223,57 @@ mod tests {
         on_yes.unwrap()(&mut app);
         settle(&mut app, &mut rx).await;
         assert_eq!(posts_to(&server, &format!("{repo}modify/")).await, [json!({ "remove_content_units": [p1, "/prc/1/"] })]);
+    }
+
+    /// Remove the marked unit from the browsed version 1 on a mock server whose task ends as `task`.
+    /// `away`: the operator opens the Task Center before the task ends.
+    async fn remove_one(task: Value, away: bool) -> App {
+        use crate::tui::app::{ListState, Modal, Screen};
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/file/file/r/");
+        get(&server, &repo, json!({ "pulp_href": repo, "name": "r", "latest_version_href": format!("{repo}versions/1/") })).await;
+        let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") }));
+        wiremock::Mock::given(method("POST")).and(path(format!("{repo}modify/"))).respond_with(accepted).mount(&server).await;
+        let mut t = json!({ "pulp_href": format!("{API}tasks/1/"), "name": "pulpcore.app.tasks.repository.add_and_remove" });
+        t.as_object_mut().unwrap().extend(task.as_object().unwrap().clone());
+        get(&server, &format!("{API}tasks/1/"), t).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let k = Kind::Content { version: format!("{repo}versions/1/"), ctype: 0 };
+        (app.screen, app.list) = (Screen::List(k.clone()), ListState::new(k));
+        app.list.marked = [format!("{API}content/file/files/1/")].into();
+        content_action(&mut app, format!("{repo}versions/1/"), Act::RemoveContent);
+        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
+        on_yes.unwrap()(&mut app);
+        if away {
+            app.open(Screen::List(Kind::Tasks));
+        }
+        settle(&mut app, &mut rx).await;
+        app
+    }
+
+    #[tokio::test]
+    async fn removed_content_shows_the_new_version_where_the_old_one_is_still_shown() {
+        use crate::tui::app::Screen;
+        let repo = format!("{API}repositories/file/file/r/");
+        let done = json!({ "state": "completed", "created_resources": [format!("{repo}versions/2/")] });
+        let texts = |app: &App| app.notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>();
+
+        let app = remove_one(done.clone(), false).await;
+        assert_eq!(app.screen, Screen::List(Kind::Content { version: format!("{repo}versions/2/"), ctype: 0 }));
+        assert!(app.list.marked.is_empty());
+        assert!(texts(&app).contains(&"removed 1 unit(s): now showing version 2".into()), "{:?}", texts(&app));
+        assert_eq!(app.tasks.items[0].label, "remove 1 unit(s)", "the Task Center keeps the readable label");
+
+        let app = remove_one(done, true).await;
+        assert_eq!(app.screen, Screen::List(Kind::Tasks), "the operator left: the screen stays");
+        assert!(texts(&app).contains(&"removed 1 unit(s): new version 2".into()), "{:?}", texts(&app));
+
+        let app = remove_one(json!({ "state": "failed", "error": { "description": "boom" } }), false).await;
+        assert_eq!(app.screen, Screen::List(Kind::Content { version: format!("{repo}versions/1/"), ctype: 0 }));
+        assert_eq!(app.list.marked.len(), 1, "a failure keeps the marks");
+        let errors: Vec<_> = app.notices.iter().filter(|n| n.level == Level::Error).map(|n| n.text.clone()).collect();
+        assert_eq!(errors, ["task failed: remove 1 unit(s): boom"], "Pulp's message, once");
     }
 
     #[tokio::test]
