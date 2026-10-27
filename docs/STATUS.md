@@ -1,6 +1,6 @@
 # Implementation status
 
-Date: 2026-10-26. Tested against pulpcore 3.123.0, pulp_rpm 3.39.3, pulp_file 3.123.0,
+Date: 2026-10-27. Tested against pulpcore 3.123.0, pulp_rpm 3.39.3, pulp_file 3.123.0,
 pulp_deb 3.11.1 (`quay.io/pulp/pulp:latest`), see [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Verified workflows
@@ -13,6 +13,7 @@ Automated against real Pulp containers (`tests/run-live.sh`):
 | File: local repo, single and chunked upload, remove content, sync from manifest, publish, distribute, fetch served files, update, roll back, verify | `live_repos::file_lifecycle` |
 | Deb: remote with distribution `fixture`, mirror sync (4 packages; compare keys also list the release and release component), structured copy with `exclude name=*-dbg` (3 packages and the Release records), publish, distribute, served `Packages` index without the excluded package and package digest; a publication with the test signing service `pulp-tui-deb-test` is reused for that service only (the repository default gets another one) and serves `Release`, `Release.gpg` and `InRelease` | `live_deb::deb_mirror_copy_publish_verify` |
 | File: a file uploaded as `reports/q1,2024.txt` (a comma in the path) is published, served and verified (`PULP_MANIFEST matches 1 files`) | `live_repos::file_path_with_a_comma_is_served_and_verified` |
+| File: versions 1-3, each published; v2 pinned through its publication and v3 the newest published version of a distribution that follows the repository are reported as protected with their reasons, and Pulp itself refuses both deletes (HTTP 400); unserved v1 is not protected and its delete completes | `live_repos::served_versions_are_protected_from_delete` |
 | Deb: a package removed together with its release records (`deb::with_release_records`, `modify/`) is not in the served `Packages` index of the new publication; the other packages are | `live_deb::a_removed_deb_package_is_no_longer_served` |
 | Deb Content View: `exclude name=*-dbg`, preview (`+ fixture-alpha_1.0-1_amd64`, no `fixture-beta-dbg`), publish signed with the test service (Library verifies), promote to Dev (signature served, excluded package not in `Packages`), publish again with `none` (Library serves `Release` without `Release.gpg`/`InRelease`, Dev still signed), a version begun with the service in its checkpoint and finished by Resume (signed again), a composite with this view as its only component (publishes, verifies, serves the signature) | `live_deb::deb_content_view` |
 | Content Views: RPM + File snapshot with filters, preview, numbered versions, Library, Dev, Prod path rule, rollback, served-content verification, retention protection, advisory filtering, partial failure and retry, resume of an interrupted publish (re-attach to the submitted task), cleanup | `live_cv::content_view_lifecycle` |
@@ -52,17 +53,17 @@ private CA through a non-loopback address, with and without `ca_cert` (results i
 
 ## Test results (last run)
 
-* `cargo test --lib`: 309 passed
+* `cargo test --lib`: 320 passed
 * `cargo test --test mock_http`: 30 passed
-* Live (`tests/run-live.sh repos cv rbac failures replication shared_db deb real`,
-  2026-10-26, on new containers after `tests/env/pulp-env.sh down-all`): repos 3, cv 4,
-  rbac 1, failures 2, replication 2, shared_db 6 (PostgreSQL 16, schema 5), deb 3,
-  real 3 (614 s) — all passed
+* Live (`tests/run-live.sh` and `tests/run-live.sh real`, 2026-10-27, on new containers
+  after `tests/env/pulp-env.sh down-all`): repos 4, cv 4, rbac 1, failures 2,
+  replication 2, shared_db 6 (PostgreSQL 16, schema 5), deb 3, real 3 (657 s) — all passed
 * `cargo fmt --check`, `cargo clippy --all-targets -D warnings` (default and
   `--no-default-features`): clean
-* `podman build -f Containerfile .`: built (30.8 MB image; no keyring; it contains the
-  PostgreSQL driver; `pulp-tui --version` runs)
-* `cargo audit` (494 crates): no vulnerabilities; 3 "unmaintained" warnings, unchanged
+* `podman build -f Containerfile .` (2026-10-26; dependencies and Containerfile unchanged
+  since): built (30.8 MB image; no keyring; it contains the PostgreSQL driver;
+  `pulp-tui --version` runs)
+* `cargo audit` (2026-10-26, 494 crates; `Cargo.lock` unchanged since): no vulnerabilities; 3 "unmaintained" warnings, unchanged
   (RUSTSEC-2026-0370/0371/0372: `zvariant`, `zvariant_derive`, `zbus_names`), all
   reached only through the optional `keyring` feature (Secret Service over D-Bus). Builds
   with `--no-default-features` (the container image) do not contain them.
