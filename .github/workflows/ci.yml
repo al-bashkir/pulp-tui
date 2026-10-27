@@ -3,8 +3,20 @@ name: ci
 on:
   push:
     branches: [main]
+    paths: &code
+      - 'src/**'
+      - 'tests/**'
+      - 'examples/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rustfmt.toml'
+      - 'Containerfile'
+      - '.cargo/**'
+      - '.github/workflows/**'
   pull_request:
-  workflow_call: # release.yml runs it before a release
+    paths: *code
+  workflow_call: # release.yml runs it before a release (path filters do not apply)
 
 permissions:
   contents: read
