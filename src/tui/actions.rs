@@ -908,8 +908,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                     let rel = f.opt("relative_path").map(str::to_string);
                     let href = href.clone();
                     app.job(format!("upload {}", path.display()), move |ctx| async move {
-                        // As in `ops::upload`: only a file larger than one chunk uses uploads/.
-                        if tokio::fs::metadata(&path).await?.len() as usize > ctx.client.upload_chunk() {
+                        if ops::chunked(&ctx.client, tokio::fs::metadata(&path).await?.len()) {
                             ctx.caps.require(Feature::ChunkedUpload)?;
                         }
                         let p2 = ctx.clone();

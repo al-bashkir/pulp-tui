@@ -446,6 +446,11 @@ pub struct UploadResult {
     pub task: Option<Task>,
 }
 
+/// A file of `size` bytes goes through the chunked upload API (`uploads/`).
+pub fn chunked(c: &PulpClient, size: u64) -> bool {
+    size as usize > c.upload_chunk()
+}
+
 /// Upload a local file as RPM package or File content, optionally adding it to a repository.
 /// Small files go in one request; large ones use the chunked upload API. The server's
 /// digest is compared with the local one, and an unfinished chunked upload is deleted on failure.
@@ -474,7 +479,7 @@ pub async fn upload(
     let mut f = tokio::fs::File::open(path).await.map_err(io)?;
     let mut hasher = Sha256::new();
 
-    let (m, upload_href) = if size as usize <= chunk {
+    let (m, upload_href) = if !chunked(c, size) {
         let mut buf = Vec::with_capacity(size as usize);
         f.read_to_end(&mut buf).await.map_err(io)?;
         hasher.update(&buf);
