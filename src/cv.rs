@@ -901,6 +901,57 @@ impl CvService {
         Ok(())
     }
 
+    // ---- unpromote ---------------------------------------------------------------------
+
+    /// The environment and the served rows that unpromoting view `cv_id` from `env_id` deletes. Refused while
+    /// a later environment on the path still has the view: unpromote goes back along the path. Reads only.
+    pub async fn unpromote_impact(&self, cv_id: i64, env_id: i64) -> Result<(Environment, Vec<BindingRepo>)> {
+        let cv = self.store.content_view(cv_id).await?.name;
+        let envs = self.store.environments(&self.scope).await?;
+        let env = envs.iter().find(|e| e.id == env_id).ok_or_else(|| anyhow!("unknown environment"))?;
+        if !self.store.env_cv_ids(env_id).await?.contains(&cv_id) {
+            bail!("{cv} is not in {}", env.name);
+        }
+        let mut later = vec![];
+        for e in envs.iter().filter(|e| comes_after(&envs, e, env_id)) {
+            if self.store.env_cv_ids(e.id).await?.contains(&cv_id) {
+                later.push(e.name.as_str());
+            }
+        }
+        if !later.is_empty() {
+            bail!("{cv} is still in {}; unpromote it there first", later.join(", "));
+        }
+        Ok((env.clone(), self.store.binding_repos(env_id, cv_id).await?))
+    }
+
+    /// Stop serving view `cv_id` in `env_id`: delete its distributions there, then forget the binding. A rerun
+    /// after a failure deletes what is left. A distribution of another pulp-tui database is kept.
+    pub async fn unpromote(&self, cv_id: i64, env_id: i64, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
+        let (env, rows) = self.unpromote_impact(cv_id, env_id).await?;
+        let aliases = self.store.aliases().await?;
+        for b in &rows {
+            if let Some(o) = self.foreign_owner(&b.distribution, &aliases).await? {
+                log(format!("keeping {}: owned by another pulp-tui database ({o})", b.distribution));
+                continue;
+            }
+            log(format!("deleting {} (/{})", b.distribution, b.base_path));
+            self.alive()?;
+            match self.client.delete(&b.distribution).await {
+                Ok(m) => {
+                    ops::settle(&self.client, m, on).await?;
+                }
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.alive()?;
+        self.store.delete_binding(env_id, cv_id).await?;
+        let cv = self.store.content_view(cv_id).await?.name;
+        self.audit("cv.unpromote", &format!("{cv} from {}: {} distribution(s)", env.name, rows.len())).await;
+        log(format!("{cv} is not in {} any more", env.name));
+        Ok(())
+    }
+
     // ---- lifecycle environment labels -----------------------------------------------
 
     /// The served paths that the label `label` of environment `env_id` moves: each served row whose
@@ -1265,6 +1316,18 @@ impl CvService {
         self.audit("cv.delete", &cv.name).await;
         Ok(())
     }
+}
+
+/// Whether environment `e` comes after environment `id` on its path.
+fn comes_after(envs: &[Environment], e: &Environment, id: i64) -> bool {
+    let mut prior = e.prior_id;
+    while let Some(p) = prior {
+        if p == id {
+            return true;
+        }
+        prior = envs.iter().find(|x| x.id == p).and_then(|x| x.prior_id);
+    }
+    false
 }
 
 fn norm_epoch(e: &str) -> String {
@@ -1987,6 +2050,66 @@ mod tests {
         let e = svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap_err();
         assert!(e.to_string().starts_with("web in Library: partial: unbind old"), "{e}");
         assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().state, "partial", "os is served: not failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpromote_deletes_the_owned_distributions_and_forgets_the_view() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (dev, cv) = web_in_dev(&svc).await;
+        let (ours, theirs) = ("/pulp/api/v3/distributions/rpm/rpm/1/", "/pulp/api/v3/distributions/rpm/rpm/2/");
+        for (i, (repo, href)) in [("os", ours), ("mirror", theirs)].into_iter().enumerate() {
+            let b = BindingRepo {
+                env_id: dev,
+                cv_id: cv,
+                repo_href: format!("/pulp/api/v3/repositories/rpm/rpm/{i}/"),
+                repo_name: repo.into(),
+                repo_type: RepoType::Rpm,
+                distribution: href.into(),
+                base_path: format!("dev/web/{repo}"),
+                publication: Some("/pulp/api/v3/publications/rpm/rpm/3/".into()),
+            };
+            svc.store.save_binding_repo(&b).await.unwrap();
+        }
+        serve_owner(&server, ours, svc.store.db_id()).await;
+        serve_owner(&server, theirs, "other").await;
+        Mock::given(method("DELETE")).and(path(ours)).respond_with(ResponseTemplate::new(204)).mount(&server).await;
+        let logs = Mutex::new(vec![]);
+        svc.unpromote(cv, dev, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+        let sent = server.received_requests().await.unwrap();
+        let deleted: Vec<&str> = sent.iter().filter(|r| r.method.as_str() == "DELETE").map(|r| r.url.path()).collect();
+        assert_eq!(deleted, [ours]);
+        let keeping = format!("keeping {theirs}: owned by another pulp-tui database (other)");
+        assert!(logs.into_inner().unwrap().contains(&keeping));
+        assert!(svc.store.binding(dev, cv).await.unwrap().is_none());
+        assert!(svc.store.binding_repos(dev, cv).await.unwrap().is_empty());
+        let e = svc.unpromote(cv, dev, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), "web is not in Dev");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpromote_is_refused_while_a_later_environment_has_the_view() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        // Library -> Dev -> Test, the view in all three; later Test only gets it back (a rollback there), not Dev.
+        let (dev, cv) = web_in_dev(&svc).await;
+        let (lib, v) = (svc.store.ensure_library("k").await.unwrap(), svc.store.binding(dev, cv).await.unwrap().unwrap().version_id);
+        let test = svc.store.create_env("k", "Test", dev, false).await.unwrap();
+        svc.store.set_binding(lib, cv, v, "active").await.unwrap();
+        svc.store.set_binding(test, cv, v, "active").await.unwrap();
+        let e = svc.unpromote(cv, dev, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), "web is still in Test; unpromote it there first");
+        svc.store.delete_binding(test, cv).await.unwrap();
+        svc.unpromote(cv, dev, &|_| {}, &ops::no_progress).await.unwrap();
+        svc.store.set_binding(test, cv, v, "active").await.unwrap();
+        let e = svc.unpromote(cv, lib, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), "web is still in Test; unpromote it there first");
+        assert!(svc.store.binding(lib, cv).await.unwrap().is_some());
+        svc.unpromote(cv, test, &|_| {}, &ops::no_progress).await.unwrap();
+        svc.unpromote(cv, lib, &|_| {}, &ops::no_progress).await.unwrap();
+        assert!(svc.store.version_in_use(v).await.unwrap().is_empty(), "the version can be deleted now");
     }
 
     /// Scope "k": Library, Dev (label "dev"), view "web" with a published version bound to Dev.

@@ -1146,6 +1146,14 @@ impl Store {
         Ok(())
     }
 
+    /// Forget view `cv_id` in environment `env_id`: its served rows, then its binding.
+    pub async fn delete_binding(&self, env_id: i64, cv_id: i64) -> Result<()> {
+        for t in ["binding_repos", "bindings"] {
+            sqlx::query(&format!("DELETE FROM {t} WHERE env_id = $1 AND cv_id = $2")).bind(env_id).bind(cv_id).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
     /// `set_binding` only while the binding is still this promotion's `promoting` row (see `fail_publishing_version`).
     pub async fn finish_promoting_binding(&self, env_id: i64, cv_id: i64, version_id: i64, state: &str) -> Result<()> {
         sqlx::query(
