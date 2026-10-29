@@ -225,6 +225,58 @@ async fn environment_relabel_moves_served_paths() {
     cleanup(&c, &[&repo, &remote]).await;
 }
 
+#[tokio::test]
+async fn unpromote_goes_back_along_the_path() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvun");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
+    let cv = store.create_cv(&profile, &id, "").await.unwrap();
+    store
+        .set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] })
+        .await
+        .unwrap();
+    let v1 = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let lib = store.ensure_library(&profile).await.unwrap();
+    let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
+    let test = store.create_env(&profile, "Test", dev, false).await.unwrap();
+    svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    svc.promote(cv, v1.id, test, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    let readme = |label: &str| format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, label, "docs"));
+    assert_eq!(c.fetch_content(&readme("test"), 1 << 20).await.unwrap().0, 200);
+
+    let e = svc.unpromote(cv, dev, &quiet, &no_progress).await.unwrap_err().to_string();
+    assert_eq!(e, format!("{id} is still in Test; unpromote it there first"));
+    assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 200, "the refusal changed nothing");
+
+    // Test stops serving and its distribution is gone in Pulp; Dev still serves.
+    let dist = store.binding_repos(test, cv).await.unwrap()[0].distribution.clone();
+    svc.unpromote(cv, test, &quiet, &no_progress).await.unwrap();
+    assert_eq!(c.fetch_content(&readme("test"), 1 << 20).await.unwrap().0, 404);
+    assert!(c.get::<serde_json::Value>(&dist, &[]).await.unwrap_err().is_not_found());
+    assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 200);
+
+    // A new promotion serves the same path again.
+    svc.promote(cv, v1.id, test, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    assert_eq!(c.fetch_content(&readme("test"), 1 << 20).await.unwrap().0, 200);
+    assert!(svc.verify(cv, test).await.unwrap().is_empty());
+
+    // Back along the path; then the version is no longer bound and can be deleted.
+    for env in [test, dev, lib] {
+        svc.unpromote(cv, env, &quiet, &no_progress).await.unwrap();
+    }
+    assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 404);
+    svc.delete_version(v1.id, &quiet, &no_progress).await.unwrap();
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
 /// Two databases (stores with different ids) share one Pulp and one Content View name.
 #[tokio::test]
 async fn content_view_owned_by_another_database() {
