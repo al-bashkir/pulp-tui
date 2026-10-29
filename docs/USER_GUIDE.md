@@ -834,6 +834,10 @@ pulp-tui [--config FILE] [--profile NAME] [--data-dir DIR]     start the TUI
 pulp-tui check                       test a profile non-interactively
 pulp-tui export-cv [-o FILE]         export Content View definitions (JSON, no secrets)
 pulp-tui import-cv FILE              import them (existing names are kept)
+pulp-tui export-repos [-o FILE]      export repository and remote definitions of the server
+                                     (JSON, no secrets)
+pulp-tui import-repos FILE           create the ones the server does not have (existing
+                                     names are kept)
 pulp-tui db migrate                  create or upgrade the schema of the profile's database
 pulp-tui --profile NAME db copy [--from PROFILE|local]
                                      copy Content View data into the database of NAME, from
@@ -856,6 +860,35 @@ shows one warning notice). Pin the component again with **e**. A component that 
 does not find, or that is itself a composite, is skipped with a `warning:` line that names
 it. A format 1 file still imports. A pulp-tui from before composites refuses a format 2
 file. The database needs schema 4 (`pulp-tui db migrate`) for composites.
+
+`export-repos` and `import-repos` use the Pulp server of the selected profile, not a
+database. Use them to copy the repository setup of one server to another:
+
+```
+pulp-tui --profile old export-repos -o repos.json
+pulp-tui --profile new import-repos repos.json
+```
+
+The export file has `"format": 1`. It holds the RPM, File and Deb remotes and repositories
+with the fields that the server accepts on create. A repository holds the name of its
+remote, and the import gives it the remote of that name on the target server. The export
+does not include:
+
+* secrets: passwords, usernames, client keys and proxy credentials (Pulp never shows them),
+  `sles_auth_token` and `headers`. The file lists the credentials a remote had in
+  `secrets`; after the import, `import-repos` prints `warning: RPM remote os: set
+  username, password again by hand (not in the export)`. Set them with **e** on Remotes.
+* signing services: they are objects of the source server. Set them again with **e** on
+  Repositories.
+* objects that Content Views or replication manage (labels `pulp_tui_cv`, `pulp_tui_env`,
+  `pulp_tui_db`, `pulp_tui_replica`, `UpstreamPulp`). Their owner creates them.
+* distributions, publications and content.
+
+`export-repos` prints a `note:` line on stderr for each item it leaves out. `import-repos`
+never changes an existing object. It keeps an object whose name exists and prints the
+fields that are different, for example `warning: RPM repository os exists; kept (differs:
+description)`. A field that the target server does not have is left out with a warning.
+Because of this, you can run the import again after an error, and the result is the same.
 
 Logs: `<data-dir>/pulp-tui.log`; level with `PULP_TUI_LOG` (for example
 `PULP_TUI_LOG=pulp_tui=debug`). Secrets are never logged.

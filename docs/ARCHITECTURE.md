@@ -11,7 +11,7 @@ tools for normal operation.
 | Transport | `src/pulp/client.rs` | Auth (basic, bearer, mTLS), TLS (always verified, custom CA bundles), proxies, timeouts, bounded concurrency (semaphore), retries for reads only, pagination, response size limit, error mapping, href confinement to the configured API root, recording of each request attempt in the in-memory session log |
 | Capabilities | `src/pulp/caps.rs` | `status/` (component versions, health, content origin), `login/` or `users/?username=` (current user), live OpenAPI schema (endpoints, fields, enums) |
 | Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs`, `src/pulp/rpm.rs`, `src/pulp/file.rs`, `src/pulp/deb.rs` | RPM/File/Deb endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification |
-| Services | `src/cv.rs`, `src/replication.rs`, `src/filters.rs` | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules, `rpmvercmp` and the dpkg version comparison |
+| Services | `src/cv.rs`, `src/replication.rs`, `src/filters.rs`, `src/repo_export.rs` | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules, `rpmvercmp` and the dpkg version comparison, export and import of repository and remote definitions |
 | Storage | `src/store.rs` | sqlx (SQLite, optionally PostgreSQL): task references, Content View definitions, versions, checkpoints, environments, bindings, audit log with operator, locks, replication runs |
 | TUI | `src/tui/*` | Event loop, state, screens, forms, confirmations, Task Center |
 
@@ -420,6 +420,15 @@ database and offers copy, switch or cancel; the profile is saved only after the 
 Export/import (`pulp-tui export-cv`, `import-cv`, or the Servers screen) moves Content
 View and environment definitions between databases (format 2, see "Schema and upgrades").
 It contains no secrets and no Pulp state.
+
+`pulp-tui export-repos` and `import-repos` (`src/repo_export.rs`) move repository and
+remote definitions between Pulp servers. The export keeps the fields of the plugin's
+request schema from the live OpenAPI (so it needs that schema) and leaves out readable
+secrets (`sles_auth_token`, `headers`, credentials in `url`/`proxy_url`), hrefs (signing
+services) and objects with an ownership label (`pulp_tui_*`, `UpstreamPulp`). A repository
+holds the name of its remote. The import creates the remotes, then the repositories, finds
+the remote of the same name on the target, and keeps objects whose name exists, so a rerun
+ends in the same state. It never changes an existing object.
 
 ## Security model
 

@@ -53,6 +53,7 @@ server gives the final answer; the dashboard shows a warning.
 | Composite Content Views (`live_cv::composite_content_view_rocky9`): one publication served by two distributions at once (the component's Library distribution and the composite's own), auto publish after the extras view publishes, deleting a composite version or a composite keeps the publications and repositories of its components | verified |
 | Native replication: select by `q_select`, nodelete policy, rerun, upstream update | verified |
 | Fallback replication: dry run, create, idempotent rerun, upstream update, conflict with native-replicated objects, loop guard, self-replication guard | verified |
+| Repository and remote definitions (`export-repos` on pulp2, `import-repos` on pulp1): RPM and Deb remotes with their repositories and a File repository, no secret in the file, the repository's remote found by name, idempotent rerun | verified |
 | RBAC: 401 on wrong password, 403 without role, no self-escalation, model-level creator role, group object role, role removal | verified |
 | Task cancellation (waiting and running), 409 on completed task, TLS errors, unreadable CA bundle | verified |
 | Mock HTTP: pagination, foreign `next` links, 401/403/409, malformed JSON, read retries vs mutation non-retry, 429 Retry-After, timeouts, unreachable server, task polling, old-server capability negotiation, read-only blocking, size limits | verified |
@@ -145,6 +146,13 @@ server gives the final answer; the dashboard shows a warning.
   with `null` unsets the value (`hidden_fields` shows `is_set: false`; checked live for a
   File remote and repository). The remote and repository Edit forms send `null` for `-`
   and for a cleared Remote.
+* **Readable remote secrets.** The write-only fields of a remote (`username`, `password`,
+  `client_key`, `proxy_username`, `proxy_password`) are never in a GET answer;
+  `hidden_fields` shows which are set. pulp_rpm 3.39.3 `sles_auth_token` is not write-only
+  (`serializers/repository.py`): a GET returns it. `headers` can hold an `Authorization`
+  header. pulpcore 3.123.0 refuses credentials in `url` ("The remote url contains username
+  or password") and in `proxy_url` (`serializers/base.py`), but older servers can have them.
+  `export-repos` leaves out all of these.
 
 ## pulp_deb
 

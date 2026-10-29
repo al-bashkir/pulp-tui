@@ -5,7 +5,7 @@ Guidance for contributors and coding agents working on pulp-tui.
 ## Architecture in one paragraph
 
 `src/pulp/` is the REST layer (transport, capabilities, typed models, plugin operations).
-`src/cv.rs`, `src/replication.rs`, `src/filters.rs` are services built only on that layer.
+`src/cv.rs`, `src/replication.rs`, `src/filters.rs`, `src/repo_export.rs` are services built only on that layer.
 `src/store.rs` is the SQLite/PostgreSQL store for application-owned state. `src/session_log.rs` is the
 in-memory request/action log for the Logs screen. `src/tui/` is the UI:
 `app.rs` (state, jobs, keys, modals), `kinds.rs` (screens: source, columns, actions),
