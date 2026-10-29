@@ -188,6 +188,18 @@ content type that the Content browser lists, each line starts with its type, suc
 publications, and you type the version id; refused for Content View snapshots; never needed
 for rollback).
 
+**O** prunes orphans on the whole server (Pulp `orphans/cleanup/`): content that no
+repository version has, and artifacts (files) that no content uses. Deleting versions
+makes orphans; this frees their disk space. A form asks how long the content must be an
+orphan (minutes, default 1440, which is Pulp's default). pulp-tui sends this time with the
+request, because it cannot read the server's `ORPHAN_PROTECTION_TIME`, and counts the
+content with the same time. So the count in the confirm dialog is what Pulp deletes. Type
+the profile name to start. When the task ends, a notice shows what Pulp deleted, for
+example `prune orphans on lab: deleted 12 content unit(s) and 30 artifact(s)`. `0` deletes
+all orphans, also the content of an upload that is still running. A sync downloads
+deleted content again. A read-only profile does not allow it. A server without
+`orphans/cleanup/` shows "orphan cleanup is not supported by this server".
+
 ### Content browser
 Opened from a repository or version. `t` cycles the content types of the repository type.
 RPM: packages, advisories, modulemds, package groups, distribution trees, repo metadata

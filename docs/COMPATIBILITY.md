@@ -54,6 +54,7 @@ server gives the final answer; the dashboard shows a warning.
 | Native replication: select by `q_select`, nodelete policy, rerun, upstream update | verified |
 | Fallback replication: dry run, create, idempotent rerun, upstream update, conflict with native-replicated objects, loop guard, self-replication guard | verified |
 | Repository and remote definitions (`export-repos` on pulp2, `import-repos` on pulp1): RPM and Deb remotes with their repositories and a File repository, no secret in the file, the repository's remote found by name, idempotent rerun | verified |
+| Orphan cleanup (**O** on Repository Versions, TUI on pulp1, 1440 minutes): count, typed confirm, `orphan_cleanup` task, notice from its progress reports | verified once (manual) |
 | RBAC: 401 on wrong password, 403 without role, no self-escalation, model-level creator role, group object role, role removal | verified |
 | Task cancellation (waiting and running), 409 on completed task, TLS errors, unreadable CA bundle | verified |
 | Mock HTTP: pagination, foreign `next` links, 401/403/409, malformed JSON, read retries vs mutation non-retry, 429 Retry-After, timeouts, unreachable server, task polling, old-server capability negotiation, read-only blocking, size limits | verified |
@@ -153,6 +154,15 @@ server gives the final answer; the dashboard shows a warning.
   header. pulpcore 3.123.0 refuses credentials in `url` ("The remote url contains username
   or password") and in `proxy_url` (`serializers/base.py`), but older servers can have them.
   `export-repos` leaves out all of these.
+* **Orphan cleanup.** `POST orphans/cleanup/` (pulpcore 3.123.0) takes
+  `orphan_protection_time` (minutes; without it the server setting
+  `ORPHAN_PROTECTION_TIME` applies, which the API does not show) and returns a task
+  (`orphan_cleanup`) with the progress reports `clean-up.content` and
+  `clean-up.artifacts`. `content/?orphaned_for=N` counts the content that a cleanup with
+  the same N deletes. Protection counts from the content's `timestamp_of_interest`, not from
+  when it became an orphan: on pulp1, 142,224 units were orphans at `orphaned_for=0` and none
+  at 1440, because all of them were created that day. The old `DELETE orphans/` still
+  exists; pulp-tui does not use it.
 
 ## pulp_deb
 
