@@ -214,6 +214,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         (Kind::Profiles, _) => profile_action(app, act, item),
         (Kind::Repos(t, _), _) => repo_action(app, *t, act, item),
         (Kind::Remotes(t), _) => remote_action(app, *t, act, item),
+        (Kind::Versions(_), Act::PruneOrphans) => prune_orphans(app),
         (Kind::Versions(_), _) => version_action(app, act, item),
         (Kind::Content { version, .. }, _) => content_action(app, version.clone(), act),
         (Kind::Publications(t), _) => publication_action(app, *t, act, item),
@@ -1371,6 +1372,48 @@ fn version_action(app: &mut App, act: Act, item: Value) {
     }
 }
 
+/// Orphan cleanup of the whole server. The count and the request use the protection time the operator gives:
+/// the server's own `ORPHAN_PROTECTION_TIME` cannot be read, so a count without it would not match what goes.
+fn prune_orphans(app: &mut App) {
+    if caps(app).is_some_and(|c| !c.has_endpoint("orphans/cleanup/")) {
+        return app.error("orphan cleanup is not supported by this server");
+    }
+    let minutes = Field::new("minutes", "Orphaned for at least (minutes)", FieldKind::Number)
+        .value("1440")
+        .help("1440 = Pulp's default; 0 = all, also the content of an upload that is still running");
+    app.form(Form::new("Prune orphan content", vec![minutes]), |app, f| {
+        let minutes: u32 = f.get("minutes").trim().parse().map_err(|_| "minutes must be a whole number from 0".to_string())?;
+        let profile = app.profile.clone().unwrap_or_default();
+        app.job("count orphan content", move |ctx| async move {
+            let c = &ctx.client;
+            let orphans: Page<Value> = c.list(&c.api("content/"), &[("orphaned_for", minutes.to_string()), ("limit", "1".into())]).await?;
+            let lines = vec![
+                format!("Delete the orphans on {profile}: content that no repository version has, and files that no content uses."),
+                format!("{} content unit(s) orphaned for {minutes} minutes or more.", orphans.count),
+                "Pulp cannot undo this. A sync downloads deleted content again.".into(),
+            ];
+            ap(move |app| {
+                let typed = profile.clone();
+                app.confirm_danger("Prune orphan content", lines, &typed, move |app| {
+                    let label = format!("prune orphans on {profile}");
+                    app.job(label.clone(), move |ctx| async move {
+                        let c = &ctx.client;
+                        let m = c.post(&c.api("orphans/cleanup/"), &json!({ "orphan_protection_time": minutes })).await?;
+                        ap(move |app| follow(app, m, label.clone(), move |app, t| orphans_pruned(app, &label, &t)))
+                    })
+                })
+            })
+        });
+        Ok(())
+    });
+}
+
+/// The cleanup task ended: what its progress reports say it deleted.
+fn orphans_pruned(app: &mut App, label: &str, t: &Task) {
+    let done = |code: &str| t.progress_reports.iter().find(|r| r.code == code).and_then(|r| r.done).unwrap_or(0);
+    app.ok(format!("{label}: deleted {} content unit(s) and {} artifact(s)", done("clean-up.content"), done("clean-up.artifacts")));
+}
+
 /// Show what a distribution serves now and what it will serve, then re-point on confirmation.
 fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
     app.job(format!("rollback preview {dist}"), move |ctx| async move {
@@ -2145,6 +2188,65 @@ mod tests {
         );
         let patches = server.received_requests().await.unwrap();
         patches.iter().find(|r| r.method.as_str() == "PATCH").unwrap().body_json().unwrap()
+    }
+
+    #[tokio::test]
+    async fn prune_orphans_counts_with_the_protection_time_it_sends() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}content/")))
+            .and(query_param("orphaned_for", "60"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 12, "next": null, "results": [] })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(format!("{API}orphans/cleanup/")))
+            .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reports = json!([
+            { "code": "clean-up.content", "message": "Clean up orphan Content", "total": 12, "done": 12 },
+            { "code": "clean-up.artifacts", "message": "Clean up orphan Artifacts", "total": 30, "done": 30 },
+        ]);
+        let task =
+            json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "name": "orphan_cleanup", "progress_reports": reports });
+        get(&server, &format!("{API}tasks/1/"), task).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Versions(None);
+        run(&mut app, Act::PruneOrphans, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.fields[0].value, "1440", "Pulp's default");
+        form.fields[0].value = "-1".into();
+        assert!(submit(&mut app, &form).is_err(), "minutes are a whole number from 0");
+        form.fields[0].value = "60".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed.as_deref(), Some("lab"), "the operator types the profile name");
+        assert!(lines.iter().any(|l| l.contains("12 content unit(s) orphaned for 60 minutes or more")), "{lines:?}");
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        let requests = server.received_requests().await.unwrap();
+        let post: Value = requests.iter().find(|r| r.method.as_str() == "POST").unwrap().body_json().unwrap();
+        assert_eq!(post, json!({ "orphan_protection_time": 60 }));
+        let texts: Vec<&String> = app.notices.iter().map(|n| &n.text).collect();
+        assert!(texts.iter().any(|t| *t == "prune orphans on lab: deleted 12 content unit(s) and 30 artifact(s)"), "{texts:?}");
+    }
+
+    #[tokio::test]
+    async fn prune_orphans_needs_the_cleanup_endpoint() {
+        let server = wiremock::MockServer::start().await;
+        let (mut app, _rx) = connected(&server).await;
+        let mut caps = plugins();
+        caps.paths.insert("repositories/".into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        app.list.kind = Kind::Versions(None);
+        run(&mut app, Act::PruneOrphans, Value::Null);
+        assert!(app.modal.is_none());
+        assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("orphan cleanup is not supported by this server"));
     }
 
     #[tokio::test]

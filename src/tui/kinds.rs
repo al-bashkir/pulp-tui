@@ -164,6 +164,7 @@ pub enum Act {
     Roles,
     Members,
     BreakLock,
+    PruneOrphans,
     /// In no `actions()` list: offered on Connect and save; here so that `mutates` classifies them.
     MigrateDb,
     CopyDb,
@@ -206,6 +207,7 @@ impl Act {
             ToggleProtected => 'L',
             ToggleActive => 'A',
             BreakLock => 'U',
+            PruneOrphans => 'O',
         }
     }
 
@@ -261,6 +263,7 @@ impl Act {
             Roles => "Roles",
             Members => "Members",
             BreakLock => "Break lock",
+            PruneOrphans => "Prune orphan content (whole server)",
             MigrateDb => "Migrate database",
             CopyDb => "Copy Content View data",
         }
@@ -302,7 +305,7 @@ impl Act {
     }
 
     pub fn needs_item(self) -> bool {
-        !matches!(self, Act::Create | Act::DismissTasks | Act::ImportCv | Act::ExportCv | Act::FallbackReplicate)
+        !matches!(self, Act::Create | Act::DismissTasks | Act::ImportCv | Act::ExportCv | Act::FallbackReplicate | Act::PruneOrphans)
     }
 }
 
@@ -635,7 +638,7 @@ impl Kind {
                 actions
             }
             Kind::Remotes(_) | Kind::Roles => vec![Create, Edit, Delete, Inspect],
-            Kind::Versions(_) => vec![Content, Publish, Distribute, Rollback, Compare, Delete, Inspect],
+            Kind::Versions(_) => vec![Content, Publish, Distribute, Rollback, Compare, Delete, PruneOrphans, Inspect],
             // A structured Deb copy brings the release records of binary packages only; other units would arrive alone.
             Kind::Content { version, ctype } if RepoType::from_href(version) == Some(RepoType::Deb) && *ctype != 0 => {
                 vec![Inspect, RemoveContent]
@@ -1119,6 +1122,7 @@ mod tests {
         assert!(Kind::ContentViews.actions().contains(&Act::CvSyncRepos) && Act::CvSyncRepos.key() == 'f');
         assert!(!Act::Delete.mutates(&Kind::Profiles, true));
         assert!(Act::ImportCv.mutates(&Kind::Profiles, true), "bulk create in the shared database");
+        assert!(Act::PruneOrphans.mutates(&Kind::Versions(None), false), "deletes content on the server");
         assert!(!Act::ImportCv.mutates(&Kind::Profiles, false));
         assert!(Act::MigrateDb.mutates(&Kind::Profiles, false) && Act::CopyDb.mutates(&Kind::Profiles, false));
         assert!(!Kind::Profiles.actions().iter().any(|a| matches!(a, Act::MigrateDb | Act::CopyDb)), "offered on Connect and save only");
