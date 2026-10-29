@@ -608,6 +608,27 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                 })
             });
         }
+        Act::Unpromote => {
+            let Some(st) = cv_store(app) else { return };
+            app.spawn("read environments".into(), true, async move {
+                let mut envs = vec![];
+                for e in st.environments(&p).await? {
+                    if st.env_cv_ids(e.id).await?.contains(&id) {
+                        envs.push(e.name);
+                    }
+                }
+                ap(move |app| {
+                    if envs.is_empty() {
+                        return app.error(format!("{name} is not in any environment"));
+                    }
+                    let form = Form::new(format!("Unpromote {name}"), vec![Field::new("env", "Environment", FieldKind::Choice(envs))]);
+                    app.form(form, move |app, f| {
+                        unpromote_preview(app, id, name.clone(), f.get("env").to_string());
+                        Ok(())
+                    });
+                })
+            });
+        }
         Act::CvDrift => app.job(format!("verify {name}"), move |ctx| async move {
             let (svc, mut lines) = (ctx.cv()?, vec![]);
             for e in svc.store.environments(&svc.scope).await? {
@@ -781,6 +802,34 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
             } else {
                 app.confirm_prod(title, lines, &typed, go);
             }
+        })
+    });
+}
+
+/// Show the distributions that unpromoting deletes, then run it.
+fn unpromote_preview(app: &mut App, cv: i64, name: String, env: String) {
+    app.load_job(format!("read what unpromoting {name} from {env} deletes"), move |ctx| async move {
+        let svc = ctx.cv()?;
+        let envs = svc.store.environments(&svc.scope).await?;
+        let e = envs.into_iter().find(|e| e.name == env).ok_or_else(|| anyhow!("unknown environment {env}"))?;
+        let (e, rows) = svc.unpromote_impact(cv, e.id).await?;
+        let mut lines = vec![format!("Unpromote {name} from {env}: delete its distributions there (consumers lose these URLs):")];
+        lines.extend(rows.iter().map(|b| format!("  {}: /{}", b.repo_name, b.base_path)));
+        lines.push(String::new());
+        lines.push("Versions and snapshots stay; promote again to serve the view here.".into());
+        // Like a promotion to a protected environment, the environment is typed too.
+        let typed = if e.protected { format!("{name} {env}") } else { name.clone() };
+        ap(move |app| {
+            app.confirm_danger(format!("Unpromote {name} from {env}"), lines, &typed, move |app| {
+                app.job(format!("unpromote {name} from {env}"), move |ctx| async move {
+                    let svc = ctx.cv()?.locked(cv, &format!("unpromote from {env}")).await?;
+                    svc.unpromote(cv, e.id, &ctx.log(), &ctx.on_task()).await?;
+                    ap(move |app| {
+                        app.ok(format!("{name} is not in {env} any more"));
+                        app.reload();
+                    })
+                });
+            });
         })
     });
 }
@@ -1697,6 +1746,49 @@ mod tests {
             Some(Modal::Confirm { lines, .. }) => lines,
             _ => panic!("no confirmation"),
         }
+    }
+
+    #[tokio::test]
+    async fn unpromote_shows_the_paths_it_deletes_then_deletes_them() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        let prod = st.create_env("lab", "Prod", lib, true).await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        st.set_binding(prod, web, v.id, "active").await.unwrap();
+        let row = crate::store::BindingRepo {
+            env_id: prod,
+            cv_id: web,
+            repo_href: format!("{REPOS}rpm/rpm/1/"),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: "/pulp/api/v3/distributions/rpm/rpm/1/".into(),
+            base_path: "prod/web/os".into(),
+            publication: Some("/p/1/".into()),
+        };
+        st.save_binding_repo(&row).await.unwrap();
+        cv_action(&mut app, "lab", Act::Unpromote, json!({ "id": web, "name": "web" }));
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no environment form") };
+        assert!(matches!(&form.fields[0].kind, FieldKind::Choice(c) if c == &["Prod"]), "only where the view is");
+        submit(&mut app, &form).unwrap();
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, on_yes, .. }) = app.modal.take() else { panic!("no confirmation") };
+        assert!(lines.contains(&"  os: /prod/web/os".to_string()), "{lines:?}");
+        assert_eq!(typed.as_deref(), Some("web Prod"));
+        Mock::given(method("DELETE"))
+            .and(path("/pulp/api/v3/distributions/rpm/rpm/1/"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        on_yes.unwrap()(&mut app);
+        drain(&mut app, &mut rx).await;
+        let notices: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+        assert!(notices.contains(&"web is not in Prod any more"), "{notices:?}");
+        assert!(st.binding(prod, web).await.unwrap().is_none());
     }
 
     #[tokio::test]

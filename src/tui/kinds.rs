@@ -152,6 +152,7 @@ pub enum Act {
     CvVersions,
     CvSyncRepos,
     Promote,
+    Unpromote,
     CvDrift,
     Resume,
     ToggleProtected,
@@ -180,7 +181,7 @@ impl Act {
             SyncHistory | ReplicationHistory => 'H',
             Versions | CvVersions => 'v',
             Content | Connect | Members => 'o',
-            Upload => 'u',
+            Upload | Unpromote => 'u',
             Publish | CvPublish => 'P',
             Distribute | CvDrift => 'D',
             CopyContent => 'C',
@@ -248,6 +249,7 @@ impl Act {
             CvVersions => "Versions",
             CvSyncRepos => "Sync repositories",
             Promote => "Promote version to environment",
+            Unpromote => "Unpromote from environment",
             CvDrift => "Verify / drift check (all environments)",
             Resume => "Resume / retry publish",
             ToggleProtected => "Toggle protected",
@@ -274,7 +276,7 @@ impl Act {
             // Edit changes the label, which moves distributions on the server.
             Kind::Environments => shared || matches!(self, Edit),
             Kind::ContentViews => {
-                matches!(self, Delete | CvPublish | CvSyncRepos | Promote | Rollback | BreakLock)
+                matches!(self, Delete | CvPublish | CvSyncRepos | Promote | Unpromote | Rollback | BreakLock)
                     || shared && matches!(self, Create | Edit | CvAddRepo | CvFilters | CvRemoveRepo | CvAddComponent | CvRemoveComponent)
             }
             Kind::CvVersions { .. } => matches!(self, Delete | Promote | Rollback | Resume),
@@ -648,6 +650,7 @@ impl Kind {
                 CvPublish,
                 Promote,
                 Rollback,
+                Unpromote,
                 CvDrift,
                 CvAddRepo,
                 CvFilters,

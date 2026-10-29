@@ -141,6 +141,10 @@ idle group whose counts stay the same for three polls is also treated as final.
   audit entry is `env.relabel`.
 * **Rollback** is a promotion of any earlier published version. Newer versions are never
   deleted.
+* **Unpromote** deletes the view's distributions in one environment (one of another
+  database is kept), then the served rows and the binding (`Store::delete_binding`, last,
+  so a rerun deletes what is left). It is refused while a later environment on the path
+  still has the view. The audit entry is `cv.unpromote`.
 * **Verify / drift**: for every binding, check that the distribution serves the expected
   publication, that the publication belongs to the expected snapshot version, that the
   snapshot still exists, and that served content matches (`PULP_MANIFEST` equal to the
@@ -364,7 +368,7 @@ holder shown in the dialog, so it cannot remove a lock that another operator too
 Dropping the `CvLock` (workflow end, Esc) releases the row
 by token. A crash leaves the row until it expires. The same code runs for the local file, so
 two pulp-tui processes on one host also exclude each other. Publish, resume, promote
-(rollback, reconcile), delete view and delete version lock; preview, compare, verify and
+(rollback, reconcile), unpromote, delete view and delete version lock; preview, compare, verify and
 edits do not. The exception is an environment relabel: it takes the locks of every view
 bound in the environment, in `cv_id` order, and fails with the holder's name if one is taken,
 before it changes anything. `CvLock::acquire` never waits, so two relabels cannot block each

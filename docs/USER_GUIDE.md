@@ -240,6 +240,7 @@ Views" below.
 | v | versions of the view |
 | M | promote a version to an environment (preview of every distribution; protected environments require typing their name) |
 | b | roll back an environment to an earlier version |
+| u | unpromote: take the view out of an environment. It deletes the view's distributions there (the dialog lists the paths; type the view name, and also the environment when it is protected, for example `web Prod`) and removes the binding, so the version can be deleted. Versions and snapshots stay. Refused while a later environment on the path still has the view: go back along the path (Prod, then Test, then Dev). |
 | D | verify all environments (drift check) |
 | U | break the lock of the selected view (shows who holds it; you type the view name). See "Shared database". |
 
