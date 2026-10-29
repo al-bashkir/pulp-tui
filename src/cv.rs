@@ -288,6 +288,45 @@ impl CvService {
         }
     }
 
+    /// The derived repositories of the view's own (not borrowed) version rows. Refused while another view
+    /// serves one of their publications: deleting the repository deletes its publications.
+    async fn snapshot_repos(&self, cv: &ContentView) -> Result<BTreeSet<String>> {
+        let served = self.store.served_publications(&self.scope).await?;
+        let mut repos: BTreeSet<String> = BTreeSet::new();
+        for v in self.store.versions(cv.id).await? {
+            for vr in self.store.version_repos(v.id).await?.into_iter().filter(|vr| !vr.borrowed) {
+                if let Some((_, other, env)) = served.iter().find(|(p, o, _)| *o != cv.name && vr.publication.as_ref() == Some(p)) {
+                    bail!(
+                        "content view {}: publication of {} is still served by {other} in {env}; \
+                         promote {other} in {env} again (or roll it back) so it stops serving it, or delete {other} first",
+                        cv.name,
+                        vr.repo().repo_name
+                    );
+                }
+                repos.extend(vr.derived_repo);
+            }
+        }
+        Ok(repos)
+    }
+
+    /// Delete `href` unless another pulp-tui database owns it (then it is logged and kept). Already gone is fine.
+    async fn delete_owned(&self, href: &str, aliases: &[String], log: Log<'_>, on: OnTask<'_>) -> Result<()> {
+        if let Some(o) = self.foreign_owner(href, aliases).await? {
+            log(format!("keeping {href}: owned by another pulp-tui database ({o})"));
+            return Ok(());
+        }
+        log(format!("deleting {href}"));
+        self.alive()?;
+        match self.client.delete(href).await {
+            Ok(m) => {
+                ops::settle(&self.client, m, on).await?;
+                Ok(())
+            }
+            Err(e) if e.is_not_found() => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     // ---- selection ---------------------------------------------------------------
 
     async fn select(&self, repo: &CvRepo, source_version: &str, with_keys: bool) -> Result<Selection> {
@@ -909,15 +948,12 @@ impl CvService {
         let cv = self.store.content_view(cv_id).await?.name;
         let envs = self.store.environments(&self.scope).await?;
         let env = envs.iter().find(|e| e.id == env_id).ok_or_else(|| anyhow!("unknown environment"))?;
-        if !self.store.env_cv_ids(env_id).await?.contains(&cv_id) {
+        let has = self.store.cv_env_ids(cv_id).await?;
+        if !has.contains(&env_id) {
             bail!("{cv} is not in {}", env.name);
         }
-        let mut later = vec![];
-        for e in envs.iter().filter(|e| comes_after(&envs, e, env_id)) {
-            if self.store.env_cv_ids(e.id).await?.contains(&cv_id) {
-                later.push(e.name.as_str());
-            }
-        }
+        let later: Vec<&str> =
+            envs.iter().filter(|e| has.contains(&e.id) && comes_after(&envs, e, env_id)).map(|e| e.name.as_str()).collect();
         if !later.is_empty() {
             bail!("{cv} is still in {}; unpromote it there first", later.join(", "));
         }
@@ -930,19 +966,7 @@ impl CvService {
         let (env, rows) = self.unpromote_impact(cv_id, env_id).await?;
         let aliases = self.store.aliases().await?;
         for b in &rows {
-            if let Some(o) = self.foreign_owner(&b.distribution, &aliases).await? {
-                log(format!("keeping {}: owned by another pulp-tui database ({o})", b.distribution));
-                continue;
-            }
-            log(format!("deleting {} (/{})", b.distribution, b.base_path));
-            self.alive()?;
-            match self.client.delete(&b.distribution).await {
-                Ok(m) => {
-                    ops::settle(&self.client, m, on).await?;
-                }
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.delete_owned(&b.distribution, &aliases, log, on).await?;
         }
         self.alive()?;
         self.store.delete_binding(env_id, cv_id).await?;
@@ -1278,38 +1302,10 @@ impl CvService {
             );
         }
         let mut hrefs: Vec<String> = self.store.all_binding_repos(cv_id).await?.into_iter().map(|b| b.distribution).collect();
-        let served = self.store.served_publications(&self.scope).await?;
-        let mut repos: BTreeSet<String> = BTreeSet::new();
-        for v in self.store.versions(cv_id).await? {
-            for vr in self.store.version_repos(v.id).await?.into_iter().filter(|vr| !vr.borrowed) {
-                // Deleting the derived repository deletes its publications, also one another view still serves.
-                if let Some((_, other, env)) = served.iter().find(|(p, o, _)| *o != cv.name && vr.publication.as_ref() == Some(p)) {
-                    bail!(
-                        "content view {}: publication of {} is still served by {other} in {env}; \
-                         promote {other} in {env} again (or roll it back) so it stops serving it, or delete {other} first",
-                        cv.name,
-                        vr.repo().repo_name
-                    );
-                }
-                repos.extend(vr.derived_repo);
-            }
-        }
-        hrefs.extend(repos);
+        hrefs.extend(self.snapshot_repos(&cv).await?);
         let aliases = self.store.aliases().await?;
         for h in hrefs {
-            if let Some(o) = self.foreign_owner(&h, &aliases).await? {
-                log(format!("keeping {h}: owned by another pulp-tui database ({o})"));
-                continue;
-            }
-            log(format!("deleting {h}"));
-            self.alive()?;
-            match self.client.delete(&h).await {
-                Ok(m) => {
-                    ops::settle(&self.client, m, on).await?;
-                }
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.delete_owned(&h, &aliases, log, on).await?;
         }
         self.alive()?;
         self.store.delete_cv(cv_id).await?;
@@ -2087,6 +2083,56 @@ mod tests {
         assert!(svc.store.binding_repos(dev, cv).await.unwrap().is_empty());
         let e = svc.unpromote(cv, dev, &|_| {}, &ops::no_progress).await.unwrap_err();
         assert_eq!(e.to_string(), "web is not in Dev");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_view_deletes_owned_objects_and_keeps_those_of_another_database() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (dev, cv) = web_in_dev(&svc).await;
+        let (ours, theirs, gone) =
+            ("/pulp/api/v3/distributions/rpm/rpm/1/", "/pulp/api/v3/distributions/rpm/rpm/2/", "/pulp/api/v3/distributions/rpm/rpm/3/");
+        for (i, href) in [ours, theirs, gone].into_iter().enumerate() {
+            let b = BindingRepo {
+                env_id: dev,
+                cv_id: cv,
+                repo_href: format!("/pulp/api/v3/repositories/rpm/rpm/{i}/"),
+                repo_name: format!("r{i}"),
+                repo_type: RepoType::Rpm,
+                distribution: href.into(),
+                base_path: format!("dev/web/r{i}"),
+                publication: None,
+            };
+            svc.store.save_binding_repo(&b).await.unwrap();
+        }
+        serve_owner(&server, ours, svc.store.db_id()).await;
+        serve_owner(&server, theirs, "other").await;
+        Mock::given(method("DELETE")).and(path(ours)).respond_with(ResponseTemplate::new(204)).mount(&server).await;
+        // A snapshot of web, and another view that serves a publication that is not web's: no refusal.
+        published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/9/").await;
+        let api = svc.store.create_cv("k", "api", "").await.unwrap();
+        let served = BindingRepo {
+            env_id: dev,
+            cv_id: api,
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/8/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: "/pulp/api/v3/distributions/rpm/rpm/8/".into(),
+            base_path: "dev/api/os".into(),
+            publication: Some("/pulp/api/v3/publications/rpm/rpm/99/".into()),
+        };
+        svc.store.save_binding_repo(&served).await.unwrap();
+        let logs = Mutex::new(vec![]);
+        svc.delete_view(cv, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+        let sent = server.received_requests().await.unwrap();
+        let mut deleted: Vec<&str> = sent.iter().filter(|r| r.method.as_str() == "DELETE").map(|r| r.url.path()).collect();
+        deleted.sort();
+        assert_eq!(deleted, [ours, gone, DERIVED], "a 404 on delete is fine");
+        assert!(logs.into_inner().unwrap().contains(&format!("keeping {theirs}: owned by another pulp-tui database (other)")));
+        let left: Vec<String> = svc.store.content_views("k").await.unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(left, ["api"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

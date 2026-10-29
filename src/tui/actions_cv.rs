@@ -611,12 +611,8 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
         Act::Unpromote => {
             let Some(st) = cv_store(app) else { return };
             app.spawn("read environments".into(), true, async move {
-                let mut envs = vec![];
-                for e in st.environments(&p).await? {
-                    if st.env_cv_ids(e.id).await?.contains(&id) {
-                        envs.push(e.name);
-                    }
-                }
+                let has = st.cv_env_ids(id).await?;
+                let envs: Vec<String> = st.environments(&p).await?.into_iter().filter(|e| has.contains(&e.id)).map(|e| e.name).collect();
                 ap(move |app| {
                     if envs.is_empty() {
                         return app.error(format!("{name} is not in any environment"));

@@ -1068,6 +1068,14 @@ impl Store {
         .await?)
     }
 
+    /// Ids of the environments with a binding or served rows of the view.
+    pub async fn cv_env_ids(&self, cv_id: i64) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar("SELECT env_id FROM bindings WHERE cv_id = $1 UNION SELECT env_id FROM binding_repos WHERE cv_id = $1")
+            .bind(cv_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     pub async fn set_env_protected(&self, id: i64, protected: bool) -> Result<()> {
         sqlx::query("UPDATE environments SET protected = $2 WHERE id = $1").bind(id).bind(protected as i64).execute(&self.pool).await?;
         Ok(())

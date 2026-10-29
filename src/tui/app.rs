@@ -2103,6 +2103,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_dashboard_head_shows_health_user_and_domains() {
+        let server = wiremock::MockServer::start().await;
+        let mut app = on_rpm_repos(&server).await;
+        let status = serde_json::json!({ "versions": [], "database_connection": { "connected": true },
+            "redis_connection": { "connected": true }, "domain_enabled": true });
+        let caps = Arc::make_mut(&mut app.conn.as_mut().unwrap().caps);
+        caps.set_status(serde_json::from_value(status).unwrap());
+        caps.user = Some(crate::pulp::caps::CurrentUser { href: String::new(), username: "admin".into(), is_staff: Some(true) });
+        app.open(Screen::Dashboard);
+        for want in [
+            "User          admin (staff/admin)",
+            "Health        database: ok   redis: ok   workers: 0   content apps: 0",
+            "Domains       enabled",
+        ] {
+            assert!(app.dashboard.iter().any(|l| l == want), "{want:?} in {:?}", app.dashboard);
+        }
+    }
+
+    #[tokio::test]
     async fn the_dashboard_shows_at_once_and_fills_in_the_counts() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
