@@ -8,6 +8,7 @@ use pulp_tui::pulp::models::Distribution;
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{Capabilities, Feature, PulpClient, RepoType};
 use pulp_tui::replication::{self, PlanAction};
+use pulp_tui::repo_export;
 use pulp_tui::store::Store;
 use serde_json::{Value, json};
 
@@ -145,4 +146,51 @@ async fn fallback_replication() {
     // Loop guard: distributions served by the destination itself are skipped.
     let plan = replication::plan(&dst, &dst, &[RepoType::Rpm], &prefix, Some("http://localhost:8080/pulp/content/")).await.unwrap();
     assert!(plan.iter().all(|p| p.action == PlanAction::Skip && p.note.contains("loop")), "{plan:?}");
+}
+
+/// `export-repos` on pulp2 and `import-repos` on pulp1: a repository gets the remote of the same name on pulp1,
+/// no secret is in the file, and a rerun keeps everything.
+#[tokio::test]
+async fn repo_definitions_move_between_servers() {
+    if !live_enabled() {
+        return;
+    }
+    let (up, down) = (upstream_client(), client());
+    let p = unique("rx");
+    let remote = json!({ "name": format!("{p}-rpm"), "url": "https://mirror.example/os/", "policy": "on_demand",
+        "username": "u", "password": "pw", "sles_auth_token": "tok", "headers": [{ "X-Token": "t" }] });
+    let rpm_remote = create(&up, RepoType::Rpm.remotes(), remote, "/remotes/").await;
+    let repo = json!({ "name": format!("{p}-rpm"), "description": "d", "retain_repo_versions": 3, "remote": rpm_remote });
+    create(&up, RepoType::Rpm.repositories(), repo, "/repositories/").await;
+    let remote = json!({ "name": format!("{p}-deb"), "url": "http://deb.example/debian/", "distributions": "bookworm" });
+    let deb_remote = create(&up, RepoType::Deb.remotes(), remote, "/remotes/").await;
+    create(&up, RepoType::Deb.repositories(), json!({ "name": format!("{p}-deb"), "remote": deb_remote }), "/repositories/").await;
+    create(&up, RepoType::File.repositories(), json!({ "name": format!("{p}-file") }), "/repositories/").await;
+
+    let (mut ex, _) = repo_export::export(&up, &Capabilities::detect(&up).await.unwrap()).await.unwrap();
+    ex.remotes.retain(|e| e.name.starts_with(&p));
+    ex.repositories.retain(|e| e.name.starts_with(&p));
+    assert_eq!((ex.remotes.len(), ex.repositories.len()), (2, 3));
+    let file = serde_json::to_string(&ex).unwrap();
+    for secret in ["\"pw\"", "tok", "X-Token"] {
+        assert!(!file.contains(secret), "{secret} in {file}");
+    }
+    let secrets = &ex.remotes.iter().find(|e| e.name == format!("{p}-rpm")).unwrap().secrets;
+    assert!(secrets.contains(&"username".into()) && secrets.contains(&"password".into()), "{secrets:?}");
+
+    let caps = Capabilities::detect(&down).await.unwrap();
+    let (created, kept, notes) = repo_export::import(&down, &caps, &ex).await.unwrap();
+    assert_eq!((created, kept), (5, 0), "{notes:?}");
+    for t in [RepoType::Rpm, RepoType::Deb] {
+        let name = format!("{p}-{}", t.component());
+        let repo: Value = ops::find_by_name(&down, &down.api(t.repositories()), &name).await.unwrap().unwrap();
+        let remote: Value = ops::find_by_name(&down, &down.api(t.remotes()), &name).await.unwrap().unwrap();
+        assert_eq!(repo["remote"], remote["pulp_href"], "{name}: the repository has the remote of this server");
+    }
+    let repo: Value = ops::find_by_name(&down, &down.api(RepoType::Rpm.repositories()), &format!("{p}-rpm")).await.unwrap().unwrap();
+    assert_eq!((repo["description"].as_str(), repo["retain_repo_versions"].as_u64()), (Some("d"), Some(3)));
+
+    let (created, kept, notes) = repo_export::import(&down, &caps, &ex).await.unwrap();
+    assert_eq!((created, kept), (0, 5));
+    assert!(notes.is_empty(), "a rerun finds nothing different: {notes:?}");
 }
