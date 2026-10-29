@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use pulp_tui::config::{Config, default_config_path, default_data_dir};
 use pulp_tui::pulp::{Capabilities, PulpClient};
+use pulp_tui::repo_export;
 use pulp_tui::store::{NotMigrated, Store};
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -37,6 +38,13 @@ enum Cmd {
     },
     /// Import Content View and environment definitions from JSON.
     ImportCv { file: PathBuf },
+    /// Export the repository and remote definitions of the server (no secrets) as JSON.
+    ExportRepos {
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+    },
+    /// Create the repositories and remotes of an export that the server does not have (existing names are kept).
+    ImportRepos { file: PathBuf },
     /// Print an example configuration file.
     ConfigExample,
     /// Manage the external Content View database of the selected profile (`[database]` or its own `database`).
@@ -155,6 +163,33 @@ async fn run() -> Result<()> {
             println!("imported {cvs} content view(s) and {envs} environment(s) into profile {name}");
             for w in warnings {
                 println!("warning: {w}");
+            }
+            Ok(())
+        }
+        Some(Cmd::ExportRepos { output }) => {
+            let name = profile.context("no profile configured")?;
+            let c = PulpClient::new(&name, &cfg.profiles[&name], &cfg.settings)?;
+            let (ex, notes) = repo_export::export(&c, &Capabilities::detect(&c).await?).await?;
+            let json = serde_json::to_string_pretty(&ex)?;
+            match output {
+                Some(p) => std::fs::write(&p, json).with_context(|| format!("write {}", p.display()))?,
+                None => println!("{json}"),
+            }
+            // stderr: stdout may be the export itself.
+            for n in notes {
+                eprintln!("note: {n}");
+            }
+            Ok(())
+        }
+        Some(Cmd::ImportRepos { file }) => {
+            let ex = serde_json::from_slice(&std::fs::read(&file).with_context(|| format!("read {}", file.display()))?)
+                .with_context(|| format!("parse {}", file.display()))?;
+            let name = profile.context("no profile configured")?;
+            let c = PulpClient::new(&name, &cfg.profiles[&name], &cfg.settings)?;
+            let (created, kept, notes) = repo_export::import(&c, &Capabilities::detect(&c).await?, &ex).await?;
+            println!("profile {name}: created {created}, kept {kept} existing (remotes and repositories)");
+            for n in notes {
+                println!("warning: {n}");
             }
             Ok(())
         }
