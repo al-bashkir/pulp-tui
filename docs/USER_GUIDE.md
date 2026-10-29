@@ -93,7 +93,10 @@ Server health (database, Redis, workers, content apps, storage), the current use
 installed plugins with versions, detected capabilities (RPM, File, Deb, ...), counts of
 repositories, distributions, content and tasks (a Deb line when the server has pulp_deb),
 and the number of Content Views and environments (it says if they are in the local file
-or in the shared database). `r` refreshes.
+or in the shared database). It shows at once with what the connect found; each count
+shows `...` until its request returns. `r` refreshes health, plugin versions and counts,
+and keeps the old values until the new ones come; the capability marks change only with a
+new connect.
 
 ### Servers
 Named profiles from the config file. Actions: **o** connect, **T** test connection (shows

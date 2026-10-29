@@ -246,6 +246,8 @@ pub struct App {
     pub jobs: Vec<Job>,
     pub tasks: TaskCenter,
     pub dashboard: Vec<String>,
+    /// Dashboard values that came in for this connection; shown until a refresh brings new ones.
+    pub dashboard_stats: HashMap<super::actions::Stat, String>,
     /// Last repository visited, used by the Repository Versions screen.
     pub last_repo: Option<(crate::pulp::RepoType, String, String)>,
     pub quit: bool,
@@ -283,6 +285,7 @@ impl App {
             jobs: vec![],
             tasks,
             dashboard: vec![],
+            dashboard_stats: HashMap::new(),
             last_repo: None,
             quit: false,
             tx,
@@ -693,6 +696,7 @@ impl App {
         self.connecting = true;
         self.tasks = TaskCenter::new(self.cfg.settings.poll_bounds());
         self.dashboard.clear();
+        self.dashboard_stats.clear();
         self.history.clear();
         let db = self.cfg.database_for(name);
         if let Some((d, _)) = &db {
@@ -2099,6 +2103,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_dashboard_shows_at_once_and_fills_in_the_counts() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let status = serde_json::json!({ "versions": [{ "component": "rpm", "version": "3.40.0" }] });
+        let ok = |body: Value| ResponseTemplate::new(200).set_body_json(body);
+        Mock::given(method("GET")).and(path("/pulp/api/v3/status/")).respond_with(ok(status)).mount(&server).await;
+        let repos = serde_json::json!({ "count": 7, "next": null, "results": [] });
+        Mock::given(method("GET")).and(path("/pulp/api/v3/repositories/rpm/rpm/")).respond_with(ok(repos)).mount(&server).await;
+        let mut app = on_rpm_repos(&server).await;
+        let mut rx = app.rx.take().unwrap();
+        let line = |app: &App, start: &str| app.dashboard.iter().find(|l| l.starts_with(start)).cloned().unwrap_or_default();
+        let seven = format!("  RPM repositories   {:>8}   ", 7);
+        app.open(Screen::Dashboard);
+        // Before any answer: what the connect detected, and placeholders for the counts.
+        assert_eq!(line(&app, "  rpm"), format!("  {:<14} 3.39.3", "rpm"), "{:?}", app.dashboard);
+        assert!(line(&app, "  RPM repositories").contains("..."), "{:?}", app.dashboard);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(line(&app, "  rpm"), format!("  {:<14} 3.40.0", "rpm"), "status is read again");
+        assert!(line(&app, "  RPM repositories").starts_with(&seven), "{:?}", app.dashboard);
+        // A refresh keeps the values until the new ones come.
+        app.reload();
+        assert!(line(&app, "  RPM repositories").starts_with(&seven), "{:?}", app.dashboard);
+        settle(&mut app, &mut rx).await;
+        let paths: Vec<String> = server.received_requests().await.unwrap().iter().map(|r| r.url.path().to_string()).collect();
+        assert!(!paths.iter().any(|p| p.contains("login/") || p.contains("docs/")), "capabilities detected again: {paths:?}");
+    }
+
+    #[tokio::test]
     async fn a_list_result_for_another_screen_is_dropped() {
         use wiremock::matchers::{method, path};
         let server = wiremock::MockServer::start().await;
@@ -2165,12 +2198,11 @@ mod tests {
         let m = rx.recv().await.unwrap();
         // The operator opens the Dashboard before the list result is handled.
         app.open(Screen::Dashboard);
-        let dashboard = app.jobs.last().unwrap().id;
         app.handle_msg(m);
-        let jobs: Vec<u64> = app.jobs.iter().map(|j| j.id).collect();
+        let jobs: Vec<&str> = app.jobs.iter().map(|j| j.label.as_str()).filter(|l| *l != "load dashboard").collect();
         let list_gets =
             server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/pulp/api/v3/repositories/rpm/rpm/").count();
-        assert_eq!((jobs, app.list.loading, list_gets), (vec![dashboard], false, 1));
+        assert_eq!((jobs, app.list.loading, list_gets), (vec![], false, 1));
     }
 
     #[tokio::test]

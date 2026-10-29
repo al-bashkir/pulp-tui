@@ -1781,121 +1781,159 @@ pub fn load_dashboard(app: &mut App) {
     for id in app.jobs.iter().filter(|j| j.label == "load dashboard").map(|j| j.id).collect::<Vec<_>>() {
         app.abort_job(id);
     }
-    app.load_job("load dashboard", move |ctx: Ctx| async move {
-        let c = &ctx.client;
-        let caps = crate::pulp::Capabilities::detect(c).await?;
-        let count = |path: String, q: Vec<(&'static str, String)>| {
-            let c = c.clone();
-            async move {
-                let mut q = q;
-                q.push(("limit", "1".into()));
-                q.push(("fields", "pulp_href".into()));
-                c.list::<Value>(&c.api(&path), &q)
-                    .await
-                    .map(|p| p.count.to_string())
-                    .unwrap_or_else(|e| format!("n/a ({})", e.status().map(|s| s.to_string()).unwrap_or_default()))
-            }
-        };
-        let mut lines = vec![];
-        let st = caps.status.clone();
-        if let Some(st) = &st {
-            lines.push(format!("Server        {}   content: {}", c.profile(), caps.content_base().unwrap_or_default()));
-            lines.push(format!(
-                "User          {}",
-                caps.user
-                    .as_ref()
-                    .map(|u| format!("{}{}", u.username, if u.is_staff == Some(true) { " (staff/admin)" } else { "" }))
-                    .unwrap_or("anonymous".into())
-            ));
-            lines.push(format!(
-                "Health        database: {}   redis: {}   workers: {}   content apps: {}",
-                if st.database_connection.as_ref().is_some_and(|d| d["connected"] == true) { "ok" } else { "DOWN" },
-                st.redis_connection.as_ref().map(|r| if r["connected"] == true { "ok" } else { "not connected" }).unwrap_or("n/a"),
-                st.online_workers.len(),
-                st.online_content_apps.len(),
-            ));
-            if let Some(sto) = &st.storage {
-                let gib = |k: &str| sto[k].as_f64().map(|x| format!("{:.1} GiB", x / 1073741824.0)).unwrap_or_default();
-                lines.push(format!("Storage       used {} / total {}   free {}", gib("used"), gib("total"), gib("free")));
-            }
-            if st.domain_enabled == Some(true) {
-                lines.push("Domains       enabled".into());
-            }
-        }
-        lines.push(String::new());
-        lines.push("Plugins and capabilities".into());
-        for (k, v) in &caps.versions {
-            lines.push(format!("  {k:<14} {v}"));
-        }
-        use crate::pulp::Feature::*;
-        for (f, label) in [
-            (Rpm, "RPM"),
-            (File, "File"),
-            (Deb, "Deb"),
-            (RpmCopy, "RPM copy API"),
-            (DebCopy, "Deb copy API"),
-            (ChunkedUpload, "chunked uploads"),
-            (NativeReplication, "native replication (tech preview)"),
-            (Users, "users/groups/roles API"),
-        ] {
-            lines.push(format!("  [{}] {label}", if caps.supports(f) { "x" } else { " " }));
-        }
-        if let Some(e) = &caps.openapi_error {
-            lines.push(format!("  OpenAPI unavailable: {e}"));
-        }
-        lines.push(String::new());
-        lines.push("Statistics".into());
-        lines.push(format!(
-            "  RPM repositories   {:>8}   File repositories {:>8}",
-            count("repositories/rpm/rpm/".into(), vec![]).await,
-            count("repositories/file/file/".into(), vec![]).await
-        ));
-        lines.push(format!(
-            "  RPM distributions  {:>8}   File distributions{:>8}",
-            count("distributions/rpm/rpm/".into(), vec![]).await,
-            count("distributions/file/file/".into(), vec![]).await
-        ));
-        lines.push(format!(
-            "  RPM packages       {:>8}   File content      {:>8}",
-            count("content/rpm/packages/".into(), vec![]).await,
-            count("content/file/files/".into(), vec![]).await
-        ));
-        if caps.supports(Deb) {
-            lines.push(format!(
-                "  Deb repositories {:>6}   distributions {:>6}   packages {:>8}",
-                count(RepoType::Deb.repositories().into(), vec![]).await,
-                count(RepoType::Deb.distributions().into(), vec![]).await,
-                count(RepoType::Deb.content().into(), vec![]).await
-            ));
-        }
-        lines.push(format!(
-            "  Tasks running {}  waiting {}  failed (all time) {}",
-            count("tasks/".into(), vec![("state", "running".into())]).await,
-            count("tasks/".into(), vec![("state", "waiting".into())]).await,
-            count("tasks/".into(), vec![("state", "failed".into())]).await
-        ));
-        // A shared database that is down must not hide the Pulp part of the dashboard.
-        let counts = async {
-            let st = ctx.cv()?.store;
-            let place = if st.external { "shared database" } else { "local to this pulp-tui database" };
-            anyhow::Ok((st.content_views(&ctx.scope).await?.len(), st.environments(&ctx.scope).await?.len(), place))
-        };
-        lines.push(match counts.await {
-            Ok((cvs, envs, place)) => format!("  Content Views {cvs}   lifecycle environments {envs}   ({place})"),
-            Err(e) => format!("  Content Views: {e:#}"),
-        });
-        // Operators compare it: only the same key shares Content Views.
-        if ctx.cv_store.as_ref().is_ok_and(|st| st.external) {
-            lines.push(format!("  shared database scope: {}", ctx.scope));
-        }
-        let caps = std::sync::Arc::new(caps);
+    // The text shows at once, from the capabilities of the connect; each value comes in when its request returns.
+    let mut wanted = vec![];
+    dashboard_lines(app, &mut |s| {
+        wanted.push(s);
+        String::new()
+    });
+    show_dashboard(app);
+    app.load_job("load dashboard", |ctx: Ctx| async move {
+        let st: crate::pulp::models::Status = ctx.client.get(&ctx.client.api("status/"), &[]).await?;
         ap(move |app| {
             if let Some(conn) = app.conn.as_mut() {
-                conn.caps = caps;
+                std::sync::Arc::make_mut(&mut conn.caps).set_status(st);
             }
-            app.dashboard = lines;
+            show_dashboard(app);
         })
     });
+    for s in wanted {
+        app.load_job("load dashboard", move |ctx: Ctx| async move {
+            let v = load_stat(&ctx, s).await;
+            ap(move |app| {
+                app.dashboard_stats.insert(s, v);
+                show_dashboard(app);
+            })
+        });
+    }
+}
+
+/// A Dashboard value with a request of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Stat {
+    /// Number of objects in a list: path under `api/v3/`, task state.
+    Count(&'static str, Option<&'static str>),
+    ContentViews,
+}
+
+async fn load_stat(ctx: &Ctx, s: Stat) -> String {
+    match s {
+        Stat::Count(path, state) => {
+            let c = &ctx.client;
+            let mut q = vec![("limit", "1".to_string()), ("fields", "pulp_href".into())];
+            q.extend(state.map(|s| ("state", s.to_string())));
+            c.list::<Value>(&c.api(path), &q)
+                .await
+                .map(|p| p.count.to_string())
+                .unwrap_or_else(|e| format!("n/a ({})", e.status().map(|s| s.to_string()).unwrap_or_default()))
+        }
+        // A shared database that is down must not hide the Pulp part of the dashboard.
+        Stat::ContentViews => {
+            let counts = async {
+                let st = ctx.cv()?.store;
+                let place = if st.external { "shared database" } else { "local to this pulp-tui database" };
+                anyhow::Ok((st.content_views(&ctx.scope).await?.len(), st.environments(&ctx.scope).await?.len(), place))
+            };
+            match counts.await {
+                Ok((cvs, envs, place)) => format!("Content Views {cvs}   lifecycle environments {envs}   ({place})"),
+                Err(e) => format!("Content Views: {e:#}"),
+            }
+        }
+    }
+}
+
+fn show_dashboard(app: &mut App) {
+    app.dashboard = dashboard_lines(app, &mut |s| app.dashboard_stats.get(&s).cloned().unwrap_or_else(|| "...".into()));
+}
+
+/// The Dashboard of the connection; `stat` gives each value that has a request of its own.
+fn dashboard_lines(app: &App, stat: &mut dyn FnMut(Stat) -> String) -> Vec<String> {
+    let Some(conn) = &app.conn else { return vec![] };
+    let (c, caps) = (&conn.client, &conn.caps);
+    let mut lines = vec![];
+    if let Some(st) = &caps.status {
+        lines.push(format!("Server        {}   content: {}", c.profile(), caps.content_base().unwrap_or_default()));
+        lines.push(format!(
+            "User          {}",
+            caps.user
+                .as_ref()
+                .map(|u| format!("{}{}", u.username, if u.is_staff == Some(true) { " (staff/admin)" } else { "" }))
+                .unwrap_or("anonymous".into())
+        ));
+        lines.push(format!(
+            "Health        database: {}   redis: {}   workers: {}   content apps: {}",
+            if st.database_connection.as_ref().is_some_and(|d| d["connected"] == true) { "ok" } else { "DOWN" },
+            st.redis_connection.as_ref().map(|r| if r["connected"] == true { "ok" } else { "not connected" }).unwrap_or("n/a"),
+            st.online_workers.len(),
+            st.online_content_apps.len(),
+        ));
+        if let Some(sto) = &st.storage {
+            let gib = |k: &str| sto[k].as_f64().map(|x| format!("{:.1} GiB", x / 1073741824.0)).unwrap_or_default();
+            lines.push(format!("Storage       used {} / total {}   free {}", gib("used"), gib("total"), gib("free")));
+        }
+        if st.domain_enabled == Some(true) {
+            lines.push("Domains       enabled".into());
+        }
+    }
+    lines.push(String::new());
+    lines.push("Plugins and capabilities".into());
+    for (k, v) in &caps.versions {
+        lines.push(format!("  {k:<14} {v}"));
+    }
+    use crate::pulp::Feature::*;
+    for (f, label) in [
+        (Rpm, "RPM"),
+        (File, "File"),
+        (Deb, "Deb"),
+        (RpmCopy, "RPM copy API"),
+        (DebCopy, "Deb copy API"),
+        (ChunkedUpload, "chunked uploads"),
+        (NativeReplication, "native replication (tech preview)"),
+        (Users, "users/groups/roles API"),
+    ] {
+        lines.push(format!("  [{}] {label}", if caps.supports(f) { "x" } else { " " }));
+    }
+    if let Some(e) = &caps.openapi_error {
+        lines.push(format!("  OpenAPI unavailable: {e}"));
+    }
+    lines.push(String::new());
+    lines.push("Statistics".into());
+    let mut n = |path, state| stat(Stat::Count(path, state));
+    lines.push(format!(
+        "  RPM repositories   {:>8}   File repositories {:>8}",
+        n("repositories/rpm/rpm/", None),
+        n("repositories/file/file/", None)
+    ));
+    lines.push(format!(
+        "  RPM distributions  {:>8}   File distributions{:>8}",
+        n("distributions/rpm/rpm/", None),
+        n("distributions/file/file/", None)
+    ));
+    lines.push(format!(
+        "  RPM packages       {:>8}   File content      {:>8}",
+        n("content/rpm/packages/", None),
+        n("content/file/files/", None)
+    ));
+    if caps.supports(Deb) {
+        lines.push(format!(
+            "  Deb repositories {:>6}   distributions {:>6}   packages {:>8}",
+            n(RepoType::Deb.repositories(), None),
+            n(RepoType::Deb.distributions(), None),
+            n(RepoType::Deb.content(), None)
+        ));
+    }
+    lines.push(format!(
+        "  Tasks running {}  waiting {}  failed (all time) {}",
+        n("tasks/", Some("running")),
+        n("tasks/", Some("waiting")),
+        n("tasks/", Some("failed"))
+    ));
+    lines.push(format!("  {}", stat(Stat::ContentViews)));
+    // Operators compare it: only the same key shares Content Views.
+    if app.cv_store.as_ref().is_ok_and(|st| st.external) {
+        lines.push(format!("  shared database scope: {}", conn.scope));
+    }
+    lines
 }
 
 #[cfg(test)]

@@ -65,12 +65,8 @@ pub fn parse_version(v: &str) -> (u64, u64, u64) {
 
 impl Capabilities {
     pub async fn detect(c: &PulpClient) -> Result<Self> {
-        let status: Status = c.get(&c.api("status/"), &[]).await?;
-        let mut caps = Capabilities {
-            versions: status.versions.iter().map(|v| (v.component.clone(), v.version.clone())).collect(),
-            status: Some(status),
-            ..Default::default()
-        };
+        let mut caps = Capabilities::default();
+        caps.set_status(c.get(&c.api("status/"), &[]).await?);
         let user_of = |v: &Value| CurrentUser {
             href: v["pulp_href"].as_str().unwrap_or_default().into(),
             username: v["username"].as_str().unwrap_or_default().into(),
@@ -102,6 +98,12 @@ impl Capabilities {
             Err(e) => caps.openapi_error = Some(e.to_string()),
         }
         Ok(caps)
+    }
+
+    /// The `status/` answer and the component versions it lists.
+    pub fn set_status(&mut self, status: Status) {
+        self.versions = status.versions.iter().map(|v| (v.component.clone(), v.version.clone())).collect();
+        self.status = Some(status);
     }
 
     pub fn load_openapi(&mut self, doc: &Value) {
