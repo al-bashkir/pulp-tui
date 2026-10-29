@@ -208,7 +208,8 @@ publication id; refused for publications of Content View snapshots).
 ### Distributions
 `t` switches RPM/File/Deb. Details say whether a distribution is **PINNED** (publication or
 repository version) or **FOLLOWS LATEST** (repository). **y** copies the content URL
-(OSC 52 terminal clipboard), **V** verifies what is served (for a distribution that follows
+(OSC 52 terminal clipboard; in tmux it needs `set -g allow-passthrough on` or
+`set -s set-clipboard on`), **V** verifies what is served (for a distribution that follows
 a repository: its newest publication, which is not the latest version when that version has
 no publication), **b** re-points to a version (preview first; Deb: with the signing service
 of the publication it serves now), **c**/**e** create/edit

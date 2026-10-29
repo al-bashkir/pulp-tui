@@ -184,8 +184,15 @@ pub fn pretty(v: &Value) -> Vec<String> {
 pub fn copy_to_clipboard(s: &str) {
     use std::io::Write;
     let mut out = std::io::stdout();
-    let _ = write!(out, "\x1b]52;c;{}\x07", crate::pulp::client::base64_encode(s.as_bytes()));
+    let _ = out.write_all(osc52(s, std::env::var_os("TMUX").is_some()).as_bytes());
     let _ = out.flush();
+}
+
+/// tmux drops a program's OSC 52 unless `set-clipboard on` (the default is `external`); the copy in a
+/// passthrough sequence gets to the outer terminal when `allow-passthrough on`.
+fn osc52(s: &str, tmux: bool) -> String {
+    let seq = format!("\x1b]52;c;{}\x07", crate::pulp::client::base64_encode(s.as_bytes()));
+    if tmux { format!("{seq}\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b")) } else { seq }
 }
 
 pub fn run(app: &mut App, act: Act, item: Value) {
@@ -1894,6 +1901,13 @@ pub fn load_dashboard(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inside_tmux_the_copy_also_passes_through_to_the_outer_terminal() {
+        let plain = "\x1b]52;c;aHR0cDovL3gv\x07";
+        assert_eq!(osc52("http://x/", false), plain);
+        assert_eq!(osc52("http://x/", true), format!("{plain}\x1bPtmux;\x1b\x1b]52;c;aHR0cDovL3gv\x07\x1b\\"));
+    }
 
     #[test]
     fn repo_body_sends_only_changes_on_edit() {
