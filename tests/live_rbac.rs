@@ -13,7 +13,7 @@ fn user_client(user: &str, password: &str) -> PulpClient {
     let dir = tempfile::tempdir().unwrap().keep();
     std::fs::write(dir.join("pw"), password).unwrap();
     let p = Profile {
-        url: std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
+        url: std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
         username: Some(user.into()),
         secret: Some(format!("file:{}", dir.join("pw").display())),
         ..Default::default()
@@ -32,8 +32,8 @@ async fn rbac_is_enforced_and_not_bypassed() {
     let user = create(&admin, "users/", json!({ "username": name, "password": password, "is_active": true }), "/users/").await;
     let u = user_client(&name, password);
 
-    // Wrong password: clear 401.
-    let e = user_client(&name, "wrong").get::<Value>(&admin.api("login/"), &[]).await.unwrap_err();
+    // Wrong password: clear 401 (not login/: pulpcore 3.63 has none and answers 404).
+    let e = user_client(&name, "wrong").get::<Value>(&admin.api(RepoType::File.repositories()), &[]).await.unwrap_err();
     assert_eq!(e.status(), Some(401), "{e}");
 
     // No roles: reading lists works but shows nothing; creating is forbidden.
