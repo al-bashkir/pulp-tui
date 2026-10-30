@@ -5,14 +5,30 @@
 All live tests (`tests/run-live.sh`) passed on 2026-10-25 against the
 `quay.io/pulp/pulp:latest` all-in-one image:
 
-| Component | Version |
-|---|---|
-| pulpcore | 3.123.0 |
-| pulp_rpm | 3.39.3 |
-| pulp_file | 3.123.0 |
-| pulp_deb | 3.11.1 |
+| Component                             | Version                                                     |
+| ------------------------------------- | ----------------------------------------------------------- |
+| pulpcore                              | 3.123.0                                                     |
+| pulp_rpm                              | 3.39.3                                                      |
+| pulp_file                             | 3.123.0                                                     |
+| pulp_deb                              | 3.11.1                                                      |
 | PostgreSQL (optional shared database) | 16.15 (`docker.io/library/postgres:16`), through sqlx 0.8.6 |
-| Client OS | Fedora 44 (Linux 7.2), Rust 1.99 |
+| Client OS                             | Fedora 44 (Linux 7.2), Rust 1.99                            |
+
+On 2026-10-30, all live scenarios, `real` included (Debian `main`, Rocky 9 BaseOS and
+AppStream), passed on fresh containers of these all-in-one images:
+
+| Image                       | pulpcore / pulp_file | pulp_rpm | pulp_deb | `real` |
+| --------------------------- | -------------------- | -------- | -------- | ------ |
+| `quay.io/pulp/pulp:3.63.36` | 3.63.36              | 3.27.12  | 3.5.4    | 807 s  |
+| `quay.io/pulp/pulp:3.95.3`  | 3.95.3               | 3.34.0   | 3.8.1    | 804 s  |
+| `quay.io/pulp/pulp:latest`  | 3.123.1              | 3.39.5   | 3.11.1   | 680 s  |
+
+On 3.95.3, one `native_replication` run failed once with "connection closed before
+message completed" on `POST upstream-pulps/`; the next two runs passed.
+
+The nginx of the 3.63.36 image listens on IPv4 only. With rootless podman (pasta),
+`localhost` on the host goes to `::1` and the connection is reset, so the test
+environment uses `127.0.0.1`.
 
 Other versions are not tested. pulp-tui detects capabilities at runtime and shows a
 precise "not supported by this server: …" message when a screen or action needs
@@ -20,47 +36,47 @@ something the server does not have.
 
 ## Runtime detection
 
-| Feature | Detected by | When missing |
-|---|---|---|
-| RPM screens | `status/` component `rpm` | screen shows "not supported: pulp_rpm plugin" |
-| File screens | `status/` component `file` | same for pulp_file |
-| Deb screens | `status/` component `deb` | same for pulp_deb |
-| Deb Content View signing (`signing_service`, `signing_service_release_overrides`) | the field is in the JSON of the derived repository | the field is not sent; a chosen signing service stops the publish with "not supported by this server" |
-| RPM copy (Content Views, copy action) | `status/` component `rpm` and OpenAPI path `rpm/copy/` | the copy action shows "not supported by this server" before its form; a Content View publish gets the server's error |
-| Deb copy (copy action, Add to repository, Content Views) | `status/` component `deb` and OpenAPI path `deb/copy/` | same as RPM copy |
-| Chunked upload | OpenAPI `uploads/` and `{upload_href}` | an upload larger than one chunk (`upload_chunk_mb`) shows "not supported by this server" before it sends anything; smaller files do not need it |
-| Native replication | pulpcore ≥ 3.23 and OpenAPI `upstream-pulps/`, `{upstream_pulp_href}replicate/` | Replication screen points to the fallback |
-| Replication deletion policy | OpenAPI field `UpstreamPulp.policy` | field hidden |
-| Distribution filter for replication | field `q_select`, else `pulp_label_select` | matching field shown |
-| RPM sync policies | enum `SyncPolicyEnum` | defaults to additive / mirror_complete / mirror_content_only |
-| Repository form fields (checksum type, signing services, retain package versions, manifest) | OpenAPI schema fields | field hidden |
-| Current user | `login/`, else (pulpcore without it, e.g. 3.63) `users/?username=` with the Basic-auth name | header shows "anonymous": no `login/` and the user cannot read `users/`, or bearer auth |
-| Users/groups/roles | OpenAPI `users/`, `roles/` | screen shows not supported |
+| Feature                                                                                     | Detected by                                                                                 | When missing                                                                                                                                    |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| RPM screens                                                                                 | `status/` component `rpm`                                                                   | screen shows "not supported: pulp_rpm plugin"                                                                                                   |
+| File screens                                                                                | `status/` component `file`                                                                  | same for pulp_file                                                                                                                              |
+| Deb screens                                                                                 | `status/` component `deb`                                                                   | same for pulp_deb                                                                                                                               |
+| Deb Content View signing (`signing_service`, `signing_service_release_overrides`)           | the field is in the JSON of the derived repository                                          | the field is not sent; a chosen signing service stops the publish with "not supported by this server"                                           |
+| RPM copy (Content Views, copy action)                                                       | `status/` component `rpm` and OpenAPI path `rpm/copy/`                                      | the copy action shows "not supported by this server" before its form; a Content View publish gets the server's error                            |
+| Deb copy (copy action, Add to repository, Content Views)                                    | `status/` component `deb` and OpenAPI path `deb/copy/`                                      | same as RPM copy                                                                                                                                |
+| Chunked upload                                                                              | OpenAPI `uploads/` and `{upload_href}`                                                      | an upload larger than one chunk (`upload_chunk_mb`) shows "not supported by this server" before it sends anything; smaller files do not need it |
+| Native replication                                                                          | pulpcore ≥ 3.23 and OpenAPI `upstream-pulps/`, `{upstream_pulp_href}replicate/`             | Replication screen points to the fallback                                                                                                       |
+| Replication deletion policy                                                                 | OpenAPI field `UpstreamPulp.policy`                                                         | field hidden                                                                                                                                    |
+| Distribution filter for replication                                                         | field `q_select`, else `pulp_label_select`                                                  | matching field shown                                                                                                                            |
+| RPM sync policies                                                                           | enum `SyncPolicyEnum`                                                                       | defaults to additive / mirror_complete / mirror_content_only                                                                                    |
+| Repository form fields (checksum type, signing services, retain package versions, manifest) | OpenAPI schema fields                                                                       | field hidden                                                                                                                                    |
+| Current user                                                                                | `login/`, else (pulpcore without it, e.g. 3.63) `users/?username=` with the Basic-auth name | header shows "anonymous": no `login/` and the user cannot read `users/`, or bearer auth                                                         |
+| Users/groups/roles                                                                          | OpenAPI `users/`, `roles/`                                                                  | screen shows not supported                                                                                                                      |
 
 If the OpenAPI document cannot be read (for example a 403), checks are optimistic and the
 server gives the final answer; the dashboard shows a warning.
 
 ## Verified behavior (live tests)
 
-| Area | Status |
-|---|---|
-| RPM: create, upload (single + idempotent repeat), remote, sync (mirror_complete, additive), versions, diff, publish, distribute, served content (metadata + package digest), update, rollback | verified |
-| File: create, upload (single request and chunked with progress), remove content (old versions unchanged), sync from manifest, publish, distribute, served manifest, update, rollback, mismatch detection | verified |
-| Distribution base path conflicts | refused with 409 |
-| Distribution `base_path` PATCH (environment relabel): runs as a task (`ageneral_update`), moves the distribution in place (same href, same publication), the new path answers 200 and the old path 404 as soon as the task ends (no content-cache delay seen); a promotion after the relabel serves at the new label | verified |
-| Content Views: multi-repo snapshot, RPM/File filters, advisory filtering, numbered versions, Library auto-binding, promotion path rules, rollback, served-content verification, retention protection, partial failure + retry, resume with re-attach to a submitted task, version and view deletion | verified |
-| Deb (`live_deb`): mirror sync of the fixture, filtered structured copy, publication, distribution, served `Release`, `Packages` index and package digest; a publication with the test signing service is reused only for that service and serves `Release.gpg` and `InRelease`; a Deb Content View with `exclude name=*-dbg`, signed with a service, unsigned (`none`), resumed from a checkpoint with the service, promoted to Dev, and used by a composite; a per-release key of the source signs a `same as source` publish and a `none` publish removes it | verified |
-| Composite Content Views (`live_cv::composite_content_view_rocky9`): one publication served by two distributions at once (the component's Library distribution and the composite's own), auto publish after the extras view publishes, deleting a composite version or a composite keeps the publications and repositories of its components | verified |
-| Native replication: select by `q_select`, nodelete policy, rerun, upstream update | verified |
-| Fallback replication: dry run, create, idempotent rerun, upstream update, conflict with native-replicated objects, loop guard, self-replication guard | verified |
-| Repository and remote definitions (`export-repos` on pulp2, `import-repos` on pulp1): RPM and Deb remotes with their repositories and a File repository, no secret in the file, the repository's remote found by name, idempotent rerun | verified |
-| Orphan cleanup (**O** on Repository Versions, TUI on pulp1, 1440 minutes): count, typed confirm, `orphan_cleanup` task, notice from its progress reports | verified once (manual) |
-| RBAC: 401 on wrong password, 403 without role, no self-escalation, model-level creator role, group object role, role removal | verified |
-| Task cancellation (waiting and running), 409 on completed task, TLS errors, unreadable CA bundle | verified |
-| Mock HTTP: pagination, foreign `next` links, 401/403/409, malformed JSON, read retries vs mutation non-retry, 429 Retry-After, timeouts, unreachable server, task polling, old-server capability negotiation, read-only blocking, size limits | verified |
-| Shared database on PostgreSQL 16 (`live_shared_db`): explicit schema creation (`db migrate`), refusal of an uninitialized, older and newer schema, two operators on one database, lock conflict and release, 8 simultaneous acquisitions of a free lock (exactly one wins), every store method, composite views (pins, borrowed rows, the foreign keys that refuse deleting a component, `db copy` of a composite), `db copy` from a local file, a profile with its own database next to a local profile, the migration of schema 2 rows to schema 3 (labels `library`/`dev`/`dev` for `Library`/`Dev`/`dev`, a served path kept, a used label refused) | verified |
-| Shared database with a role that has only `SELECT/INSERT/UPDATE/DELETE` (manual): import, export, `db migrate` on a current schema | verified |
-| Shared database TLS: `ca_cert` against a server with a private CA, connected through a non-loopback address (`verify-full`), see "Database TLS" | verified once (manual) |
+| Area                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Status                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| RPM: create, upload (single + idempotent repeat), remote, sync (mirror_complete, additive), versions, diff, publish, distribute, served content (metadata + package digest), update, rollback                                                                                                                                                                                                                                                                                                                                                                                                                                                           | verified               |
+| File: create, upload (single request and chunked with progress), remove content (old versions unchanged), sync from manifest, publish, distribute, served manifest, update, rollback, mismatch detection                                                                                                                                                                                                                                                                                                                                                                                                                                                | verified               |
+| Distribution base path conflicts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | refused with 409       |
+| Distribution `base_path` PATCH (environment relabel): runs as a task (`ageneral_update`), moves the distribution in place (same href, same publication), the new path answers 200 and the old path 404 as soon as the task ends (no content-cache delay seen); a promotion after the relabel serves at the new label                                                                                                                                                                                                                                                                                                                                    | verified               |
+| Content Views: multi-repo snapshot, RPM/File filters, advisory filtering, numbered versions, Library auto-binding, promotion path rules, rollback, served-content verification, retention protection, partial failure + retry, resume with re-attach to a submitted task, version and view deletion                                                                                                                                                                                                                                                                                                                                                     | verified               |
+| Deb (`live_deb`): mirror sync of the fixture, filtered structured copy, publication, distribution, served `Release`, `Packages` index and package digest; a publication with the test signing service is reused only for that service and serves `Release.gpg` and `InRelease`; a Deb Content View with `exclude name=*-dbg`, signed with a service, unsigned (`none`), resumed from a checkpoint with the service, promoted to Dev, and used by a composite; a per-release key of the source signs a `same as source` publish and a `none` publish removes it                                                                                          | verified               |
+| Composite Content Views (`live_cv::composite_content_view_rocky9`): one publication served by two distributions at once (the component's Library distribution and the composite's own), auto publish after the extras view publishes, deleting a composite version or a composite keeps the publications and repositories of its components                                                                                                                                                                                                                                                                                                             | verified               |
+| Native replication: select by `q_select`, nodelete policy, rerun, upstream update                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | verified               |
+| Fallback replication: dry run, create, idempotent rerun, upstream update, conflict with native-replicated objects, loop guard, self-replication guard                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | verified               |
+| Repository and remote definitions (`export-repos` on pulp2, `import-repos` on pulp1): RPM and Deb remotes with their repositories and a File repository, no secret in the file, the repository's remote found by name, idempotent rerun                                                                                                                                                                                                                                                                                                                                                                                                                 | verified               |
+| Orphan cleanup (**O** on Repository Versions, TUI on pulp1, 1440 minutes): count, typed confirm, `orphan_cleanup` task, notice from its progress reports                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | verified once (manual) |
+| RBAC: 401 on wrong password (any authenticated endpoint; pulpcore 3.63 has no `login/`), 403 without role, no self-escalation, model-level creator role, group object role, role removal                                                                                                                                                                                                                                                                                                                                                                                                                                                                | verified               |
+| Task cancellation (waiting and running), 409 on completed task, TLS errors, unreadable CA bundle                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | verified               |
+| Mock HTTP: pagination, foreign `next` links, 401/403/409, malformed JSON, read retries vs mutation non-retry, 429 Retry-After, timeouts, unreachable server, task polling, old-server capability negotiation, read-only blocking, size limits                                                                                                                                                                                                                                                                                                                                                                                                           | verified               |
+| Shared database on PostgreSQL 16 (`live_shared_db`): explicit schema creation (`db migrate`), refusal of an uninitialized, older and newer schema, two operators on one database, lock conflict and release, 8 simultaneous acquisitions of a free lock (exactly one wins), every store method, composite views (pins, borrowed rows, the foreign keys that refuse deleting a component, `db copy` of a composite), `db copy` from a local file, a profile with its own database next to a local profile, the migration of schema 2 rows to schema 3 (labels `library`/`dev`/`dev` for `Library`/`Dev`/`dev`, a served path kept, a used label refused) | verified               |
+| Shared database with a role that has only `SELECT/INSERT/UPDATE/DELETE` (manual): import, export, `db migrate` on a current schema                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | verified               |
+| Shared database TLS: `ca_cert` against a server with a private CA, connected through a non-loopback address (`verify-full`), see "Database TLS"                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | verified once (manual) |
 
 ## Known server behaviors that affect operators
 
@@ -100,6 +116,8 @@ server gives the final answer; the dashboard shows a warning.
   type and matches the bindings in the client before it deletes a publication, a version
   or a repository (checked on 3.123.0 / pulp_rpm 3.39.3).
 * **Native replication** pins distributions with `repository_version`, not a publication.
+  pulpcore 3.95.3 (`app/replica.py`) does not pin: its distributions follow the repository
+  (`repository`, `publication: null`).
   pulp-tui shows these as pinned and re-points them correctly. A distribution PATCH is
   merged with the stored object (pulpcore `serializers/publication.py`): a body with
   `publication` but without `repository_version: null` gets HTTP 400, and
@@ -221,12 +239,12 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
   (`client_max_body_size 10m`). Measured with `deb/copy/` bodies of synthetic package hrefs
   (75 bytes each in that test; pulp-tui writes compact JSON, 74 bytes each):
 
-  | hrefs | body bytes | result |
-  |---|---|---|
-  | 1 | 372 | 400 with a JSON validation error (body accepted) |
-  | 34,900 | 2,617,797 | 400 with a JSON validation error (body accepted) |
-  | 35,000 | 2,625,297 | 400 HTML `Bad Request (400)` (body refused) |
-  | 60,000 | 4,500,297 | 400 HTML `Bad Request (400)` (body refused) |
+  | hrefs  | body bytes | result                                           |
+  | ------ | ---------- | ------------------------------------------------ |
+  | 1      | 372        | 400 with a JSON validation error (body accepted) |
+  | 34,900 | 2,617,797  | 400 with a JSON validation error (body accepted) |
+  | 35,000 | 2,625,297  | 400 HTML `Bad Request (400)` (body refused)      |
+  | 60,000 | 4,500,297  | 400 HTML `Bad Request (400)` (body refused)      |
 
   `rpm/copy/` and `modify/` have the same limit. So pulp-tui sends a list in batches of
   at most 2,000,000 bytes of hrefs (`ops::batches`, sized by the longest href), one task
@@ -273,13 +291,13 @@ Checked on 2026-10-23 (by hand, not part of `tests/run-live.sh`): PostgreSQL 16.
 `DNS:<host>`, `DNS:localhost`, `IP:127.0.0.1`), published on the LAN address of the
 test host. `pulp-tui db migrate` connected through that non-loopback address:
 
-| `[database]` | Result |
-|---|---|
-| `ca_cert` = the private CA | connects (`schema 0 -> 2`) |
-| `ca_cert` = a PEM file with an unrelated CA first, then the private CA | connects |
-| no `ca_cert` | `invalid peer certificate: UnknownIssuer` |
-| no `ca_cert`, `SSL_CERT_FILE` = the private CA (OS store would trust it) | `invalid peer certificate: UnknownIssuer` (the OS store is not read) |
-| `ca_cert` = an unrelated CA | `invalid peer certificate: UnknownIssuer` |
+| `[database]`                                                               | Result                                                                                                                                                                                       |
+| -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ca_cert` = the private CA                                                 | connects (`schema 0 -> 2`)                                                                                                                                                                   |
+| `ca_cert` = a PEM file with an unrelated CA first, then the private CA     | connects                                                                                                                                                                                     |
+| no `ca_cert`                                                               | `invalid peer certificate: UnknownIssuer`                                                                                                                                                    |
+| no `ca_cert`, `SSL_CERT_FILE` = the private CA (OS store would trust it)   | `invalid peer certificate: UnknownIssuer` (the OS store is not read)                                                                                                                         |
+| `ca_cert` = an unrelated CA                                                | `invalid peer certificate: UnknownIssuer`                                                                                                                                                    |
 | `ca_cert` = the private CA, URL host `172.17.0.1` (not in the certificate) | `invalid peer certificate: certificate not valid for name "172.17.0.1"; certificate is only valid for IpAddress(<host-ip>), DnsName("<host>"), DnsName("localhost") or IpAddress(127.0.0.1)` |
 
 The live tests connect to `127.0.0.1` without TLS, so they do not exercise this path.

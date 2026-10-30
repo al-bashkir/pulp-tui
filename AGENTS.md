@@ -38,6 +38,7 @@ Read `docs/ARCHITECTURE.md` before changing workflows.
 
 ```sh
 cargo fmt --check
+dprint check                       # Markdown (dprint.json)
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
 cargo test                         # unit + mock HTTP

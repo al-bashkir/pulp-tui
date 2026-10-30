@@ -21,23 +21,23 @@
 
 ## Keys
 
-| Key | Action |
-|---|---|
-| `Tab` | switch focus between the screen list and the main area |
-| `:` or `Ctrl-P` | command palette: go to a screen, connect to a server, dismiss finished tasks. It opens in filter mode (`-- FILTER --`): type to filter, `Ctrl-J/K` or `Ctrl-N/P` move. `Esc` goes to move mode (`j k g G`), `/` filters again, a second `Esc` closes |
-| `?` | help (a text view: `j k g G Ctrl-D Ctrl-U` scroll, `Esc` closes) |
-| `N` | notification log |
-| `q` / `Ctrl-C` | quit (q asks first when client operations still run) |
-| `↑ ↓ j k PgUp PgDn Ctrl-D Ctrl-U g G` | move (in the screen list: `j k g G` choose a screen) |
-| `h` / `l` | from the list to the screen list / from the screen list open the screen |
-| `Enter` | action menu of the selected item (shows the shortcut letter of each action; `*` marks actions that change the server) |
-| `/` | search: server-side, or in the list for Content Views and other pulp-tui screens (empty clears; lists the API cannot filter, such as Versions and Publications, say `this list has no search`) |
-| `s` / `S` | sort by next column / reverse (current page) |
-| `n` / `p` | next / previous page (100 items per page) |
-| `Space` | mark item (compare, bulk remove or add content) |
-| `t` | toggle RPM/File/Deb, content type, tracked/server tasks, task polling in Logs, or Content View snapshots in Repositories |
-| `r` | refresh |
-| `Esc` | cancel a loading request, clear marks, or go back |
+| Key                                   | Action                                                                                                                                                                                                                                               |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Tab`                                 | switch focus between the screen list and the main area                                                                                                                                                                                               |
+| `:` or `Ctrl-P`                       | command palette: go to a screen, connect to a server, dismiss finished tasks. It opens in filter mode (`-- FILTER --`): type to filter, `Ctrl-J/K` or `Ctrl-N/P` move. `Esc` goes to move mode (`j k g G`), `/` filters again, a second `Esc` closes |
+| `?`                                   | help (a text view: `j k g G Ctrl-D Ctrl-U` scroll, `Esc` closes)                                                                                                                                                                                     |
+| `N`                                   | notification log                                                                                                                                                                                                                                     |
+| `q` / `Ctrl-C`                        | quit (q asks first when client operations still run)                                                                                                                                                                                                 |
+| `↑ ↓ j k PgUp PgDn Ctrl-D Ctrl-U g G` | move (in the screen list: `j k g G` choose a screen)                                                                                                                                                                                                 |
+| `h` / `l`                             | from the list to the screen list / from the screen list open the screen                                                                                                                                                                              |
+| `Enter`                               | action menu of the selected item (shows the shortcut letter of each action; `*` marks actions that change the server)                                                                                                                                |
+| `/`                                   | search: server-side, or in the list for Content Views and other pulp-tui screens (empty clears; lists the API cannot filter, such as Versions and Publications, say `this list has no search`)                                                       |
+| `s` / `S`                             | sort by next column / reverse (current page)                                                                                                                                                                                                         |
+| `n` / `p`                             | next / previous page (100 items per page)                                                                                                                                                                                                            |
+| `Space`                               | mark item (compare, bulk remove or add content)                                                                                                                                                                                                      |
+| `t`                                   | toggle RPM/File/Deb, content type, tracked/server tasks, task polling in Logs, or Content View snapshots in Repositories                                                                                                                             |
+| `r`                                   | refresh                                                                                                                                                                                                                                              |
+| `Esc`                                 | cancel a loading request, clear marks, or go back                                                                                                                                                                                                    |
 
 In forms (they open in move mode): `j k`/`Tab`/`↑↓` change the field, `i` or `Enter` edits
 a text field (the box shows `-- EDIT --`), `Enter` then goes to the next field (submits on
@@ -89,6 +89,7 @@ the typed text as the value (with no text, it closes the list and keeps the old 
 ## Screens
 
 ### Dashboard
+
 Server health (database, Redis, workers, content apps, storage), the current user,
 installed plugins with versions, detected capabilities (RPM, File, Deb, ...), counts of
 repositories, distributions, content and tasks (a Deb line when the server has pulp_deb),
@@ -99,6 +100,7 @@ and keeps the old values until the new ones come; the capability marks change on
 new connect.
 
 ### Servers
+
 Named profiles from the config file. Actions: **o** connect, **T** test connection (shows
 user, content origin, plugin versions), **c**/**e** create/edit, **d** remove from the
 config (after typing the name; Pulp is not changed, and the Content View definitions of the
@@ -124,6 +126,7 @@ that has Content View data, pulp-tui asks `Database of <profile> changes`: copy 
 switch, switch without copy, or Esc. See "Shared database" for both.
 
 ### RPM Repositories / File Repositories / Deb Repositories
+
 Columns: name, latest version, default remote, retention, description. Details explain
 retention and mark Content View snapshot repositories. The Deb screen needs the pulp_deb
 plugin on the server.
@@ -132,18 +135,18 @@ The list does not show Content View snapshot repositories (`pulp-tui-cv-<view>-<
 `pulp_tui_cv`). Press **t** to show or hide them; the title shows `snapshots shown` when they
 are visible.
 
-| Key | Action |
-|---|---|
-| v | versions of the repository |
-| o | browse content of the latest version |
-| f | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File and Deb: additive, mirror). Mirror policies show a warning first. |
-| H | sync history (tasks that touched this repository) |
-| u | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed or cancelled (Esc) chunked uploads are deleted. Not offered for Deb repositories (upload of `.deb` files is not supported). |
-| P | publish the latest version: always creates a new publication, with the repository settings at that moment. Deb asks for an optional signing service (empty = the repository's own keys). The field is not asked when the server's Deb publications have no `signing_service`. |
-| D | distribute: pin the latest version (publication) or follow the repository latest. Deb asks for the same optional signing service as **P**, for the pinned publication; a publication of the version is reused only when its signing service is the same. |
-| C | copy content from another repository (filter rules; RPM can copy dependencies; a Deb copy is structured: it also copies the Release, component and architecture records of the packages, and never solves dependencies) |
-| c / e / d | create / edit / delete (delete names every distribution that serves the repository, a version or a publication of it; refused while it holds Content View snapshots) |
-| i | full JSON |
+| Key       | Action                                                                                                                                                                                                                                                                                |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| v         | versions of the repository                                                                                                                                                                                                                                                            |
+| o         | browse content of the latest version                                                                                                                                                                                                                                                  |
+| f         | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File and Deb: additive, mirror). Mirror policies show a warning first.                                                                     |
+| H         | sync history (tasks that touched this repository)                                                                                                                                                                                                                                     |
+| u         | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed or cancelled (Esc) chunked uploads are deleted. Not offered for Deb repositories (upload of `.deb` files is not supported). |
+| P         | publish the latest version: always creates a new publication, with the repository settings at that moment. Deb asks for an optional signing service (empty = the repository's own keys). The field is not asked when the server's Deb publications have no `signing_service`.         |
+| D         | distribute: pin the latest version (publication) or follow the repository latest. Deb asks for the same optional signing service as **P**, for the pinned publication; a publication of the version is reused only when its signing service is the same.                              |
+| C         | copy content from another repository (filter rules; RPM can copy dependencies; a Deb copy is structured: it also copies the Release, component and architecture records of the packages, and never solves dependencies)                                                               |
+| c / e / d | create / edit / delete (delete names every distribution that serves the repository, a version or a publication of it; refused while it holds Content View snapshots)                                                                                                                  |
+| i         | full JSON                                                                                                                                                                                                                                                                             |
 
 Edit sends only changed fields. Remote shows the default remote by name; clear it to remove
 the default remote. Edit, sync, upload, copy and content add/remove are refused
@@ -158,6 +161,7 @@ Content Views (see "Deb repositories in Content Views"). The fallback replicatio
 and File only.
 
 ### Remotes
+
 `t` switches RPM/File/Deb. Create/edit: URL (File: URL of `PULP_MANIFEST`; Deb: the Debian
 archive base URL, the directory that holds `dists/`), download policy, TLS validation,
 CA/client certificate and key (file paths; content is uploaded), username and password,
@@ -167,16 +171,17 @@ Delete lists repositories that use the remote.
 
 Deb remote fields (each is shown only when the server has it):
 
-| Field | Meaning |
-|---|---|
-| Distributions | required; space-separated releases to mirror, for example `bookworm bookworm-updates` |
-| Components | space-separated, for example `main contrib`; empty = all |
-| Architectures | space-separated, for example `amd64 arm64`; empty = all |
-| Sync source packages / udebs / installer files | on or off (default off) |
-| Ignore missing package indices | on or off; keeps a sync going when a `Packages` index is missing upstream |
-| GPG public key | path of a local file; its content is uploaded and Pulp uses it to check the `Release` signature. On edit, empty keeps the server value and `-` clears it |
+| Field                                          | Meaning                                                                                                                                                  |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Distributions                                  | required; space-separated releases to mirror, for example `bookworm bookworm-updates`                                                                    |
+| Components                                     | space-separated, for example `main contrib`; empty = all                                                                                                 |
+| Architectures                                  | space-separated, for example `amd64 arm64`; empty = all                                                                                                  |
+| Sync source packages / udebs / installer files | on or off (default off)                                                                                                                                  |
+| Ignore missing package indices                 | on or off; keeps a sync going when a `Packages` index is missing upstream                                                                                |
+| GPG public key                                 | path of a local file; its content is uploaded and Pulp uses it to check the `Release` signature. On edit, empty keeps the server value and `-` clears it |
 
 ### Repository Versions
+
 From a repository (**v**) or for all repositories. Columns: number, created, present /
 added / removed counts. Actions: **o** content, **P** publish this version (always a new publication), **D**
 distribute it (Deb: both ask for the optional signing service, as in Repositories), **b**
@@ -201,6 +206,7 @@ deleted content again. A read-only profile does not allow it. A server without
 `orphans/cleanup/` shows "orphan cleanup is not supported by this server".
 
 ### Content browser
+
 Opened from a repository or version. `t` cycles the content types of the repository type.
 RPM: packages, advisories, modulemds, package groups, distribution trees, repo metadata
 files. Deb: packages (package, version, architecture, sha256), releases (distribution,
@@ -214,6 +220,7 @@ repository version; old versions are unchanged. When the task ends, a notice giv
 **x**, a Content screen that still shows the old version switches to the new one; the marks stay when the task fails.
 
 ### Publications
+
 `t` switches RPM/File/Deb. **c** create from repository name and optional version number
 (Deb: and the optional signing service, as in Repositories): always a new publication, with the
 repository settings at that moment. **D** distribute: serves exactly the selected publication.
@@ -221,6 +228,7 @@ repository settings at that moment. **D** distribute: serves exactly the selecte
 publication id; refused for publications of Content View snapshots).
 
 ### Distributions
+
 `t` switches RPM/File/Deb. Details say whether a distribution is **PINNED** (publication or
 repository version) or **FOLLOWS LATEST** (repository). **y** copies the content URL
 (OSC 52 terminal clipboard; in tmux it needs `set -g allow-passthrough on` or
@@ -235,26 +243,27 @@ roll back) or renamed, and its `pulp_tui_*` labels stay (promote finds it by nam
 labels); its base path and other labels can be edited, and delete warns.
 
 ### Content Views
+
 Managed by pulp-tui (see `docs/ARCHITECTURE.md`). Columns: composite (`yes` for a
 composite view), repositories, latest version, environments with bound versions and
 states. A composite view has components instead of repositories; see "Composite Content
 Views" below.
 
-| Key | Action |
-|---|---|
-| c / e / d | create / edit description / delete (removes the view's distributions and snapshot repositories, never source repositories; the dialog lists every served path, and a served protected environment must be typed after the view name, for example `web Prod`). On a composite, Edit also sets auto publish and the pin of each component, and Delete removes only its distributions. |
-| a | add repositories: a multi-select picker of RPM, File and Deb repositories (those already in the view and Content View snapshot repositories are not listed) and filter rules; the rules apply to each selected repository, so a selection of more than one type needs empty rules. On a composite: add components (see below). |
-| F | edit the filter rules of one repository (not offered on a composite) |
-| x | remove a repository from the definition (published versions are unchanged). On a composite: remove a component. |
-| f | sync repositories: a multi-select picker of the view's repositories (all marked) and one sync policy (RPM values when the view has an RPM repository, else the File and Deb values additive and mirror; File and Deb repositories treat any mirror policy as mirror). Each repository syncs from its own default remote; one without is skipped. Mirror policies show a warning first. The tasks show in Tasks; the result lists each repository: new version, no change, failed or skipped. Sync does not publish. Not offered on a composite. |
-| w | preview: exact content the draft selects compared with the latest published version |
-| P | publish a new version: notes (and the Deb signing, when the view has a Deb repository) → preview → confirm; the version becomes active in Library |
-| v | versions of the view |
-| M | promote a version to an environment (preview of every distribution; protected environments require typing their name) |
-| b | roll back an environment to an earlier version |
-| u | unpromote: take the view out of an environment. It deletes the view's distributions there (the dialog lists the paths; type the view name, and also the environment when it is protected, for example `web Prod`) and removes the binding, so the version can be deleted. Versions and snapshots stay. Refused while a later environment on the path still has the view: go back along the path (Prod, then Test, then Dev). |
-| D | verify all environments (drift check) |
-| U | break the lock of the selected view (shows who holds it; you type the view name). See "Shared database". |
+| Key       | Action                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| c / e / d | create / edit description / delete (removes the view's distributions and snapshot repositories, never source repositories; the dialog lists every served path, and a served protected environment must be typed after the view name, for example `web Prod`). On a composite, Edit also sets auto publish and the pin of each component, and Delete removes only its distributions.                                                                                                                                                             |
+| a         | add repositories: a multi-select picker of RPM, File and Deb repositories (those already in the view and Content View snapshot repositories are not listed) and filter rules; the rules apply to each selected repository, so a selection of more than one type needs empty rules. On a composite: add components (see below).                                                                                                                                                                                                                  |
+| F         | edit the filter rules of one repository (not offered on a composite)                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| x         | remove a repository from the definition (published versions are unchanged). On a composite: remove a component.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| f         | sync repositories: a multi-select picker of the view's repositories (all marked) and one sync policy (RPM values when the view has an RPM repository, else the File and Deb values additive and mirror; File and Deb repositories treat any mirror policy as mirror). Each repository syncs from its own default remote; one without is skipped. Mirror policies show a warning first. The tasks show in Tasks; the result lists each repository: new version, no change, failed or skipped. Sync does not publish. Not offered on a composite. |
+| w         | preview: exact content the draft selects compared with the latest published version                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| P         | publish a new version: notes (and the Deb signing, when the view has a Deb repository) → preview → confirm; the version becomes active in Library                                                                                                                                                                                                                                                                                                                                                                                               |
+| v         | versions of the view                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| M         | promote a version to an environment (preview of every distribution; protected environments require typing their name)                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| b         | roll back an environment to an earlier version                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| u         | unpromote: take the view out of an environment. It deletes the view's distributions there (the dialog lists the paths; type the view name, and also the environment when it is protected, for example `web Prod`) and removes the binding, so the version can be deleted. Versions and snapshots stay. Refused while a later environment on the path still has the view: go back along the path (Prod, then Test, then Dev).                                                                                                                    |
+| D         | verify all environments (drift check)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| U         | break the lock of the selected view (shows who holds it; you type the view name). See "Shared database".                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
 Publish, promote, roll back, delete (the view or a version) and *Resume* take a lock on
 the view while they run; a second operator (or a second pulp-tui on this host) gets
@@ -409,6 +418,7 @@ extras.
     to normal views.
 
 ### Content View versions
+
 **M** promote, **b** roll back, **m** compare with the marked version, **R** resume a
 publish that failed or was interrupted (continues from checkpoints and re-attaches to a
 submitted task; with a shared database it can also continue a publish that another
@@ -424,6 +434,7 @@ component versions first (`rocky9-extras: v1 -> v2`), then the added and removed
 each repository.
 
 ### Lifecycle Environments
+
 Library exists automatically. **c** creates an environment after an existing one
 (paths can branch). **L** toggles protection. **d** deletes an unused environment. With a
 shared database, environments belong to the server and every operator sees them.
@@ -444,6 +455,7 @@ the relabel is not moved; run Edit again. A label must not overlap the base path
 another path, and the rows that fail stay as described above.
 
 ### Replication
+
 Native Upstream Pulp objects (tech preview). **c**/**e** create/edit: upstream base URL
 as reachable from *this* Pulp server, relative API root (`pulp/`), domain, credentials,
 CA/client certificates, TLS validation, distribution filter (`q_select`, e.g.
@@ -457,6 +469,7 @@ another base path is reported as a 409 conflict, and the replica stays at its ol
 Delete the replica distribution, or move it by hand, to make it follow.
 
 ### Users, Groups, Roles
+
 Users: **R** roles, **c**/**e** create/edit, **w** set password (Pulp's local users
 only), **A** enable/disable, **d** delete (refused for yourself; staff accounts warn).
 Role assignments: **c** add (role name, optional object href or domain for scope), **d**
@@ -465,6 +478,7 @@ remove; owner/admin roles ask for confirmation. Groups: **o** members, **R** rol
 edited (permissions as a comma list) and deleted.
 
 ### Tasks
+
 Tracked tasks with state, progress (only what Pulp reports; no invented percentages),
 start time and errors. The top box lists client operations still running. **W** opens a
 live view of the task (state, progress reports, times, error, created resources) that
@@ -474,6 +488,7 @@ tasks, the oldest finished one goes by itself). `t` switches to all
 server tasks (**a** tracks one; **W** tracks it and opens the live view).
 
 ### Logs
+
 Everything that happened in this session, newest first, with the time in UTC. It works
 without a connection and follows new rows while it is open. Three kinds of rows:
 `request` (every HTTP request to Pulp: method, path, status or error, duration),
@@ -501,11 +516,11 @@ prints a full example. Profile selection: `--profile` > `$PULP_TUI_PROFILE` >
 
 Secrets are references:
 
-| Reference | Use |
-|---|---|
-| `env:PULP_PASSWORD` | environment variable (CI, containers) |
-| `file:/run/secrets/pulp` | mounted secret file (trailing newline is removed) |
-| `keyring` | system keyring, service `pulp-tui`, user = profile name (store it with **K**; see "System keyring") |
+| Reference                | Use                                                                                                 |
+| ------------------------ | --------------------------------------------------------------------------------------------------- |
+| `env:PULP_PASSWORD`      | environment variable (CI, containers)                                                               |
+| `file:/run/secrets/pulp` | mounted secret file (trailing newline is removed)                                                   |
+| `keyring`                | system keyring, service `pulp-tui`, user = profile name (store it with **K**; see "System keyring") |
 
 Auth methods: `basic` (username + secret), `bearer` (secret is the token), `none`
 (anonymous or identity from the mTLS client certificate). TLS options: `ca_cert`
@@ -543,21 +558,21 @@ form value that is the same as what the profile would use without a block (the i
 pulp-tui does not keep a keyring file. It gives the secret to the keyring of the operating
 system:
 
-| System | Store |
-|---|---|
+| System     | Store                                                                                                    |
+| ---------- | -------------------------------------------------------------------------------------------------------- |
 | Linux, BSD | Secret Service over D-Bus (`org.freedesktop.secrets`): GNOME Keyring, KDE Wallet (`ksecretd`), KeePassXC |
-| macOS | Keychain |
-| Windows | Credential Manager |
+| macOS      | Keychain                                                                                                 |
+| Windows    | Credential Manager                                                                                       |
 
 On Linux the secret goes to the `default` collection (unlocked first, which can show a
 password prompt). Each entry has the attributes `service=pulp-tui` and `username=<user>`
 and the label `keyring:<user>@pulp-tui`:
 
-| Secret | Keyring user |
-|---|---|
-| Pulp server of profile `prod` | `prod` |
-| `[profiles.prod.database]` | `[database]:prod` |
-| top-level `[database]` | `[database]` |
+| Secret                        | Keyring user      |
+| ----------------------------- | ----------------- |
+| Pulp server of profile `prod` | `prod`            |
+| `[profiles.prod.database]`    | `[database]:prod` |
+| top-level `[database]`        | `[database]`      |
 
 * **K** on the Servers screen only writes the keyring. Set `secret = "keyring"` in the
   config too, else pulp-tui does not read the entry. **K** again replaces the secret.
@@ -710,8 +725,8 @@ database of a profile and choose "copy and switch" (see above).
 
 ### What is shared
 
-| Shared (in the external database) | Always local (`<data-dir>/pulp-tui.db`) |
-|---|---|
+| Shared (in the external database)                                                                                               | Always local (`<data-dir>/pulp-tui.db`)     |
+| ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
 | Content Views, repositories and filters, versions and checkpoints, environments, bindings, audit log (with the operator), locks | Task Center references, replication history |
 
 * **Server key.** In the shared database, rows belong to the server, not to a profile name:
@@ -805,12 +820,12 @@ pulp-tui refuses to change Content View objects by hand (retention, sync, upload
 content changes, delete). Other Pulp clients (`pulp` CLI, scripts, the API) do not know these
 rules. A user with write access to a snapshot repository can break published versions:
 
-| Change by another client | Result |
-|---|---|
-| add or remove content | no effect on published versions; the next publish replaces it |
-| set `retain_repo_versions` | Pulp deletes old versions and their publications: older Content View versions and rollback stop working |
-| delete the repository or a distribution | the environments of that view stop serving that repository |
-| point a distribution to another publication | the environment serves wrong content; the drift check (**D**) reports it |
+| Change by another client                    | Result                                                                                                  |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| add or remove content                       | no effect on published versions; the next publish replaces it                                           |
+| set `retain_repo_versions`                  | Pulp deletes old versions and their publications: older Content View versions and rollback stop working |
+| delete the repository or a distribution     | the environments of that view stop serving that repository                                              |
+| point a distribution to another publication | the environment serves wrong content; the drift check (**D**) reports it                                |
 
 Only Pulp RBAC stops this. Set up the roles so that only pulp-tui operators can change these
 objects:

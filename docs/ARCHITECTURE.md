@@ -6,14 +6,14 @@ tools for normal operation.
 
 ## Layers
 
-| Layer | Module | Responsibility |
-|---|---|---|
-| Transport | `src/pulp/client.rs` | Auth (basic, bearer, mTLS), TLS (always verified, custom CA bundles), proxies, timeouts, bounded concurrency (semaphore), retries for reads only, pagination, response size limit, error mapping, href confinement to the configured API root, recording of each request attempt in the in-memory session log |
-| Capabilities | `src/pulp/caps.rs` | `status/` (component versions, health, content origin), `login/` or `users/?username=` (current user), live OpenAPI schema (endpoints, fields, enums) |
-| Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs`, `src/pulp/rpm.rs`, `src/pulp/file.rs`, `src/pulp/deb.rs` | RPM/File/Deb endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification |
-| Services | `src/cv.rs`, `src/replication.rs`, `src/filters.rs`, `src/repo_export.rs` | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules, `rpmvercmp` and the dpkg version comparison, export and import of repository and remote definitions |
-| Storage | `src/store.rs` | sqlx (SQLite, optionally PostgreSQL): task references, Content View definitions, versions, checkpoints, environments, bindings, audit log with operator, locks, replication runs |
-| TUI | `src/tui/*` | Event loop, state, screens, forms, confirmations, Task Center |
+| Layer          | Module                                                                                            | Responsibility                                                                                                                                                                                                                                                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Transport      | `src/pulp/client.rs`                                                                              | Auth (basic, bearer, mTLS), TLS (always verified, custom CA bundles), proxies, timeouts, bounded concurrency (semaphore), retries for reads only, pagination, response size limit, error mapping, href confinement to the configured API root, recording of each request attempt in the in-memory session log |
+| Capabilities   | `src/pulp/caps.rs`                                                                                | `status/` (component versions, health, content origin), `login/` or `users/?username=` (current user), live OpenAPI schema (endpoints, fields, enums)                                                                                                                                                         |
+| Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs`, `src/pulp/rpm.rs`, `src/pulp/file.rs`, `src/pulp/deb.rs` | RPM/File/Deb endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification                                                                                                                                        |
+| Services       | `src/cv.rs`, `src/replication.rs`, `src/filters.rs`, `src/repo_export.rs`                         | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules, `rpmvercmp` and the dpkg version comparison, export and import of repository and remote definitions                                                                                             |
+| Storage        | `src/store.rs`                                                                                    | sqlx (SQLite, optionally PostgreSQL): task references, Content View definitions, versions, checkpoints, environments, bindings, audit log with operator, locks, replication runs                                                                                                                              |
+| TUI            | `src/tui/*`                                                                                       | Event loop, state, screens, forms, confirmations, Task Center                                                                                                                                                                                                                                                 |
 
 ### Plugins
 
@@ -62,10 +62,10 @@ idle group whose counts stay the same for three polls is also treated as final.
 
 ## Native Pulp concepts versus application-managed concepts
 
-| Concept | Owner | Notes |
-|---|---|---|
-| Repository, Remote, Repository Version, Publication, Distribution, Task, Task Group, User, Group, Role, Upstream Pulp | **Pulp** | Used as documented. The Repository and the Remote are separate objects. |
-| Content View, Content View Version, Lifecycle Environment, Promotion, Binding | **pulp-tui** | Not a Pulp API and not Katello. Stored in the local SQLite file, or in the external database of the profile (its own `database`, else `[database]`; see "Storage"), and built from the Pulp objects above. |
+| Concept                                                                                                               | Owner        | Notes                                                                                                                                                                                                      |
+| --------------------------------------------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Repository, Remote, Repository Version, Publication, Distribution, Task, Task Group, User, Group, Role, Upstream Pulp | **Pulp**     | Used as documented. The Repository and the Remote are separate objects.                                                                                                                                    |
+| Content View, Content View Version, Lifecycle Environment, Promotion, Binding                                         | **pulp-tui** | Not a Pulp API and not Katello. Stored in the local SQLite file, or in the external database of the profile (its own `database`, else `[database]`; see "Storage"), and built from the Pulp objects above. |
 
 ### Content View implementation
 
@@ -94,6 +94,7 @@ idle group whose counts stay the same for three polls is also treated as final.
      when it was made (an unchanged selection records the version of the previous publish).
      Deb: always create one, because a publication signed with repository keys stores
      `signing_service: null` and cannot be told apart from an unsigned one.
+
   Every step writes a checkpoint. The href of a submitted copy task is stored before
   waiting, so an interrupted publish **re-attaches to the same task** and does not submit
   it again. A copy task that failed or was canceled is cleared from the checkpoint, so the
@@ -237,10 +238,10 @@ method serves SQLite and PostgreSQL. All store calls are `async`; the UI thread 
 calls them (they run in jobs). pulp-tui holds the local file and one store for each
 external database in use:
 
-| Store | Opened | Holds | Rows scoped by |
-|---|---|---|---|
-| Local file `<data_dir>/pulp-tui.db` (SQLite, WAL) | always, migrated on open | task references, replication runs; also the Content View data of every profile without an external database | profile name |
-| External database (PostgreSQL, or SQLite at a path): the `database` of a profile, else `[database]` | on Connect (a job), never migrated by an open | Content Views (also composites and their components), repositories and filters, versions and checkpoints, environments, bindings, audit log, locks | server key |
+| Store                                                                                               | Opened                                        | Holds                                                                                                                                              | Rows scoped by |
+| --------------------------------------------------------------------------------------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| Local file `<data_dir>/pulp-tui.db` (SQLite, WAL)                                                   | always, migrated on open                      | task references, replication runs; also the Content View data of every profile without an external database                                        | profile name   |
+| External database (PostgreSQL, or SQLite at a path): the `database` of a profile, else `[database]` | on Connect (a job), never migrated by an open | Content Views (also composites and their components), repositories and filters, versions and checkpoints, environments, bindings, audit log, locks | server key     |
 
 `Config::database_for(profile)` decides which database a profile uses: its own `database`,
 else `[database]`, else the local file (`None`). A profile with `url = "local"` also gets

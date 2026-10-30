@@ -1,0 +1,9 @@
+{
+  "markdown": {
+    "emphasisKind": "asterisks",
+    "unorderedListKind": "asterisks"
+  },
+  "plugins": [
+    "npm:@dprint/markdown@0.28.2"
+  ]
+}
