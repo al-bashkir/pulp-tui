@@ -65,6 +65,8 @@ async fn downstream_has(c: &PulpClient, dist_name: &str, nevra: &str) -> bool {
     let version = match (&d.repository_version, &d.publication) {
         (Some(v), _) => v.clone(),
         (None, Some(p)) => c.get::<Value>(p, &[]).await.unwrap()["repository_version"].as_str().unwrap().to_string(),
+        // Older pulpcore (3.95) replicates with a distribution that follows the repository.
+        _ if d.repository.is_some() => latest(c, d.repository.as_deref().unwrap()).await,
         _ => panic!("distribution {dist_name} serves nothing"),
     };
     ops::verify_served(c, RepoType::Rpm, d.base_url.as_deref().unwrap(), &version, "").await.unwrap();
