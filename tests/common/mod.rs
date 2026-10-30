@@ -35,7 +35,7 @@ pub fn client_for(url: &str, name: &str) -> PulpClient {
 }
 
 pub fn client() -> PulpClient {
-    client_for(&std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://localhost:8080".into()), "pulp1")
+    client_for(&std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()), "pulp1")
 }
 
 /// Upstream fixture repositories as seen from inside the Pulp container.

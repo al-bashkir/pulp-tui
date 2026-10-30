@@ -28,7 +28,7 @@ port_of() { case "$1" in pulp1) echo 8080 ;; pulp2) echo 8081 ;; *) echo "unknow
 # and, for the upstream, from the other container (replication downloads).
 origin_of() {
   case "$1" in
-    pulp1) echo "http://localhost:$(port_of pulp1)" ;;
+    pulp1) echo "http://127.0.0.1:$(port_of pulp1)" ;;
     pulp2) echo "http://host.containers.internal:$(port_of pulp2)" ;;
   esac
 }
@@ -36,7 +36,7 @@ origin_of() {
 wait_ready() {
   local port=$1 i
   for i in $(seq 1 120); do
-    if curl -fsS -o /dev/null "http://localhost:$port/pulp/api/v3/status/"; then return 0; fi
+    if curl -fsS -o /dev/null "http://127.0.0.1:$port/pulp/api/v3/status/"; then return 0; fi
     sleep 2
   done
   echo "Pulp on port $port did not become ready" >&2
@@ -69,7 +69,7 @@ EOF
     "$IMAGE" >/dev/null
   wait_ready "$port"
   $RUNTIME exec "$name" pulpcore-manager reset-admin-password --password "$ADMIN_PASSWORD" >/dev/null
-  echo "$name ready: http://localhost:$port (admin/$ADMIN_PASSWORD)"
+  echo "$name ready: http://127.0.0.1:$port (admin/$ADMIN_PASSWORD)"
 }
 
 down() {
@@ -129,7 +129,7 @@ http_down() {
 deb_signing_up() {
   local name=$1 port svc=pulp-tui-deb-test
   port=$(port_of "$name")
-  if curl -fsS -u "admin:$ADMIN_PASSWORD" "http://localhost:$port/pulp/api/v3/signing-services/?name=$svc" | grep -q '"count":1'; then
+  if curl -fsS -u "admin:$ADMIN_PASSWORD" "http://127.0.0.1:$port/pulp/api/v3/signing-services/?name=$svc" | grep -q '"count":1'; then
     echo "$svc already registered on $name"
     return 0
   fi

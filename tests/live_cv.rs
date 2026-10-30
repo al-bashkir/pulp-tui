@@ -76,7 +76,7 @@ async fn content_view_lifecycle() {
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
     assert_eq!(svc.verify(cv, dev).await.unwrap(), Vec::<String>::new());
     let dev_docs = c
-        .fetch_content(&format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, "dev", "docs")), 1 << 20)
+        .fetch_content(&format!("http://127.0.0.1:8080/pulp/content/{}/docs/readme.txt", base_path(&id, "dev", "docs")), 1 << 20)
         .await
         .unwrap();
     assert_eq!(dev_docs.0, 200);
@@ -200,7 +200,7 @@ async fn environment_relabel_moves_served_paths() {
     let lib = store.ensure_library(&profile).await.unwrap();
     let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
-    let readme = |label: &str| format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, label, "docs"));
+    let readme = |label: &str| format!("http://127.0.0.1:8080/pulp/content/{}/docs/readme.txt", base_path(&id, label, "docs"));
     assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 200);
 
     // The impact names the move; the relabel moves the one served row and the view still verifies.
@@ -247,7 +247,7 @@ async fn unpromote_goes_back_along_the_path() {
     let test = store.create_env(&profile, "Test", dev, false).await.unwrap();
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
     svc.promote(cv, v1.id, test, Mode::Promote, &quiet, &no_progress).await.unwrap();
-    let readme = |label: &str| format!("http://localhost:8080/pulp/content/{}/docs/readme.txt", base_path(&id, label, "docs"));
+    let readme = |label: &str| format!("http://127.0.0.1:8080/pulp/content/{}/docs/readme.txt", base_path(&id, label, "docs"));
     assert_eq!(c.fetch_content(&readme("test"), 1 << 20).await.unwrap().0, 200);
 
     let e = svc.unpromote(cv, dev, &quiet, &no_progress).await.unwrap_err().to_string();
@@ -368,7 +368,7 @@ async fn composite_content_view_rocky9() {
     let lib = store.ensure_library(&profile).await.unwrap();
     assert_eq!(svc.verify(comp, lib).await.unwrap(), Vec::<String>::new());
     assert!(svc.verify(extras, lib).await.unwrap().is_empty(), "one publication, served by two distributions");
-    let url = |label: &str, repo: &str, file: &str| format!("http://localhost:8080/pulp/content/{}/{file}", base_path(&id, label, repo));
+    let url = |label: &str, repo: &str, file: &str| format!("http://127.0.0.1:8080/pulp/content/{}/{file}", base_path(&id, label, repo));
     assert_eq!(c.fetch_content(&url("library", "docs", "docs/readme.txt"), 1 << 20).await.unwrap().0, 200);
     assert_eq!(c.fetch_content(&url("library", "os", "repodata/repomd.xml"), 1 << 20).await.unwrap().0, 200);
 

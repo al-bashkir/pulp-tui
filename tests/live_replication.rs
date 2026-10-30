@@ -13,7 +13,7 @@ use pulp_tui::store::Store;
 use serde_json::{Value, json};
 
 fn upstream_client() -> PulpClient {
-    client_for(&std::env::var("PULP_TUI_TEST_UPSTREAM_URL").unwrap_or_else(|_| "http://localhost:8081".into()), "pulp2")
+    client_for(&std::env::var("PULP_TUI_TEST_UPSTREAM_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into()), "pulp2")
 }
 
 /// URL of pulp2 as seen from the pulp1 container.
@@ -127,7 +127,7 @@ async fn fallback_replication() {
     let store = Store::open_in_memory().await.unwrap();
 
     // Dry run, then execute.
-    let plan = replication::plan(&up, &dst, &RepoType::ALL, &prefix, Some("http://localhost:8080/pulp/content/")).await.unwrap();
+    let plan = replication::plan(&up, &dst, &RepoType::ALL, &prefix, Some("http://127.0.0.1:8080/pulp/content/")).await.unwrap();
     assert_eq!(plan.iter().map(|p| p.action.clone()).collect::<Vec<_>>(), vec![PlanAction::Create, PlanAction::Create], "{plan:?}");
     assert!(plan.iter().find(|p| p.t == RepoType::File).unwrap().remote_url.ends_with("/PULP_MANIFEST"));
     let res = replication::run(&dst, &store, up.profile(), &plan, false, &|_| {}, &no_progress).await.unwrap();
@@ -144,7 +144,7 @@ async fn fallback_replication() {
     assert_eq!(store.last_replications(dst.profile(), up.profile()).await.unwrap().len(), 2);
 
     // Loop guard: distributions served by the destination itself are skipped.
-    let plan = replication::plan(&dst, &dst, &[RepoType::Rpm], &prefix, Some("http://localhost:8080/pulp/content/")).await.unwrap();
+    let plan = replication::plan(&dst, &dst, &[RepoType::Rpm], &prefix, Some("http://127.0.0.1:8080/pulp/content/")).await.unwrap();
     assert!(plan.iter().all(|p| p.action == PlanAction::Skip && p.note.contains("loop")), "{plan:?}");
 }
 
