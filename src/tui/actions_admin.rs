@@ -206,11 +206,20 @@ fn group_action(app: &mut App, act: Act, item: Value) {
     match act {
         Act::Members => app.push(Kind::GroupUsers { group: href, name }),
         Act::Roles => app.push(Kind::GroupRoles { group: href, name }),
-        Act::Create => app.form(Form::new("New group", vec![Field::text("name", "Name").required()]), |app, f| {
-            let b = json!({ "name": f.get("name") });
-            submit(app, format!("create group {}", f.get("name")), move |c| async move { Ok(c.post(&c.api("groups/"), &b).await?) });
-            Ok(())
-        }),
+        Act::Create | Act::Edit => {
+            let edit = act == Act::Edit;
+            let title = if edit { format!("Rename group {name}") } else { "New group".into() };
+            let field = Field::text("name", "Name").required().value(if edit { name.clone() } else { String::new() });
+            app.form(Form::new(title, vec![field]), move |app, f| {
+                let (href, new) = (href.clone(), f.get("name").to_string());
+                let label = if edit { format!("rename group {name} to {new}") } else { format!("create group {new}") };
+                let b = json!({ "name": new });
+                submit(app, label, move |c| async move {
+                    Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api("groups/"), &b).await? })
+                });
+                Ok(())
+            })
+        }
         Act::Delete => app.confirm_danger(
             format!("Delete group {name}"),
             vec!["Members lose all permissions granted through this group.".into()],
@@ -1333,6 +1342,30 @@ mod tests {
         settle(&mut app, &mut rx).await;
         let errors: Vec<_> = notices(&app).into_iter().filter(|(l, _)| *l == Level::Error).collect();
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn group_edit_renames_the_group() {
+        use crate::tui::kinds::{Act, Kind};
+        use wiremock::matchers::body_json;
+        let server = MockServer::start().await;
+        let g = "/pulp/api/v3/groups/7/";
+        Mock::given(method("PATCH"))
+            .and(path(g))
+            .and(body_json(json!({ "name": "ops-2" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": g, "name": "ops-2" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        assert!(Kind::Groups.actions().contains(&Act::Edit));
+        super::group_action(&mut app, Act::Edit, json!({ "pulp_href": g, "name": "ops" }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!((form.title.as_str(), form.get("name")), ("Rename group ops", "ops"), "prefilled");
+        form.fields[0].value = "ops-2".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(notices(&app).contains(&(Level::Ok, "rename group ops to ops-2: done".into())), "{:?}", notices(&app));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use super::kinds::{Act, Kind, s, short};
 use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile, database_keyring_user};
 use crate::filters::{Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
-use crate::pulp::models::{Distribution, Publication, RepoVersion, Task, TaskGroup};
+use crate::pulp::models::{Distribution, Publication, RepoVersion, TASK_FINAL_STATES, Task, TaskGroup};
 use crate::pulp::ops::{self, repo_of_version, version_number};
 use crate::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::Store;
@@ -213,7 +213,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         (Kind::Content { version, .. }, _) => content_action(app, version.clone(), act),
         (Kind::Publications(t), _) => publication_action(app, *t, act, item),
         (Kind::Distributions(t), _) => distribution_action(app, *t, act, item),
-        (Kind::Tasks | Kind::ServerTasks, _) => task_action(app, act, item),
+        (Kind::Tasks | Kind::ServerTasks(_) | Kind::TaskGroups, _) => task_action(app, act, item),
         (Kind::ContentViews | Kind::CvVersions { .. } | Kind::Environments, _) => super::actions_cv::run(app, act, item),
         _ => super::actions_admin::run(app, act, item),
     }
@@ -636,6 +636,60 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
                     })
                 };
                 app.spawn("import".into(), false, fut);
+            });
+        }
+        // The same functions and file as `export-repos` / `import-repos`; the export never holds a secret.
+        Act::ExportRepos => {
+            let profile = if name.is_empty() { app.profile.clone().unwrap_or_default() } else { name };
+            let Some(p) = app.cfg.profiles.get(&profile).cloned() else { return };
+            let settings = app.cfg.settings.clone();
+            let title = format!("Export repository definitions of {profile} to file");
+            app.input(title, &format!("pulp-tui-{profile}-repos.json"), move |app, path| {
+                let fut = async move {
+                    let c = PulpClient::new(&profile, &p, &settings)?;
+                    let (ex, notes) = crate::repo_export::export(&c, &Capabilities::detect(&c).await?).await?;
+                    tokio::fs::write(&path, serde_json::to_string_pretty(&ex)?).await.with_context(|| format!("write {path}"))?;
+                    ap(move |app| {
+                        let (r, n) = (ex.remotes.len(), ex.repositories.len());
+                        app.ok(format!("exported {r} remote(s) and {n} repositories of {profile} to {path} (no secrets)"));
+                        if !notes.is_empty() {
+                            app.text(format!("Export of {profile}"), notes.iter().map(|n| format!("note: {n}")).collect());
+                        }
+                    })
+                };
+                app.spawn("export repositories".into(), false, fut);
+            });
+        }
+        Act::ImportRepos => {
+            let profile = app.profile.clone().unwrap_or_default();
+            app.input(format!("Import repository definitions into {profile} from file"), "", move |app, path| {
+                app.job(format!("plan import of {path}"), move |ctx| async move {
+                    let read = tokio::fs::read(&path).await.with_context(|| format!("read {path}"))?;
+                    let ex: crate::repo_export::ServerExport = serde_json::from_slice(&read).with_context(|| format!("parse {path}"))?;
+                    let (create, keep, notes) = crate::repo_export::plan(&ctx.client, &ctx.caps, &ex).await?;
+                    let head = format!("Import {path} into {profile}: create {create}, keep {keep} existing (remotes and repositories).");
+                    let lines = [vec![head, "Existing objects are never changed.".into(), String::new()], notes].concat();
+                    let title = format!("Import repository definitions into {profile}");
+                    ap(move |app| {
+                        if create == 0 {
+                            return app.text(title, lines);
+                        }
+                        app.confirm(title, lines, move |app| {
+                            app.job(format!("import {path}"), move |ctx| async move {
+                                let (created, kept, notes) = crate::repo_export::import(&ctx.client, &ctx.caps, &ex).await?;
+                                ap(move |app| {
+                                    let done =
+                                        format!("profile {profile}: created {created}, kept {kept} existing (remotes and repositories)");
+                                    app.ok(done.clone());
+                                    if !notes.is_empty() {
+                                        let lines = [vec![done], notes.iter().map(|n| format!("warning: {n}")).collect()].concat();
+                                        app.text(format!("Import into {profile}"), lines);
+                                    }
+                                })
+                            })
+                        })
+                    })
+                });
             });
         }
         _ => {}
@@ -2418,6 +2472,57 @@ fn task_action(app: &mut App, act: Act, item: Value) {
             let label = Some(s(&item, "label")).filter(|l| !l.is_empty()).unwrap_or_else(|| s(&item, "name"));
             app.watch_task(&href, &label);
         }
+        Act::Filter => {
+            let Kind::ServerTasks(q) = app.list.kind.clone() else { return };
+            let get = |k: &str| q.iter().find(|(p, _)| *p == k).map(|(_, v)| v.clone()).unwrap_or_default();
+            let states = ["", "waiting", "running", "completed", "failed", "canceled", "canceling", "skipped"];
+            let fields = vec![
+                Field::new("state", "State", FieldKind::Choice(states.map(String::from).to_vec())).value(get("state")),
+                Field::text("name", "Name contains").value(app.list.filter.clone()),
+                Field::text("reserved_resources", "Resource href")
+                    .value(get("reserved_resources"))
+                    .help("tasks that locked it, e.g. a repository"),
+                Field::text("started_at__gte", "Started at or after")
+                    .value(get("started_at__gte"))
+                    .help("2026-11-01 or 2026-11-01T08:00:00Z"),
+            ];
+            app.form(Form::new("Filter server tasks", fields).note("An empty field does not filter."), |app, f| {
+                let q = ["state", "reserved_resources", "started_at__gte"].into_iter().filter_map(|k| f.opt(k).map(|v| (k, v.to_string())));
+                let k = Kind::ServerTasks(q.collect());
+                (app.list.kind, app.screen) = (k.clone(), Screen::List(k));
+                (app.list.filter, app.list.offset, app.list.selected) = (f.get("name").to_string(), 0, 0);
+                app.reload();
+                Ok(())
+            });
+        }
+        Act::Delete if !unsupported(app, Feature::TaskDelete) => {
+            let (name, state) = (s(&item, "name"), s(&item, "state"));
+            if !TASK_FINAL_STATES.contains(&state.as_str()) {
+                return app.error(format!("task {name} is {state}: only a finished task can be deleted (cancel it first)"));
+            }
+            let lines = vec![
+                format!("Delete the record of task {name} ({href}, {state}) on Pulp."),
+                "What the task made stays; its state, progress and error are gone.".into(),
+            ];
+            app.confirm("Delete server task", lines, move |app| {
+                submit(app, format!("delete task {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+            });
+        }
+        Act::PurgeTasks if !unsupported(app, Feature::TaskPurge) => {
+            let fields = vec![
+                Field::text("finished_before", "Finished before").required().help("2026-10-01 or 2026-10-01T08:00:00"),
+                Field::text("states", "States").required().value("completed").help("comma separated: completed, failed, canceled, skipped"),
+            ];
+            app.form(Form::new("Purge finished tasks", fields), |app, f| {
+                let before = f.get("finished_before").to_string();
+                let states: Vec<String> = f.get("states").split(',').map(str::trim).filter(|v| !v.is_empty()).map(String::from).collect();
+                if let Some(bad) = states.iter().find(|v| !TASK_FINAL_STATES.contains(&v.as_str())) {
+                    return Err(format!("{bad} is not a final state ({})", TASK_FINAL_STATES.join(", ")));
+                }
+                purge_tasks(app, before, states);
+                Ok(())
+            });
+        }
         Act::CancelTask => {
             let note = [
                 "This is a server-side cancellation (not just closing the client).".to_string(),
@@ -2439,6 +2544,39 @@ fn task_action(app: &mut App, act: Act, item: Value) {
         }
         _ => {}
     }
+}
+
+/// Count the tasks that `tasks/purge/` would delete (the same filter as Pulp's purge), then purge after the typed profile name.
+fn purge_tasks(app: &mut App, before: String, states: Vec<String>) {
+    let profile = app.profile.clone().unwrap_or_default();
+    app.job("count tasks to purge", move |ctx| async move {
+        let c = &ctx.client;
+        let q = [("finished_at__lt", before.clone()), ("state__in", states.join(",")), ("limit", "1".into())];
+        let n = c.list::<Value>(&c.api("tasks/"), &q).await?.count;
+        let lines = vec![
+            format!("Purge on {profile}: {n} task(s) in state {} that finished before {before}.", states.join(", ")),
+            "Pulp deletes their records (not what they made), only the ones that you may delete.".into(),
+            "Pulp cannot undo this.".into(),
+        ];
+        ap(move |app| {
+            let typed = profile.clone();
+            app.confirm_danger("Purge finished tasks", lines, &typed, move |app| {
+                let label = format!("purge tasks on {profile}");
+                app.job(label.clone(), move |ctx| async move {
+                    let c = &ctx.client;
+                    let m = c.post(&c.api("tasks/purge/"), &json!({ "finished_before": before, "states": states })).await?;
+                    ap(move |app| {
+                        follow(app, m, label.clone(), move |app, t| {
+                            let done = |code: &str| t.progress_reports.iter().find(|r| r.code == code).and_then(|r| r.done).unwrap_or(0);
+                            let failed = done("purge.tasks.error");
+                            let kept = if failed > 0 { format!(", {failed} could not be deleted") } else { String::new() };
+                            app.ok(format!("{label}: deleted {} task(s){kept}", done("purge.tasks.key.core.Task")));
+                        })
+                    })
+                })
+            })
+        })
+    });
 }
 
 /// PATCH `state: canceled` on a task or a task group, then report the state that Pulp gives.
@@ -4248,6 +4386,303 @@ mod tests {
         task_action(&mut app, Act::DismissTasks, Value::Null);
         assert_eq!(texts(&app).last(), Some(&(Level::Ok, "dismissed 2 finished task(s) from the list (Pulp keeps its records)".into())));
         assert!(app.tasks.items.is_empty() && app.list.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_tasks_filter_by_state_name_resource_and_start_time() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/rpm/rpm/1/");
+        let failed =
+            json!({ "pulp_href": format!("{API}tasks/9/"), "name": "pulp_rpm.app.tasks.synchronizing.synchronize", "state": "failed" });
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}tasks/")))
+            .and(query_param("state", "failed"))
+            .and(query_param("name__contains", "sync"))
+            .and(query_param("reserved_resources", repo.as_str()))
+            .and(query_param("started_at__gte", "2026-11-01"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([failed]))))
+            .mount(&server)
+            .await;
+        get(&server, &format!("{API}tasks/"), page(json!([]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.open(Screen::List(Kind::ServerTasks(vec![])));
+        settle(&mut app, &mut rx).await;
+        let filter = Kind::ServerTasks(vec![]).actions().into_iter().find(|a| a.key() == 'F').expect("F on Server tasks");
+        assert!(!filter.mutates(&Kind::ServerTasks(vec![]), false) && !filter.needs_item(), "read-only mode and an empty list keep it");
+        let form = |app: &mut App| {
+            run(app, filter, Value::Null);
+            let Some(Modal::Form { form, submit }) = app.modal.take() else { panic!("no form") };
+            (form, submit)
+        };
+        let (mut f, mut submit) = form(&mut app);
+        assert_eq!(keys(&f), ["state", "name", "reserved_resources", "started_at__gte"]);
+        for (k, v) in [("state", "failed"), ("name", "sync"), ("reserved_resources", repo.as_str()), ("started_at__gte", "2026-11-01")] {
+            f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+        }
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.list.items, [failed], "the server filtered: {:?}", app.list.error);
+        assert!(app.list.kind.title().starts_with("Server tasks (state=failed, reserved_resources="), "{}", app.list.kind.title());
+
+        // The form shows the filters in use; empty fields filter nothing.
+        let (mut f, mut submit) = form(&mut app);
+        assert_eq!(f.fields.iter().map(|x| x.value.as_str()).collect::<Vec<_>>(), ["failed", "sync", repo.as_str(), "2026-11-01"]);
+        f.fields.iter_mut().for_each(|x| x.value.clear());
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!((app.list.kind.clone(), app.list.filter.as_str()), (Kind::ServerTasks(vec![]), ""));
+        assert!(app.list.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn purge_counts_the_matching_tasks_then_purges_after_the_typed_name() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{body_json, method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}tasks/")))
+            .and(query_param("finished_at__lt", "2026-10-01"))
+            .and(query_param("state__in", "completed,failed"))
+            .and(query_param("limit", "1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 7, "next": null, "results": [] })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(format!("{API}tasks/purge/")))
+            .and(body_json(json!({ "finished_before": "2026-10-01", "states": ["completed", "failed"] })))
+            .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reports = json!([{ "code": "purge.tasks.key.core.Task", "message": "Purged task-objects of type core.Task", "done": 7 },
+                             { "code": "purge.tasks.error", "message": "Tasks failed to purge", "done": 0 }]);
+        get(
+            &server,
+            &format!("{API}tasks/1/"),
+            json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "progress_reports": reports }),
+        )
+        .await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::ServerTasks(vec![]);
+        let purge = app.list.kind.actions().into_iter().find(|a| a.key() == 'P').expect("P on Server tasks");
+        assert!(purge.mutates(&app.list.kind, false) && !purge.needs_item());
+        run(&mut app, purge, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(
+            (keys(&form), form.get("states")),
+            (vec!["finished_before".to_string(), "states".into()], "completed"),
+            "Pulp's default"
+        );
+        form.fields[0].value = "2026-10-01".into();
+        form.fields[1].value = "completed, running".into();
+        assert_eq!(submit(&mut app, &form), Err("running is not a final state (completed, failed, canceled, skipped)".into()));
+        form.fields[1].value = "completed, failed".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed.as_deref(), Some("lab"), "the operator types the profile name");
+        assert_eq!(lines[0], "Purge on lab: 7 task(s) in state completed, failed that finished before 2026-10-01.");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("purge tasks on lab: deleted 7 task(s)"));
+
+        // A server without the endpoint: refused before the form.
+        let mut caps = plugins();
+        caps.paths.insert("tasks/".into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, purge, Value::Null);
+        assert!(app.modal.is_none());
+        assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("not supported by this server: task purge (tasks/purge/)"));
+    }
+
+    #[tokio::test]
+    async fn delete_of_a_server_task_refuses_an_unfinished_one() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let task = format!("{API}tasks/5/");
+        wiremock::Mock::given(method("DELETE"))
+            .and(path(task.as_str()))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        get(&server, &format!("{API}tasks/"), page(json!([]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::ServerTasks(vec![]);
+        assert!(app.list.kind.actions().contains(&Act::Delete));
+        for state in ["waiting", "running", "canceling"] {
+            run(&mut app, Act::Delete, json!({ "pulp_href": task, "name": "sync", "state": state }));
+            assert!(app.modal.is_none(), "{state}");
+            let e = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+            assert_eq!(e, format!("task sync is {state}: only a finished task can be deleted (cancel it first)"));
+        }
+        run(&mut app, Act::Delete, json!({ "pulp_href": task, "name": "sync", "state": "failed" }));
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(lines[0], format!("Delete the record of task sync ({task}, failed) on Pulp."));
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("delete task sync: done"));
+
+        // A server without DELETE on a task.
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "{task_href}": { "get": {}, "patch": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, Act::Delete, json!({ "pulp_href": task, "name": "sync", "state": "failed" }));
+        assert!(app.modal.is_none());
+        assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("not supported by this server: task delete (DELETE on a task)"));
+    }
+
+    #[tokio::test]
+    async fn workers_screen_lists_the_workers_read_only_and_needs_the_endpoint() {
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let w = json!({ "pulp_href": format!("{API}workers/1/"), "name": "411@pulp1", "last_heartbeat": "2026-11-01T19:34:54.468059Z",
+            "current_task": format!("{API}tasks/0190abcd-1234-5678/") });
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}workers/")))
+            .and(query_param("ordering", "name"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([w]))))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        assert_eq!(Kind::TaskGroups.toggle(), Some(Kind::Workers), "t on Task groups");
+        app.open(Screen::List(Kind::Workers));
+        settle(&mut app, &mut rx).await;
+        let cols: Vec<(&str, String)> = Kind::Workers.columns().iter().map(|c| (c.title, (c.get)(&app.list.items[0]))).collect();
+        assert_eq!(
+            cols,
+            [("name", "411@pulp1".into()), ("last heartbeat", "2026-11-01 19:34:54".into()), ("current task", "0190abcd-1234".into())]
+        );
+        assert_eq!(Kind::Workers.actions(), [Act::Inspect], "read-only");
+        assert!(Kind::Workers.searchable());
+
+        let mut caps = plugins();
+        caps.paths.insert("tasks/".into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        app.reload();
+        assert_eq!(app.list.error.as_deref(), Some("not supported by this server: workers API (workers/)"));
+    }
+
+    #[tokio::test]
+    async fn task_groups_screen_lists_counts_and_cancels_a_group() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{body_json, method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let group = format!("{API}task-groups/1/");
+        let g = json!({ "pulp_href": group, "description": "Replication of up", "waiting": 1, "running": 2, "completed": 3,
+            "failed": 0, "canceled": 0, "skipped": 0 });
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}task-groups/")))
+            .and(query_param("exclude_fields", "tasks"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([g]))))
+            .mount(&server)
+            .await;
+        let mut full = g.clone();
+        full["tasks"] = json!([{ "state": "waiting" }, { "state": "running" }, { "state": "running" }, { "state": "completed" }]);
+        get(&server, &group, full).await;
+        wiremock::Mock::given(method("PATCH"))
+            .and(path(group.as_str()))
+            .and(body_json(json!({ "state": "canceled" })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(g.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        let order: Vec<Kind> = std::iter::successors(Some(Kind::Tasks), |k| k.toggle().filter(|n| *n != Kind::Tasks)).collect();
+        assert_eq!(order, [Kind::Tasks, Kind::ServerTasks(vec![]), Kind::TaskGroups, Kind::Workers], "t goes round");
+        app.open(Screen::List(Kind::TaskGroups));
+        settle(&mut app, &mut rx).await;
+        let row = app.list.items[0].clone();
+        let cols: Vec<String> = Kind::TaskGroups.columns().iter().map(|c| format!("{}={}", c.title, (c.get)(&row))).collect();
+        assert_eq!(cols, ["description=Replication of up", "waiting=1", "running=2", "completed=3", "failed=0", "canceled=0", "skipped=0"]);
+        assert_eq!(Kind::TaskGroups.actions(), [Act::CancelTask, Act::Inspect]);
+        assert!(!Kind::TaskGroups.searchable(), "task-groups/ has no filters");
+
+        run(&mut app, Act::CancelTask, row);
+        settle(&mut app, &mut rx).await; // the group is read before its confirmation
+        let Some(Modal::Confirm { title, lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirmation") };
+        assert_eq!(title, "Cancel task group");
+        assert_eq!(lines[0], "Ask Pulp to cancel the whole task group Replication of up: 3 of 4 task(s) are not finished.");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+
+        let mut caps = plugins();
+        caps.paths.insert("tasks/".into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        app.reload();
+        assert_eq!(app.list.error.as_deref(), Some("not supported by this server: task groups API (task-groups/)"));
+    }
+
+    /// Answer the open path input with `path`.
+    fn type_path(app: &mut App, path: &str) {
+        let Some(crate::tui::app::Modal::Input { on_done: Some(done), .. }) = app.modal.take() else { panic!("no path input") };
+        done(app, path.into());
+    }
+
+    #[tokio::test]
+    async fn servers_export_and_import_repository_definitions_as_the_cli_does() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        get(&server, &format!("{API}status/"), json!({ "versions": [{ "component": "rpm", "version": "3.29.0" }] })).await;
+        let schemas = json!({ "rpm.RpmRemote": { "properties": { "name": {}, "url": {}, "headers": {}, "sles_auth_token": {} } },
+            "rpm.RpmRepository": { "properties": { "name": {}, "description": {}, "remote": {} } } });
+        get(&server, &format!("{API}docs/api.json"), json!({ "paths": {}, "components": { "schemas": schemas } })).await;
+        let remote = json!({ "pulp_href": format!("{API}remotes/rpm/rpm/1/"), "name": "os", "url": "https://mirror.example/os/",
+            "headers": [{ "Authorization": "Bearer secret-1" }], "sles_auth_token": "secret-2" });
+        get(&server, &format!("{API}remotes/rpm/rpm/"), page(json!([remote]))).await;
+        let repo = json!({ "pulp_href": format!("{API}repositories/rpm/rpm/1/"), "name": "app", "description": "d", "remote": format!("{API}remotes/rpm/rpm/1/") });
+        get(&server, &format!("{API}repositories/rpm/rpm/"), page(json!([repo]))).await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(format!("{API}remotes/rpm/rpm/")))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{API}remotes/rpm/rpm/2/") })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        let caps = Capabilities::detect(&app.conn.as_ref().unwrap().client).await.unwrap();
+        app.conn.as_mut().unwrap().caps = Arc::new(caps.clone());
+        app.list.kind = Kind::Profiles;
+        let act = |key| Kind::Profiles.actions().into_iter().find(|a| a.key() == key).unwrap();
+        let (export, import) = (act('X'), act('J'));
+        assert!(!export.mutates(&Kind::Profiles, false) && import.mutates(&Kind::Profiles, false), "import creates objects on Pulp");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("repos.json").display().to_string();
+        run(&mut app, export, json!({ "name": "lab" }));
+        type_path(&mut app, &file);
+        settle(&mut app, &mut rx).await;
+        let written = std::fs::read_to_string(&file).unwrap();
+        let (cli, _) = crate::repo_export::export(&app.conn.as_ref().unwrap().client, &caps).await.unwrap();
+        assert_eq!(written, serde_json::to_string_pretty(&cli).unwrap(), "the file of export-repos");
+        assert!(!written.contains("secret-"), "no secret: {written}");
+        let Some(Modal::Text { lines, .. }) = app.modal.take() else {
+            panic!("no notes: {:?}", app.notices.iter().map(|n| &n.text).collect::<Vec<_>>())
+        };
+        assert!(lines.contains(&"note: RPM remote os: headers left out (it can hold a secret)".to_string()), "{lines:?}");
+
+        // The same file plus a new remote: the plan comes first, the import after the confirmation.
+        let mut ex = cli.clone();
+        ex.remotes.push(crate::repo_export::Entry { name: "new-os".into(), ..ex.remotes[0].clone() });
+        std::fs::write(&file, serde_json::to_vec(&ex).unwrap()).unwrap();
+        run(&mut app, import, Value::Null);
+        type_path(&mut app, &file);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, on_yes: Some(yes), .. }) = app.modal.take() else {
+            panic!("no plan: {:?}", app.notices.iter().map(|n| &n.text).collect::<Vec<_>>())
+        };
+        assert_eq!(title, "Import repository definitions into lab");
+        assert_eq!(lines[0], format!("Import {file} into lab: create 1, keep 2 existing (remotes and repositories)."));
+        assert!(lines.contains(&"RPM remote new-os: create".to_string()), "{lines:?}");
+        let posts = |reqs: Vec<wiremock::Request>| reqs.iter().filter(|r| r.method.as_str() == "POST").count();
+        assert_eq!(posts(server.received_requests().await.unwrap()), 0, "the plan sends nothing");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let texts: Vec<&String> = app.notices.iter().map(|n| &n.text).collect();
+        assert!(texts.contains(&&"profile lab: created 1, kept 2 existing (remotes and repositories)".to_string()), "{texts:?}");
     }
 
     #[tokio::test]

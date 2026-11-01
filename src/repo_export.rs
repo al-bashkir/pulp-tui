@@ -187,18 +187,33 @@ pub async fn export(c: &PulpClient, caps: &Capabilities) -> Result<(ServerExport
 /// Create the remotes, then the repositories, of the file that the server does not have. Returns the
 /// objects created, the objects kept (same name on the server) and notes.
 pub async fn import(c: &PulpClient, caps: &Capabilities, ex: &ServerExport) -> Result<(usize, usize, Vec<String>)> {
+    run(c, caps, ex, true).await
+}
+
+/// What `import` would do, without a change: the same counts and notes, and `<object>: create` for each object it creates.
+pub async fn plan(c: &PulpClient, caps: &Capabilities, ex: &ServerExport) -> Result<(usize, usize, Vec<String>)> {
+    run(c, caps, ex, false).await
+}
+
+async fn run(c: &PulpClient, caps: &Capabilities, ex: &ServerExport, apply: bool) -> Result<(usize, usize, Vec<String>)> {
     check(caps, ex)?;
     let (mut created, mut kept, mut notes) = (0, 0, vec![]);
     for t in ex.remotes.iter().chain(&ex.repositories).map(|e| e.repo_type).collect::<BTreeSet<_>>() {
-        let (cr, kp, n) = import_type(c, caps, t, ex).await?;
+        let (cr, kp, n) = import_type(c, caps, t, ex, apply).await?;
         (created, kept) = (created + cr, kept + kp);
         notes.extend(n);
     }
     Ok((created, kept, notes))
 }
 
-/// `import` for the entries of one plugin type.
-async fn import_type(c: &PulpClient, caps: &Capabilities, t: RepoType, ex: &ServerExport) -> Result<(usize, usize, Vec<String>)> {
+/// `import` (or with `apply` false, `plan`) for the entries of one plugin type.
+async fn import_type(
+    c: &PulpClient,
+    caps: &Capabilities,
+    t: RepoType,
+    ex: &ServerExport,
+    apply: bool,
+) -> Result<(usize, usize, Vec<String>)> {
     let (mut created, mut kept, mut notes) = (0, 0, vec![]);
     // Remote href -> name: the server's remotes and the ones this import creates.
     let mut remotes = BTreeMap::new();
@@ -220,7 +235,12 @@ async fn import_type(c: &PulpClient, caps: &Capabilities, t: RepoType, ex: &Serv
                 continue;
             }
             let (body, left_out) = create_body(e, &writable, &remotes);
-            let href = ops::create(c, &c.api(collection), &body, collection, &no_progress).await?;
+            let href = if apply {
+                ops::create(c, &c.api(collection), &body, collection, &no_progress).await?
+            } else {
+                notes.push(format!("{label}: create"));
+                format!("new:{}", e.name) // a repository of the file finds this remote by name
+            };
             if what == "remote" {
                 remotes.insert(href, e.name.clone());
             }
@@ -374,6 +394,41 @@ mod tests {
                 json!({ "name": "app", "description": "d", "remote": remote_href(5), "pulp_labels": {} }),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn plan_says_what_import_does_without_a_change() {
+        let server = MockServer::start().await;
+        serve(&server, "remotes/rpm/rpm/", json!([])).await;
+        serve(&server, "repositories/rpm/rpm/", json!([
+            { "pulp_href": format!("{API}repositories/rpm/rpm/7/"), "name": "kept", "description": "server", "remote": null, "pulp_labels": {} },
+        ]))
+        .await;
+        let mut os = rpm("os", json!({ "url": "https://mirror.example/os/", "pulp_labels": {} }));
+        os.secrets = vec!["password".into()];
+        let ex = ServerExport {
+            format: 1,
+            remotes: vec![os],
+            repositories: vec![
+                rpm("app", json!({ "description": "d", "remote": "os", "pulp_labels": {} })),
+                rpm("kept", json!({ "description": "file", "remote": null, "pulp_labels": {} })),
+            ],
+        };
+        let (create, keep, notes) = plan(&client(&server), &caps(), &ex).await.unwrap();
+        assert_eq!((create, keep), (2, 1));
+        assert_eq!(
+            notes,
+            [
+                "RPM remote os: create",
+                "RPM remote os: set password again by hand (not in the export)",
+                "RPM repository app: create",
+                "RPM repository kept exists; kept (differs: description)",
+            ],
+            "the repository finds the remote that the import creates first"
+        );
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing is sent");
+        let refused = ServerExport { format: 2, ..ex };
+        assert_eq!(plan(&client(&server), &caps(), &refused).await.unwrap_err().to_string(), "unsupported export format 2");
     }
 
     #[test]

@@ -47,6 +47,10 @@ pub enum Feature {
     PulpExport,
     FilesystemExport,
     PulpImport,
+    TaskDelete,
+    TaskPurge,
+    Workers,
+    TaskGroups,
 }
 
 impl Feature {
@@ -66,6 +70,10 @@ impl Feature {
             Feature::PulpExport => "Pulp export (exporters/core/pulp/)",
             Feature::FilesystemExport => "filesystem export (exporters/core/filesystem/)",
             Feature::PulpImport => "Pulp import (importers/core/pulp/, import-check/)",
+            Feature::TaskDelete => "task delete (DELETE on a task)",
+            Feature::TaskPurge => "task purge (tasks/purge/)",
+            Feature::Workers => "workers API (workers/)",
+            Feature::TaskGroups => "task groups API (task-groups/)",
         }
     }
 }
@@ -190,6 +198,10 @@ impl Capabilities {
             Feature::PulpExport => self.has_endpoint("exporters/core/pulp/"),
             Feature::FilesystemExport => self.has_endpoint("exporters/core/filesystem/"),
             Feature::PulpImport => self.has_endpoint("importers/core/pulp/") && self.has_endpoint("importers/core/pulp/import-check/"),
+            Feature::TaskDelete => self.has_operation("{task_href}", "delete"),
+            Feature::TaskPurge => self.has_endpoint("tasks/purge/"),
+            Feature::Workers => self.has_endpoint("workers/"),
+            Feature::TaskGroups => self.has_endpoint("task-groups/"),
         }
     }
 

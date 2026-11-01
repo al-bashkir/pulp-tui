@@ -35,7 +35,7 @@
 | `s` / `S`                             | sort by next column / reverse (current page)                                                                                                                                                                                                         |
 | `n` / `p`                             | next / previous page (100 items per page)                                                                                                                                                                                                            |
 | `Space`                               | mark item (compare, bulk remove or add content)                                                                                                                                                                                                      |
-| `t`                                   | toggle RPM/File/Deb, content type, tracked/server tasks, task polling in Logs, or Content View snapshots in Repositories                                                                                                                             |
+| `t`                                   | toggle RPM/File/Deb, content type, tracked tasks / server tasks / task groups / workers, task polling in Logs, or Content View snapshots in Repositories                                                                                             |
 | `r`                                   | refresh                                                                                                                                                                                                                                              |
 | `Esc`                                 | cancel a loading request, clear marks, or go back                                                                                                                                                                                                    |
 
@@ -112,8 +112,14 @@ server stay where they are: the dialog names the database of the profile, or say
 file), **K** store a password/token in the system keyring (when the profile has its own
 database, it first asks if the secret is for the "Pulp server" or the "database"),
 **E**/**I** export/import Content View definitions (with an external database, import
-writes to it, so a read-only profile cannot import). See "Server profiles" and "Shared
-database" below.
+writes to it, so a read-only profile cannot import), **X**/**J** export/import repository
+and remote definitions. **X** exports the server of the selected profile to a file (the
+same file as `export-repos`, no secrets; a text view lists the `note:` lines). **J**
+imports a file into the connected server: it first shows the plan (`create N, keep M
+existing`, a `create` line per new object and the notes), and creates the objects after
+you confirm (as `import-repos`; existing objects are never changed, and a file with
+nothing to create only shows the plan). See "Server profiles", "Shared database" and
+"Command line" below.
 
 The create/edit form has three database fields: **Database**, **Database secret** and
 **Database CA**. **Database** shows the database that the profile uses now: the path of the
@@ -730,7 +736,7 @@ only), **A** enable/disable, **d** delete (refused for yourself; staff accounts 
 Role assignments: **c** add (role, optional object, and an optional domain when the
 server has domains enabled), **d**
 remove; owner/admin roles ask for confirmation. Groups: **o** members, **R** roles,
-**c**/**d**. Roles: system roles are locked (read-only); custom roles can be created,
+**c** create, **e** rename (a `PATCH` of `name`; members and roles stay), **d** delete. Roles: system roles are locked (read-only); custom roles can be created,
 edited (permissions as a comma list) and deleted.
 
 ### Tasks
@@ -749,6 +755,32 @@ server tasks (**a** tracks one; **W** tracks it and opens the live view). A nati
 replication and an ACS refresh are one row for their task group: the progress counts the
 finished tasks of the group, and a restart re-attaches it like a task. A task or group that ends canceled or
 skipped gives a warning; a failed one gives an error.
+
+On the server tasks, **F** filters the list on the server: state, name contains (the same
+filter as `/`), resource href (`reserved_resources`: the tasks that locked this object, for
+example a repository) and started at or after (`started_at__gte`: `2026-11-01` or
+`2026-11-01T08:00:00Z`; Pulp checks the format and the list shows its error). An empty
+field does not filter. The title shows the filters in use, for example `Server tasks
+(state=failed)`.
+
+**d** deletes the record of a finished task on Pulp (after a confirmation; what the task
+made stays). A waiting, running or canceling task is refused: cancel it first (**X**).
+**P** purges finished tasks of the whole server (`tasks/purge/`): give *Finished before*
+(`2026-10-01`) and the states (comma list of `completed`, `failed`, `canceled`, `skipped`;
+default `completed`). pulp-tui first counts the matching tasks that you can see, then you
+type the profile name. Pulp deletes only the tasks that you may delete. When the purge
+task ends, a notice gives the number of deleted tasks. A server without the endpoint or
+the DELETE says `not supported by this server`.
+
+`t` on the server tasks opens **Task groups** (`task-groups/`, newest first; Pulp has no
+filter for them, so there is no search): description and the number of waiting, running,
+completed, failed, canceled and skipped tasks. **i** shows the group with its tasks, **X**
+cancels the whole group on the server (the confirmation names it and counts its
+unfinished tasks; a server without group cancel says `not supported by this server`).
+
+`t` on the task groups opens **Workers** (`workers/`, read-only): name, last heartbeat and
+the current task of each worker, also of a worker that stopped (an old heartbeat). `/`
+searches the name, **i** shows a worker. `t` goes back to the tracked tasks.
 
 ### Logs
 
@@ -1154,7 +1186,8 @@ it. A format 1 file still imports. A pulp-tui from before composites refuses a f
 file. The database needs schema 4 (`pulp-tui db migrate`) for composites.
 
 `export-repos` and `import-repos` use the Pulp server of the selected profile, not a
-database. Use them to copy the repository setup of one server to another:
+database (in the TUI: **X** and **J** on Servers). Use them to copy the repository setup of
+one server to another:
 
 ```
 pulp-tui --profile old export-repos -o repos.json

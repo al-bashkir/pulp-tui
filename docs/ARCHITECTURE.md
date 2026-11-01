@@ -518,7 +518,11 @@ secrets (`sles_auth_token`, `headers`, credentials in `url`/`proxy_url`), hrefs 
 services) and objects with an ownership label (`pulp_tui_*`, `UpstreamPulp`). A repository
 holds the name of its remote. The import creates the remotes, then the repositories, finds
 the remote of the same name on the target, and keeps objects whose name exists, so a rerun
-ends in the same state. It never changes an existing object.
+ends in the same state. It never changes an existing object. The Servers screen (**X**,
+**J**) calls the same `export` and `import`; before the import it runs `repo_export::plan`,
+the same walk with no request that changes anything (a remote that the import would create
+gets a placeholder href, so a repository of the file finds it by name), and shows its result
+for confirmation.
 
 ## Security model
 

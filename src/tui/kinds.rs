@@ -62,7 +62,10 @@ pub enum Kind {
     },
     Roles,
     Tasks,
-    ServerTasks,
+    /// All tasks of the server, with the query filters of the filter form (**F**); `/` searches the name.
+    ServerTasks(Vec<(&'static str, String)>),
+    TaskGroups,
+    Workers,
     /// This session's requests, actions and notices; `polls` also shows task polling.
     Logs {
         polls: bool,
@@ -170,6 +173,9 @@ pub enum Act {
     StoreSecret,
     ExportCv,
     ImportCv,
+    /// Repository and remote definitions of a server (`repo_export`, as `export-repos` / `import-repos`).
+    ExportRepos,
+    ImportRepos,
     CvAddRepo,
     CvFilters,
     CvRemoveRepo,
@@ -200,6 +206,10 @@ pub enum Act {
     Imports,
     /// Alternate content source: index what the source has (`refresh/`, a task group).
     Refresh,
+    /// Query filters of a server list (Server tasks).
+    Filter,
+    /// `tasks/purge/`: delete the records of finished tasks.
+    PurgeTasks,
     /// In no `actions()` list: offered on Connect and save; here so that `mutates` classifies them.
     MigrateDb,
     CopyDb,
@@ -218,7 +228,7 @@ impl Act {
             Versions | CvVersions => 'v',
             Content | Connect | Members | Exports | Imports => 'o',
             Upload | Unpromote => 'u',
-            Publish | CvPublish => 'P',
+            Publish | CvPublish | PurgeTasks => 'P',
             Distribute | CvDrift => 'D',
             CopyContent => 'C',
             RemoveContent | CvRemoveRepo | CvRemoveComponent => 'x',
@@ -234,7 +244,9 @@ impl Act {
             StoreSecret => 'K',
             ExportCv | Export => 'E',
             ImportCv | Import => 'I',
-            CvFilters | FallbackReplicate | Repair => 'F',
+            ExportRepos => 'X',
+            ImportRepos => 'J',
+            CvFilters | FallbackReplicate | Repair | Filter => 'F',
             CvPreview | Password => 'w',
             Promote | MigrateDb => 'M',
             CopyDb => 'Y',
@@ -281,6 +293,8 @@ impl Act {
             StoreSecret => "Store secret in system keyring",
             ExportCv => "Export Content View definitions",
             ImportCv => "Import Content View definitions",
+            ExportRepos => "Export repository definitions",
+            ImportRepos => "Import repository definitions",
             CvAddRepo => "Add repositories",
             CvFilters => "Edit repository filters",
             CvRemoveRepo => "Remove repository",
@@ -309,6 +323,8 @@ impl Act {
             Import => "Import (check first)",
             Imports => "Imports",
             Refresh => "Refresh (index the source)",
+            Filter => "Filter (state, name, resource, start time)",
+            PurgeTasks => "Purge finished tasks (whole server)",
             MigrateDb => "Migrate database",
             CopyDb => "Copy Content View data",
         }
@@ -320,7 +336,7 @@ impl Act {
         use Act::*;
         match k {
             // Migrate and copy change a database; import creates Content Views and environments in the shared one.
-            Kind::Profiles => matches!(self, MigrateDb | CopyDb) || shared && matches!(self, ImportCv),
+            Kind::Profiles => matches!(self, MigrateDb | CopyDb | ImportRepos) || shared && matches!(self, ImportCv),
             // Edit changes the label, which moves distributions on the server.
             Kind::Environments => shared || matches!(self, Edit),
             Kind::ContentViews => {
@@ -347,12 +363,25 @@ impl Act {
                     | CvDrift
                     | Exports
                     | Imports
+                    | Filter
             ),
         }
     }
 
     pub fn needs_item(self) -> bool {
-        !matches!(self, Act::Create | Act::DismissTasks | Act::ImportCv | Act::ExportCv | Act::FallbackReplicate | Act::PruneOrphans)
+        !matches!(
+            self,
+            Act::Create
+                | Act::DismissTasks
+                | Act::ImportCv
+                | Act::ExportCv
+                | Act::ExportRepos
+                | Act::ImportRepos
+                | Act::FallbackReplicate
+                | Act::PruneOrphans
+                | Act::Filter
+                | Act::PurgeTasks
+        )
     }
 }
 
@@ -391,7 +420,12 @@ impl Kind {
             Kind::GroupRoles { name, .. } => format!("Roles of group {name}"),
             Kind::Roles => "Roles".into(),
             Kind::Tasks => "Task Center (tracked tasks)  [t: all server tasks]".into(),
-            Kind::ServerTasks => "Server tasks  [t: tracked tasks]".into(),
+            Kind::ServerTasks(q) => {
+                let f: Vec<String> = q.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                format!("Server tasks{}  [t: task groups]", if f.is_empty() { String::new() } else { format!(" ({})", f.join(", ")) })
+            }
+            Kind::TaskGroups => "Task groups (newest first)  [t: workers]".into(),
+            Kind::Workers => "Workers  [t: tracked tasks]".into(),
             Kind::Logs { polls } => {
                 format!("Logs (this session, UTC)  [t: show/hide task polling]{}", if *polls { " — polling shown" } else { "" })
             }
@@ -418,6 +452,8 @@ impl Kind {
             Kind::Importers => Feature::PulpImport,
             Kind::Users | Kind::UserRoles { .. } | Kind::Groups | Kind::GroupUsers { .. } | Kind::GroupRoles { .. } => Feature::Users,
             Kind::Roles => Feature::Roles,
+            Kind::Workers => Feature::Workers,
+            Kind::TaskGroups => Feature::TaskGroups,
             _ => return None,
         };
         caps.require(f).err().map(|e| {
@@ -440,8 +476,10 @@ impl Kind {
                 let n = RepoType::from_href(version)?.content_types().len();
                 Kind::Content { version: version.clone(), ctype: (ctype + 1) % n }
             }
-            Kind::Tasks => Kind::ServerTasks,
-            Kind::ServerTasks => Kind::Tasks,
+            Kind::Tasks => Kind::ServerTasks(vec![]),
+            Kind::ServerTasks(_) => Kind::TaskGroups,
+            Kind::TaskGroups => Kind::Workers,
+            Kind::Workers => Kind::Tasks,
             Kind::PulpExporters => Kind::FsExporters,
             Kind::FsExporters => Kind::PulpExporters,
             Kind::Logs { polls } => Kind::Logs { polls: !polls },
@@ -506,11 +544,13 @@ impl Kind {
             Kind::GroupUsers { group, .. } => (format!("{group}users/"), vec![], None),
             Kind::GroupRoles { group, .. } => (format!("{group}roles/"), vec![], None),
             Kind::Roles => ("roles/".into(), vec![("ordering", "name".into())], name),
-            Kind::ServerTasks => (
-                "tasks/".into(),
-                vec![("ordering", "-pulp_created".into()), ("exclude_fields", "progress_reports".into())],
-                Some("name__contains"),
-            ),
+            Kind::Workers => ("workers/".into(), vec![("ordering", "name".into())], name),
+            // No filters and no ordering in the API; the task list of a group comes with Inspect.
+            Kind::TaskGroups => ("task-groups/".into(), vec![("exclude_fields", "tasks".into())], None),
+            Kind::ServerTasks(f) => {
+                let q = [("ordering", "-pulp_created".into()), ("exclude_fields", "progress_reports".into())];
+                ("tasks/".into(), q.into_iter().chain(f.iter().cloned()).collect(), Some("name__contains"))
+            }
             _ => return None,
         })
     }
@@ -708,10 +748,24 @@ impl Kind {
                 col("progress", 26, |v| s(v, "progress")),
                 col("started", 19, |v| ts(v, "started")),
             ],
-            Kind::ServerTasks => vec![
+            Kind::ServerTasks(_) => vec![
                 col("state", 10, |v| s(v, "state")),
                 col("name", 44, |v| s(v, "name").trim_start_matches("pulpcore.app.tasks.").to_string()),
                 col("created", 19, |v| ts(v, "pulp_created")),
+            ],
+            Kind::TaskGroups => vec![
+                col("description", 36, |v| s(v, "description")),
+                col("waiting", 7, |v| s(v, "waiting")),
+                col("running", 7, |v| s(v, "running")),
+                col("completed", 9, |v| s(v, "completed")),
+                col("failed", 6, |v| s(v, "failed")),
+                col("canceled", 8, |v| s(v, "canceled")),
+                col("skipped", 7, |v| s(v, "skipped")),
+            ],
+            Kind::Workers => vec![
+                col("name", 30, |v| s(v, "name")),
+                col("last heartbeat", 19, |v| ts(v, "last_heartbeat")),
+                col("current task", 14, |v| short(&s(v, "current_task"))),
             ],
             Kind::Logs { .. } => vec![
                 col("time", 8, |v| s(v, "at")),
@@ -725,7 +779,7 @@ impl Kind {
     pub fn actions(&self) -> Vec<Act> {
         use Act::*;
         match self {
-            Kind::Profiles => vec![Connect, TestProfile, Create, Edit, Delete, StoreSecret, ExportCv, ImportCv],
+            Kind::Profiles => vec![Connect, TestProfile, Create, Edit, Delete, StoreSecret, ExportCv, ImportCv, ExportRepos, ImportRepos],
             Kind::Repos(t, _) => {
                 let mut actions = vec![
                     Versions,
@@ -788,10 +842,11 @@ impl Kind {
             Kind::Imports { .. } => vec![Inspect],
             Kind::Users => vec![Roles, Create, Edit, Password, ToggleActive, Delete, Inspect],
             Kind::UserRoles { .. } | Kind::GroupRoles { .. } | Kind::GroupUsers { .. } => vec![Create, Delete],
-            Kind::Groups => vec![Members, Roles, Create, Delete, Inspect],
+            Kind::Groups => vec![Members, Roles, Create, Edit, Delete, Inspect],
             Kind::Tasks => vec![WatchTask, Inspect, CancelTask, DismissTasks],
-            Kind::ServerTasks => vec![WatchTask, Inspect, TrackTask, CancelTask],
-            Kind::Logs { .. } => vec![Inspect],
+            Kind::ServerTasks(_) => vec![WatchTask, Inspect, TrackTask, CancelTask, Filter, Delete, PurgeTasks],
+            Kind::TaskGroups => vec![CancelTask, Inspect],
+            Kind::Workers | Kind::Logs { .. } => vec![Inspect],
         }
     }
 
@@ -1014,10 +1069,12 @@ mod tests {
             Kind::UserRoles { user: "u".into(), name: "u".into() },
             Kind::GroupUsers { group: "g".into(), name: "g".into() },
             Kind::GroupRoles { group: "g".into(), name: "g".into() },
-            Kind::ServerTasks,
+            Kind::ServerTasks(vec![]),
             Kind::Exports { exporter: "/e/".into(), name: "e".into() },
             Kind::FsExporters,
             Kind::Imports { importer: "/i/".into(), name: "i".into() },
+            Kind::TaskGroups,
+            Kind::Workers,
         ]);
         for k in kinds {
             // A Content View row is a normal or a composite view: the actions differ, so check both.
