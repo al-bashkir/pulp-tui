@@ -199,7 +199,8 @@ idle group whose counts stay the same for three polls is also treated as final.
   the component: for every composite with the flag that lists the component as `latest`
   (`Store::auto_composites`) it takes the composite's lock and publishes, and returns one
   result per composite, so a locked or failing composite does not undo the component's
-  publish. It never promotes beyond Library. The compare and preview of composites list
+  publish. It never promotes beyond Library, and publishes nothing while Library is
+  protected (nobody types the confirmation). The compare and preview of composites list
   the component versions first (`cv::component_lines`).
 * **Database ID label**: derived repositories and CV distributions also carry
   `pulp_tui_db=<database id>` (`Store::db_id`). An object that carries the id of another

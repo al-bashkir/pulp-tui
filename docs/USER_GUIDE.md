@@ -257,7 +257,7 @@ Views" below.
 | x         | remove a repository from the definition (published versions are unchanged). On a composite: remove a component.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | f         | sync repositories: a multi-select picker of the view's repositories (all marked) and one sync policy (RPM values when the view has an RPM repository, else the File and Deb values additive and mirror; File and Deb repositories treat any mirror policy as mirror). Each repository syncs from its own default remote; one without is skipped. Mirror policies show a warning first. The tasks show in Tasks; the result lists each repository: new version, no change, failed or skipped. Sync does not publish. Not offered on a composite. |
 | w         | preview: exact content the draft selects compared with the latest published version                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| P         | publish a new version: notes (and the Deb signing, when the view has a Deb repository) → preview → confirm; the version becomes active in Library (when that step fails, the version stays published and the warning says `Library step failed: …; promote v4 to Library`)                                                                                                                                                                                                                                                                      |
+| P         | publish a new version: notes (and the Deb signing, when the view has a Deb repository) → preview → confirm (type `Library` when Library is protected); the version becomes active in Library (when that step fails, the version stays published and the warning says `Library step failed: …; promote v4 to Library`)                                                                                                                                                                                                                           |
 | v         | versions of the view                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | M         | promote a version to an environment (preview of every distribution; protected environments require typing their name)                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | b         | roll back an environment to an earlier version                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -401,7 +401,9 @@ extras.
   2 published and active in Library; auto publish: rocky9 v2 published`. If a composite
   fails (for example, it is locked), the component stays published and the notice is a
   warning that names the composite and the reason. Auto publish never promotes: the new
-  composite version is active in Library only; promote it yourself.
+  composite version is active in Library only; promote it yourself. While Library is
+  protected, auto publish publishes nothing, because nobody types the confirmation:
+  `rocky9: not published: Library is protected (publish it yourself)`.
 * **Delete.** The delete actions never remove an object that a component owns.
   * A component version that a composite version uses (or a composite pins) cannot be
     deleted: `version 1 is used by rocky9 v1, rocky9 (pinned)`.
@@ -424,7 +426,7 @@ publish that failed or was interrupted (continues from checkpoints and re-attach
 submitted task; with a shared database it can also continue a publish that another
 operator started; the version becomes active in Library only when no newer version is
 published, else the warning says `Library not changed: v5 is newer (use Rollback to serve
-v4)`), **W** watch the pending copy task of a publishing version (see Tasks;
+v4)`; when Library is protected, you type `Library` first), **W** watch the pending copy task of a publishing version (see Tasks;
 only the copy step, and the publication of a Deb repository, store their task, so during
 other steps W says that no task is pending),
 **d** delete (refused while bound, and while a composite uses it),
@@ -438,7 +440,8 @@ each repository.
 ### Lifecycle Environments
 
 Library exists automatically. **c** creates an environment after an existing one
-(paths can branch). **L** toggles protection. **d** deletes an unused environment. With a
+(paths can branch). **L** toggles protection: to change what a protected environment
+serves, you type its name (promote, roll back; for Library also publish and *Resume*). **d** deletes an unused environment. With a
 shared database, environments belong to the server and every operator sees them.
 
 Each environment has a **label**, the part of the served path that names it (column

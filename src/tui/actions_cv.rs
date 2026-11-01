@@ -160,6 +160,16 @@ fn pin_form(app: &mut App, composite: i64, name: String, parts: Parts) {
     });
 }
 
+/// Run `go` after the typed confirmation of a protected Library (as a promotion to a protected environment
+/// asks), else after the plain confirmation `title` (none: at once).
+fn guard_library(app: &mut App, protected: bool, lines: Vec<String>, title: Option<String>, go: impl FnOnce(&mut App) + 'static) {
+    match (protected, title) {
+        (true, _) => app.confirm_danger(format!("{LIBRARY} is protected"), lines, LIBRARY, go),
+        (false, Some(title)) => app.confirm(title, lines, go),
+        (false, None) => go(app),
+    }
+}
+
 /// The notice of a publish with `note` (why Library does not serve the version) and the results of the auto
 /// publish that followed: a warning when there is a note or one failed.
 fn auto_notice(msg: String, note: Option<String>, auto: Vec<Result<String, String>>) -> (Level, String) {
@@ -505,8 +515,9 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                     let mut lines = svc.preview(id, latest).await?;
                     lines.insert(0, "Publishing creates a new immutable version and makes it active in Library.".into());
                     lines.insert(1, String::new());
+                    let protected = svc.library_protected().await?;
                     ap(move |app| {
-                        app.confirm(format!("Publish {name}"), lines, move |app| {
+                        guard_library(app, protected, lines, Some(format!("Publish {name}")), move |app| {
                             app.job(format!("publish {name}"), move |ctx| async move {
                                 let (v, note) = ctx
                                     .cv()?
@@ -829,6 +840,23 @@ fn unpromote_preview(app: &mut App, cv: i64, name: String, env: String) {
     });
 }
 
+/// Resume the publish of version `vid` (number `number`) of view `cv`, then auto publish its composites.
+fn resume(app: &mut App, cv: i64, name: String, vid: i64, number: String) {
+    app.job(format!("resume {name} v{number}"), move |ctx| async move {
+        let svc = ctx.cv()?.locked(cv, &format!("resume v{number}")).await?;
+        // A stale list can show a published version as failed: resume returns at once, nothing new to auto publish.
+        let was_published = svc.store.version(vid).await?.state == "published";
+        let (v, note) = svc.resume(vid, &ctx.log(), &ctx.on_task()).await?;
+        drop(svc); // release the lock of this view; composites take their own
+        let auto = if was_published { vec![] } else { ctx.cv()?.auto_publish(cv, &ctx.log(), &ctx.on_task()).await };
+        ap(move |app| {
+            let (level, text) = auto_notice(format!("{name} v{} published", v.number), note, auto);
+            app.notify(level, text);
+            app.reload();
+        })
+    });
+}
+
 fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, item: Value) {
     let vid = item["id"].as_i64().unwrap_or_default();
     let number = s(&item, "number");
@@ -871,18 +899,10 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                 app.notify(Level::Info, "version is already published");
                 return;
             }
-            app.job(format!("resume {name} v{number}"), move |ctx| async move {
-                let svc = ctx.cv()?.locked(cv, &format!("resume v{number}")).await?;
-                // A stale list can show a published version as failed: resume returns at once, nothing new to auto publish.
-                let was_published = svc.store.version(vid).await?.state == "published";
-                let (v, note) = svc.resume(vid, &ctx.log(), &ctx.on_task()).await?;
-                drop(svc); // release the lock of this view; composites take their own
-                let auto = if was_published { vec![] } else { ctx.cv()?.auto_publish(cv, &ctx.log(), &ctx.on_task()).await };
-                ap(move |app| {
-                    let (level, text) = auto_notice(format!("{name} v{} published", v.number), note, auto);
-                    app.notify(level, text);
-                    app.reload();
-                })
+            let lines = vec![format!("Resume {name} v{number}: it becomes active in Library unless a newer version is published.")];
+            app.load_job(format!("read {LIBRARY}"), move |ctx| async move {
+                let protected = ctx.cv()?.library_protected().await?;
+                ap(move |app| guard_library(app, protected, lines, None, move |app| resume(app, cv, name, vid, number)))
             });
         }
         Act::Delete => {
@@ -1599,6 +1619,53 @@ mod tests {
         assert!(text.ends_with("; promote v1 to Library; auto publish: rocky9 v1 published"), "{text}");
         assert_eq!(st.version(v1.id).await.unwrap().state, "published");
         assert_eq!(st.versions(c).await.unwrap().len(), 1, "the composite auto published");
+    }
+
+    #[tokio::test]
+    async fn publish_and_resume_ask_to_type_library_when_it_is_protected() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        // A composite of a version without repositories: preview and publish send nothing to Pulp.
+        let os = st.create_cv("lab", "os", "").await.unwrap();
+        publish_empty(&st, os).await;
+        let c = st.create_composite("lab", "rocky9", "").await.unwrap();
+        st.set_component(c, os, None).await.unwrap();
+        app.push(Kind::ContentViews);
+        let publish = |app: &mut App| {
+            cv_action(app, "lab", Act::CvPublish, json!({ "id": c, "name": "rocky9", "composite": true }));
+            let (form, mut submit) = open_form(app);
+            submit(app, &form).unwrap();
+        };
+        let confirm = |app: &mut App| match app.modal.take() {
+            Some(Modal::Confirm { title, typed, on_yes, .. }) => (title, typed, on_yes.unwrap()),
+            _ => panic!("no confirmation"),
+        };
+        publish(&mut app);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(confirm(&mut app).1, None, "an open Library takes a plain confirmation");
+
+        let lib = st.ensure_library("lab").await.unwrap();
+        st.set_env_protected(lib, true).await.unwrap();
+        publish(&mut app);
+        drain(&mut app, &mut rx).await;
+        let (title, typed, on_yes) = confirm(&mut app);
+        assert_eq!((title.as_str(), typed.as_deref()), ("Library is protected", Some(LIBRARY)));
+        assert!(st.versions(c).await.unwrap().is_empty(), "nothing before the confirmation");
+        on_yes(&mut app);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Ok, "rocky9 version 1 published and active in Library"));
+
+        let v2 = st.begin_version(os, "", &[]).await.unwrap();
+        st.finish_version(v2.id, "failed", None).await.unwrap();
+        version_action(&mut app, "lab", os, "os".into(), Act::Resume, json!({ "id": v2.id, "number": 2, "state": "failed" }));
+        drain(&mut app, &mut rx).await;
+        let (title, typed, on_yes) = confirm(&mut app);
+        assert_eq!((title.as_str(), typed.as_deref()), ("Library is protected", Some(LIBRARY)));
+        assert_eq!(st.version(v2.id).await.unwrap().state, "failed", "nothing before the confirmation");
+        on_yes(&mut app);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(st.version(v2.id).await.unwrap().state, "published");
     }
 
     #[tokio::test]

@@ -512,24 +512,39 @@ impl CvService {
             let name = self.store.content_view(component_id).await?.name;
             let latest = self.store.versions(component_id).await?.into_iter().find(|v| v.state == "published");
             let notes = format!("auto publish after {name} v{}", latest.map_or(0, |v| v.number));
-            anyhow::Ok((notes, self.store.auto_composites(component_id).await?))
+            anyhow::Ok((notes, self.store.auto_composites(component_id).await?, self.library_protected().await?))
         };
-        let (notes, composites) = match found.await {
+        let (notes, composites, protected) = match found.await {
             Ok(x) => x,
             Err(e) => return vec![Err(format!("auto publish: {e:#}"))],
         };
         let mut out = vec![];
         for c in composites {
-            let res = async {
-                CvService { lock: None, ..self.clone() }.locked(c.id, "auto publish").await?.publish(c.id, &notes, "", log, on).await
-            };
-            out.push(match res.await {
-                Ok((v, None)) => Ok(format!("{} v{} published", c.name, v.number)),
-                Ok((v, Some(note))) => Err(format!("{} v{} published; {note}", c.name, v.number)),
-                Err(e) => Err(format!("{}: {e:#}", c.name)),
-            });
+            out.push(self.auto_publish_one(&c, &notes, protected, log, on).await);
         }
         out
+    }
+
+    /// The `auto_publish` of composite `c`: an error when it is not published, or published but not served.
+    async fn auto_publish_one(
+        &self,
+        c: &ContentView,
+        notes: &str,
+        protected: bool,
+        log: Log<'_>,
+        on: OnTask<'_>,
+    ) -> std::result::Result<String, String> {
+        let res = async {
+            if protected {
+                bail!("not published: Library is protected (publish it yourself)"); // nobody types its confirmation
+            }
+            CvService { lock: None, ..self.clone() }.locked(c.id, "auto publish").await?.publish(c.id, notes, "", log, on).await
+        };
+        match res.await {
+            Ok((v, None)) => Ok(format!("{} v{} published", c.name, v.number)),
+            Ok((v, Some(note))) => Err(format!("{} v{} published; {note}", c.name, v.number)),
+            Err(e) => Err(format!("{}: {e:#}", c.name)),
+        }
     }
 
     /// Run (or continue) the publish workflow of a version from its checkpoints. With the version, why
@@ -581,6 +596,11 @@ impl CvService {
                 Err(e)
             }
         }
+    }
+
+    /// Whether Library is protected: re-pointing it then needs a typed confirmation.
+    pub async fn library_protected(&self) -> Result<bool> {
+        Ok(self.store.environments(&self.scope).await?.iter().any(|e| e.name == LIBRARY && e.protected))
     }
 
     /// Make the just-published `v` active in Library, unless a newer version is published: resuming an
@@ -2572,6 +2592,32 @@ mod tests {
             assert!(s.versions(c).await.unwrap().is_empty());
         }
         assert_eq!(s.version(v.id).await.unwrap().state, "published", "the component's publish stays");
+
+        // Nobody types the confirmation of a protected Library during an auto publish.
+        let lib = s.ensure_library("k").await.unwrap();
+        s.set_env_protected(lib, true).await.unwrap();
+        let r = svc.auto_publish(os, &|_| {}, &ops::no_progress).await;
+        assert_eq!(r[2], Err("web: not published: Library is protected (publish it yourself)".to_string()));
+        assert_eq!(s.versions(web).await.unwrap().len(), 1);
+
+        // Library still serves "old" of web, through a distribution of another database: the Library step fails.
+        s.set_env_protected(lib, false).await.unwrap();
+        let old = BindingRepo {
+            env_id: lib,
+            cv_id: web,
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/9/".into(),
+            repo_name: "old".into(),
+            repo_type: RepoType::Rpm,
+            distribution: DIST.into(),
+            base_path: "library/web/old".into(),
+            publication: Some("/pulp/api/v3/publications/rpm/rpm/3/".into()),
+        };
+        s.save_binding_repo(&old).await.unwrap();
+        serve_owner(&server, DIST, "other").await;
+        let r = svc.auto_publish(os, &|_| {}, &ops::no_progress).await;
+        let e = r[2].as_ref().unwrap_err();
+        assert!(e.starts_with("web v2 published; Library step failed: ") && e.ends_with("; promote v2 to Library"), "{e}");
+        assert_eq!(s.versions(web).await.unwrap()[0].state, "published", "the composite version stays published");
     }
 
     #[tokio::test(flavor = "multi_thread")]
