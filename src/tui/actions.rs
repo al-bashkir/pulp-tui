@@ -773,6 +773,81 @@ fn repo_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
     }
 }
 
+/// Sync options of RPM and Deb, each shown when the server's sync request has it. They start at the server defaults.
+fn sync_fields(t: RepoType, caps: Option<&Capabilities>) -> Vec<Field> {
+    let schema = match t {
+        RepoType::Rpm => "RpmRepositorySyncURL",
+        RepoType::Deb => "AptRepositorySyncURL",
+        RepoType::File => return vec![],
+    };
+    let has = |f: &str| caps.is_none_or(|c| c.has_field(schema, f));
+    let mut fields = vec![];
+    if has("optimize") {
+        let help = "off = full re-sync, also when the upstream metadata did not change";
+        fields.push(Field::new("optimize", "Optimize", FieldKind::Bool).value("true").help(help));
+    }
+    if t == RepoType::Rpm && has("skip_types") {
+        let types = caps.and_then(|c| c.enum_values("SkipTypesEnum")).map(<[String]>::to_vec);
+        for ty in types.unwrap_or_else(|| vec!["srpm".into(), "treeinfo".into()]) {
+            fields.push(Field::new(&format!("skip_{ty}"), &format!("Skip {ty}"), FieldKind::Bool));
+        }
+    }
+    fields
+}
+
+/// The sync options the operator changed: `optimize` turned off, the checked `skip_types`.
+fn sync_options(f: &Form) -> Value {
+    let mut b = json!({});
+    if f.changed("optimize") {
+        b["optimize"] = f.bool("optimize").into();
+    }
+    let skip: Vec<&str> = f.fields.iter().filter(|x| x.value == "true").filter_map(|x| x.key.strip_prefix("skip_")).collect();
+    if !skip.is_empty() {
+        b["skip_types"] = skip.into();
+    }
+    b
+}
+
+fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Value) {
+    let caps = caps(app);
+    let policies = sync_policies(caps.as_deref(), t);
+    let default = item["remote"].as_str().map(str::to_string);
+    let note = if default.is_some() { "repository has a default remote" } else { "repository has NO default remote: pick one" };
+    let label = format!("remote of {name}");
+    let open = move |app: &mut App, current: String| {
+        let mut fields = vec![
+            Field::pick("remote", "Remote", Source::Remotes(t)).help("empty = the repository's default remote").value(current),
+            Field::new("policy", "Sync policy", FieldKind::Choice(policies)),
+        ];
+        fields.extend(sync_fields(t, caps.as_deref()));
+        app.form(Form::new(format!("Sync {name}"), fields).note(note), move |app, f| {
+            let (remote, policy) = (f.opt("remote").map(str::to_string), f.get("policy").to_string());
+            let (href, name, options) = (href.clone(), name.clone(), sync_options(f));
+            let go = move |app: &mut App| {
+                submit(app, format!("sync {name} ({policy})"), move |c| async move {
+                    let r = match remote {
+                        Some(r) => Some(href_by_name(&c, t.remotes(), &r).await?),
+                        None => None,
+                    };
+                    Ok(ops::sync_with(&c, t, &href, r.as_deref(), &policy, options).await?)
+                })
+            };
+            confirm_mirror(app, f.get("policy"), go);
+            Ok(())
+        });
+    };
+    match default {
+        // The picker holds names: read the default remote's name so the field shows it.
+        Some(r) => app.job(label, move |ctx| async move {
+            let v = ctx.client.get::<Value>(&r, &[("fields", "name".into())]).await;
+            // An unreadable remote leaves the field empty, which still syncs from the default remote.
+            let current = v.map(|v| s(&v, "name")).unwrap_or_default();
+            ap(move |app| open(app, current))
+        }),
+        None => open(app, String::new()),
+    }
+}
+
 fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
@@ -832,47 +907,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 })
             });
         }
-        Act::Sync => {
-            let policies = sync_policies(caps(app).as_deref(), t);
-            let default = item["remote"].as_str().map(str::to_string);
-            let note = if default.is_some() { "repository has a default remote" } else { "repository has NO default remote: pick one" };
-            let label = format!("remote of {name}");
-            let open = move |app: &mut App, current: String| {
-                let form = Form::new(
-                    format!("Sync {name}"),
-                    vec![
-                        Field::pick("remote", "Remote", Source::Remotes(t)).help("empty = the repository's default remote").value(current),
-                        Field::new("policy", "Sync policy", FieldKind::Choice(policies)),
-                    ],
-                )
-                .note(note);
-                app.form(form, move |app, f| {
-                    let (remote, policy) = (f.opt("remote").map(str::to_string), f.get("policy").to_string());
-                    let (href, name) = (href.clone(), name.clone());
-                    let go = move |app: &mut App| {
-                        submit(app, format!("sync {name} ({policy})"), move |c| async move {
-                            let r = match remote {
-                                Some(r) => Some(href_by_name(&c, t.remotes(), &r).await?),
-                                None => None,
-                            };
-                            Ok(ops::sync(&c, t, &href, r.as_deref(), &policy).await?)
-                        })
-                    };
-                    confirm_mirror(app, f.get("policy"), go);
-                    Ok(())
-                });
-            };
-            match default {
-                // The picker holds names: read the default remote's name so the field shows it.
-                Some(r) => app.job(label, move |ctx| async move {
-                    let v = ctx.client.get::<Value>(&r, &[("fields", "name".into())]).await;
-                    // An unreadable remote leaves the field empty, which still syncs from the default remote.
-                    let current = v.map(|v| s(&v, "name")).unwrap_or_default();
-                    ap(move |app| open(app, current))
-                }),
-                None => open(app, String::new()),
-            }
-        }
+        Act::Sync => repo_sync(app, t, href, name, &item),
         Act::SyncHistory => app.job(format!("sync history {name}"), move |ctx| async move {
             let c = &ctx.client;
             let q = [
@@ -3059,6 +3094,54 @@ mod tests {
         repo_action(&mut app, RepoType::Rpm, Act::Sync, json!({ "pulp_href": "/r/", "name": "x", "remote": null }));
         let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
         assert_eq!(form.get("remote"), "");
+    }
+
+    #[tokio::test]
+    async fn sync_sends_optimize_and_skip_types_only_when_the_operator_sets_them() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
+            .mount(&server)
+            .await;
+        let remote = format!("{API}remotes/file/file/7/");
+        get(&server, &format!("{API}remotes/file/file/"), page(json!([{ "pulp_href": remote, "name": "web" }]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let none: &[(&str, &str)] = &[];
+        let (rpm, deb) = (&["remote", "policy", "optimize", "skip_srpm", "skip_treeinfo"][..], &["remote", "policy", "optimize"][..]);
+        let off = [("optimize", "false"), ("skip_srpm", "true")];
+        for (t, set, fields, want) in [
+            (RepoType::Rpm, none, rpm, json!({ "sync_policy": "additive" })),
+            (RepoType::Rpm, &off, rpm, json!({ "sync_policy": "additive", "optimize": false, "skip_types": ["srpm"] })),
+            (RepoType::Deb, &off[..1], deb, json!({ "mirror": false, "optimize": false })),
+            (RepoType::File, none, &["remote", "policy"], json!({ "mirror": false })),
+            // A remote picked by name is sent as its href.
+            (RepoType::File, &[("remote", "web")], &["remote", "policy"], json!({ "remote": remote, "mirror": false })),
+        ] {
+            let repo = format!("{API}{}r/", t.repositories());
+            repo_action(&mut app, t, Act::Sync, json!({ "pulp_href": repo, "name": "os", "remote": null }));
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            assert_eq!(keys(&form), fields, "{t:?}");
+            for (k, v) in set {
+                form.fields.iter_mut().find(|f| f.key == *k).unwrap().value = v.to_string();
+            }
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+            assert_eq!(posts_to(&server, &format!("{repo}sync/")).await.last(), Some(&want), "{t:?} {set:?}");
+        }
+
+        // A server whose sync schemas lack the fields (older plugin) shows none of them.
+        let mut caps = plugins();
+        for s in ["RpmRepositorySyncURL", "AptRepositorySyncURL"] {
+            caps.schemas.insert(s.into(), ["remote", "mirror", "sync_policy"].map(String::from).into());
+        }
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        for t in [RepoType::Rpm, RepoType::Deb] {
+            repo_action(&mut app, t, Act::Sync, json!({ "pulp_href": "/r/", "name": "os", "remote": null }));
+            let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+            assert_eq!(keys(&form), ["remote", "policy"], "{t:?}");
+        }
     }
 
     #[tokio::test]

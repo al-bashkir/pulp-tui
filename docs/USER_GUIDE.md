@@ -139,7 +139,7 @@ are visible.
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | v         | versions of the repository                                                                                                                                                                                                                                                            |
 | o         | browse content of the latest version                                                                                                                                                                                                                                                  |
-| f         | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File and Deb: additive, mirror). Mirror policies show a warning first.                                                                     |
+| f         | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File and Deb: additive, mirror). Mirror policies show a warning first. RPM and Deb: sync options (below).                                  |
 | H         | sync history (tasks that touched this repository)                                                                                                                                                                                                                                     |
 | u         | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed or cancelled (Esc) chunked uploads are deleted. Not offered for Deb repositories (upload of `.deb` files is not supported). |
 | P         | publish the latest version: always creates a new publication, with the repository settings at that moment. Deb asks for an optional signing service (empty = the repository's own keys). The field is not asked when the server's Deb publications have no `signing_service`.         |
@@ -151,6 +151,13 @@ are visible.
 Edit sends only changed fields. Remote shows the default remote by name; clear it to remove
 the default remote. Edit, sync, upload, copy and content add/remove are refused
 on Content View snapshot repositories (a change of retention would prune their snapshots).
+
+Sync options (each is shown only when the server's sync request has it, and is sent only
+when you change it): **Optimize** (RPM and Deb) is on, Pulp's default. Turn it off for a
+full re-sync: Pulp then processes the upstream metadata also when it did not change.
+**Skip srpm** and **Skip treeinfo** (RPM) send `skip_types`: the sync does not download
+source packages or the distribution tree (`.treeinfo`). Pulp refuses skip types with
+`mirror_complete`.
 
 Deb repositories use the same keys. Sync a Deb repository from a Deb remote, publish it
 (**P**) and distribute it (**D**) as for the other types. A Deb distribution is served

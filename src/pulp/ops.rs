@@ -182,7 +182,11 @@ pub async fn find_by_name<T: serde::de::DeserializeOwned>(c: &PulpClient, collec
 
 /// File and Deb have only `mirror: bool`: any `mirror*` policy (the RPM values, from a mixed Content View) means mirror.
 pub async fn sync(c: &PulpClient, t: RepoType, repo: &str, remote: Option<&str>, policy: &str) -> Result<Mutation> {
-    let mut body = json!({});
+    sync_with(c, t, repo, remote, policy, json!({})).await
+}
+
+/// `sync` with more fields of the plugin's sync request in `body` (`optimize`, `skip_types`).
+pub async fn sync_with(c: &PulpClient, t: RepoType, repo: &str, remote: Option<&str>, policy: &str, mut body: Value) -> Result<Mutation> {
     if let Some(r) = remote {
         body["remote"] = r.into();
     }

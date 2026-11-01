@@ -49,6 +49,7 @@ something the server does not have.
 | Replication deletion policy                                                                 | OpenAPI field `UpstreamPulp.policy`                                                         | field hidden                                                                                                                                    |
 | Distribution filter for replication                                                         | field `q_select`, else `pulp_label_select`                                                  | matching field shown                                                                                                                            |
 | RPM sync policies                                                                           | enum `SyncPolicyEnum`                                                                       | defaults to additive / mirror_complete / mirror_content_only                                                                                    |
+| Sync options `optimize` (RPM, Deb), `skip_types` (RPM)                                      | fields of `RpmRepositorySyncURL`, `AptRepositorySyncURL`; enum `SkipTypesEnum`              | field hidden: the sync uses the server default (skip types without the enum: `srpm`, `treeinfo`)                                                |
 | Repository form fields (checksum type, signing services, retain package versions, manifest) | OpenAPI schema fields                                                                       | field hidden                                                                                                                                    |
 | Current user                                                                                | `login/`, else (pulpcore without it, e.g. 3.63) `users/?username=` with the Basic-auth name | header shows "anonymous": no `login/` and the user cannot read `users/`, or bearer auth                                                         |
 | Users/groups/roles                                                                          | OpenAPI `users/`, `roles/`                                                                  | screen shows not supported                                                                                                                      |
@@ -115,6 +116,10 @@ server gives the final answer; the dashboard shows a warning.
   distribution list has no `publication` filter: pulp-tui lists the distributions of the
   type and matches the bindings in the client before it deletes a publication, a version
   or a repository (checked on 3.123.0 / pulp_rpm 3.39.3).
+* **Sync options.** pulp_rpm 3.39.5 refuses a `mirror_complete` sync with `skip_types`
+  (HTTP 400, `viewsets/repository.py`). `optimize` (RPM and Deb, default `true`) and
+  `skip_types` (RPM, `srpm` and `treeinfo`) are in the sync request of every tested version
+  (pulp_rpm 3.27.12 to 3.39.5, pulp_deb 3.5.4 to 3.11.1).
 * **Native replication** pins distributions with `repository_version`, not a publication.
   pulpcore 3.95.3 (`app/replica.py`) does not pin: its distributions follow the repository
   (`repository`, `publication: null`).
