@@ -48,12 +48,14 @@ something the server does not have.
 | Native replication                                                                          | pulpcore ≥ 3.23 and OpenAPI `upstream-pulps/`, `{upstream_pulp_href}replicate/`             | Replication screen points to the fallback                                                                                                                                                             |
 | Replication deletion policy                                                                 | OpenAPI field `UpstreamPulp.policy`                                                         | field hidden                                                                                                                                                                                          |
 | Distribution filter for replication                                                         | field `q_select`, else `pulp_label_select`                                                  | matching field shown                                                                                                                                                                                  |
+| Choices of the remote download policy and the replication deletion policy                   | the enum that the `$ref` of the `policy` property points to (not its generated name)        | defaults to immediate / on_demand / streamed and nodelete / labeled / all                                                                                                                             |
 | Fallback replication of a type                                                              | `status/` component of the type on the source and on the destination                        | the dry run stops with "<profile> (source): not supported by this server: pulp_file plugin" before it lists or changes anything                                                                       |
 | RPM sync policies                                                                           | enum `SyncPolicyEnum`                                                                       | defaults to additive / mirror_complete / mirror_content_only                                                                                                                                          |
-| Sync options `optimize` (RPM, Deb), `skip_types` (RPM)                                      | fields of `RpmRepositorySyncURL`, `AptRepositorySyncURL`; enum `SkipTypesEnum`              | field hidden: the sync uses the server default (skip types without the enum: `srpm`, `treeinfo`)                                                                                                      |
+| Sync options `optimize` (RPM, File, Deb), `skip_types` (RPM)                                | fields of `{Rpm,File,Apt}RepositorySyncURL`; enum `SkipTypesEnum`                           | field hidden: the sync uses the server default (skip types without the enum: `srpm`, `treeinfo`)                                                                                                      |
 | Repository form fields (checksum type, signing services, retain package versions, manifest) | OpenAPI schema fields                                                                       | field hidden                                                                                                                                                                                          |
 | Current user                                                                                | `login/`, else (pulpcore without it, e.g. 3.63) `users/?username=` with the Basic-auth name | header shows "anonymous": no `login/` and the user cannot read `users/`, or bearer auth                                                                                                               |
 | Users/groups/roles                                                                          | OpenAPI `users/`, `roles/`                                                                  | screen shows not supported                                                                                                                                                                            |
+| Domain scope of a role assignment                                                           | `status/` `domain_enabled: true`                                                            | the Assign role form has no Domain field                                                                                                                                                              |
 
 If the OpenAPI document cannot be read (for example a 403), checks are optimistic and the
 server gives the final answer; the dashboard shows a warning.
@@ -136,9 +138,11 @@ server gives the final answer; the dashboard shows a warning.
   type and matches the bindings in the client before it deletes a publication, a version
   or a repository (checked on 3.123.0 / pulp_rpm 3.39.3).
 * **Sync options.** pulp_rpm 3.39.5 refuses a `mirror_complete` sync with `skip_types`
-  (HTTP 400, `viewsets/repository.py`). `optimize` (RPM and Deb, default `true`) and
+  (HTTP 400, `viewsets/repository.py:259-264`); the sync form refuses this pair before it
+  sends anything. `optimize` (RPM and Deb, default `true`) and
   `skip_types` (RPM, `srpm` and `treeinfo`) are in the sync request of every tested version
-  (pulp_rpm 3.27.12 to 3.39.5, pulp_deb 3.5.4 to 3.11.1).
+  (pulp_rpm 3.27.12 to 3.39.5, pulp_deb 3.5.4 to 3.11.1). pulp_file has `optimize` (default
+  `true`) in `FileRepositorySyncURL` too (pulpcore 3.123.1, `pulp_file/app/viewsets.py`).
 * **Native replication** pins distributions with `repository_version`, not a publication.
   pulpcore 3.95.3 (`app/replica.py`) does not pin: its distributions follow the repository
   (`repository`, `publication: null`).
@@ -232,6 +236,14 @@ server gives the final answer; the dashboard shows a warning.
   header. pulpcore 3.123.0 refuses credentials in `url` ("The remote url contains username
   or password") and in `proxy_url` (`serializers/base.py`), but older servers can have them.
   `export-repos` leaves out all of these.
+* **Remote URL scheme.** The remote `url` of pulpcore 3.123.1 is a `CharField`: Pulp saves
+  any scheme (a slip like `host:8000/x` has the scheme `host`) and only the sync fails ("URL
+  ... not supported"). The downloaders handle `http`, `https` and `file`; a `file://` path
+  must be under `ALLOWED_IMPORT_PATHS` (`validate_url`). The remote form accepts only these
+  three schemes, and the Upstream Pulp form only `http` and `https`. `proxy_url` is a
+  `CharField` too ("Format: scheme://host:port", `serializers/base.py`): Pulp saves
+  `proxy.corp:3128` (scheme `proxy.corp`). The remote form accepts a proxy only with `http`
+  or `https`; an unchanged value on edit is not sent and not checked.
 * **Orphan cleanup.** `POST orphans/cleanup/` (pulpcore 3.123.0) takes
   `orphan_protection_time` (minutes; without it the server setting
   `ORPHAN_PROTECTION_TIME` applies, which the API does not show) and returns a task
@@ -291,11 +303,16 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
   nothing. So pulp-tui sends `null` for each per-release key that a Content View snapshot
   repository must lose (signing `none` or a service, or a key the source no longer has).
   The Deb repository edit form does the same for each release that the operator removes.
+  `package_signing_fingerprint_release_overrides` merges the same way
+  (`_update_package_signing_fingerprint_overrides`), but its values are not nullable: an
+  empty string deletes the override. The edit form sends `""` for each removed release.
 * Repository signing fields: `signing_service`, `signing_service_release_overrides` and
   `publish_upstream_release_fields` (model default `true`) are in pulp_deb 3.5.4, 3.8.1 and
-  3.11.1. `package_signing_service`, `package_signing_fingerprint` (and the per-release
-  fingerprints, which pulp-tui does not show) are only in 3.11.1 (migration
-  `0035_package_signing`). `signing_service` accepts only an APT release signing service,
+  3.11.1. `package_signing_service`, `package_signing_fingerprint` and
+  `package_signing_fingerprint_release_overrides` are only in 3.11.1 (migration
+  `0035_package_signing`). `excluded_package_metadata_fields` (a list, model default `[]`;
+  the default of a publication that does not set its own) is in 3.11.1 (migration
+  `0042_add_excluded_package_metadata_fields`); an edit clears it with `[]`. `signing_service` accepts only an APT release signing service,
   `package_signing_service` only an APT package signing service. The package signing service
   signs packages on upload and `modify/` (`tasks/signing.py`), not on sync or `deb/copy/`.
 * `AptPublication` defaults are `structured=true` and `simple=false`.

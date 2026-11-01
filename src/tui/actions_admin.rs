@@ -1,6 +1,6 @@
 //! Users, groups, roles (Pulp RBAC) and replication actions.
 
-use super::actions::{ap, caps, submit};
+use super::actions::{ap, caps, submit, url_with_scheme};
 use super::app::{App, Level};
 use super::form::{Field, FieldKind, Form, Source};
 use super::kinds::{Act, Kind, s};
@@ -145,40 +145,7 @@ fn role_assignment(app: &mut App, act: Act, item: Value, owner: String, owner_na
     let who = if group { format!("group {owner_name}") } else { format!("user {owner_name}") };
     let is_me = !group && me(app).as_deref() == Some(owner_name.as_str());
     match act {
-        Act::Create => {
-            let form = Form::new(
-                format!("Assign role to {who}"),
-                vec![
-                    Field::pick("role", "Role", Source::Roles).required(),
-                    Field::pick("content_object", "Object", Source::RoleObjects).help("empty = model-level (all objects)"),
-                    Field::pick("domain", "Domain", Source::Domains).help("optional domain scope"),
-                ],
-            );
-            app.form(form, move |app, f| {
-                let role = f.get("role").to_string();
-                let mut b = json!({ "role": role, "content_object": f.opt("content_object") });
-                if let Some(d) = f.opt("domain") {
-                    b["domain"] = d.into();
-                }
-                let url = format!("{owner}roles/");
-                let label = format!("assign {role} to {who}");
-                let go = move |app: &mut App| submit(app, label, move |c| async move { Ok(c.post(&url, &b).await?) });
-                if is_powerful(&role) {
-                    let scope = if f.opt("content_object").is_none() { "ALL objects of its type" } else { "the given object" };
-                    app.confirm(
-                        "Grant powerful role?",
-                        vec![
-                            format!("{role} grants owner/admin level permissions on {scope}."),
-                            "Check this is intended (privilege escalation).".into(),
-                        ],
-                        go,
-                    );
-                } else {
-                    go(app);
-                }
-                Ok(())
-            });
-        }
+        Act::Create => assign_role(app, owner, who),
         Act::Delete => {
             let href = s(&item, "pulp_href");
             let role = s(&item, "role");
@@ -192,6 +159,42 @@ fn role_assignment(app: &mut App, act: Act, item: Value, owner: String, owner_na
         }
         _ => {}
     }
+}
+
+/// The Assign role form for `owner` (a user or group href; `who` names it). A powerful role asks first.
+fn assign_role(app: &mut App, owner: String, who: String) {
+    let mut fields = vec![
+        Field::pick("role", "Role", Source::Roles).required(),
+        Field::pick("content_object", "Object", Source::RoleObjects).help("empty = model-level (all objects)"),
+    ];
+    if caps(app).is_some_and(|c| c.status.as_ref().is_some_and(|s| s.domain_enabled == Some(true))) {
+        fields.push(Field::pick("domain", "Domain", Source::Domains).help("optional domain scope"));
+    }
+    let form = Form::new(format!("Assign role to {who}"), fields);
+    app.form(form, move |app, f| {
+        let role = f.get("role").to_string();
+        let mut b = json!({ "role": role, "content_object": f.opt("content_object") });
+        if let Some(d) = f.opt("domain") {
+            b["domain"] = d.into();
+        }
+        let url = format!("{owner}roles/");
+        let label = format!("assign {role} to {who}");
+        let go = move |app: &mut App| submit(app, label, move |c| async move { Ok(c.post(&url, &b).await?) });
+        if is_powerful(&role) {
+            let scope = if f.opt("content_object").is_none() { "ALL objects of its type" } else { "the given object" };
+            app.confirm(
+                "Grant powerful role?",
+                vec![
+                    format!("{role} grants owner/admin level permissions on {scope}."),
+                    "Check this is intended (privilege escalation).".into(),
+                ],
+                go,
+            );
+        } else {
+            go(app);
+        }
+        Ok(())
+    });
 }
 
 fn group_action(app: &mut App, act: Act, item: Value) {
@@ -336,7 +339,7 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
             if has("policy") {
                 let mut policies = caps
                     .as_ref()
-                    .and_then(|c| c.enum_values("Policy357Enum").map(|e| e.to_vec()))
+                    .and_then(|c| c.field_enum("UpstreamPulp", "policy").map(|e| e.to_vec()))
                     .unwrap_or_else(|| vec!["nodelete".into(), "labeled".into(), "all".into()]);
                 policies.sort_by_key(|p| p != "nodelete"); // non-destructive default first
                 fields.push(Field::new("policy", "Deletion policy", FieldKind::Choice(policies)).value(if edit {
@@ -352,8 +355,8 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
             .note("nodelete: never delete local objects. labeled: may delete objects created by earlier replications.")
             .note("all: replication manages ALL local objects of the domain and may DELETE unrelated local repositories.");
             app.form(form, move |app, f| {
-                let origin =
-                    url::Url::parse(f.get("base_url")).map_err(|e| format!("invalid base URL: {e}"))?.origin().ascii_serialization();
+                // Replication talks to the upstream API over HTTP.
+                let origin = url_with_scheme(f.get("base_url"), &["http", "https"])?.origin().ascii_serialization();
                 replication::guard_self(&origin, &dst_origin).map_err(|e| e.to_string())?;
                 let mut b = json!({});
                 let mut files = vec![];
@@ -698,6 +701,115 @@ mod tests {
         assert!(n.iter().any(|(l, t)| *l == Level::Warn && t.contains("Replication of up") && t.contains("canceled 1")), "{n:?}");
         settle(&mut app, &mut rx).await;
         assert_eq!(store.tasks("lab", 10).await.unwrap()[0].state, "canceled", "stored final: not re-attached again");
+    }
+
+    #[tokio::test]
+    async fn upstream_base_url_needs_http_or_https() {
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        super::upstream_action(&mut app, crate::tui::kinds::Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        let mut set = |k: &str, v: &str| form.fields.iter_mut().find(|f| f.key == k).unwrap().value = v.into();
+        set("name", "up");
+        set("base_url", "foo:8000/x");
+        assert_eq!(submit(&mut app, &form), Err("invalid URL: use http://, https:// (not foo:)".into()));
+        assert!(app.jobs.is_empty(), "nothing sent");
+        form.fields.iter_mut().find(|f| f.key == "base_url").unwrap().value = "https://upstream.example.com".into();
+        assert_eq!(submit(&mut app, &form), Ok(()));
+        assert_eq!(app.jobs.len(), 1, "the create is sent");
+    }
+
+    #[tokio::test]
+    async fn upstream_policy_choices_come_from_the_policy_property() {
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let mut caps = crate::pulp::Capabilities::default();
+        // `Policy357Enum` today: the generated name can change between versions.
+        caps.load_openapi(&json!({ "components": { "schemas": {
+            "UpstreamPulp": { "properties": { "policy": { "allOf": [{ "$ref": "#/components/schemas/PolicyC4dEnum" }] } } },
+            "PolicyC4dEnum": { "enum": ["all", "labeled", "nodelete", "keep"] }
+        } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        super::upstream_action(&mut app, crate::tui::kinds::Act::Create, Value::Null);
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        let policy = form.fields.iter().find(|f| f.key == "policy").unwrap();
+        assert_eq!(policy.kind, super::FieldKind::Choice(["nodelete", "all", "labeled", "keep"].map(String::from).to_vec()));
+    }
+
+    #[tokio::test]
+    async fn assign_role_shows_the_domain_only_when_domains_are_enabled() {
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let form_keys = |app: &mut App| {
+            super::role_assignment(app, crate::tui::kinds::Act::Create, Value::Null, "/u/1/".into(), "bob".into(), false);
+            let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+            form.fields.iter().map(|f| f.key.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(form_keys(&mut app), ["role", "content_object"], "status without domain_enabled");
+        let conn = app.conn.as_mut().unwrap();
+        let mut caps = (*conn.caps).clone();
+        caps.status = Some(serde_json::from_value(json!({ "versions": [], "domain_enabled": true })).unwrap());
+        conn.caps = Arc::new(caps);
+        assert_eq!(form_keys(&mut app), ["role", "content_object", "domain"]);
+    }
+
+    #[tokio::test]
+    async fn assign_and_remove_role_send_what_the_operator_confirmed() {
+        use crate::tui::kinds::Act;
+        use wiremock::matchers::body_json;
+        let server = MockServer::start().await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        // Logged in as bob, domains enabled (set before each form: the jobs below may read the server again).
+        let as_bob = |app: &mut App| {
+            let conn = app.conn.as_mut().unwrap();
+            let mut caps = (*conn.caps).clone();
+            caps.status = Some(serde_json::from_value(json!({ "versions": [], "domain_enabled": true })).unwrap());
+            caps.user = Some(crate::pulp::caps::CurrentUser { href: "/u/".into(), username: "bob".into(), is_staff: None });
+            conn.caps = Arc::new(caps);
+        };
+        let (user, roles) = ("/pulp/api/v3/users/1/", "/pulp/api/v3/users/1/roles/");
+        let created = ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{roles}5/") }));
+        let viewer = json!({ "role": "file.filerepository_viewer", "content_object": null, "domain": "/d/1/" });
+        Mock::given(method("POST")).and(path(roles)).and(body_json(viewer)).respond_with(created.clone()).expect(1).mount(&server).await;
+        let admin = json!({ "role": "core.task_admin", "content_object": null });
+        Mock::given(method("POST")).and(path(roles)).and(body_json(admin)).respond_with(created).expect(1).mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{roles}5/")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let assign = |app: &mut App, role: &str, domain: &str| {
+            as_bob(app);
+            super::role_assignment(app, Act::Create, Value::Null, user.into(), "bob".into(), false);
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            for (k, v) in [("role", role), ("domain", domain)] {
+                form.fields.iter_mut().find(|f| f.key == k).unwrap().value = v.into();
+            }
+            submit(app, &form).unwrap();
+        };
+        assign(&mut app, "file.filerepository_viewer", "/d/1/");
+        assert!(app.modal.is_none(), "an ordinary role is sent at once");
+        settle(&mut app, &mut rx).await;
+        assign(&mut app, "core.task_admin", "");
+        let Some(Modal::Confirm { title, lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirmation") };
+        assert_eq!(title, "Grant powerful role?");
+        assert_eq!(lines[0], "core.task_admin grants owner/admin level permissions on ALL objects of its type.");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+
+        let item = json!({ "pulp_href": format!("{roles}5/"), "role": "core.task_admin" });
+        as_bob(&mut app);
+        super::role_assignment(&mut app, Act::Delete, item, user.into(), "bob".into(), false);
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirmation") };
+        assert_eq!(
+            lines,
+            ["Remove role core.task_admin from user bob.", "WARNING: this is YOUR account; you may lose permissions you need right now."]
+        );
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let errors: Vec<_> = notices(&app).into_iter().filter(|(l, _)| *l == Level::Error).collect();
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]

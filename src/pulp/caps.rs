@@ -23,6 +23,8 @@ pub struct Capabilities {
     /// Schema name -> property names (request and response schemas).
     pub schemas: BTreeMap<String, BTreeSet<String>>,
     pub enums: BTreeMap<String, Vec<String>>,
+    /// (schema, property) -> name of the schema that the property's `$ref` points to.
+    pub refs: BTreeMap<(String, String), String>,
     pub openapi_error: Option<String>,
 }
 
@@ -114,6 +116,12 @@ impl Capabilities {
             for (name, s) in schemas {
                 if let Some(props) = s["properties"].as_object() {
                     self.schemas.insert(name.clone(), props.keys().cloned().collect());
+                    for (prop, p) in props {
+                        // drf-spectacular puts a reference with its own description in `allOf`.
+                        if let Some(r) = p["$ref"].as_str().or(p["allOf"][0]["$ref"].as_str()) {
+                            self.refs.insert((name.clone(), prop.clone()), r.trim_start_matches("#/components/schemas/").into());
+                        }
+                    }
                 }
                 if let Some(e) = s["enum"].as_array() {
                     self.enums.insert(name.clone(), e.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
@@ -137,6 +145,11 @@ impl Capabilities {
     }
     pub fn enum_values(&self, name: &str) -> Option<&[String]> {
         self.enums.get(name).map(Vec::as_slice)
+    }
+    /// Values of the enum that property `field` of `schema` refers to. Use it when the enum name is
+    /// generated (`Policy692Enum`): such a name can change between versions, the property does not.
+    pub fn field_enum(&self, schema: &str, field: &str) -> Option<&[String]> {
+        self.refs.get(&(schema.to_string(), field.to_string())).and_then(|n| self.enum_values(n))
     }
 
     pub fn supports(&self, f: Feature) -> bool {
@@ -215,5 +228,19 @@ mod tests {
         assert!(!c.supports(Feature::DebCopy), "the plugin too");
         assert!(!c.supports(Feature::Users));
         assert_eq!(c.enum_values("SyncPolicyEnum").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn field_enum_follows_the_ref_of_the_property() {
+        let mut c = Capabilities::default();
+        c.load_openapi(&json!({ "components": { "schemas": {
+            "UpstreamPulp": { "properties": { "policy": { "$ref": "#/components/schemas/PolicyE1fEnum" }, "name": { "type": "string" } } },
+            "rpm.RpmRemote": { "properties": { "policy": { "allOf": [{ "$ref": "#/components/schemas/Policy0a2Enum" }] } } },
+            "PolicyE1fEnum": { "enum": ["all", "labeled", "nodelete"] },
+            "Policy0a2Enum": { "enum": ["immediate", "on_demand", "streamed"] }
+        } } }));
+        assert_eq!(c.field_enum("UpstreamPulp", "policy").unwrap(), ["all", "labeled", "nodelete"]);
+        assert_eq!(c.field_enum("rpm.RpmRemote", "policy").unwrap(), ["immediate", "on_demand", "streamed"]);
+        assert_eq!(c.field_enum("UpstreamPulp", "name"), None);
     }
 }

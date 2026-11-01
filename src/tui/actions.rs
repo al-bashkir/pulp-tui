@@ -704,19 +704,29 @@ fn deb_repo_fields(has: &dyn Fn(&str) -> bool, v: &Value) -> Vec<Field> {
         let f = Field::text("package_signing_fingerprint", "Package signing fingerprint");
         fields.push(f.value(s(v, "package_signing_fingerprint")).help("v4:<hex fingerprint> or keyid:<16 hex>"));
     }
+    if has("package_signing_fingerprint_release_overrides") {
+        let f = Field::text("package_signing_fingerprint_release_overrides", "Per-release package fingerprints");
+        let help = "release=fingerprint,...; a release you remove loses its override";
+        fields.push(f.value(format_labels(&v["package_signing_fingerprint_release_overrides"])).help(help));
+    }
     if has("publish_upstream_release_fields") {
         let on = if v["publish_upstream_release_fields"] == false { "false" } else { "true" };
         fields.push(Field::new("publish_upstream_release_fields", "Publish upstream Release fields", FieldKind::Bool).value(on));
     }
+    if has("excluded_package_metadata_fields") {
+        let names: Vec<&str> = v["excluded_package_metadata_fields"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let f = Field::text("excluded_package_metadata_fields", "Excluded package metadata fields");
+        fields.push(f.value(names.join(",")).help("field,...: left out of the Packages indices (publication default)"));
+    }
     fields
 }
 
-/// `release=href,...` as Pulp's per-release overrides. pulp_deb changes only the releases that a request
-/// names, so each release of `old` (the value before the edit) that `new` lacks is sent as null (deleted).
-fn release_overrides(new: &str, old: &str) -> Result<Value, String> {
+/// `release=value,...` as Pulp's per-release overrides. pulp_deb changes only the releases that a request
+/// names, so each release of `old` (the value before the edit) that `new` lacks is sent as `removed` (deleted).
+fn release_overrides(new: &str, old: &str, removed: Value) -> Result<Value, String> {
     let mut out = parse_labels(old)?;
     let m = out.as_object_mut().expect("parse_labels makes an object");
-    m.values_mut().for_each(|v| *v = Value::Null);
+    m.values_mut().for_each(|v| *v = removed.clone());
     m.extend(parse_labels(new)?.as_object().cloned().unwrap_or_default());
     Ok(out)
 }
@@ -760,7 +770,14 @@ fn repo_body(f: &Form, edit: bool) -> Result<Value, String> {
                 continue;
             }
             ("signing_service_release_overrides", _) if !v.is_empty() || edit => {
-                release_overrides(v, &fld.initial).map_err(|e| format!("{}: {e}", fld.label))?
+                release_overrides(v, &fld.initial, Value::Null).map_err(|e| format!("{}: {e}", fld.label))?
+            }
+            // pulp_deb deletes a fingerprint override sent as "": the value is not nullable.
+            ("package_signing_fingerprint_release_overrides", _) if !v.is_empty() || edit => {
+                release_overrides(v, &fld.initial, "".into()).map_err(|e| format!("{}: {e}", fld.label))?
+            }
+            ("excluded_package_metadata_fields", _) if !v.is_empty() || edit => {
+                v.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>().into()
             }
             (_, FieldKind::Bool) => Value::Bool(v == "true"),
             (_, FieldKind::Number) if v.is_empty() && edit && fld.key == "retain_repo_versions" => Value::Null,
@@ -806,12 +823,12 @@ fn repo_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
     }
 }
 
-/// Sync options of RPM and Deb, each shown when the server's sync request has it. They start at the server defaults.
+/// Sync options, each shown when the server's sync request has it. They start at the server defaults.
 fn sync_fields(t: RepoType, caps: Option<&Capabilities>) -> Vec<Field> {
     let schema = match t {
         RepoType::Rpm => "RpmRepositorySyncURL",
         RepoType::Deb => "AptRepositorySyncURL",
-        RepoType::File => return vec![],
+        RepoType::File => "FileRepositorySyncURL",
     };
     let has = |f: &str| caps.is_none_or(|c| c.has_field(schema, f));
     let mut fields = vec![];
@@ -856,6 +873,10 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
         app.form(Form::new(format!("Sync {name}"), fields).note(note), move |app, f| {
             let (remote, policy) = (f.opt("remote").map(str::to_string), f.get("policy").to_string());
             let (href, name, options) = (href.clone(), name.clone(), sync_options(f));
+            // pulp_rpm sync() answers HTTP 400 to this pair; say it before any request.
+            if policy == "mirror_complete" && options.get("skip_types").is_some() {
+                return Err("Pulp refuses skip types with mirror_complete: clear the Skip fields or choose another sync policy".into());
+            }
             let go = move |app: &mut App| {
                 submit(app, format!("sync {name} ({policy})"), move |c| async move {
                     let r = match remote {
@@ -1279,8 +1300,22 @@ fn remote_body(f: &Form, edit: bool) -> Result<(Value, Vec<(String, String)>), S
             _ => b[fld.key.as_str()] = val.into(),
         }
     }
-    url::Url::parse(f.get("url")).map_err(|e| format!("invalid URL: {e}"))?;
+    // Pulp checks a file:// path against its ALLOWED_IMPORT_PATHS.
+    url_with_scheme(f.get("url"), &["http", "https", "file"])?;
+    // Pulp stores any proxy text; a bad one fails only at sync time. An unchanged one on edit is not sent.
+    if let Some(p) = b["proxy_url"].as_str() {
+        url_with_scheme(p, &["http", "https"]).map_err(|e| format!("Proxy URL: {e}"))?;
+    }
     Ok((b, files))
+}
+
+/// `u` parsed as a URL with one of `schemes`. A slip like `host:8000/x` parses too, with the scheme `host`.
+pub(super) fn url_with_scheme(u: &str, schemes: &[&str]) -> Result<url::Url, String> {
+    let url = url::Url::parse(u).map_err(|e| format!("invalid URL: {e}"))?;
+    if !schemes.contains(&url.scheme()) {
+        return Err(format!("invalid URL: use {}:// (not {}:)", schemes.join("://, "), url.scheme()));
+    }
+    Ok(url)
 }
 
 fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
@@ -1294,7 +1329,7 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             let write_only = if edit { WRITE_ONLY } else { "" };
             let policies = caps
                 .as_ref()
-                .and_then(|c| c.enum_values("Policy692Enum").map(|e| e.to_vec()))
+                .and_then(|c| c.field_enum(t.remote_schema(), "policy").map(|e| e.to_vec()))
                 .unwrap_or_else(|| vec!["immediate".into(), "on_demand".into(), "streamed".into()]);
             let mut fields = vec![
                 Field::text("name", "Name").required().value(s(&v, "name")),
@@ -2176,7 +2211,8 @@ mod tests {
     fn deb_repository_signing_fields_follow_the_server_schema() {
         let keys = |f: &[Field]| f.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
         let all = ["signing_service", "signing_service_release_overrides", "package_signing_service", "package_signing_fingerprint"];
-        let all = [&all[..], &["publish_upstream_release_fields"]].concat();
+        let more = ["package_signing_fingerprint_release_overrides", "publish_upstream_release_fields", "excluded_package_metadata_fields"];
+        let all = [&all[..], &more[..]].concat();
         assert_eq!(keys(&repo_extra_fields(RepoType::Deb, None, &Value::Null)), all);
         // pulp_deb before package signing (3.5, 3.8) has only the Release signing fields.
         let mut caps = Capabilities::default();
@@ -2221,6 +2257,32 @@ mod tests {
     }
 
     #[test]
+    fn deb_repository_body_sends_fingerprint_overrides_and_excluded_fields() {
+        let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+        let (fp, ex) = ("package_signing_fingerprint_release_overrides", "excluded_package_metadata_fields");
+        let mut new = repo_form(RepoType::Deb, None, None, "");
+        set(&mut new, "name", "apt");
+        let b = repo_body(&new, false).unwrap();
+        assert!(b.get(fp).is_none() && b.get(ex).is_none(), "empty on create: not sent: {b}");
+        set(&mut new, fp, "bookworm=v4:AB");
+        set(&mut new, ex, "Phased-Update-Percentage, X-Note,");
+        let b = repo_body(&new, false).unwrap();
+        assert_eq!((&b[fp], &b[ex]), (&json!({ "bookworm": "v4:AB" }), &json!(["Phased-Update-Percentage", "X-Note"])));
+
+        let item = json!({ "name": "apt", fp: { "bookworm": "v4:AB", "trixie": "v4:CD" }, ex: ["X-Note"], "pulp_labels": {} });
+        let mut f = repo_form(RepoType::Deb, None, Some(&item), "");
+        assert_eq!((f.get(fp), f.get(ex)), ("bookworm=v4:AB,trixie=v4:CD", "X-Note"), "as stored");
+        assert_eq!(repo_body(&f, true).unwrap(), json!({}), "untouched: nothing is sent");
+        // pulp_deb changes only the releases a PATCH names and deletes one sent as "" (its fingerprint is not nullable).
+        set(&mut f, fp, "trixie=v4:EF");
+        set(&mut f, ex, "");
+        assert_eq!(repo_body(&f, true).unwrap(), json!({ fp: { "bookworm": "", "trixie": "v4:EF" }, ex: [] }));
+        set(&mut f, fp, "trixie");
+        let e = repo_body(&f, true).unwrap_err();
+        assert!(e.starts_with("Per-release package fingerprints: ") && e.contains("must be key=value"), "{e}");
+    }
+
+    #[test]
     fn remote_body_on_create_sends_only_the_filled_fields() {
         let f = Form::new(
             "t",
@@ -2236,6 +2298,71 @@ mod tests {
         let (b, files) = remote_body(&f, false).unwrap();
         assert_eq!(b, json!({ "name": "r", "url": "https://h/repo/", "tls_validation": false }));
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn remote_url_needs_a_scheme_pulp_can_download() {
+        let form = |url: &str| Form::new("t", vec![Field::text("name", "Name").value("r"), Field::text("url", "URL").value(url)]);
+        // A slip like `ners.internal:8000/...` is a valid URL whose scheme is `ners.internal`; the sync fails later.
+        for (slip, scheme) in [("foo:8000/x", "foo"), ("ners.internal:8000/file/PULP_MANIFEST", "ners.internal")] {
+            assert_eq!(
+                remote_body(&form(slip), false).unwrap_err(),
+                format!("invalid URL: use http://, https://, file:// (not {scheme}:)")
+            );
+        }
+        // Pulp downloads file:// from its ALLOWED_IMPORT_PATHS (the server checks the path).
+        for ok in ["https://h/repo/", "http://h:8000/x", "file:///srv/import/x"] {
+            assert_eq!(remote_body(&form(ok), false).unwrap().0["url"], ok);
+        }
+    }
+
+    #[test]
+    fn remote_proxy_url_needs_http_or_https() {
+        let form = |proxy: &str| {
+            let fields = vec![
+                Field::text("name", "Name").value("r"),
+                Field::text("url", "URL").value("https://h/"),
+                Field::text("proxy_url", "Proxy URL"),
+            ];
+            let mut f = Form::new("t", fields);
+            f.fields[2].value = proxy.into();
+            f
+        };
+        // `proxy.corp:3128` is a valid URL with the scheme `proxy.corp`: Pulp stores it and the sync fails later.
+        for (slip, scheme) in [("proxy.corp:3128", "proxy.corp"), ("socks5://p:1080", "socks5")] {
+            assert_eq!(
+                remote_body(&form(slip), false).unwrap_err(),
+                format!("Proxy URL: invalid URL: use http://, https:// (not {scheme}:)")
+            );
+        }
+        assert_eq!(remote_body(&form("not a url"), false).unwrap_err(), "Proxy URL: invalid URL: relative URL without a base");
+        assert_eq!(remote_body(&form("http://proxy.corp:3128"), false).unwrap().0["proxy_url"], "http://proxy.corp:3128");
+        // On edit an unchanged value is not sent, so it is not checked; a cleared one is null.
+        let mut f = Form::new(
+            "t",
+            vec![Field::text("url", "URL").value("https://h/"), Field::text("proxy_url", "Proxy URL").value("proxy.corp:3128")],
+        );
+        assert_eq!(remote_body(&f, true).unwrap().0, json!({}));
+        f.fields[1].value.clear();
+        assert_eq!(remote_body(&f, true).unwrap().0, json!({ "proxy_url": null }));
+    }
+
+    #[tokio::test]
+    async fn remote_policy_choices_come_from_the_policy_property() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (mut app, _rx) = connected(&server).await;
+        let mut caps = plugins();
+        // The schema generator names the enum by a hash (`Policy692Enum` today): another server version can rename it.
+        caps.load_openapi(&json!({ "components": { "schemas": {
+            "file.FileRemote": { "properties": { "policy": { "allOf": [{ "$ref": "#/components/schemas/PolicyA1bEnum" }] } } },
+            "PolicyA1bEnum": { "enum": ["immediate", "on_demand", "streamed", "later"] }
+        } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        remote_action(&mut app, RepoType::File, Act::Create, Value::Null);
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        let policy = form.fields.iter().find(|f| f.key == "policy").unwrap();
+        assert_eq!(policy.kind, FieldKind::Choice(["immediate", "on_demand", "streamed", "later"].map(String::from).to_vec()));
     }
 
     #[test]
@@ -3354,9 +3481,10 @@ mod tests {
             (RepoType::Rpm, none, rpm, json!({ "sync_policy": "additive" })),
             (RepoType::Rpm, &off, rpm, json!({ "sync_policy": "additive", "optimize": false, "skip_types": ["srpm"] })),
             (RepoType::Deb, &off[..1], deb, json!({ "mirror": false, "optimize": false })),
-            (RepoType::File, none, &["remote", "policy"], json!({ "mirror": false })),
+            (RepoType::File, none, deb, json!({ "mirror": false })),
+            (RepoType::File, &off[..1], deb, json!({ "mirror": false, "optimize": false })),
             // A remote picked by name is sent as its href.
-            (RepoType::File, &[("remote", "web")], &["remote", "policy"], json!({ "remote": remote, "mirror": false })),
+            (RepoType::File, &[("remote", "web")], deb, json!({ "remote": remote, "mirror": false })),
         ] {
             let repo = format!("{API}{}r/", t.repositories());
             repo_action(&mut app, t, Act::Sync, json!({ "pulp_href": repo, "name": "os", "remote": null }));
@@ -3369,14 +3497,26 @@ mod tests {
             settle(&mut app, &mut rx).await;
             assert_eq!(posts_to(&server, &format!("{repo}sync/")).await.last(), Some(&want), "{t:?} {set:?}");
         }
+        // Pulp answers 400 to skip types with mirror_complete: the form refuses them and sends nothing.
+        let repo = format!("{API}repositories/rpm/rpm/m/");
+        repo_action(&mut app, RepoType::Rpm, Act::Sync, json!({ "pulp_href": repo, "name": "os", "remote": null }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        for (k, v) in [("policy", "mirror_complete"), ("skip_srpm", "true")] {
+            form.fields.iter_mut().find(|f| f.key == k).unwrap().value = v.into();
+        }
+        let e = "Pulp refuses skip types with mirror_complete: clear the Skip fields or choose another sync policy";
+        assert_eq!(submit(&mut app, &form), Err(e.into()));
+        assert!(app.modal.is_none(), "no mirror confirm");
+        settle(&mut app, &mut rx).await;
+        assert!(posts_to(&server, &format!("{repo}sync/")).await.is_empty());
 
         // A server whose sync schemas lack the fields (older plugin) shows none of them.
         let mut caps = plugins();
-        for s in ["RpmRepositorySyncURL", "AptRepositorySyncURL"] {
+        for s in ["RpmRepositorySyncURL", "AptRepositorySyncURL", "FileRepositorySyncURL"] {
             caps.schemas.insert(s.into(), ["remote", "mirror", "sync_policy"].map(String::from).into());
         }
         app.conn.as_mut().unwrap().caps = Arc::new(caps);
-        for t in [RepoType::Rpm, RepoType::Deb] {
+        for t in [RepoType::Rpm, RepoType::Deb, RepoType::File] {
             repo_action(&mut app, t, Act::Sync, json!({ "pulp_href": "/r/", "name": "os", "remote": null }));
             let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
             assert_eq!(keys(&form), ["remote", "policy"], "{t:?}");

@@ -34,9 +34,7 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
         Source::SigningServices => vec![("signing-services/", NAME_HREF, "name", "pulp_href", "")],
         Source::Roles => vec![("roles/", "name", "name", "name", "")],
         Source::Users => vec![("users/", "username", "username", "username", "")],
-        Source::Domains if !ctx.caps.status.as_ref().is_some_and(|s| s.domain_enabled == Some(true)) => {
-            bail!("domains are not enabled on this server")
-        }
+        // The role form shows a Domain field only when the server has domains enabled.
         Source::Domains => vec![("domains/", NAME_HREF, "name", "pulp_href", "")],
         Source::RoleObjects => return role_objects(ctx, role).await,
         Source::ContentViews => return content_views(ctx).await,
@@ -198,12 +196,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn domains_need_domains_enabled_and_role_objects_need_a_role() {
+    async fn domains_list_hrefs_and_role_objects_need_a_role() {
         let server = MockServer::start().await;
-        let mut caps = Capabilities::default();
-        let ctx = ctx_for(&server, caps.clone()).await;
-        let e = load_options(&ctx, &Source::Domains, "").await.unwrap_err();
-        assert_eq!(e.to_string(), "domains are not enabled on this server");
+        let ctx = ctx_for(&server, Capabilities::default()).await;
         let e = load_options(&ctx, &Source::RoleObjects, "").await.unwrap_err();
         assert_eq!(e.to_string(), "pick a role first");
 
@@ -214,8 +209,6 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        caps.status = Some(serde_json::from_value(json!({ "versions": [], "domain_enabled": true })).unwrap());
-        let ctx = ctx_for(&server, caps).await;
         let items = load_options(&ctx, &Source::Domains, "").await.unwrap();
         assert_eq!(items.iter().map(|i| (i.label.as_str(), i.value.as_str())).collect::<Vec<_>>(), [("d1", "/h/d1/")]);
     }

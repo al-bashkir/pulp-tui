@@ -153,11 +153,11 @@ the default remote. Edit, sync, upload, copy and content add/remove are refused
 on Content View snapshot repositories (a change of retention would prune their snapshots).
 
 Sync options (each is shown only when the server's sync request has it, and is sent only
-when you change it): **Optimize** (RPM and Deb) is on, Pulp's default. Turn it off for a
+when you change it): **Optimize** (RPM, File and Deb) is on, Pulp's default. Turn it off for a
 full re-sync: Pulp then processes the upstream metadata also when it did not change.
 **Skip srpm** and **Skip treeinfo** (RPM) send `skip_types`: the sync does not download
 source packages or the distribution tree (`.treeinfo`). Pulp refuses skip types with
-`mirror_complete`.
+`mirror_complete`, so the form refuses them before it sends the sync.
 
 Deb repositories use the same keys. Sync a Deb repository from a Deb remote, publish it
 (**P**) and distribute it (**D**) as for the other types. A Deb distribution is served
@@ -169,13 +169,15 @@ and File only.
 
 Deb repository fields (create and edit; each is shown only when the server has it):
 
-| Field                           | Meaning                                                                                                                                                                                                      |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Signing service (Release)       | signs the `Release` file of a publication made without its own signing service (**P** with the field empty)                                                                                                  |
-| Per-release signing services    | `release=signing service href,...`, for example `bookworm=/pulp/api/v3/signing-services/<id>/`; this service signs that release instead. On edit, a release that you remove from the list loses its override |
-| Package signing service         | signs the `.deb` packages that an upload or `modify/` adds (not a sync or a copy); not in pulp_deb 3.8 and older                                                                                             |
-| Package signing fingerprint     | the key that the package signing service uses: `v4:<hex fingerprint>` or `keyid:<16 hex>`                                                                                                                    |
-| Publish upstream Release fields | on (Pulp's default for a new repository): a publication uses the `Release` fields (version, origin, label, description) of the upstream                                                                      |
+| Field                            | Meaning                                                                                                                                                                                                      |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Signing service (Release)        | signs the `Release` file of a publication made without its own signing service (**P** with the field empty)                                                                                                  |
+| Per-release signing services     | `release=signing service href,...`, for example `bookworm=/pulp/api/v3/signing-services/<id>/`; this service signs that release instead. On edit, a release that you remove from the list loses its override |
+| Package signing service          | signs the `.deb` packages that an upload or `modify/` adds (not a sync or a copy); not in pulp_deb 3.8 and older                                                                                             |
+| Package signing fingerprint      | the key that the package signing service uses: `v4:<hex fingerprint>` or `keyid:<16 hex>`                                                                                                                    |
+| Per-release package fingerprints | `release=fingerprint,...`, for example `bookworm=v4:<hex>`; the packages of that release are signed with this key instead. On edit, a release that you remove from the list loses its override               |
+| Publish upstream Release fields  | on (Pulp's default for a new repository): a publication uses the `Release` fields (version, origin, label, description) of the upstream                                                                      |
+| Excluded package metadata fields | `field,...`, for example `Phased-Update-Percentage`: custom package fields that a publication leaves out of the `Packages` indices when it does not set its own list. Clear it on edit to keep all fields    |
 
 A Release file is signed with the signing service of the publication, else the per-release
 service, else the repository's service. The pickers list the signing services of all
@@ -183,10 +185,12 @@ plugins; Pulp refuses one of the wrong type. Clear a field on edit to remove the
 
 ### Remotes
 
-`t` switches RPM/File/Deb. Create/edit: URL (File: URL of `PULP_MANIFEST`; Deb: the Debian
-archive base URL, the directory that holds `dists/`), download policy, TLS validation,
+`t` switches RPM/File/Deb. Create/edit: URL (`http://`, `https://`, or `file://` under the
+server's `ALLOWED_IMPORT_PATHS`; File: URL of `PULP_MANIFEST`; Deb: the Debian archive
+base URL, the directory that holds `dists/`), download policy, TLS validation,
 CA/client certificate and key (file paths; content is uploaded), username and password,
-proxy, concurrency, rate limit, labels, SLES token (RPM). The edit form cannot show the
+proxy (`http://` or `https://` with host and port, for example `http://proxy.corp:3128`),
+concurrency, rate limit, labels, SLES token (RPM). The edit form cannot show the
 certificates, key, credentials and token: empty keeps the server value, `-` clears it.
 Delete lists repositories that use the remote.
 
@@ -515,7 +519,7 @@ another path, and the rows that fail stay as described above.
 ### Replication
 
 Native Upstream Pulp objects (tech preview). **c**/**e** create/edit: upstream base URL
-as reachable from *this* Pulp server, relative API root (`pulp/`), domain, credentials,
+(`http://` or `https://`) as reachable from *this* Pulp server, relative API root (`pulp/`), domain, credentials,
 CA/client certificates, TLS validation, distribution filter (`q_select`, e.g.
 `name__startswith="rhel9"`), deletion policy (`nodelete` default; `all` needs typed
 confirmation). **R** replicates and shows the task group result; canceled or skipped tasks
@@ -534,7 +538,8 @@ Delete the replica distribution, or move it by hand, to make it follow.
 
 Users: **R** roles, **c**/**e** create/edit, **w** set password (Pulp's local users
 only), **A** enable/disable, **d** delete (refused for yourself; staff accounts warn).
-Role assignments: **c** add (role name, optional object href or domain for scope), **d**
+Role assignments: **c** add (role, optional object, and an optional domain when the
+server has domains enabled), **d**
 remove; owner/admin roles ask for confirmation. Groups: **o** members, **R** roles,
 **c**/**d**. Roles: system roles are locked (read-only); custom roles can be created,
 edited (permissions as a comma list) and deleted.
