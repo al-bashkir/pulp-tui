@@ -96,8 +96,9 @@ async fn native_replication() {
     }
     let upstream_href = ops::create(&dst, &dst.api("upstream-pulps/"), &body, "/upstream-pulps/", &no_progress).await.unwrap();
 
-    let lines = replication::replicate_native(&dst, &upstream_href, &|_| {}).await.unwrap();
+    let (group, lines) = replication::replicate_native(&dst, &upstream_href, &|_| {}).await.unwrap();
     assert!(lines[0].contains("Replication of"), "{lines:?}");
+    assert_eq!((group.canceled, group.skipped), (0, 0), "{lines:?}");
     assert!(downstream_has(&dst, &format!("{prefix}-os"), "fixture-alpha-1.0-1.noarch").await);
     let docs: Distribution =
         ops::find_by_name(&dst, &dst.api(RepoType::File.distributions()), &format!("{prefix}-docs")).await.unwrap().unwrap();

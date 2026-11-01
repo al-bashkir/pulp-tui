@@ -303,6 +303,9 @@ impl TaskGroup {
     pub fn done(&self) -> u64 {
         self.completed + self.failed + self.canceled + self.skipped
     }
+    pub fn counts(&self) -> String {
+        format!("completed {}  failed {}  canceled {}  skipped {}", self.completed, self.failed, self.canceled, self.skipped)
+    }
     /// `all_tasks_dispatched` is not reliable (pulpcore 3.123 leaves it false after a
     /// replication), so a failure or the replication finalizer also ends the group.
     pub fn is_final(&self) -> bool {

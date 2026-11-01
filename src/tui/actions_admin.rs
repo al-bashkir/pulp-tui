@@ -427,8 +427,11 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                     };
                     let res = replication::replicate_native(&ctx.client, &href, &on).await;
                     ap(move |app| match res {
-                        Ok(lines) => {
-                            app.ok(format!("replication of {name} completed"));
+                        Ok((g, lines)) => {
+                            match g.canceled + g.skipped {
+                                0 => app.ok(format!("replication of {name} completed")),
+                                _ => app.notify(Level::Warn, format!("replication of {name} not complete: {}", g.counts())),
+                            }
                             app.text(format!("Replication of {name}"), lines);
                             app.reload();
                         }
@@ -580,6 +583,82 @@ mod tests {
         super::upstream_action(&mut app, crate::tui::kinds::Act::Replicate, item);
         assert!(app.modal.is_none(), "no confirmation");
         assert!(app.notices.iter().any(|n| n.text.contains("refusing self-replication")));
+    }
+
+    use crate::tui::app::{App, Level, Modal, Msg};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const UP: &str = "/pulp/api/v3/upstream-pulps/1/";
+    const GROUP: &str = "/pulp/api/v3/task-groups/1/";
+
+    /// A replication group: `replicate_distributions` completed, one sync is in `state`.
+    fn group(state: &str) -> Value {
+        let mut g = json!({ "pulp_href": GROUP, "description": "Replication of up", "all_tasks_dispatched": true, "completed": 1,
+            "tasks": [{ "name": "pulpcore.app.tasks.replica.replicate_distributions", "state": "completed" },
+                      { "name": "pulp_rpm.app.tasks.synchronizing.synchronize", "state": state }] });
+        g[state] = (g[state].as_u64().unwrap_or(0) + 1).into();
+        g
+    }
+
+    async fn serve(server: &MockServer, verb: &str, p: &str, status: u16, body: Value) {
+        Mock::given(method(verb)).and(path(p)).respond_with(ResponseTemplate::new(status).set_body_json(body)).mount(server).await;
+    }
+
+    /// An app on `store`, connected to `server` as profile `lab`, with its jobs done.
+    async fn connected(server: &MockServer, store: Arc<crate::store::Store>) -> (App, UnboundedReceiver<Msg>) {
+        use crate::config::{AuthMethod, Config, Profile};
+        serve(server, "GET", "/pulp/api/v3/status/", 200, json!({ "versions": [] })).await;
+        let mut cfg = Config::default();
+        cfg.profiles.insert("lab".into(), Profile { url: server.uri(), auth: AuthMethod::None, ..Default::default() });
+        let mut app = App::new(cfg, "/dev/null".into(), store.clone(), Ok(store));
+        let mut rx = app.rx.take().unwrap();
+        app.connect("lab");
+        settle(&mut app, &mut rx).await;
+        (app, rx)
+    }
+
+    async fn settle(app: &mut App, rx: &mut UnboundedReceiver<Msg>) {
+        while !app.jobs.is_empty() {
+            let m = rx.recv().await.unwrap();
+            app.handle_msg(m);
+        }
+    }
+
+    /// Confirm Replicate of upstream `up` (its POST answers with `GROUP`).
+    async fn start_replication(server: &MockServer) -> (App, UnboundedReceiver<Msg>) {
+        serve(server, "POST", &format!("{UP}replicate/"), 202, json!({ "task_group": GROUP })).await;
+        let (mut app, rx) = connected(server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let item = json!({ "pulp_href": UP, "name": "up", "base_url": "https://upstream.example.com/" });
+        super::upstream_action(&mut app, crate::tui::kinds::Act::Replicate, item);
+        let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirmation") };
+        yes(&mut app);
+        (app, rx)
+    }
+
+    fn notices(app: &App) -> Vec<(Level, String)> {
+        app.notices.iter().map(|n| (n.level, n.text.clone())).collect()
+    }
+
+    #[tokio::test]
+    async fn a_replication_with_canceled_or_skipped_tasks_is_not_a_success() {
+        for (state, counts) in [("canceled", "canceled 1"), ("skipped", "skipped 1")] {
+            let server = MockServer::start().await;
+            serve(&server, "GET", GROUP, 200, group(state)).await;
+            let (mut app, mut rx) = start_replication(&server).await;
+            settle(&mut app, &mut rx).await;
+            let n = notices(&app);
+            assert!(n.iter().any(|(l, t)| *l == Level::Warn && t.contains(counts)), "{state}: {n:?}");
+            assert!(!n.iter().any(|(l, t)| *l == Level::Ok && t.contains("eplication of up")), "{state}: {n:?}");
+        }
+        let server = MockServer::start().await;
+        serve(&server, "GET", GROUP, 200, group("completed")).await;
+        let (mut app, mut rx) = start_replication(&server).await;
+        settle(&mut app, &mut rx).await;
+        assert!(notices(&app).iter().any(|(l, t)| *l == Level::Ok && t.contains("completed")), "{:?}", notices(&app));
     }
 
     #[test]

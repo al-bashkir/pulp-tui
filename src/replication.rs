@@ -19,17 +19,18 @@ use serde_json::{Value, json};
 
 pub const LABEL_REPLICA: &str = "pulp_tui_replica";
 
-/// Trigger native replication and wait for its task group.
-pub async fn replicate_native(c: &PulpClient, upstream_href: &str, on: &(dyn Fn(&TaskGroup) + Send + Sync)) -> Result<Vec<String>> {
+/// Trigger native replication and wait for its task group. A failed task is an error; the
+/// caller reports canceled or skipped tasks from the returned group.
+pub async fn replicate_native(
+    c: &PulpClient,
+    upstream_href: &str,
+    on: &(dyn Fn(&TaskGroup) + Send + Sync),
+) -> Result<(TaskGroup, Vec<String>)> {
     let Mutation::TaskGroup(g) = c.post(&format!("{upstream_href}replicate/"), &json!({})).await? else {
         bail!("replicate did not return a task group");
     };
     let group = ops::wait_task_group(c, &g, on).await?;
-    let mut lines = vec![
-        format!("{} ({})", group.description, g),
-        format!("completed {}  failed {}  canceled {}  skipped {}", group.completed, group.failed, group.canceled, group.skipped),
-        String::new(),
-    ];
+    let mut lines = vec![format!("{} ({})", group.description, g), group.counts(), String::new()];
     for t in &group.tasks {
         let name = t["name"].as_str().unwrap_or_default().rsplit('.').next().unwrap_or_default().to_string();
         let mut line = format!("  {:<10} {name}  {}", t["state"].as_str().unwrap_or_default(), t["pulp_href"].as_str().unwrap_or_default());
@@ -44,7 +45,7 @@ pub async fn replicate_native(c: &PulpClient, upstream_href: &str, on: &(dyn Fn(
     if group.failed > 0 {
         bail!("{}", lines.join("\n"));
     }
-    Ok(lines)
+    Ok((group, lines))
 }
 
 /// Refuse replicating a server into itself.

@@ -465,7 +465,8 @@ Native Upstream Pulp objects (tech preview). **c**/**e** create/edit: upstream b
 as reachable from *this* Pulp server, relative API root (`pulp/`), domain, credentials,
 CA/client certificates, TLS validation, distribution filter (`q_select`, e.g.
 `name__startswith="rhel9"`), deletion policy (`nodelete` default; `all` needs typed
-confirmation). **R** replicates and shows the task group result. **H** shows recent
+confirmation). **R** replicates and shows the task group result; canceled or skipped tasks
+give a warning with the counts. **H** shows recent
 replication task groups. **F** starts the fallback: choose another configured profile as
 source, types, a name filter and additive or mirror mode; a dry run lists
 CREATE / SYNC / SKIP per distribution before anything changes; reruns are safe. The

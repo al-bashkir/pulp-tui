@@ -224,7 +224,8 @@ failed publish keeps its checkpoints; *Resume* continues from them.
 
 * **Native** (`upstream-pulps/`, pulpcore ≥ 3.23, tech preview): pulp-tui manages the
   Upstream Pulp object, starts `replicate/`, follows the task group and lists task results.
-  The deletion policy belongs to Pulp. The form puts `nodelete` first and requires typed
+  A failed task fails the replication; a canceled or skipped task is not a success either
+  and gives a warning with the counts. The deletion policy belongs to Pulp. The form puts `nodelete` first and requires typed
   confirmation for `all`.
 * **Fallback** (`src/replication.rs`): content synchronization only. For each selected
   upstream RPM/File distribution it creates or updates a remote (pointing at the published

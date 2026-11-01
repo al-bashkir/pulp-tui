@@ -157,6 +157,12 @@ server gives the final answer; the dashboard shows a warning.
   state. Cancelling a completed task returns 409 and is shown as such.
 * `all_tasks_dispatched` of replication task groups stays false in 3.123; see
   `docs/ARCHITECTURE.md` for how completion is detected.
+* **Canceled replication tasks.** On 3.63 `replicate_distributions` sets
+  `all_tasks_dispatched` itself, so a canceled sync leaves a group with `failed 0,
+  canceled 1`. On 3.95 and 3.123 `finalize_replication` fails when another task of the
+  group did not complete, but a canceled `replicate_distributions` dispatches no finalizer:
+  the group ends with only `canceled 1`. pulp-tui reports canceled or skipped tasks as not
+  complete (read in the pulpcore source of the three images).
 * `api_root` of an Upstream Pulp is relative and needs a trailing slash (`pulp/`).
 * **Clearing remote fields.** pulpcore `RemoteNetworkConfigSerializer` (`ca_cert`,
   `client_cert`, `client_key`, `username`, `password`, `proxy_username`,
