@@ -209,6 +209,10 @@ server gives the final answer; the dashboard shows a warning.
   (Content View copy or publication, fallback replication sync) and nothing is published.
 * `all_tasks_dispatched` of replication task groups stays false in 3.123; see
   `docs/ARCHITECTURE.md` for how completion is detected.
+* **`task-groups/` has no filters** in 3.123 (only `limit`, `offset`, `fields`,
+  `exclude_fields` in the live OpenAPI) and lists the newest first. The replication history
+  pages through it and keeps the groups whose description is `Replication of <upstream>`:
+  it stops at five matches or after 2000 groups.
 * **Canceled replication tasks.** On 3.63 `replicate_distributions` sets
   `all_tasks_dispatched` itself, so a canceled sync leaves a group with `failed 0,
   canceled 1`. On 3.95 and 3.123 `finalize_replication` fails when another task of the
@@ -220,8 +224,11 @@ server gives the final answer; the dashboard shows a warning.
   `TaskGroup::is_final` (3.63: `all_tasks_dispatched`; 3.95 and 3.123: the
   `finalize_replication` task, or a failed or canceled task), never only by the three-poll
   rule. Cancel of a group (`PATCH {task_group_href}`, `task_groups_cancel`) exists on 3.95
-  and 3.123, not on 3.63: **X** on a replication row there shows Pulp's refusal, and the row
-  keeps the state that Pulp reports.
+  and 3.123, not on 3.63. pulp-tui reads the `patch` operation of `{task_group_href}` from
+  the OpenAPI: without it, **X** on a replication row says "not supported by this server" and sends
+  nothing; with it, the confirmation reads the group first (description, unfinished tasks).
+  pulpcore `cancel_task_group` (`tasking/tasks.py`) cancels every waiting or running task of
+  the group and sets `all_tasks_dispatched`. The row keeps the state that Pulp reports.
 * `api_root` of an Upstream Pulp is relative and needs a trailing slash (`pulp/`).
 * **Clearing remote fields.** pulpcore `RemoteNetworkConfigSerializer` (`ca_cert`,
   `client_cert`, `client_key`, `username`, `password`, `proxy_username`,

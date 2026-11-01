@@ -77,14 +77,18 @@ the typed text as the value (with no text, it closes the list and keeps the old 
 
 ### Three kinds of "cancel"
 
-1. **Esc on a loading list** cancels the HTTP request in the client.
+1. **Esc on a loading list** cancels the HTTP request in the client. Esc does not stop an
+   operation (sync, publish, replication, upload): the client waits until it ends.
 2. **Quitting** stops waiting for client operations. Pulp tasks continue on the server and
    are re-attached in the Task Center at the next start. **Connect** to a profile also stops
    waiting for them, so it asks first while operations run. When a task cannot be read
    (network or server error for more than about two minutes), the operation ends with
    "could not read task …, it may still be running": it is not reported as failed.
 3. **Tasks → X** asks Pulp to cancel a server task. The Task Center then shows the state
-   that Pulp reports (`canceled`, or `failed`/`completed` if the task ended first).
+   that Pulp reports (`canceled`, or `failed`/`completed` if the task ended first). On a
+   task group (a native replication) it cancels the whole group: the confirmation names the
+   group and how many of its tasks are not finished. A server without group cancel says
+   "not supported by this server" and nothing is sent.
 
 ## Screens
 
@@ -97,7 +101,7 @@ and the number of Content Views and environments (it says if they are in the loc
 or in the shared database). It shows at once with what the connect found; each count
 shows `...` until its request returns. `r` refreshes health, plugin versions and counts,
 and keeps the old values until the new ones come; the capability marks change only with a
-new connect.
+new connect. When a tracked task ends, the Dashboard refreshes the same way by itself.
 
 ### Servers
 
@@ -141,7 +145,7 @@ are visible.
 | o         | browse content of the latest version                                                                                                                                                                                                                                                  |
 | f         | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File and Deb: additive, mirror). Mirror policies show a warning first. RPM and Deb: sync options (below).                                  |
 | H         | sync history (tasks that touched this repository)                                                                                                                                                                                                                                     |
-| u         | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed or cancelled (Esc) chunked uploads are deleted. Not offered for Deb repositories (upload of `.deb` files is not supported). |
+| u         | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed chunked uploads are deleted, also on a Connect. Not offered for Deb repositories (upload of `.deb` files is not supported). |
 | P         | publish the latest version: always creates a new publication, with the repository settings at that moment. Deb asks for an optional signing service (empty = the repository's own keys). The field is not asked when the server's Deb publications have no `signing_service`.         |
 | D         | distribute: pin the latest version (publication) or follow the repository latest. Deb asks for the same optional signing service as **P**, for the pinned publication; a publication of the version is reused only when its signing service is the same.                              |
 | C         | copy content from another repository (filter rules; RPM can copy dependencies; a Deb copy is structured: it also copies the Release, component and architecture records of the packages, and never solves dependencies)                                                               |
@@ -525,8 +529,9 @@ Native Upstream Pulp objects (tech preview). **c**/**e** create/edit: upstream b
 CA/client certificates, TLS validation, distribution filter (`q_select`, e.g.
 `name__startswith="rhel9"`), deletion policy (`nodelete` default; `all` needs typed
 confirmation). **R** replicates and shows the task group result; canceled or skipped tasks
-give a warning with the counts. **H** shows recent
-replication task groups. **F** starts the fallback: choose another configured profile as
+give a warning with the counts. **H** shows the five newest
+replication task groups of this upstream (it reads at most the 2000 newest task groups of
+the server). **F** starts the fallback: choose another configured profile as
 source, types, a name filter and additive or mirror mode; a dry run lists
 CREATE / SYNC / SKIP per distribution before anything changes; reruns are safe. Both
 servers must have the plugin of each chosen type: else the dry run stops with, for example,
@@ -552,7 +557,11 @@ edited (permissions as a comma list) and deleted.
 ### Tasks
 
 Tracked tasks with state, progress (only what Pulp reports; no invented percentages),
-start time and errors. The top box lists client operations still running. **W** opens a
+start time and errors. The label is the operation that started the task (for example
+`publish web`, `replicate up`); a task tracked from the server tasks keeps Pulp's task name.
+After a restart, pulp-tui reads the start times of the finished rows from Pulp once, in one
+request; an unfinished row shows Pulp's start time once it is polled. A purged task, or a failed
+read, keeps the time pulp-tui first tracked the task. The top box lists client operations still running. **W** opens a
 live view of the task (state, progress reports, times, error, created resources) that
 refreshes until the task ends; **i** details with all progress reports, **X** cancel on
 the server (confirmation), **z** dismiss finished tasks from the list (above 500 tracked
@@ -849,8 +858,8 @@ database of a profile and choose "copy and switch" (see above).
   lock either: the last write wins.
 * The holder renews the lock every 30 seconds. A lock that is not renewed for 2 minutes is
   expired, and the next operator takes it over. Times come from the client clocks.
-* The lock is released when the workflow ends (also with an error), and when you press Esc
-  on its job. If pulp-tui crashes, the lock stays until it expires.
+* The lock is released when the workflow ends (also with an error), and when Connect stops
+  its job. If pulp-tui crashes, the lock stays until it expires.
 * If a holder loses the lock (someone broke it, another operator took it over after it
   expired, or the database is not reachable or does not answer a renewal within 30 s), the
   workflow stops before its next change in Pulp and before its next checkpoint: `lock on

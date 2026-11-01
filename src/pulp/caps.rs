@@ -20,6 +20,8 @@ pub struct Capabilities {
     pub user: Option<CurrentUser>,
     /// OpenAPI paths relative to `api/v3/` (`upstream-pulps/`, `{upstream_pulp_href}replicate/`).
     pub paths: BTreeSet<String>,
+    /// (path, method) of each operation, the path as in `paths`: `("{task_group_href}", "patch")`.
+    pub operations: BTreeSet<(String, String)>,
     /// Schema name -> property names (request and response schemas).
     pub schemas: BTreeMap<String, BTreeSet<String>>,
     pub enums: BTreeMap<String, Vec<String>>,
@@ -41,6 +43,7 @@ pub enum Feature {
     ReplicationPolicy,
     Users,
     Roles,
+    TaskGroupCancel,
 }
 
 impl Feature {
@@ -56,6 +59,7 @@ impl Feature {
             Feature::ReplicationPolicy => "Upstream Pulp `policy` field",
             Feature::Users => "users API",
             Feature::Roles => "roles API",
+            Feature::TaskGroupCancel => "task group cancel (PATCH on a task group)",
         }
     }
 }
@@ -110,7 +114,11 @@ impl Capabilities {
 
     pub fn load_openapi(&mut self, doc: &Value) {
         if let Some(paths) = doc["paths"].as_object() {
-            self.paths = paths.keys().map(|p| p.rsplit_once("api/v3/").map(|(_, r)| r.to_string()).unwrap_or_else(|| p.clone())).collect();
+            for (p, item) in paths {
+                let rel = p.rsplit_once("api/v3/").map(|(_, r)| r.to_string()).unwrap_or_else(|| p.clone());
+                self.operations.extend(item.as_object().into_iter().flat_map(|o| o.keys()).map(|m| (rel.clone(), m.clone())));
+                self.paths.insert(rel);
+            }
         }
         if let Some(schemas) = doc["components"]["schemas"].as_object() {
             for (name, s) in schemas {
@@ -140,6 +148,10 @@ impl Capabilities {
     pub fn has_endpoint(&self, rel: &str) -> bool {
         self.paths.is_empty() || self.paths.contains(rel)
     }
+    /// `has_endpoint` for one method of the path (`patch`); unknown is "present" too.
+    pub fn has_operation(&self, rel: &str, method: &str) -> bool {
+        self.paths.is_empty() || self.operations.contains(&(rel.to_string(), method.to_string()))
+    }
     pub fn has_field(&self, schema: &str, field: &str) -> bool {
         self.schemas.is_empty() || self.schemas.get(schema).is_some_and(|s| s.contains(field))
     }
@@ -168,6 +180,7 @@ impl Capabilities {
             Feature::ReplicationPolicy => self.supports(Feature::NativeReplication) && self.has_field("UpstreamPulp", "policy"),
             Feature::Users => self.has_endpoint("users/"),
             Feature::Roles => self.has_endpoint("roles/"),
+            Feature::TaskGroupCancel => self.has_operation("{task_group_href}", "patch"),
         }
     }
 
@@ -215,12 +228,14 @@ mod tests {
         assert!(c.supports(Feature::DebCopy), "no OpenAPI: optimistic");
         c.versions.insert("core".into(), "3.40.0".into());
         c.load_openapi(&json!({
-            "paths": {"/pulp/api/v3/upstream-pulps/": {}, "{upstream_pulp_href}replicate/": {}, "/pulp/{pulp_domain}/api/v3/rpm/copy/": {}},
+            "paths": {"/pulp/api/v3/upstream-pulps/": {}, "{upstream_pulp_href}replicate/": {}, "/pulp/{pulp_domain}/api/v3/rpm/copy/": {},
+                "{task_group_href}": {"get": {}, "patch": {}}},
             "components": {"schemas": {"UpstreamPulp": {"properties": {"name": {}}}, "SyncPolicyEnum": {"enum": ["additive", "mirror_complete"]}}}
         }));
         assert!(c.supports(Feature::NativeReplication));
         assert!(!c.supports(Feature::ReplicationPolicy));
         assert!(c.supports(Feature::RpmCopy));
+        assert!(c.supports(Feature::TaskGroupCancel) && !c.has_operation("{task_group_href}", "delete"));
         assert_eq!(c.require(Feature::DebCopy).unwrap_err().to_string(), "not supported by this server: Deb copy API (deb/copy/)");
         c.paths.insert("deb/copy/".into());
         assert!(c.supports(Feature::DebCopy));

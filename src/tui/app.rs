@@ -8,7 +8,7 @@ use super::tasks::{TaskCenter, Tracked};
 use super::view::help_lines;
 use crate::config::{Config, Database};
 use crate::cv::CvService;
-use crate::pulp::models::Task;
+use crate::pulp::models::{TASK_FINAL_STATES, Task};
 use crate::pulp::{Capabilities, PulpClient};
 use crate::store::{NotMigrated, Store};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -37,8 +37,8 @@ pub enum Msg {
         id: u64,
         text: String,
     },
-    /// Task snapshot from a workflow that polls the task itself.
-    Task(Task),
+    /// Task snapshot from a workflow that polls the task itself, and the id of its job.
+    Task(Task, Option<u64>),
     TaskPolled {
         href: String,
         result: Result<Task, crate::pulp::PulpError>,
@@ -86,9 +86,9 @@ impl Ctx {
         let _ = self.tx.send(Msg::JobProgress { id: self.job, text: text.into() });
     }
     pub fn on_task(&self) -> impl Fn(&Task) + Send + Sync + use<> {
-        let tx = self.tx.clone();
+        let (tx, job) = (self.tx.clone(), self.job);
         move |t: &Task| {
-            let _ = tx.send(Msg::Task(t.clone()));
+            let _ = tx.send(Msg::Task(t.clone(), Some(job)));
         }
     }
     pub fn log(&self) -> impl Fn(String) + Send + Sync + use<> {
@@ -192,7 +192,7 @@ pub fn item_key(v: &Value) -> String {
 fn task_row(t: &Tracked) -> Value {
     serde_json::json!({
         "pulp_href": t.href, "label": t.label, "state": t.state, "progress": t.progress(),
-        "started": t.task.as_ref().and_then(|x| x.started_at.clone()).unwrap_or_default(),
+        "started": t.task.as_ref().map_or(t.started.clone(), |x| x.started_at.clone().unwrap_or_default()),
         "error": t.error, "task": t.task,
     })
 }
@@ -547,12 +547,12 @@ impl App {
                 return; // no task changed: the task rows and a watch stay as they are
             }
             // Sent by a job of the previous server that the Connect aborted.
-            Msg::Task(_) if self.connecting => {}
-            Msg::Task(t) => self.task_update(t, true),
+            Msg::Task(..) if self.connecting => {}
+            Msg::Task(t, job) => self.task_update(t, true, job),
             Msg::TaskPolled { href, result } => match result {
                 // A poll sent before a Connect answers for the previous server.
                 _ if !self.tasks.items.iter().any(|t| t.href == href) => {}
-                Ok(t) => self.task_update(t, false),
+                Ok(t) => self.task_update(t, false, None),
                 Err(e) if e.is_not_found() => self.task_gone(&href),
                 Err(e) => self.tasks.poll_failed(&href, e.to_string()),
             },
@@ -616,12 +616,16 @@ impl App {
         }
     }
 
-    fn task_update(&mut self, t: Task, driven: bool) {
+    fn task_update(&mut self, t: Task, driven: bool, job: Option<u64>) {
         let href = t.pulp_href.clone();
         let state = t.state.clone();
         let err = t.error_message();
         // A task that a workflow reports is not tracked yet: store it too, so a restart re-attaches it.
         let new = !self.tasks.items.iter().any(|x| x.href == href);
+        // The operation names the row better than Pulp's task name (`pulpcore.app.tasks.base.general_update`).
+        if new && let Some(j) = job.and_then(|id| self.jobs.iter().find(|j| j.id == id)) {
+            self.tasks.track(&href, &j.label, "waiting");
+        }
         let finished = self.tasks.update(t, driven);
         let label = self.tasks.items.iter().find(|x| x.href == href).map(|x| x.label.clone()).unwrap_or_default();
         if let Some(p) = self.profile.clone()
@@ -652,9 +656,9 @@ impl App {
             "canceled" | "skipped" => self.notify(Level::Warn, text),
             _ => self.error(text),
         }
-        // Refresh the visible list once when a task finishes (not on every tick). A newer load
-        // replaces one in flight, which may hold the state from before the task.
-        if matches!(self.screen, Screen::List(_)) {
+        // Refresh the visible list or Dashboard once when a task finishes (not on every tick). A
+        // newer load replaces one in flight, which may hold the state from before the task.
+        if matches!(self.screen, Screen::List(_) | Screen::Dashboard) {
             self.reload();
         }
     }
@@ -772,10 +776,43 @@ impl App {
                 let mut n = 0;
                 for r in refs.iter().rev() {
                     app.tasks.track(&r.href, &r.label, &r.state);
+                    if let Some(t) = app.tasks.items.iter_mut().find(|t| t.href == r.href) {
+                        t.started = r.created_at.clone();
+                    }
                     n += (!super::tasks::is_final_state(&r.state)) as usize;
                 }
                 if n > 0 {
                     app.notify(Level::Info, format!("re-attached to {n} unfinished task(s) from a previous session"));
+                }
+                // A final row is never polled: read Pulp's start times once (at most 50 refs, one page).
+                let done: Vec<String> =
+                    refs.into_iter().filter(|r| TASK_FINAL_STATES.contains(&r.state.as_str())).map(|r| r.href).collect();
+                if !done.is_empty() && app.conn.is_some() {
+                    app.load_job("read task start times", move |ctx| async move {
+                        let c = &ctx.client;
+                        // Matched by href below, so a server that ignores the filter cannot give a wrong time.
+                        let q = [
+                            ("pulp_href__in", done.join(",")),
+                            ("fields", "pulp_href,started_at".into()),
+                            ("limit", done.len().to_string()),
+                        ];
+                        let page = match c.list::<Value>(&c.api("tasks/"), &q).await {
+                            Ok(p) => p,
+                            // Not worth a dialog: the stored times stay.
+                            Err(e) => {
+                                crate::session_log::record("notice", c.profile(), format!("task start times not read: {e}"), vec![]);
+                                return ap(|_| {});
+                            }
+                        };
+                        ap(move |app| {
+                            for v in page.results {
+                                let (Some(h), Some(s)) = (v["pulp_href"].as_str(), v["started_at"].as_str()) else { continue };
+                                if let Some(t) = app.tasks.items.iter_mut().find(|t| t.href == h) {
+                                    t.started = s.into();
+                                }
+                            }
+                        })
+                    });
                 }
             })
         });
@@ -1974,7 +2011,7 @@ mod tests {
         app.reload();
         assert_eq!(app.list.current().unwrap()["pulp_href"], "/t/1/");
         // A workflow reports a new task: it goes on top, and the cursor stays on /t/1/ (Cancel keeps its target).
-        app.handle_msg(Msg::Task(task("/t/2/")));
+        app.handle_msg(Msg::Task(task("/t/2/"), None));
         assert_eq!((app.list.items.len(), app.list.current().unwrap()["pulp_href"].as_str()), (2, Some("/t/1/")));
         // A poll answer sent to the previous server before a Connect is dropped.
         app.handle_msg(Msg::TaskPolled { href: "/t/9/".into(), result: Ok(task("/t/9/")) });
@@ -2026,7 +2063,7 @@ mod tests {
         let mut app = app_on(Kind::Profiles).await;
         let task = |n: u32, state: &str| {
             let t = serde_json::json!({ "pulp_href": format!("/t/{n}/"), "state": state, "name": "sync os", "error": { "description": "stop" } });
-            Msg::Task(serde_json::from_value(t).unwrap())
+            Msg::Task(serde_json::from_value(t).unwrap(), None)
         };
         app.handle_msg(task(1, "running"));
         assert!(app.notices.is_empty() && app.list.generation == 0, "a running task: no notice, no reload");
@@ -2044,7 +2081,39 @@ mod tests {
         }
         app.screen = Screen::Dashboard;
         app.handle_msg(task(6, "completed"));
-        assert_eq!(app.list.generation, 4, "not a list: nothing to reload");
+        assert_eq!(app.list.generation, 4, "the Dashboard reloads itself, not the list");
+    }
+
+    #[tokio::test]
+    async fn a_finished_task_reloads_the_dashboard_counts_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let ok = |body: Value| ResponseTemplate::new(200).set_body_json(body);
+        let count = |n: u64| ok(serde_json::json!({ "count": n, "next": null, "results": [] }));
+        let status = ok(serde_json::json!({ "versions": [] }));
+        Mock::given(method("GET")).and(path("/pulp/api/v3/status/")).respond_with(status).mount(&server).await;
+        let repos = || path("/pulp/api/v3/repositories/rpm/rpm/");
+        Mock::given(method("GET")).and(repos()).respond_with(count(7)).up_to_n_times(1).mount(&server).await;
+        Mock::given(method("GET")).and(repos()).respond_with(count(8)).mount(&server).await;
+        let mut app = on_rpm_repos(&server).await;
+        let mut rx = app.rx.take().unwrap();
+        let line = |app: &App| app.dashboard.iter().find(|l| l.starts_with("  RPM repositories")).cloned().unwrap_or_default();
+        let loads = |app: &App| app.jobs.iter().filter(|j| j.label == "load dashboard").count();
+        let task = |state: &str| {
+            Msg::Task(serde_json::from_value(serde_json::json!({ "pulp_href": "/t/1/", "state": state, "name": "sync" })).unwrap(), None)
+        };
+        app.open(Screen::Dashboard);
+        settle(&mut app, &mut rx).await;
+        assert!(line(&app).starts_with(&format!("  RPM repositories   {:>8}   ", 7)), "{:?}", app.dashboard);
+        app.handle_msg(task("running"));
+        assert_eq!(loads(&app), 0, "a running task: no reload");
+        app.handle_msg(task("completed"));
+        assert!(loads(&app) > 0, "the finished task reloads the Dashboard");
+        settle(&mut app, &mut rx).await;
+        assert!(line(&app).starts_with(&format!("  RPM repositories   {:>8}   ", 8)), "{:?}", app.dashboard);
+        app.handle_msg(task("completed"));
+        assert_eq!(loads(&app), 0, "once per finished task, not on every report");
     }
 
     #[tokio::test]
@@ -2069,13 +2138,82 @@ mod tests {
         let task = |state: &str| {
             serde_json::from_value::<Task>(serde_json::json!({ "pulp_href": "/t/9/", "state": state, "name": "publish" })).unwrap()
         };
-        app.handle_msg(Msg::Task(task("running")));
+        app.handle_msg(Msg::Task(task("running"), None));
         settle(&mut app, &mut rx).await;
         let refs = app.store.tasks("lab", 10).await.unwrap();
         assert_eq!((refs.len(), refs[0].href.as_str(), refs[0].state.as_str()), (1, "/t/9/", "running"));
-        app.handle_msg(Msg::Task(task("completed")));
+        app.handle_msg(Msg::Task(task("completed"), None));
         settle(&mut app, &mut rx).await;
         assert_eq!(app.store.tasks("lab", 10).await.unwrap()[0].state, "completed");
+    }
+
+    #[tokio::test]
+    async fn re_attached_final_rows_show_the_start_time_of_pulp() {
+        use wiremock::matchers::{method, path, query_param, query_param_contains};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let mut app = on_rpm_repos(&server).await;
+        app.screen = Screen::List(Kind::Tasks);
+        app.list = ListState::new(Kind::Tasks);
+        let mut rx = app.rx.take().unwrap();
+        for h in ["/t/1/", "/t/3/"] {
+            app.store.track_task("lab", h, "sync os", "waiting").await.unwrap();
+            app.store.finish_task("lab", h, "completed").await.unwrap();
+        }
+        app.store.track_task("lab", "/t/2/", "sync os", "running").await.unwrap();
+        let refs = app.store.tasks("lab", 10).await.unwrap();
+        let stored = |h: &str| refs.iter().find(|r| r.href == h).unwrap().created_at.clone();
+        let started = |app: &App, h: &str| app.task_items().into_iter().find(|r| r["pulp_href"] == h).unwrap()["started"].clone();
+        // The read fails (no answer mounted): the stored times stay, and no dialog or error notice opens.
+        app.reattach_tasks();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(started(&app, "/t/1/"), stored("/t/1/").as_str());
+        assert!(app.modal.is_none() && !app.notices.iter().any(|n| n.level == Level::Error));
+        // One list read for the final rows; /t/3/ was purged, so Pulp does not list it.
+        let page = serde_json::json!({ "count": 1, "next": null,
+            "results": [{ "pulp_href": "/t/1/", "started_at": "2026-01-02T03:04:05Z" }] });
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/tasks/"))
+            .and(query_param_contains("pulp_href__in", "/t/1/"))
+            .and(query_param_contains("pulp_href__in", "/t/3/"))
+            .and(query_param("fields", "pulp_href,started_at"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .expect(1)
+            .mount(&server)
+            .await;
+        app.reattach_tasks();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(started(&app, "/t/1/"), "2026-01-02T03:04:05Z", "a final row is never polled: Pulp's started_at, read once");
+        assert_eq!(app.list.items.iter().find(|r| r["pulp_href"] == "/t/1/").unwrap()["started"], "2026-01-02T03:04:05Z");
+        assert_eq!(started(&app, "/t/3/"), stored("/t/3/").as_str(), "a purged task keeps the stored time");
+        let polled = serde_json::json!({ "pulp_href": "/t/2/", "state": "running", "name": "s", "started_at": "2026-01-02T03:04:05Z" });
+        app.handle_msg(Msg::TaskPolled { href: "/t/2/".into(), result: Ok(serde_json::from_value(polled).unwrap()) });
+        assert_eq!(started(&app, "/t/2/"), "2026-01-02T03:04:05Z", "once Pulp is read, its started_at");
+    }
+
+    #[tokio::test]
+    async fn a_task_that_a_job_reports_has_the_label_of_the_job() {
+        let server = wiremock::MockServer::start().await;
+        let mut app = on_rpm_repos(&server).await;
+        let mut rx = app.rx.take().unwrap();
+        let task = |h: &str| {
+            serde_json::from_value::<Task>(serde_json::json!({ "pulp_href": h, "state": "running",
+                "name": "pulp_file.app.tasks.publishing.publish" }))
+            .unwrap()
+        };
+        app.track_task("/t/1/", "sync web");
+        app.job("publish web", move |ctx| async move {
+            let on = ctx.on_task();
+            on(&task("/t/1/"));
+            on(&task("/t/2/"));
+            ap(|_| {})
+        });
+        settle(&mut app, &mut rx).await;
+        let label = |h: &str| app.tasks.items.iter().find(|t| t.href == h).map(|t| t.label.clone());
+        assert_eq!(label("/t/2/").as_deref(), Some("publish web"), "a new task: the operation, not Pulp's task name");
+        assert_eq!(label("/t/1/").as_deref(), Some("sync web"), "a tracked task keeps its label");
+        let refs = app.store.tasks("lab", 10).await.unwrap();
+        assert_eq!(refs.iter().find(|r| r.href == "/t/2/").map(|r| r.label.as_str()), Some("publish web"), "stored for the next start");
     }
 
     #[tokio::test]
@@ -2084,7 +2222,7 @@ mod tests {
         let mut rx = app.rx.take().unwrap();
         app.connecting = true;
         let task = serde_json::json!({ "pulp_href": "/t/9/", "state": "running", "name": "publish" });
-        app.handle_msg(Msg::Task(serde_json::from_value(task).unwrap()));
+        app.handle_msg(Msg::Task(serde_json::from_value(task).unwrap(), None));
         settle(&mut app, &mut rx).await;
         assert!(app.tasks.items.is_empty());
         assert!(app.store.tasks("lab", 10).await.unwrap().is_empty(), "nothing stored for the new profile");

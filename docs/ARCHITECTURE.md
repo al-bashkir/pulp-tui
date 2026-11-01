@@ -9,7 +9,7 @@ tools for normal operation.
 | Layer          | Module                                                                                            | Responsibility                                                                                                                                                                                                                                                                                                |
 | -------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Transport      | `src/pulp/client.rs`                                                                              | Auth (basic, bearer, mTLS), TLS (always verified, custom CA bundles), proxies, timeouts, bounded concurrency (semaphore), retries for reads only, pagination, response size limit, error mapping, href confinement to the configured API root, recording of each request attempt in the in-memory session log |
-| Capabilities   | `src/pulp/caps.rs`                                                                                | `status/` (component versions, health, content origin), `login/` or `users/?username=` (current user), live OpenAPI schema (endpoints, fields, enums)                                                                                                                                                         |
+| Capabilities   | `src/pulp/caps.rs`                                                                                | `status/` (component versions, health, content origin), `login/` or `users/?username=` (current user), live OpenAPI schema (endpoints and their methods, fields, enums)                                                                                                                                       |
 | Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs`, `src/pulp/rpm.rs`, `src/pulp/file.rs`, `src/pulp/deb.rs` | RPM/File/Deb endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification                                                                                                                                        |
 | Services       | `src/cv.rs`, `src/replication.rs`, `src/filters.rs`, `src/repo_export.rs`                         | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules, `rpmvercmp` and the dpkg version comparison, export and import of repository and remote definitions                                                                                             |
 | Storage        | `src/store.rs`                                                                                    | sqlx (SQLite, optionally PostgreSQL): task references, Content View definitions, versions, checkpoints, environments, bindings, audit log with operator, locks, replication runs                                                                                                                              |
@@ -29,8 +29,8 @@ The TUI loop (`src/tui/mod.rs`) waits on three sources: key events, messages fro
 background jobs, and a 250 ms tick. A job is a Tokio task. It returns a closure that
 changes `App` state on the UI thread. Rendering only reads state, so drawing never waits
 on network or disk. Each list load carries a generation number; a stale response is
-dropped. The visible list reloads when a tracked task ends and when an operation job (not a
-read) fails, so it shows the state the failure left (a Content View version `failed`). Esc aborts the client-side job (the HTTP request); it never cancels a Pulp task.
+dropped. The visible list or the Dashboard reloads once when a tracked task ends, and the list
+reloads when an operation job (not a read) fails, so it shows the state the failure left (a Content View version `failed`). Esc aborts only list loads (`App::abort_loads`, the HTTP request of the list). An operation job (sync, publish, replication, upload) keeps waiting until it ends; Connect to a profile (`App::abort_all`) or quit stops the wait. Pulp tasks always continue: only *Cancel task* asks Pulp to cancel one.
 
 ### Requests and retries
 
@@ -54,8 +54,10 @@ grows by 1.5x while nothing changes, resets on progress, and has ±20 % jitter. 
 three polls run at the same time. A task that a workflow already waits on is not polled
 twice. A workflow takes only a `completed` task as done (`ops::wait_task`): a `failed`,
 `canceled` or `skipped` task stops that step with the task state as the error. After a
-restart, unfinished references are polled again ("re-attached"). A task that
-the server answers with 404 (purged) gets the final state `gone`. A poll answer for a task
+restart, unfinished references are polled again ("re-attached"). Final ones are not polled:
+one background list read (`tasks/?pulp_href__in=...&fields=pulp_href,started_at`) gives their
+`started_at`. A task that is not listed (purged), or a failed read (a quiet Logs entry, no
+dialog), keeps the `created_at` of the stored reference. A task that the server answers with 404 (purged) gets the final state `gone`. A poll answer for a task
 that is not tracked (sent to the previous server before a Connect) is dropped.
 
 Task groups (native replication) are final when no task is waiting or running and the
@@ -65,11 +67,13 @@ idle group whose counts stay the same for three polls is also treated as final.
 
 A task group is one Task Center row. Its href goes into the same task references (the href
 tells a group from a task, so the store has no extra column), and `ops::get_task` reads it
-as one task (`TaskGroup::as_task`): the description is the label, the finished tasks of the
+as one task (`TaskGroup::as_task`): the description is the task name, the finished tasks of the
 group are the progress, and the final state is `failed`, `canceled` or `skipped` when a task
 of the group ended so, else `completed`, with the counts as the error. The replication job
 reports each snapshot to the Task Center, so the row exists while it runs, the final notice
 and the list reload come from the Task Center, and a restart re-attaches the group. A task
+or group that a job reports for the first time (`Ctx::on_task`) gets the label of that job
+(`publish web`, `replicate up`), not Pulp's task name. A task
 that a workflow reports for the first time already final also gives its final notice. A
 task or group that ends `canceled` or `skipped` gives a warning, a `failed` one an error.
 Only the three-poll rule above is not in `as_task`: such a group would stay `running` in the
@@ -415,7 +419,7 @@ lock over and finished the work (the audit row is still written). A stopped publ
 its checkpoints, so *Resume* continues it; a promotion is retried. *Break lock*
 (`Store::break_lock`) deletes the row only when its owner and `acquired_at` still match the
 holder shown in the dialog, so it cannot remove a lock that another operator took meanwhile.
-Dropping the `CvLock` (workflow end, Esc) releases the row
+Dropping the `CvLock` (workflow end, or Connect, which aborts the job) releases the row
 by token. A crash leaves the row until it expires. The same code runs for the local file, so
 two pulp-tui processes on one host also exclude each other. Publish, resume, promote
 (rollback, reconcile), unpromote, delete view and delete version lock; preview, compare, verify and

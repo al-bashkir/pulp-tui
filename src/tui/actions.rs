@@ -7,7 +7,7 @@ use super::kinds::{Act, Kind, s, short};
 use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile, database_keyring_user};
 use crate::filters::{Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
-use crate::pulp::models::{Distribution, Publication, RepoVersion, Task};
+use crate::pulp::models::{Distribution, Publication, RepoVersion, Task, TaskGroup};
 use crate::pulp::ops::{self, repo_of_version, version_number};
 use crate::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::Store;
@@ -1969,28 +1969,42 @@ fn task_action(app: &mut App, act: Act, item: Value) {
             app.watch_task(&href, &label);
         }
         Act::CancelTask => {
-            let lines = vec![
-                format!("Ask Pulp to cancel task {href}."),
-                "This is a server-side cancellation (not just closing the client).".into(),
+            let note = [
+                "This is a server-side cancellation (not just closing the client).".to_string(),
                 "Pulp decides the final state; work already done may remain (e.g. downloaded artifacts).".into(),
             ];
-            app.confirm("Cancel server task", lines, move |app| {
-                app.job("cancel task", move |ctx| async move {
-                    let res = ctx.client.patch(&href, &json!({ "state": "canceled" })).await;
-                    let t = ops::get_task(&ctx.client, &href).await?;
-                    ap(move |app| {
-                        match res {
-                            Ok(_) => app.notify(Level::Info, format!("cancel requested; Pulp reports state {}", t.state)),
-                            Err(e) => app.error(format!("Pulp refused cancellation ({e}); task state is {}", t.state)),
-                        }
-                        app.handle_msg(super::app::Msg::Task(t));
-                        app.reload();
-                    })
+            if !href.contains("/task-groups/") {
+                let lines = [vec![format!("Ask Pulp to cancel task {href}.")], note.to_vec()].concat();
+                app.confirm("Cancel server task", lines, move |app| cancel_task(app, href));
+            } else if !unsupported(app, Feature::TaskGroupCancel) {
+                app.job("read task group", move |ctx| async move {
+                    let g: TaskGroup = ctx.client.get(&href, &[]).await?;
+                    let (active, all) = (g.active(), g.tasks.len());
+                    let head =
+                        format!("Ask Pulp to cancel the whole task group {}: {active} of {all} task(s) are not finished.", g.description);
+                    let lines = [vec![head], note.to_vec()].concat();
+                    ap(move |app| app.confirm("Cancel task group", lines, move |app| cancel_task(app, href)))
                 });
-            });
+            }
         }
         _ => {}
     }
+}
+
+/// PATCH `state: canceled` on a task or a task group, then report the state that Pulp gives.
+fn cancel_task(app: &mut App, href: String) {
+    app.job("cancel task", move |ctx| async move {
+        let res = ctx.client.patch(&href, &json!({ "state": "canceled" })).await;
+        let t = ops::get_task(&ctx.client, &href).await?;
+        ap(move |app| {
+            match res {
+                Ok(_) => app.notify(Level::Info, format!("cancel requested; Pulp reports state {}", t.state)),
+                Err(e) => app.error(format!("Pulp refused cancellation ({e}); task state is {}", t.state)),
+            }
+            app.handle_msg(super::app::Msg::Task(t, None));
+            app.reload();
+        })
+    });
 }
 
 // ---- dashboard --------------------------------------------------------------------------------
@@ -3187,6 +3201,8 @@ mod tests {
 
     /// An app connected to `server` as profile `lab`, with an in-memory store.
     async fn connected(server: &wiremock::MockServer) -> (App, tokio::sync::mpsc::UnboundedReceiver<super::super::app::Msg>) {
+        // The app is on the Dashboard, which a finished task reloads; every Pulp answers status/.
+        get(server, &format!("{API}status/"), json!({ "versions": [] })).await;
         let st = Arc::new(Store::open_in_memory().await.unwrap());
         let p = Profile { url: server.uri(), auth: AuthMethod::None, ..Default::default() };
         let mut cfg = crate::config::Config::default();
@@ -3472,8 +3488,9 @@ mod tests {
 
         for href in [&group, &task] {
             task_action(&mut app, Act::CancelTask, json!({ "pulp_href": href }));
+            settle(&mut app, &mut rx).await; // the group is read before its confirmation
             let Some(Modal::Confirm { title, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirmation") };
-            assert_eq!(title, "Cancel server task");
+            assert_eq!(title, if href == &group { "Cancel task group" } else { "Cancel server task" });
             yes(&mut app);
             settle(&mut app, &mut rx).await;
         }
@@ -3492,6 +3509,34 @@ mod tests {
         task_action(&mut app, Act::DismissTasks, Value::Null);
         assert_eq!(texts(&app).last(), Some(&(Level::Ok, "dismissed 2 finished task(s) from the list (Pulp keeps its records)".into())));
         assert!(app.tasks.items.is_empty() && app.list.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_of_a_task_group_names_the_group_and_needs_the_server_cancel() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let group = format!("{API}task-groups/1/");
+        let tasks = json!([{ "state": "completed" }, { "state": "running" }, { "state": "waiting" }]);
+        let g =
+            json!({ "pulp_href": group, "description": "Replication of up", "waiting": 1, "running": 1, "completed": 1, "tasks": tasks });
+        get(&server, &group, g).await;
+        let (mut app, mut rx) = connected(&server).await;
+        task_action(&mut app, Act::CancelTask, json!({ "pulp_href": group }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, .. }) = app.modal.take() else { panic!("no confirmation") };
+        assert_eq!(title, "Cancel task group");
+        assert_eq!(lines[0], "Ask Pulp to cancel the whole task group Replication of up: 2 of 3 task(s) are not finished.");
+
+        // An older pulpcore has no PATCH on a task group: refused before any request.
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "{task_group_href}": { "get": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let asked = server.received_requests().await.unwrap().len();
+        task_action(&mut app, Act::CancelTask, json!({ "pulp_href": group }));
+        assert!(app.modal.is_none() && app.jobs.is_empty(), "a confirmation or job started");
+        let e = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        assert!(e.starts_with("not supported by this server: "), "{e}");
+        assert_eq!(server.received_requests().await.unwrap().len(), asked);
     }
 
     #[tokio::test]

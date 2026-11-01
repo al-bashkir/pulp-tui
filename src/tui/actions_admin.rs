@@ -446,10 +446,20 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
         }
         Act::ReplicationHistory => app.job("replication history", move |ctx| async move {
             let c = &ctx.client;
-            let groups: Vec<Value> = c.list::<Value>(&c.api("task-groups/"), &[("limit", "100".into())]).await?.results;
             let want = format!("Replication of {name}");
+            // task-groups/ has no filters (newest first): page until five match, at most 2000 groups.
+            let (mut groups, mut seen) = (vec![], 0);
+            let mut page = c.list::<Value>(&c.api("task-groups/"), &[("limit", "100".into())]).await?;
+            loop {
+                seen += page.results.len();
+                groups.extend(page.results.into_iter().filter(|g| g["description"].as_str() == Some(want.as_str())));
+                match page.next {
+                    Some(next) if groups.len() < 5 && seen < 2000 => page = c.list(&next, &[]).await?,
+                    _ => break,
+                }
+            }
             let mut lines = vec![];
-            for g in groups.iter().filter(|g| g["description"].as_str() == Some(want.as_str())).take(5) {
+            for g in groups.iter().take(5) {
                 lines.push(format!(
                     "{}  completed {} failed {} canceled {}",
                     s(g, "pulp_href"),
@@ -462,7 +472,7 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                 }
             }
             if lines.is_empty() {
-                lines.push("no replication task groups found for this upstream".into());
+                lines.push(format!("no replication task groups found for this upstream in the newest {seen} task groups"));
             }
             ap(move |app| app.text(format!("Replication history of {name}"), lines))
         }),
@@ -650,7 +660,7 @@ mod tests {
             settle(&mut app, &mut rx).await;
             let n = notices(&app);
             assert!(n.iter().any(|(l, t)| *l == Level::Warn && t.contains(counts)), "{state}: {n:?}");
-            assert!(!n.iter().any(|(l, t)| *l == Level::Ok && t.contains("eplication of up")), "{state}: {n:?}");
+            assert!(!n.iter().any(|(l, t)| *l == Level::Ok && t.contains("replicate up")), "{state}: {n:?}");
         }
         let server = MockServer::start().await;
         serve(&server, "GET", GROUP, 200, group("completed")).await;
@@ -679,7 +689,7 @@ mod tests {
             |app: &App| app.tasks.items.iter().any(|t| t.href == GROUP) && !app.jobs.iter().any(|j| j.label.starts_with("persist"));
         until(&mut app, &mut rx, stored).await;
         let row = &app.tasks.items[0];
-        assert_eq!((row.label.as_str(), row.state.as_str()), ("Replication of up", "running"), "visible in Tasks while it runs");
+        assert_eq!((row.label.as_str(), row.state.as_str()), ("replicate up", "running"), "visible in Tasks while it runs, as its job");
         let store = app.store.clone();
         let refs = store.tasks("lab", 10).await.unwrap();
         assert_eq!((refs.len(), refs[0].href.as_str(), refs[0].state.as_str()), (1, GROUP, "running"));
@@ -698,7 +708,7 @@ mod tests {
         assert!(app.list.generation > generation, "the list reloads");
         assert_eq!(app.tasks.items[0].state, "canceled");
         let n = notices(&app);
-        assert!(n.iter().any(|(l, t)| *l == Level::Warn && t.contains("Replication of up") && t.contains("canceled 1")), "{n:?}");
+        assert!(n.iter().any(|(l, t)| *l == Level::Warn && t.contains("replicate up") && t.contains("canceled 1")), "{n:?}");
         settle(&mut app, &mut rx).await;
         assert_eq!(store.tasks("lab", 10).await.unwrap()[0].state, "canceled", "stored final: not re-attached again");
     }
@@ -717,6 +727,33 @@ mod tests {
         form.fields.iter_mut().find(|f| f.key == "base_url").unwrap().value = "https://upstream.example.com".into();
         assert_eq!(submit(&mut app, &form), Ok(()));
         assert_eq!(app.jobs.len(), 1, "the create is sent");
+    }
+
+    #[tokio::test]
+    async fn replication_history_pages_through_task_groups_until_it_has_five() {
+        use wiremock::matchers::query_param;
+        const GROUPS: &str = "/pulp/api/v3/task-groups/";
+        let server = MockServer::start().await;
+        let g = |n: usize, d: &str| json!({ "pulp_href": format!("{GROUPS}{n}/"), "description": d, "completed": 1, "failed": 0, "canceled": 0, "tasks": [] });
+        let page = |results: Vec<Value>, next: Option<u32>| {
+            let next = next.map(|o| format!("{}{GROUPS}?limit=100&offset={o}", server.uri()));
+            ResponseTemplate::new(200).set_body_json(json!({ "count": 300, "next": next, "results": results }))
+        };
+        // task-groups/ has no filters and lists newest first; a busy server has other groups on page 1.
+        let at = |o: &str| Mock::given(method("GET")).and(path(GROUPS)).and(query_param("offset", o));
+        at("100").respond_with(page((100..106).map(|n| g(n, "Replication of up")).collect(), Some(200))).mount(&server).await;
+        at("200").respond_with(page(vec![g(200, "Replication of up")], None)).mount(&server).await;
+        let first = (0..3).map(|n| g(n, "Replication of other")).collect();
+        Mock::given(method("GET")).and(path(GROUPS)).respond_with(page(first, Some(100))).mount(&server).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        super::upstream_action(&mut app, crate::tui::kinds::Act::ReplicationHistory, json!({ "pulp_href": UP, "name": "up" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no history: {:?}", notices(&app)) };
+        let rows: Vec<&String> = lines.iter().filter(|l| l.starts_with(GROUPS)).collect();
+        assert_eq!(rows.len(), 5, "the five newest replications of up, from page 2: {lines:?}");
+        assert!(rows[0].starts_with(&format!("{GROUPS}100/")), "{lines:?}");
+        let reqs = server.received_requests().await.unwrap();
+        assert!(!reqs.iter().any(|r| r.url.query().unwrap_or_default().contains("offset=200")), "five found: page 3 is not read");
     }
 
     #[tokio::test]
