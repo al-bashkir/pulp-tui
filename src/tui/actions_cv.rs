@@ -1669,6 +1669,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_resume_shows_the_failed_version_without_a_reload() {
+        let server = MockServer::start().await; // 404 for everything: the derived repository cannot be found
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        st.begin_version(web, "", &[cv_repo("os", "rpm", "1")]).await.unwrap();
+        app.push(Kind::CvVersions { cv: web, name: "web".into() });
+        drain(&mut app, &mut rx).await;
+        let item = app.list.items[0].clone();
+        assert_eq!(item["state"], "interrupted");
+        version_action(&mut app, "lab", web, "web".into(), Act::Resume, item);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app).0, Level::Error);
+        assert_eq!(app.list.items[0]["state"], "failed");
+    }
+
+    #[tokio::test]
     async fn create_makes_a_composite_view_on_request() {
         let (mut app, mut rx, st) = composite_app().await;
         for (composite, msg) in [

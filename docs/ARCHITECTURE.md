@@ -29,7 +29,8 @@ The TUI loop (`src/tui/mod.rs`) waits on three sources: key events, messages fro
 background jobs, and a 250 ms tick. A job is a Tokio task. It returns a closure that
 changes `App` state on the UI thread. Rendering only reads state, so drawing never waits
 on network or disk. Each list load carries a generation number; a stale response is
-dropped. Esc aborts the client-side job (the HTTP request); it never cancels a Pulp task.
+dropped. The visible list reloads when a tracked task ends and when an operation job (not a
+read) fails, so it shows the state the failure left (a Content View version `failed`). Esc aborts the client-side job (the HTTP request); it never cancels a Pulp task.
 
 ### Requests and retries
 

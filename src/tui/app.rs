@@ -530,7 +530,13 @@ impl App {
                         apply(self);
                         self.applying = false;
                     }
-                    Err(e) => self.error(format!("{}: {e}", job.label)),
+                    Err(e) => {
+                        self.error(format!("{}: {e}", job.label));
+                        // A failed operation can have changed state (a version is `failed` now): show it, as after a task.
+                        if !job.is_load && matches!(self.screen, Screen::List(_)) {
+                            self.reload();
+                        }
+                    }
                 }
                 self.next_queued();
             }
@@ -1990,6 +1996,21 @@ mod tests {
         tokio::time::sleep(KEY_GUARD).await;
         app.handle_key(ch('y'));
         assert!(app.quit && app.queued.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_operation_reloads_the_list_and_a_failed_read_does_not() {
+        let mut app = app_on(Kind::Profiles).await;
+        let mut rx = app.rx.take().unwrap();
+        let loads = |app: &App| app.jobs.iter().filter(|j| j.label == "load list").count();
+        app.spawn("read x".into(), true, async { anyhow::bail!("gone") });
+        let m = rx.recv().await.unwrap();
+        app.handle_msg(m);
+        assert_eq!(loads(&app), 0, "a failed read (also a failed list load) does not reload: no loop");
+        app.spawn("delete x".into(), false, async { anyhow::bail!("refused") });
+        let m = rx.recv().await.unwrap();
+        app.handle_msg(m);
+        assert_eq!(loads(&app), 1, "the list shows what the failed operation left");
     }
 
     #[tokio::test]
