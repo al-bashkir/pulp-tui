@@ -212,7 +212,19 @@ with the marked version (`Space` on one, `m` on the other; shows added/removed u
 content type that the Content browser lists, each line starts with its type, such as
 `+ advisory RHSA-2024:0001`; older → newer), **d** delete (names the distributions that serve the version or its
 publications, and you type the version id; refused for Content View snapshots; never needed
-for rollback).
+for rollback), **R** restore as latest (below).
+
+**R** makes a new latest version of the repository with the content of the selected version
+(Pulp `modify/` with `base_version`). No version is deleted by the restore, but a
+repository with `retain_repo_versions` then deletes its oldest versions, as after any new
+version. The preview shows what changes from the latest version (the same lines as
+compare) and what serves the new version: with autopublish on, Pulp publishes it at once;
+else publish it with **P**. Then the distributions that follow the repository serve it, and
+the next sync, copy or publish starts from it. **b** (rollback) is different: it re-points
+one distribution and makes no version, so the distributions that follow the repository and
+the next sync still use the newest version. The latest version itself is refused (nothing to
+restore). When the latest version already has the same content, Pulp makes no version and the
+notice says so. Refused for Content View snapshots.
 
 **O** prunes orphans on the whole server (Pulp `orphans/cleanup/`): content that no
 repository version has, and artifacts (files) that no content uses. Deleting versions

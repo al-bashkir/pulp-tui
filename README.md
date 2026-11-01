@@ -6,8 +6,8 @@ the Pulp REST API:
 * **RPM, File and Deb repositories**: repositories and remotes (separate objects), sync with
   policy previews, uploads (chunked, digest-verified; not for Deb), content browsing and
   metadata, add/remove/copy content, versions and diffs, publications (Deb: optional signing
-  service), distributions (pinned or following latest), rollback by re-pointing,
-  served-content verification.
+  service), distributions (pinned or following latest), rollback by re-pointing, restore
+  of an older version as the new latest version, served-content verification.
 * **Content Views and lifecycle environments** (Katello-inspired, implemented by pulp-tui
   on top of Pulp; not a Pulp or Katello API): filtered multi-repository snapshots,
   numbered immutable versions, promotion along `Library -> Dev -> … -> Prod`, rollback,

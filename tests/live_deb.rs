@@ -121,6 +121,16 @@ async fn a_removed_deb_package_is_no_longer_served() {
     assert_eq!(status, 200, "{index}");
     assert!(index.contains("Package: fixture-beta\n"), "{index}");
     assert!(!index.contains("fixture-beta-dbg"), "the removed package is not served: {index}");
+
+    // Restore v1 as latest (pulp_deb takes `base_version` too): with its release records, the package is served again.
+    let m = ops::restore_version(&c, &repo, &v1).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let v3 = latest(&c, &repo).await;
+    assert_eq!(ops::all_content_keys(&c, t, &v3).await.unwrap(), ops::all_content_keys(&c, t, &v1).await.unwrap());
+    let publication = ops::create_publication(&c, t, &v3, None, &no_progress).await.unwrap();
+    ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
+    let index = served(&c, &format!("{base}dists/fixture/main/binary-amd64/Packages")).await.1;
+    assert!(String::from_utf8_lossy(&index).contains("Package: fixture-beta-dbg\n"), "restored");
     cleanup(&c, &[&dist, &repo, &remote]).await;
 }
 

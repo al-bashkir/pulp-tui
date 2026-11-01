@@ -131,6 +131,8 @@ pub enum Act {
     AddToRepo,
     Compare,
     Rollback,
+    /// A new latest version with the content of the selected version (`modify/` with `base_version`).
+    Restore,
     CopyUrl,
     Verify,
     CancelTask,
@@ -203,7 +205,7 @@ impl Act {
             CvPreview | Password => 'w',
             Promote | MigrateDb => 'M',
             CopyDb => 'Y',
-            Resume | Replicate | Roles => 'R',
+            Resume | Replicate | Roles | Restore => 'R',
             ToggleProtected => 'L',
             ToggleActive => 'A',
             BreakLock => 'U',
@@ -230,6 +232,7 @@ impl Act {
             AddToRepo => "Add to another repository",
             Compare => "Compare with marked version",
             Rollback => "Roll back a distribution to this",
+            Restore => "Restore as latest version (new version)",
             CopyUrl => "Copy content URL",
             Verify => "Verify served content",
             CancelTask => "Cancel task on server",
@@ -638,7 +641,7 @@ impl Kind {
                 actions
             }
             Kind::Remotes(_) | Kind::Roles => vec![Create, Edit, Delete, Inspect],
-            Kind::Versions(_) => vec![Content, Publish, Distribute, Rollback, Compare, Delete, PruneOrphans, Inspect],
+            Kind::Versions(_) => vec![Content, Publish, Distribute, Rollback, Restore, Compare, Delete, PruneOrphans, Inspect],
             // A structured Deb copy brings the release records of binary packages only; other units would arrive alone.
             Kind::Content { version, ctype } if RepoType::from_href(version) == Some(RepoType::Deb) && *ctype != 0 => {
                 vec![Inspect, RemoveContent]
@@ -1123,6 +1126,8 @@ mod tests {
         assert!(!Act::Delete.mutates(&Kind::Profiles, true));
         assert!(Act::ImportCv.mutates(&Kind::Profiles, true), "bulk create in the shared database");
         assert!(Act::PruneOrphans.mutates(&Kind::Versions(None), false), "deletes content on the server");
+        assert!(Act::Restore.mutates(&Kind::Versions(None), false), "makes a repository version");
+        assert_eq!((Act::Restore.key(), Act::Restore.label()), ('R', "Restore as latest version (new version)"), "the menu row");
         assert!(!Act::ImportCv.mutates(&Kind::Profiles, false));
         assert!(Act::MigrateDb.mutates(&Kind::Profiles, false) && Act::CopyDb.mutates(&Kind::Profiles, false));
         assert!(!Kind::Profiles.actions().iter().any(|a| matches!(a, Act::MigrateDb | Act::CopyDb)), "offered on Connect and save only");

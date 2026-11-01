@@ -1397,6 +1397,7 @@ fn version_action(app: &mut App, act: Act, item: Value) {
                 Ok(())
             });
         }
+        Act::Restore => restore_preview(app, t, href, number),
         Act::Compare => {
             let marked: Vec<String> = app.list.marked.iter().filter(|m| **m != href).cloned().collect();
             let [other] = marked.as_slice() else {
@@ -1531,6 +1532,63 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
             })
         })
     });
+}
+
+/// Preview a new latest version with the content of `version` (what changes from the latest version), then make
+/// it on confirmation: `modify/` with `base_version`. The latest version itself is refused: nothing to restore.
+fn restore_preview(app: &mut App, t: RepoType, version: String, number: String) {
+    app.job(format!("restore preview v{number}"), move |ctx| async move {
+        let c = &ctx.client;
+        let repo = repo_of_version(&version);
+        let r: Value = c.get(&repo, &[]).await?;
+        if let Some(e) = snapshot_refusal(&r) {
+            bail!(e);
+        }
+        let (name, latest) = (s(&r, "name"), s(&r, "latest_version_href"));
+        if latest == version {
+            bail!("version {number} is already the latest version of {name}");
+        }
+        let d = ops::diff(&ops::all_content_keys(c, t, &latest).await?, &ops::all_content_keys(c, t, &version).await?);
+        let lines = restore_lines(&r, &number, d.lines(&format!("latest {}", short(&latest)), &format!("new (= v{number})")));
+        let typed = name.clone();
+        ap(move |app| {
+            app.confirm_prod(format!("Restore version {number} as latest"), lines, &typed, move |app| {
+                let label = format!("restore {name} v{number} as latest");
+                app.job(label.clone(), move |ctx| async move {
+                    let m = ops::restore_version(&ctx.client, &repo, &version).await?;
+                    ap(move |app| follow(app, m, label.clone(), move |app, t| restored(app, &label, &t)))
+                })
+            })
+        })
+    });
+}
+
+/// The restore confirm: what it does, how it differs from Rollback, what serves it, and the content `diff`.
+fn restore_lines(r: &Value, number: &str, diff: Vec<String>) -> Vec<String> {
+    let mut lines = vec![
+        format!("Make a new latest version of {} with the content of version {number}; newer versions are kept.", s(r, "name")),
+        "Rollback (b) instead re-points one distribution and makes no version. After a restore, the".into(),
+        "distributions that follow the repository and the next sync, copy and publish use the new version.".into(),
+        if r["autopublish"] == true {
+            "Autopublish is on: Pulp publishes the new version at once.".into()
+        } else {
+            "Autopublish is off: publish the new version (P) to serve it.".into()
+        },
+    ];
+    if let Some(n) = r["retain_repo_versions"].as_i64() {
+        lines.push(format!("retain_repo_versions = {n}: Pulp then deletes the versions older than the newest {n}."));
+    }
+    lines.push(String::new());
+    lines.extend(diff);
+    lines
+}
+
+/// The restore task ended: the new version, or none when the latest version already had that content.
+fn restored(app: &mut App, label: &str, t: &Task) {
+    match t.created_matching("/versions/") {
+        Some(v) => app.ok(format!("{label}: new version {}", version_number(&v))),
+        None => app.ok(format!("{label}: no new version (the latest version already has this content)")),
+    }
 }
 
 fn content_action(app: &mut App, version: String, act: Act) {
@@ -3107,6 +3165,88 @@ mod tests {
         assert_eq!(typed.as_deref(), Some("r@v3"));
         assert_eq!(lines[0], "Delete repository version 3 (r@v3) and its 0 publication(s).");
         assert!(!lines.iter().any(|l| l.contains("stop serving") || l.contains("switch")), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn restore_makes_a_new_latest_version_from_the_chosen_one_after_a_preview() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let (repo, snap) = (format!("{API}repositories/file/file/r/"), format!("{API}repositories/file/file/snap/"));
+        let v = |n: u32| format!("{repo}versions/{n}/");
+        let r = json!({ "pulp_href": repo, "name": "docs", "latest_version_href": v(3), "autopublish": false, "retain_repo_versions": 2 });
+        get(&server, &repo, r).await;
+        get(&server, &snap, json!({ "pulp_href": snap, "name": "s", "latest_version_href": format!("{snap}versions/2/"), "pulp_labels": { "pulp_tui_cv": "web" } }))
+            .await;
+        let file = |p: &str| json!({ "pulp_href": format!("{API}content/file/files/{p}/"), "relative_path": p, "sha256": "ab" });
+        for (n, files) in [(1, json!([file("a.txt")])), (3, json!([file("a.txt"), file("b.txt")]))] {
+            wiremock::Mock::given(method("GET"))
+                .and(path(format!("{API}content/file/files/")))
+                .and(query_param("repository_version", v(n)))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(files)))
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(method("POST"))
+            .and(path(format!("{repo}modify/")))
+            .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
+            .mount(&server)
+            .await;
+        get(
+            &server,
+            &format!("{API}tasks/1/"),
+            json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [v(4)] }),
+        )
+        .await;
+        let (mut app, mut rx) = connected(&server).await;
+        let last = |app: &App| app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+
+        // Nothing to restore from the latest version itself, and a Content View snapshot changes only through its view.
+        for (item, want) in [
+            (json!({ "pulp_href": v(3), "number": 3 }), "version 3 is already the latest version of docs"),
+            (json!({ "pulp_href": format!("{snap}versions/1/"), "number": 1 }), "refused: s is a snapshot repository of Content View web"),
+        ] {
+            version_action(&mut app, Act::Restore, item);
+            settle(&mut app, &mut rx).await;
+            assert!(app.modal.is_none() && last(&app).contains(want), "{}", last(&app));
+        }
+
+        version_action(&mut app, Act::Restore, json!({ "pulp_href": v(1), "number": 1 }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, on_yes, .. }) = app.modal.take() else { panic!("no confirm: {}", last(&app)) };
+        assert_eq!(title, "Restore version 1 as latest");
+        assert!(lines.contains(&"- file b.txt  (ab)".to_string()), "the preview shows what the new version loses: {lines:?}");
+        for word in ["Rollback (b)", "publish", "retain_repo_versions = 2"] {
+            assert!(lines.iter().any(|l| l.contains(word)), "{word}: {lines:?}");
+        }
+        assert!(posts_to(&server, &format!("{repo}modify/")).await.is_empty(), "nothing is sent before the confirm");
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &format!("{repo}modify/")).await, [json!({ "base_version": v(1) })]);
+        assert_eq!(last(&app), "restore docs v1 as latest: new version 4");
+        // pulpcore makes no version when the latest one already has that content.
+        restored(&mut app, "restore docs v2 as latest", &Task { state: "completed".into(), ..Default::default() });
+        assert_eq!(last(&app), "restore docs v2 as latest: no new version (the latest version already has this content)");
+    }
+
+    #[test]
+    fn the_restore_confirm_says_what_serves_the_new_version() {
+        let lines = |r: Value| restore_lines(&r, "2", vec!["+ file a.txt".into()]);
+        let off = lines(json!({ "name": "docs", "autopublish": false, "retain_repo_versions": 3 }));
+        assert_eq!(
+            off,
+            [
+                "Make a new latest version of docs with the content of version 2; newer versions are kept.",
+                "Rollback (b) instead re-points one distribution and makes no version. After a restore, the",
+                "distributions that follow the repository and the next sync, copy and publish use the new version.",
+                "Autopublish is off: publish the new version (P) to serve it.",
+                "retain_repo_versions = 3: Pulp then deletes the versions older than the newest 3.",
+                "",
+                "+ file a.txt",
+            ]
+        );
+        let on = lines(json!({ "name": "docs", "autopublish": true }));
+        assert_eq!(on[3..], ["Autopublish is on: Pulp publishes the new version at once.", "", "+ file a.txt"], "no retain line: keep all");
     }
 
     #[tokio::test]

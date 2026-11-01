@@ -367,6 +367,12 @@ pub async fn add_content(c: &PulpClient, repo: &str, units: Vec<String>) -> Resu
     c.post(&format!("{repo}modify/"), &json!({ "add_content_units": units })).await
 }
 
+/// A new latest version of `repo` with the content of its older `version`. Pulp makes no version when
+/// the latest one already has that content.
+pub async fn restore_version(c: &PulpClient, repo: &str, version: &str) -> Result<Mutation> {
+    c.post(&format!("{repo}modify/"), &json!({ "base_version": version })).await
+}
+
 /// Bytes of hrefs in one copy or modify body. Pulp refuses a body above Django's
 /// `DATA_UPLOAD_MAX_MEMORY_SIZE` (default 2,621,440) with HTTP 400; this leaves room for the rest.
 const BATCH_BYTES: usize = 2_000_000;

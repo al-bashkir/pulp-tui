@@ -96,6 +96,13 @@ async fn rpm_lifecycle() {
         ops::ensure_distribution(&c, t, &format!("{name}-other"), &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap_err();
     assert_eq!(err.status(), Some(409), "{err}");
 
+    // Restore as latest: pulp_rpm takes `base_version` too; the new version has every unit of v1.
+    let m = ops::restore_version(&c, &repo, &v1).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let v3 = latest(&c, &repo).await;
+    assert!(v3.ends_with("/versions/3/"), "{v3}");
+    assert_eq!(ops::all_content_keys(&c, t, &v3).await.unwrap(), ops::all_content_keys(&c, t, &v1).await.unwrap());
+
     cleanup(&c, &[&dist, &repo, &local, &remote]).await;
 }
 
@@ -240,4 +247,48 @@ async fn file_path_with_a_comma_is_served_and_verified() {
     let msg = ops::verify_served(&c, t, &base, &version, "").await;
     cleanup(&c, &[&dist, &publication, &repo]).await;
     assert_eq!(msg.unwrap(), "PULP_MANIFEST matches 1 files");
+}
+
+/// Restore as latest: `modify/` with `base_version` makes a new version with the content of an older one;
+/// a distribution that follows the repository serves it after the publish (no autopublish here).
+/// A second restore of the same content makes no version.
+#[tokio::test]
+async fn restored_version_is_served_after_publish() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::File;
+    let name = unique("it-restore");
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut v = vec![];
+    for i in 1..=2 {
+        let path = dir.path().join(format!("{i}.txt"));
+        // Unique bytes, so a rerun does not find the content unit of an earlier run.
+        std::fs::write(&path, format!("{name} {i}\n")).unwrap();
+        ops::upload(&c, t, &path, Some(&format!("{i}.txt")), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
+        v.push(latest(&c, &repo).await);
+    }
+    let follow = json!({ "name": name, "base_path": name, "repository": repo });
+    let follow = create(&c, t.distributions(), follow, "/distributions/").await;
+    let base = dist_url(&c, &follow).await;
+    ops::create_publication(&c, t, &v[1], None, &no_progress).await.unwrap();
+    ops::verify_served(&c, t, &base, &v[1], "").await.unwrap();
+
+    let m = ops::restore_version(&c, &repo, &v[0]).await.unwrap();
+    let task = ops::settle(&c, m, &no_progress).await.unwrap().unwrap();
+    let v3 = latest(&c, &repo).await;
+    assert_eq!(task.created_matching("/versions/").as_deref(), Some(v3.as_str()));
+    assert!(v3.ends_with("/versions/3/"), "{v3}");
+    assert_eq!(ops::all_content_keys(&c, t, &v3).await.unwrap(), ops::all_content_keys(&c, t, &v[0]).await.unwrap());
+    let _: Value = c.get(&v[1], &[]).await.unwrap(); // the newer version is kept
+    ops::verify_served(&c, t, &base, &v[1], "").await.unwrap(); // not served before a publish
+    ops::create_publication(&c, t, &v3, None, &no_progress).await.unwrap();
+    assert_eq!(ops::verify_served(&c, t, &base, &v3, "").await.unwrap(), "PULP_MANIFEST matches 1 files");
+
+    let m = ops::restore_version(&c, &repo, &v[0]).await.unwrap();
+    let task = ops::settle(&c, m, &no_progress).await.unwrap().unwrap();
+    assert_eq!((task.created_matching("/versions/"), latest(&c, &repo).await), (None, v3), "same content: no new version");
+    cleanup(&c, &[&follow, &repo]).await;
 }

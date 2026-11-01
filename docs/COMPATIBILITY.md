@@ -87,6 +87,16 @@ server gives the final answer; the dashboard shows a warning.
   direct URLs of files that exist only in the newer publication can still answer 200
   during this period. pulp-tui verifies rollbacks through metadata and says so in the
   rollback preview.
+* **Restore as latest** (`modify/` with only `base_version`). pulpcore 3.63.36, 3.95.3 and
+  3.123.1 have `base_version` in the modify request (`RepositoryAddRemoveContentSerializer`),
+  and the modify views of pulp_rpm, pulp_file and pulp_deb pass it on (read in the three
+  images), so pulp-tui does not check for it. The new
+  version starts from the content of the latest version, then removes what the base version
+  lacks and adds what it has (`Repository.new_version`); so it has every content type of the
+  base version, also the Deb release records. A version without a change is deleted at once
+  (`RepositoryVersion.__exit__`): the task completes with no created version. A new version
+  runs the retention cleanup (`retain_repo_versions`) and autopublish (`on_new_version`), as
+  a sync does. Verified in `live_repos` (File, RPM) and `live_deb` (3.123.1).
 * **Deleting a served publication or repository version.** In pulpcore 3.123.0
   (`pulpcore/app/models/publication.py`, read in the test container),
   `Publication.repository_version` is `on_delete=CASCADE`: deleting a repository version
