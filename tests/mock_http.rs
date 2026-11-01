@@ -850,7 +850,7 @@ async fn version_content_is_listed_in_large_pages() {
     assert_eq!(pulp_tui::pulp::file::files_in(&c, "/v/").await.unwrap().len(), 0);
     assert_eq!(deb::packages_in(&c, "/v/").await.unwrap().len(), 0);
     for t in RepoType::ALL {
-        assert!(ops::all_content_keys(&c, t, "/v/").await.unwrap().is_empty(), "{t:?}");
+        assert!(ops::all_content_keys(&c, &Capabilities::default(), t, "/v/").await.unwrap().is_empty(), "{t:?}");
     }
 }
 

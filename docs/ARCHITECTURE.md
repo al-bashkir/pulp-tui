@@ -182,8 +182,14 @@ Task Center (no supported pulpcore needs the rule, see COMPATIBILITY.md).
   that list checks the label again at its end and stores `partial` with `<env> was relabeled
   <label> during the promotion` (a rerun of the relabel moves the row). The audit entry is
   `env.relabel`.
-* **Rollback** is a promotion of any earlier published version. Newer versions are never
-  deleted.
+* **Rollback** is a promotion of an earlier published version, without the prior-environment
+  check. In an environment after Library, `CvService::promote` (so every caller) accepts only
+  a version with a lower number than the bound one, or the bound one again (a retry of a
+  partial rollback, or a drift repair); a newer version or an environment without a binding
+  is refused before any request (`cv::rollback_refusal`: `v5 is newer than the active v4 in
+  Test; use Promote`), because it would skip the promotion path. The TUI shows the refusal
+  instead of the preview. In Library (also the Library step of a publish) any published
+  version is accepted. Newer versions are never deleted.
 * **Unpromote** deletes the view's distributions in one environment (one of another
   database, or one without the labels of the view and environment, is kept), then the
   served rows and the binding (`Store::delete_binding`, last,

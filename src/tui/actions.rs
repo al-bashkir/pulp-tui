@@ -123,8 +123,8 @@ fn served_by(ds: &[Distribution], serves: impl Fn(&Distribution) -> bool) -> Vec
 /// version binding without a publication (File, RPM and Deb serve only publications).
 /// A repository binding serves the newest publication of the repository (pulpcore orders by repository
 /// version, then creation), which is not the latest version when that one has no publication.
-async fn served_now(c: &PulpClient, t: RepoType, d: &Value) -> anyhow::Result<Option<(String, Value, String)>> {
-    let Some(p) = ops::served_publication(c, t, d).await? else { return Ok(None) };
+async fn served_now(c: &PulpClient, caps: &Capabilities, t: RepoType, d: &Value) -> anyhow::Result<Option<(String, Value, String)>> {
+    let Some(p) = ops::served_publication(c, caps, t, d).await? else { return Ok(None) };
     let how = match (d["publication"].as_str(), d["repository_version"].as_str()) {
         (Some(x), _) => format!("pinned to publication {}", short(x)),
         (None, Some(_)) => "pinned to repository version".into(),
@@ -1399,10 +1399,10 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
 
 /// The units added and removed from version `a` to `b`, with a warning for a version of which Pulp
 /// counts other units than the compare lists (a content type it does not know, or two units with one key).
-async fn compare_versions(c: &PulpClient, t: RepoType, a: &str, b: &str) -> anyhow::Result<Vec<String>> {
-    let (ka, kb) = (ops::all_content_keys(c, t, a).await?, ops::all_content_keys(c, t, b).await?);
+async fn compare_versions(c: &PulpClient, caps: &Capabilities, t: RepoType, a: &str, b: &str) -> anyhow::Result<Vec<String>> {
+    let (ka, kb) = (ops::all_content_keys(c, caps, t, a).await?, ops::all_content_keys(c, caps, t, b).await?);
     let mut lines = ops::diff(&ka, &kb).lines(&short(a), &short(b));
-    let mut warnings = vec![];
+    let mut warnings: Vec<String> = ops::not_compared(caps, t).into_iter().collect();
     for (v, keys) in [(a, &ka), (b, &kb)] {
         let n = c.get::<RepoVersion>(v, &[]).await?.content_summary.present_count();
         if n != keys.len() as u64 {
@@ -1461,7 +1461,7 @@ fn version_action(app: &mut App, act: Act, item: Value) {
             app.job("compare versions", move |ctx| async move {
                 // Always show older -> newer.
                 let (a, b) = if version_number(&other) <= version_number(&href) { (other, href) } else { (href, other) };
-                let lines = compare_versions(&ctx.client, t, &a, &b).await?;
+                let lines = compare_versions(&ctx.client, &ctx.caps, t, &a, &b).await?;
                 ap(move |app| app.text("Version comparison", lines))
             });
         }
@@ -1544,7 +1544,7 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
             ops::find_by_name(c, &c.api(t.distributions()), &dist).await?.ok_or_else(|| anyhow!("no {} distribution {dist}", t.label()))?;
         cv_distribution_refusal(&d)?;
         // The new publication keeps the signing service of the served one (a Deb publication can have its own).
-        let (current, signing) = match served_now(c, t, &d).await? {
+        let (current, signing) = match served_now(c, &ctx.caps, t, &d).await? {
             Some((v, p, how)) => (format!("{} ({how})", short(&v)), p["signing_service"].as_str().map(str::to_string)),
             None => ("nothing".into(), None),
         };
@@ -1596,9 +1596,11 @@ fn restore_preview(app: &mut App, t: RepoType, version: String, number: String) 
             bail!("version {number} is already the latest version of {name}");
         }
         let drops: &[&str] = if t == RepoType::Deb { &deb::NEW_VERSION_DROPS } else { &[] };
-        let new = ops::content_keys_except(c, t, &version, drops).await?;
-        let d = ops::diff(&ops::all_content_keys(c, t, &latest).await?, &new);
-        let lines = restore_lines(t, &r, &number, d.lines(&format!("latest {}", short(&latest)), &format!("new (= v{number})")));
+        let new = ops::content_keys_except(c, &ctx.caps, t, &version, drops).await?;
+        let d = ops::diff(&ops::all_content_keys(c, &ctx.caps, t, &latest).await?, &new);
+        let mut diff = d.lines(&format!("latest {}", short(&latest)), &format!("new (= v{number})"));
+        diff.splice(1..1, ops::not_compared(&ctx.caps, t));
+        let lines = restore_lines(t, &r, &number, diff);
         let typed = name.clone();
         ap(move |app| {
             app.confirm_prod(format!("Restore version {number} as latest"), lines, &typed, move |app| {
@@ -1802,7 +1804,7 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         Act::Verify => app.job(format!("verify {name}"), move |ctx| async move {
             let c = &ctx.client;
             let d: Value = c.get(&href, &[]).await?;
-            let Some((version, publication, how)) = served_now(c, t, &d).await? else {
+            let Some((version, publication, how)) = served_now(c, &ctx.caps, t, &d).await? else {
                 bail!("distribution serves nothing (no binding, or no publication of its repository or version)");
             };
             let res = ops::verify_served(c, t, &s(&d, "base_url"), &version, &publication).await;
@@ -3705,9 +3707,9 @@ mod tests {
         get(&server, &format!("{API}publications/rpm/rpm/"), pubs).await;
         let (app, _rx) = connected(&server).await;
         let c = &app.conn.as_ref().unwrap().client;
-        let served = served_now(c, RepoType::Rpm, &json!({ "repository": repo })).await.unwrap().unwrap();
+        let served = served_now(c, &Capabilities::default(), RepoType::Rpm, &json!({ "repository": repo })).await.unwrap().unwrap();
         assert_eq!((served.0, s(&served.1, "layout").as_str()), (format!("{repo}versions/2/"), "flat"));
-        assert_eq!(served_now(c, RepoType::Rpm, &json!({ "name": "unbound" })).await.unwrap(), None);
+        assert_eq!(served_now(c, &Capabilities::default(), RepoType::Rpm, &json!({ "name": "unbound" })).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -3727,7 +3729,8 @@ mod tests {
             .await;
         let (app, _rx) = connected(&server).await;
         let c = &app.conn.as_ref().unwrap().client;
-        let (version, p, how) = served_now(c, RepoType::File, &json!({ "repository_version": v })).await.unwrap().unwrap();
+        let (version, p, how) =
+            served_now(c, &Capabilities::default(), RepoType::File, &json!({ "repository_version": v })).await.unwrap().unwrap();
         assert_eq!((version, s(&p, "manifest"), how.as_str()), (v.clone(), "CUSTOM".into(), "pinned to repository version"));
     }
 
@@ -3760,6 +3763,25 @@ mod tests {
         assert_eq!(title, "Verify docs");
         assert_eq!(lines.first().map(String::as_str), Some("docs: follows repository r: newest publication 1"), "{lines:?}");
         assert_eq!(lines.last().map(String::as_str), Some("OK: CUSTOM matches 1 files"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn deb_verify_expects_a_newer_verbatim_publication_of_a_followed_repository() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (repo, dist) = (format!("{API}repositories/deb/apt/r/"), format!("{API}distributions/deb/apt/d/"));
+        get(&server, &dist, json!({ "pulp_href": dist, "name": "apt", "base_url": "http://h/apt/", "repository": repo })).await;
+        let apt =
+            json!({ "pulp_href": "/apt/1/", "repository_version": format!("{repo}versions/1/"), "pulp_created": "2026-01-02T00:00:00Z" });
+        get(&server, &format!("{API}publications/deb/apt/"), page(json!([apt]))).await;
+        // pulpcore picks from all Publication types: the verbatim publication of v2 is served.
+        let verbatim = json!({ "pulp_href": "/verbatim/2/", "repository_version": format!("{repo}versions/2/"), "pulp_created": "2026-01-01T00:00:00Z" });
+        get(&server, &format!("{API}publications/deb/verbatim/"), page(json!([verbatim]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        distribution_action(&mut app, RepoType::Deb, Act::Verify, json!({ "pulp_href": dist, "name": "apt" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no result: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert!(lines.contains(&"expected content: r@v2".to_string()), "{lines:?}");
     }
 
     #[tokio::test]
@@ -3900,6 +3922,45 @@ mod tests {
                 "+ package bash-5.2-1.x86_64"
             ]
         );
+    }
+
+    /// An older plugin can lack a content endpoint: compare the other types and name the skipped one.
+    #[tokio::test]
+    async fn compare_skips_a_content_type_that_the_server_lacks() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path_regex};
+        let server = wiremock::MockServer::start().await;
+        let r = format!("{API}repositories/rpm/rpm/r/");
+        let (v1, v2) = (format!("{r}versions/1/"), format!("{r}versions/2/"));
+        wiremock::Mock::given(method("GET"))
+            .and(path_regex("/content/rpm/modulemd_obsoletes/"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("GET"))
+            .and(path_regex("/content/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([]))))
+            .mount(&server)
+            .await;
+        for (v, n) in [(&v1, 1), (&v2, 2)] {
+            get(&server, v, json!({ "pulp_href": v, "number": n, "content_summary": { "present": {} } })).await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        let mut caps = plugins();
+        let paths: serde_json::Map<String, Value> = RepoType::Rpm
+            .content_types()
+            .iter()
+            .filter(|ct| ct.path != "content/rpm/modulemd_obsoletes/")
+            .map(|ct| (format!("{API}{}", ct.path), json!({})))
+            .collect();
+        caps.load_openapi(&json!({ "paths": paths }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        app.list.marked = [v1.clone()].into();
+        version_action(&mut app, Act::Compare, json!({ "pulp_href": v2, "number": 2 }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no comparison: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert_eq!(lines[..2], ["r@v1 -> r@v2: +0 added, -0 removed", "not compared (not on this server): modulemd obsoletes"]);
     }
 
     #[tokio::test]

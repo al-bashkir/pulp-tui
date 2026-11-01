@@ -154,7 +154,9 @@ server gives the final answer; the dashboard shows a warning.
   binding change of pulp-tui therefore also sends `repository_version: null`.
 * **A distribution that follows a repository** serves the newest complete publication of
   the repository (pulpcore `models/publication.py`: ordered by repository version, then
-  creation), not the latest version. Verify compares with that publication.
+  creation), not the latest version. Verify compares with that publication. pulpcore
+  reads the base `Publication` model (`get_repository_publication_and_version`), so for Deb
+  a newer verbatim publication wins over the APT ones; Verify lists both types.
 * **RPM publish settings** (`metadata_signing_service`, `checksum_type`, `repo_config`,
   `compression_type`, `layout`) come from the repository when the publication request does
   not set them (pulp_rpm `viewsets/repository.py`). A Content View publish copies them from
@@ -177,7 +179,8 @@ server gives the final answer; the dashboard shows a warning.
   langpacks; langpacks have no id (`unique_together` is the digest), so the compare keys
   them by `digest`. The version compare and the Content browser cover all 11 types. Compare
   also reads `content_summary.present` of both versions and warns when Pulp counts other
-  units than it lists.
+  units than it lists. A content type without its endpoint in the OpenAPI (an older plugin)
+  is not read; the compare and the restore preview name it.
 * **`sha256` of RPM packages and File content** comes from the stored file (pulpcore
   `ContentChecksumSerializer`; read in pulp_rpm 3.39.3 and pulp_file 3.123.0), so it is
   `null` for `on_demand` and `streamed` content until a client downloads it. Verify then
@@ -419,7 +422,8 @@ The live tests connect to `127.0.0.1` without TLS, so they do not exercise this 
 
 * Plugins other than pulp_rpm, pulp_file and pulp_deb (container, python, …) are not managed.
 * pulp_deb: no upload of `.deb` files, no replication (native or fallback), no verbatim
-  publications, no dependency solving on copy. A verbatim publication made elsewhere still
+  publications, no dependency solving on copy. A verbatim publication made elsewhere is
+  served when it is the newest (Verify and Rollback read it) and it still
   protects its version (pulpcore `protected_versions` reads every publication type), so the
   version delete impact lists `publications/deb/verbatim/` too.
 * RPM publication layout `nested_by_digest`: the package probe of served-content checks is

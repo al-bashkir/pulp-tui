@@ -434,14 +434,21 @@ pub async fn content_keys(c: &PulpClient, t: RepoType, version: Option<&str>) ->
 
 /// Keys of every unit of a version, of each content type of `t`, prefixed with the type
 /// (`advisory FIXTURE-2026:0001`): for the Versions compare. Fetches only the fields of the keys.
-pub async fn all_content_keys(c: &PulpClient, t: RepoType, version: &str) -> Result<BTreeSet<String>> {
-    content_keys_except(c, t, version, &[]).await
+/// A type that the server has no endpoint for is left out (`not_compared` names it).
+pub async fn all_content_keys(c: &PulpClient, caps: &Capabilities, t: RepoType, version: &str) -> Result<BTreeSet<String>> {
+    content_keys_except(c, caps, t, version, &[]).await
 }
 
 /// `all_content_keys` without the content types at the API paths `skip`.
-pub async fn content_keys_except(c: &PulpClient, t: RepoType, version: &str, skip: &[&str]) -> Result<BTreeSet<String>> {
+pub async fn content_keys_except(
+    c: &PulpClient,
+    caps: &Capabilities,
+    t: RepoType,
+    version: &str,
+    skip: &[&str],
+) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
-    for ct in t.content_types().iter().filter(|ct| !skip.contains(&ct.path)) {
+    for ct in t.content_types().iter().filter(|ct| !skip.contains(&ct.path) && caps.has_endpoint(ct.path)) {
         let q = [("repository_version", version.to_string()), ("fields", ct.fields.into()), ("limit", CONTENT_PAGE.into())];
         let units: Vec<Value> = c.list_all(&c.api(ct.path), &q, 2_000_000).await?;
         out.extend(units.iter().map(ct.key));
@@ -449,18 +456,28 @@ pub async fn content_keys_except(c: &PulpClient, t: RepoType, version: &str, ski
     Ok(out)
 }
 
+/// The line that names the content types of `t` that the server has no endpoint for, if any.
+pub fn not_compared(caps: &Capabilities, t: RepoType) -> Option<String> {
+    let absent: Vec<&str> = t.content_types().iter().filter(|ct| !caps.has_endpoint(ct.path)).map(|ct| ct.label).collect();
+    (!absent.is_empty()).then(|| format!("not compared (not on this server): {}", absent.join(", ")))
+}
+
 /// The publication a distribution (JSON) serves, picked as pulpcore picks it: its own; else the newest
 /// one of its repository version; else the newest one of the newest published version of its repository.
-pub async fn served_publication(c: &PulpClient, t: RepoType, d: &Value) -> Result<Option<Value>> {
+/// pulpcore picks among all publication types, so Deb verbatim publications count too.
+pub async fn served_publication(c: &PulpClient, caps: &Capabilities, t: RepoType, d: &Value) -> Result<Option<Value>> {
     if let Some(p) = d["publication"].as_str() {
         return Ok(Some(c.get(p, &[]).await?));
     }
     let q = match (d["repository_version"].as_str(), d["repository"].as_str()) {
-        (Some(v), _) => ("repository_version", v),
-        (None, Some(r)) => ("repository", r),
+        (Some(v), _) => [("repository_version", v.to_string())],
+        (None, Some(r)) => [("repository", r.to_string())],
         (None, None) => return Ok(None),
     };
-    let pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &[(q.0, q.1.into())], 100_000).await?;
+    let mut pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &q, 100_000).await?;
+    if t == RepoType::Deb && caps.has_endpoint(deb::VERBATIM_PUBLICATIONS) {
+        pubs.extend(c.list_all::<Value>(&c.api(deb::VERBATIM_PUBLICATIONS), &q, 100_000).await?);
+    }
     let key =
         |p: &Value| (version_number(p["repository_version"].as_str().unwrap_or_default()), p["pulp_created"].as_str().map(str::to_string));
     Ok(pubs.into_iter().max_by_key(key))

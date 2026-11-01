@@ -146,7 +146,8 @@ pub async fn plan(
                 RepoType::Rpm => base,
                 RepoType::File => {
                     // pulp_file serves only from publications: only a served manifest name makes a remote URL.
-                    let m = match ops::served_publication(src, t, &serde_json::to_value(&d)?).await {
+                    // The capabilities matter only for Deb publications, which this File branch never reads.
+                    let m = match ops::served_publication(src, &Capabilities::default(), t, &serde_json::to_value(&d)?).await {
                         Err(e) => Err(format!("upstream publication not readable: {e}")),
                         Ok(None) => Err("upstream distribution serves nothing (no publication)".to_string()),
                         Ok(Some(p)) => p["manifest"].as_str().map(str::to_string).ok_or("upstream publication has no manifest".to_string()),

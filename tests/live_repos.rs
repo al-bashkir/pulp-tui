@@ -44,9 +44,9 @@ async fn rpm_lifecycle() {
     assert_eq!(rv.content_summary.present["rpm.advisory"].count, 1);
     // Versions -> Compare covers every content type: the sync (v0 -> v1) also added the advisory.
     let v0 = format!("{repo}versions/0/");
-    let k1 = ops::all_content_keys(&c, t, &v1).await.unwrap();
+    let k1 = ops::all_content_keys(&c, &Capabilities::default(), t, &v1).await.unwrap();
     assert_eq!(rv.content_summary.present_count(), k1.len() as u64, "Pulp counts the units the compare lists");
-    let d = ops::diff(&ops::all_content_keys(&c, t, &v0).await.unwrap(), &k1);
+    let d = ops::diff(&ops::all_content_keys(&c, &Capabilities::default(), t, &v0).await.unwrap(), &k1);
     assert_eq!(
         d.added,
         [
@@ -103,7 +103,10 @@ async fn rpm_lifecycle() {
     ops::settle(&c, m, &no_progress).await.unwrap();
     let v3 = latest(&c, &repo).await;
     assert!(v3.ends_with("/versions/3/"), "{v3}");
-    assert_eq!(ops::all_content_keys(&c, t, &v3).await.unwrap(), ops::all_content_keys(&c, t, &v1).await.unwrap());
+    assert_eq!(
+        ops::all_content_keys(&c, &Capabilities::default(), t, &v3).await.unwrap(),
+        ops::all_content_keys(&c, &Capabilities::default(), t, &v1).await.unwrap()
+    );
 
     cleanup(&c, &[&dist, &repo, &local, &remote]).await;
 }
@@ -137,8 +140,8 @@ async fn rpm_compare_lists_comps_units() {
         c.post_form(&c.api("rpm/comps/"), &[("repository", repo.clone())], Some(("comps.xml".into(), comps.into_bytes()))).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
     let (v0, v1) = (format!("{repo}versions/0/"), latest(&c, &repo).await);
-    let keys = ops::all_content_keys(&c, t, &v1).await.unwrap();
-    let d = ops::diff(&ops::all_content_keys(&c, t, &v0).await.unwrap(), &keys);
+    let keys = ops::all_content_keys(&c, &Capabilities::default(), t, &v1).await.unwrap();
+    let d = ops::diff(&ops::all_content_keys(&c, &Capabilities::default(), t, &v0).await.unwrap(), &keys);
     let langpacks = d.added.iter().find(|k| k.starts_with("package langpacks ")).cloned().unwrap_or_default();
     let want =
         [format!("package category {name}-category"), format!("package environment {name}-env"), format!("package group {name}-group")];
@@ -341,7 +344,10 @@ async fn restored_version_is_served_after_publish() {
     let v3 = latest(&c, &repo).await;
     assert_eq!(task.created_matching("/versions/").as_deref(), Some(v3.as_str()));
     assert!(v3.ends_with("/versions/3/"), "{v3}");
-    assert_eq!(ops::all_content_keys(&c, t, &v3).await.unwrap(), ops::all_content_keys(&c, t, &v[0]).await.unwrap());
+    assert_eq!(
+        ops::all_content_keys(&c, &Capabilities::default(), t, &v3).await.unwrap(),
+        ops::all_content_keys(&c, &Capabilities::default(), t, &v[0]).await.unwrap()
+    );
     let _: Value = c.get(&v[1], &[]).await.unwrap(); // the newer version is kept
     ops::verify_served(&c, t, &base, &v[1], &p2).await.unwrap(); // not served before a publish
     let p3: Value = c.get(&ops::create_publication(&c, t, &v3, None, &no_progress).await.unwrap(), &[]).await.unwrap();

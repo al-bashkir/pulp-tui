@@ -488,59 +488,11 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             ap(move |app| app.text(format!("Preview of {name} (draft vs latest published)"), lines))
         }),
         Act::CvPublish => {
-            let deb = item["repos"].as_array().into_iter().flatten().any(|r| r["type"] == "deb");
-            // Every Deb copy step uses `deb/copy/`.
-            if deb && unsupported(app, crate::pulp::Feature::DebCopy) {
-                return;
-            }
-            let mut fields = vec![Field::text("notes", "Change notes")];
-            if deb {
-                let choices = vec!["same as source".into(), "none".into(), "service".into()];
-                fields.push(Field::new("signing", "Deb signing", FieldKind::Choice(choices)));
-                fields.push(
-                    Field::pick("signing_service", "Signing service", Source::SigningServices).help("used when Deb signing = service"),
-                );
-            }
-            let form =
-                Form::new(format!("Publish {name}"), fields).note("A preview of the exact content is shown before anything is created.");
-            app.form(form, move |app, f| {
-                let notes = f.get("notes").to_string();
-                // Stored with the version (`CvVersionRepo::signing`): "" = same as source.
-                let signing = match f.get("signing") {
-                    "none" => "none".to_string(),
-                    "service" => f.opt("signing_service").ok_or("pick a signing service")?.to_string(),
-                    _ => String::new(),
-                };
-                let name = name.clone();
-                app.job(format!("preview {name}"), move |ctx| async move {
-                    let svc = ctx.cv()?;
-                    let latest = svc.store.versions(id).await?.into_iter().find(|v| v.state == "published").map(|v| v.id);
-                    let mut lines = svc.preview(id, latest).await?;
-                    lines.insert(0, "Publishing creates a new immutable version and makes it active in Library.".into());
-                    lines.insert(1, String::new());
-                    let protected = svc.library_protected().await?;
-                    ap(move |app| {
-                        guard_library(app, protected, lines, Some(format!("Publish {name}")), move |app| {
-                            app.job(format!("publish {name}"), move |ctx| async move {
-                                let (v, note) = ctx
-                                    .cv()?
-                                    .locked(id, "publish")
-                                    .await?
-                                    .publish(id, &notes, &signing, &ctx.log(), &ctx.on_task())
-                                    .await?;
-                                // After the lock of this view is released; composites take their own locks.
-                                let auto = ctx.cv()?.auto_publish(id, &ctx.log(), &ctx.on_task()).await;
-                                ap(move |app| {
-                                    let active = if note.is_none() { " and active in Library" } else { "" };
-                                    let (level, text) = auto_notice(format!("{name} version {} published{active}", v.number), note, auto);
-                                    app.notify(level, text);
-                                    app.reload();
-                                })
-                            });
-                        })
-                    })
-                });
-                Ok(())
+            let Some(st) = cv_store(app) else { return };
+            // The list row can be stale in a shared database: read the repositories now, as Resume does.
+            app.spawn(format!("read repositories of {name}"), true, async move {
+                let deb = st.cv_repos(id).await?.iter().any(|r| r.repo_type == RepoType::Deb);
+                ap(move |app| cv_publish(app, id, name, deb))
             });
         }
         Act::CvVersions => app.push(Kind::CvVersions { cv: id, name }),
@@ -753,6 +705,16 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
         let e = envs.into_iter().find(|e| e.name == env).ok_or_else(|| anyhow!("unknown environment {env}"))?;
         let v = st.version(vid).await?;
         let current = st.binding(e.id, cv).await?;
+        // The rule of `CvService::promote`, before a preview that the operator would confirm in vain.
+        if mode == Mode::Rollback && e.prior_id.is_some() {
+            let active = match &current {
+                Some(b) => Some(st.version(b.version_id).await?.number),
+                None => None,
+            };
+            if let Some(why) = crate::cv::rollback_refusal(&env, v.number, active) {
+                return ap(move |app| app.error(why));
+            }
+        }
         let cur_num = match &current {
             Some(b) => {
                 let running = st.lock_live(cv, crate::cv::unix_now()).await?;
@@ -844,6 +806,56 @@ fn unpromote_preview(app: &mut App, cv: i64, name: String, env: String) {
                 });
             });
         })
+    });
+}
+
+/// The Publish form of view `id`; `deb`: the view has a Deb repository (read from the store).
+fn cv_publish(app: &mut App, id: i64, name: String, deb: bool) {
+    // Every Deb copy step uses `deb/copy/`.
+    if deb && unsupported(app, crate::pulp::Feature::DebCopy) {
+        return;
+    }
+    let mut fields = vec![Field::text("notes", "Change notes")];
+    if deb {
+        let choices = vec!["same as source".into(), "none".into(), "service".into()];
+        fields.push(Field::new("signing", "Deb signing", FieldKind::Choice(choices)));
+        fields.push(Field::pick("signing_service", "Signing service", Source::SigningServices).help("used when Deb signing = service"));
+    }
+    let form = Form::new(format!("Publish {name}"), fields).note("A preview of the exact content is shown before anything is created.");
+    app.form(form, move |app, f| {
+        let notes = f.get("notes").to_string();
+        // Stored with the version (`CvVersionRepo::signing`): "" = same as source.
+        let signing = match f.get("signing") {
+            "none" => "none".to_string(),
+            "service" => f.opt("signing_service").ok_or("pick a signing service")?.to_string(),
+            _ => String::new(),
+        };
+        let name = name.clone();
+        app.job(format!("preview {name}"), move |ctx| async move {
+            let svc = ctx.cv()?;
+            let latest = svc.store.versions(id).await?.into_iter().find(|v| v.state == "published").map(|v| v.id);
+            let mut lines = svc.preview(id, latest).await?;
+            lines.insert(0, "Publishing creates a new immutable version and makes it active in Library.".into());
+            lines.insert(1, String::new());
+            let protected = svc.library_protected().await?;
+            ap(move |app| {
+                guard_library(app, protected, lines, Some(format!("Publish {name}")), move |app| {
+                    app.job(format!("publish {name}"), move |ctx| async move {
+                        let (v, note) =
+                            ctx.cv()?.locked(id, "publish").await?.publish(id, &notes, &signing, &ctx.log(), &ctx.on_task()).await?;
+                        // After the lock of this view is released; composites take their own locks.
+                        let auto = ctx.cv()?.auto_publish(id, &ctx.log(), &ctx.on_task()).await;
+                        ap(move |app| {
+                            let active = if note.is_none() { " and active in Library" } else { "" };
+                            let (level, text) = auto_notice(format!("{name} version {} published{active}", v.number), note, auto);
+                            app.notify(level, text);
+                            app.reload();
+                        })
+                    });
+                })
+            })
+        });
+        Ok(())
     });
 }
 
@@ -1322,14 +1334,21 @@ mod tests {
 
     #[tokio::test]
     async fn cv_publish_asks_for_deb_signing_only_with_a_deb_repository() {
-        let mut app = test_app().await;
-        let rpm = json!({ "name": "os", "type": "rpm", "href": format!("{REPOS}rpm/rpm/1/") });
-        let deb = json!({ "name": "apt", "type": "deb", "href": format!("{REPOS}deb/apt/2/") });
+        let (mut app, mut rx, st) = composite_app().await;
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let repo =
+            |name: &str, t: RepoType, href: &str| CvRepo { repo_href: href.into(), repo_name: name.into(), repo_type: t, filters: vec![] };
+        st.set_cv_repo(web, &repo("os", RepoType::Rpm, &format!("{REPOS}rpm/rpm/1/"))).await.unwrap();
         let keys = |f: &crate::tui::form::Form| f.fields.iter().map(|x| x.key.clone()).collect::<Vec<_>>();
-        cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": 1, "name": "web", "repos": [rpm] }));
+        // The repositories come from the store: the list row can be stale in a shared database.
+        let row = json!({ "id": web, "name": "web", "repos": [] });
+        cv_action(&mut app, "lab", Act::CvPublish, row.clone());
+        drain(&mut app, &mut rx).await;
         let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no publish form") };
         assert_eq!(keys(&form), ["notes"]);
-        cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": 1, "name": "web", "repos": [rpm, deb] }));
+        st.set_cv_repo(web, &repo("apt", RepoType::Deb, &format!("{REPOS}deb/apt/2/"))).await.unwrap();
+        cv_action(&mut app, "lab", Act::CvPublish, row);
+        drain(&mut app, &mut rx).await;
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no publish form") };
         assert_eq!(keys(&form), ["notes", "signing", "signing_service"]);
         assert_eq!(form.get("signing"), "same as source");
@@ -1366,10 +1385,14 @@ mod tests {
     #[tokio::test]
     async fn cv_publish_of_a_deb_view_needs_the_deb_copy_api() {
         let server = MockServer::start().await;
-        let mut app = test_app().await;
+        let (mut app, mut rx, st) = composite_app().await;
         connect_without_deb_copy(&mut app, &server);
-        let deb = json!({ "name": "apt", "type": "deb", "href": format!("{REPOS}deb/apt/2/") });
-        cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": 1, "name": "web", "repos": [deb] }));
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let apt = CvRepo { repo_href: format!("{REPOS}deb/apt/2/"), repo_name: "apt".into(), repo_type: RepoType::Deb, filters: vec![] };
+        st.set_cv_repo(web, &apt).await.unwrap();
+        // Another operator added the Deb repository after this list was read.
+        cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": web, "name": "web", "repos": [] }));
+        drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none(), "stopped before the publish form");
         assert_eq!(last_notice(&app), (Level::Error, "not supported by this server: Deb copy API (deb/copy/)"));
         assert!(server.received_requests().await.unwrap().is_empty(), "nothing sent");
@@ -1697,8 +1720,8 @@ mod tests {
         let c = st.create_composite("lab", "rocky9", "").await.unwrap();
         st.set_component(c, os, None).await.unwrap();
         app.push(Kind::ContentViews);
-        let publish = |app: &mut App| {
-            cv_action(app, "lab", Act::CvPublish, json!({ "id": c, "name": "rocky9", "composite": true }));
+        let publish = |app: &mut App| cv_action(app, "lab", Act::CvPublish, json!({ "id": c, "name": "rocky9", "composite": true }));
+        let submit_form = |app: &mut App| {
             let (form, mut submit) = open_form(app);
             submit(app, &form).unwrap();
         };
@@ -1707,12 +1730,16 @@ mod tests {
             _ => panic!("no confirmation"),
         };
         publish(&mut app);
+        drain(&mut app, &mut rx).await; // the form opens after the store read
+        submit_form(&mut app);
         drain(&mut app, &mut rx).await;
         assert_eq!(confirm(&mut app).1, None, "an open Library takes a plain confirmation");
 
         let lib = st.ensure_library("lab").await.unwrap();
         st.set_env_protected(lib, true).await.unwrap();
         publish(&mut app);
+        drain(&mut app, &mut rx).await;
+        submit_form(&mut app);
         drain(&mut app, &mut rx).await;
         let (title, typed, on_yes) = confirm(&mut app);
         assert_eq!((title.as_str(), typed.as_deref()), ("Library is protected", Some(LIBRARY)));
@@ -1995,6 +2022,28 @@ mod tests {
         drain(&mut app, &mut rx).await;
         let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
         assert_eq!(lines[..2], ["Dev: v1 (interrupted) DRIFT", "    binding state is interrupted"]);
+    }
+
+    #[tokio::test]
+    async fn rollback_to_a_newer_version_says_use_promote_instead_of_a_preview() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let dev = st.create_env("lab", "Dev", st.ensure_library("lab").await.unwrap(), false).await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let (v1, v2) = (publish_empty(&st, web).await, publish_empty(&st, web).await);
+        promote_preview(&mut app, web, "web".into(), v2.id, "Dev".into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no preview to confirm");
+        assert_eq!(last_notice(&app), (Level::Error, "no version is active in Dev; use Promote"));
+        st.set_binding(dev, web, v1.id, "active").await.unwrap();
+        promote_preview(&mut app, web, "web".into(), v2.id, "Dev".into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no preview to confirm");
+        assert_eq!(last_notice(&app), (Level::Error, "v2 is newer than the active v1 in Dev; use Promote"));
+        promote_preview(&mut app, web, "web".into(), v1.id, "Dev".into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(confirm_lines(&mut app)[0], "web: Dev now serves v1 (active); will serve v1", "the active version again: a retry");
     }
 
     #[tokio::test]

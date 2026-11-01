@@ -262,8 +262,19 @@ pub fn component_lines(old: &[UsedVersion], new: &[UsedVersion]) -> Vec<String> 
 pub enum Mode {
     /// Requires the version to be active in the prior environment.
     Promote,
-    /// Any published version; used to restore an earlier version.
+    /// An earlier published version (`rollback_refusal`); in Library any published version.
     Rollback,
+}
+
+/// Why a rollback of version `number` in `env` (not Library) is refused; `active` is the number bound there.
+/// A newer version, or a first one, must come through Promote: it would skip the promotion path. The active
+/// version itself is allowed: a retry of a partial rollback, or a drift repair.
+pub fn rollback_refusal(env: &str, number: i64, active: Option<i64>) -> Option<String> {
+    match active {
+        None => Some(format!("no version is active in {env}; use Promote")),
+        Some(a) if number > a => Some(format!("v{number} is newer than the active v{a} in {env}; use Promote")),
+        Some(_) => None,
+    }
 }
 
 /// Content of one repository selected by the filters.
@@ -995,6 +1006,15 @@ impl CvService {
             if pb.as_ref().map(|b| (b.version_id, b.state.as_str())) != Some((version_id, "active")) {
                 let pname = envs.iter().find(|e| e.id == prior).map(|e| e.name.as_str()).unwrap_or("?");
                 bail!("version {} is not active in {pname}; promote it there first (or use rollback)", v.number);
+            }
+        }
+        if mode == Mode::Rollback && env.prior_id.is_some() {
+            let active = match self.store.binding(env_id, cv_id).await? {
+                Some(b) => Some(self.store.version(b.version_id).await?.number),
+                None => None,
+            };
+            if let Some(why) = rollback_refusal(&env.name, v.number, active) {
+                bail!(why);
             }
         }
         self.alive()?;
@@ -2921,11 +2941,50 @@ mod tests {
         let relabel = |_: String| {
             tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(svc.store.set_env_label(dev, "qa"))).unwrap()
         };
-        let e = svc.promote(cv, v.id, dev, Mode::Rollback, &relabel, &ops::no_progress).await.unwrap_err();
+        svc.store.set_binding(lib, cv, v.id, "active").await.unwrap();
+        let e = svc.promote(cv, v.id, dev, Mode::Promote, &relabel, &ops::no_progress).await.unwrap_err();
         assert!(e.to_string().ends_with("partial: Dev was relabeled qa during the promotion; edit Dev again with label qa"), "{e}");
         assert_eq!(svc.store.binding(dev, cv).await.unwrap().unwrap().state, "partial");
         let moves: Vec<_> = svc.relabel_impact(dev, "qa").await.unwrap().into_iter().map(|(b, new)| (b.base_path, new)).collect();
         assert_eq!(moves, [("dev/web/os".to_string(), "qa/web/os".to_string())], "a rerun of the relabel moves the row");
+    }
+
+    #[tokio::test]
+    async fn rollback_after_library_goes_back_only() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let lib = svc.store.ensure_library("k").await.unwrap();
+        let test = svc.store.create_env("k", "Test", lib, false).await.unwrap();
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let mut v = vec![];
+        for _ in 0..3 {
+            v.push(published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await);
+        }
+        let rollback = |n: usize, env: i64| svc.promote(cv, v[n].id, env, Mode::Rollback, &|_| {}, &ops::no_progress);
+        let refused = async |n, env| rollback(n, env).await.unwrap_err().to_string();
+        assert_eq!(refused(2, test).await, "no version is active in Test; use Promote", "rollback is not a first promotion");
+        svc.store.set_binding(test, cv, v[1].id, "active").await.unwrap();
+        assert_eq!(refused(2, test).await, "v3 is newer than the active v2 in Test; use Promote", "it would skip the path");
+        assert_eq!(svc.store.binding(test, cv).await.unwrap().unwrap().version_id, v[1].id);
+        assert!(server.received_requests().await.unwrap().is_empty(), "refused before any request");
+
+        // Older, the active version again (a retry), and Library (any published version) go on.
+        let ok = |body: Value| ResponseTemplate::new(200).set_body_json(body);
+        let none = json!({ "count": 0, "next": null, "results": [] });
+        for p in ["/pulp/api/v3/distributions/rpm/rpm/", "/pulp/api/v3/distributions/"] {
+            Mock::given(method("GET")).and(path(p)).respond_with(ok(none.clone())).mount(&server).await;
+        }
+        let task = ResponseTemplate::new(202).set_body_json(json!({ "task": "/pulp/api/v3/tasks/1/" }));
+        Mock::given(method("POST")).and(path("/pulp/api/v3/distributions/rpm/rpm/")).respond_with(task).mount(&server).await;
+        let done = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "completed", "name": "create", "created_resources": [DIST] });
+        Mock::given(method("GET")).and(path("/pulp/api/v3/tasks/1/")).respond_with(ok(done)).mount(&server).await;
+        for (n, env) in [(0, test), (0, test), (2, lib), (0, lib)] {
+            rollback(n, env).await.unwrap();
+            let b = svc.store.binding(env, cv).await.unwrap().unwrap();
+            assert_eq!((b.version_id, b.state.as_str()), (v[n].id, "active"));
+        }
     }
 
     /// A published version of `cv` with one RPM row (derived repository DERIVED, a version and a publication).

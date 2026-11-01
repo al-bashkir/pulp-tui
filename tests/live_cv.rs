@@ -99,6 +99,11 @@ async fn content_view_lifecycle() {
     assert_eq!(store.binding(dev, cv).await.unwrap().unwrap().version_id, v1.id);
     assert!(svc.verify(cv, dev).await.unwrap().is_empty());
     assert_eq!(store.version(v2.id).await.unwrap().state, "published");
+    // Rollback goes back only: v2 again, or v1 into empty Prod, would skip the path (CV-5).
+    let refused = async |v: i64, env| svc.promote(cv, v, env, Mode::Rollback, &quiet, &no_progress).await.unwrap_err().to_string();
+    assert_eq!(refused(v2.id, dev).await, "v2 is newer than the active v1 in Dev; use Promote");
+    assert_eq!(refused(v1.id, prod).await, "no version is active in Prod; use Promote");
+    assert_eq!(store.binding(dev, cv).await.unwrap().unwrap().version_id, v1.id);
 
     // Retention protection: referenced snapshots are listed; bound versions cannot be deleted.
     let protected = store.protected_versions(&profile).await.unwrap();
