@@ -220,7 +220,7 @@ const DEB_TYPES: &[ContentType] = &[
     },
 ];
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct ProgressReport {
     #[serde(default)]
     pub message: String,
@@ -233,7 +233,7 @@ pub struct ProgressReport {
     pub suffix: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct Task {
     pub pulp_href: String,
     pub state: String,
@@ -312,6 +312,42 @@ impl TaskGroup {
         let finalized =
             self.tasks.iter().any(|t| t["name"].as_str().is_some_and(|n| n.ends_with("finalize_replication")) && t["state"] == "completed");
         self.active() == 0 && self.done() > 0 && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized)
+    }
+    /// How a final group ended: a failed task fails it; a canceled or skipped task is not a success either.
+    pub fn outcome(&self) -> &'static str {
+        if self.failed > 0 {
+            "failed"
+        } else if self.canceled > 0 {
+            "canceled"
+        } else if self.skipped > 0 {
+            "skipped"
+        } else {
+            "completed"
+        }
+    }
+    /// The group as one Task Center task. Its state is `outcome` once final; the counts are the error when not completed.
+    // shortcut: a group that only `wait_task_group`'s three-poll rule ends stays `running` here; no supported pulpcore does that.
+    pub fn as_task(&self) -> Task {
+        let state = match self.is_final() {
+            true => self.outcome(),
+            false if self.running + self.canceling > 0 => "running",
+            false => "waiting",
+        };
+        let progress = ProgressReport {
+            message: "tasks".into(),
+            state: state.into(),
+            done: Some(self.done()),
+            total: Some(self.tasks.len() as u64),
+            ..Default::default()
+        };
+        Task {
+            pulp_href: self.pulp_href.clone(),
+            state: state.into(),
+            name: self.description.clone(),
+            progress_reports: vec![progress],
+            error: (self.is_final() && state != "completed").then(|| serde_json::json!({ "description": self.counts() })),
+            ..Default::default()
+        }
     }
 }
 
@@ -559,5 +595,32 @@ mod tests {
         assert!(t.is_final());
         assert_eq!(t.error_message().as_deref(), Some("boom"));
         assert_eq!(t.created_matching("/versions/").as_deref(), Some("/r/versions/1/"));
+    }
+
+    #[test]
+    fn a_task_group_is_one_task_center_task() {
+        use serde_json::json;
+        let group = |counts: Value| -> TaskGroup {
+            let mut g = json!({ "pulp_href": "/g/1/", "description": "Replication of up", "all_tasks_dispatched": true,
+                "tasks": [{ "name": "a" }, { "name": "b" }] });
+            g.as_object_mut().unwrap().extend(counts.as_object().unwrap().clone());
+            serde_json::from_value(g).unwrap()
+        };
+        let row = |counts: Value| {
+            let t = group(counts).as_task();
+            (t.state.clone(), t.error_message())
+        };
+        assert_eq!(row(json!({ "waiting": 2 })), ("waiting".into(), None));
+        assert_eq!(row(json!({ "running": 1, "waiting": 1 })), ("running".into(), None));
+        assert_eq!(row(json!({ "canceling": 1, "completed": 1 })), ("running".into(), None), "not final while a task cancels");
+        // Final: a failed task fails the group; else a canceled one cancels it; else a skipped one.
+        let counts = |c, f, x, s| Some(format!("completed {c}  failed {f}  canceled {x}  skipped {s}"));
+        assert_eq!(row(json!({ "completed": 2 })), ("completed".into(), None));
+        assert_eq!(row(json!({ "failed": 1, "canceled": 1 })), ("failed".into(), counts(0, 1, 1, 0)));
+        assert_eq!(row(json!({ "canceled": 1, "skipped": 1 })), ("canceled".into(), counts(0, 0, 1, 1)));
+        assert_eq!(row(json!({ "completed": 1, "skipped": 1 })), ("skipped".into(), counts(1, 0, 0, 1)));
+        let t = group(json!({ "completed": 1, "running": 1 })).as_task();
+        assert_eq!((t.pulp_href.as_str(), t.name.as_str()), ("/g/1/", "Replication of up"));
+        assert_eq!((t.progress_reports[0].done, t.progress_reports[0].total), (Some(1), Some(2)), "finished of all tasks");
     }
 }

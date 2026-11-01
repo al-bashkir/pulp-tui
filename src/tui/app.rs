@@ -639,15 +639,23 @@ impl App {
             });
         }
         if finished {
-            match state.as_str() {
-                "completed" => self.ok(format!("task completed: {label}")),
-                _ => self.error(format!("task {state}: {label}{}", err.map(|e| format!(": {e}")).unwrap_or_default())),
-            }
-            // Refresh the visible list once when a task finishes (not on every tick). A newer load
-            // replaces one in flight, which may hold the state from before the task.
-            if matches!(self.screen, Screen::List(_)) {
-                self.reload();
-            }
+            self.task_finished(&state, &label, err);
+        }
+    }
+
+    /// The notice of a task that just ended in `state`, with Pulp's error `err`.
+    fn task_finished(&mut self, state: &str, label: &str, err: Option<String>) {
+        let text = format!("task {state}: {label}{}", err.map(|e| format!(": {e}")).unwrap_or_default());
+        match state {
+            "completed" => self.ok(format!("task completed: {label}")),
+            // Not a success, and not an error that Pulp reports.
+            "canceled" | "skipped" => self.notify(Level::Warn, text),
+            _ => self.error(text),
+        }
+        // Refresh the visible list once when a task finishes (not on every tick). A newer load
+        // replaces one in flight, which may hold the state from before the task.
+        if matches!(self.screen, Screen::List(_)) {
+            self.reload();
         }
     }
 
@@ -663,7 +671,7 @@ impl App {
         for href in self.tasks.due() {
             let (c, tx) = (ctx.client.clone(), self.tx.clone());
             tokio::spawn(async move {
-                let result = c.get::<Task>(&href, &[]).await;
+                let result = crate::pulp::ops::get_task(&c, &href).await;
                 let _ = tx.send(Msg::TaskPolled { href, result });
             });
         }
@@ -2011,6 +2019,32 @@ mod tests {
         let m = rx.recv().await.unwrap();
         app.handle_msg(m);
         assert_eq!(loads(&app), 1, "the list shows what the failed operation left");
+    }
+
+    #[tokio::test]
+    async fn a_finished_task_says_how_it_ended_and_reloads_the_list() {
+        let mut app = app_on(Kind::Profiles).await;
+        let task = |n: u32, state: &str| {
+            let t = serde_json::json!({ "pulp_href": format!("/t/{n}/"), "state": state, "name": "sync os", "error": { "description": "stop" } });
+            Msg::Task(serde_json::from_value(t).unwrap())
+        };
+        app.handle_msg(task(1, "running"));
+        assert!(app.notices.is_empty() && app.list.generation == 0, "a running task: no notice, no reload");
+        for (n, state, level, text) in [
+            (2, "completed", Level::Ok, "task completed: sync os"),
+            (3, "canceled", Level::Warn, "task canceled: sync os: stop"),
+            (4, "skipped", Level::Warn, "task skipped: sync os: stop"),
+            (5, "failed", Level::Error, "task failed: sync os: stop"),
+        ] {
+            let generation = app.list.generation;
+            app.handle_msg(task(n, state));
+            let last = app.notices.back().unwrap();
+            assert_eq!((last.level, last.text.as_str()), (level, text));
+            assert_eq!(app.list.generation, generation + 1, "{state}: the list reloads once");
+        }
+        app.screen = Screen::Dashboard;
+        app.handle_msg(task(6, "completed"));
+        assert_eq!(app.list.generation, 4, "not a list: nothing to reload");
     }
 
     #[tokio::test]

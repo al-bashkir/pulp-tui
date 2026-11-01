@@ -163,6 +163,13 @@ server gives the final answer; the dashboard shows a warning.
   group did not complete, but a canceled `replicate_distributions` dispatches no finalizer:
   the group ends with only `canceled 1`. pulp-tui reports canceled or skipped tasks as not
   complete (read in the pulpcore source of the three images).
+* **Task groups in the Task Center.** The group counters, `all_tasks_dispatched` and
+  `tasks` exist on 3.63 too. Every supported version ends a replication group by a rule of
+  `TaskGroup::is_final` (3.63: `all_tasks_dispatched`; 3.95 and 3.123: the
+  `finalize_replication` task, or a failed or canceled task), never only by the three-poll
+  rule. Cancel of a group (`PATCH {task_group_href}`, `task_groups_cancel`) exists on 3.95
+  and 3.123, not on 3.63: **X** on a replication row there shows Pulp's refusal, and the row
+  keeps the state that Pulp reports.
 * `api_root` of an Upstream Pulp is relative and needs a trailing slash (`pulp/`).
 * **Clearing remote fields.** pulpcore `RemoteNetworkConfigSerializer` (`ca_cert`,
   `client_cert`, `client_key`, `username`, `password`, `proxy_username`,

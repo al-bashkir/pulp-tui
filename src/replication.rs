@@ -19,13 +19,9 @@ use serde_json::{Value, json};
 
 pub const LABEL_REPLICA: &str = "pulp_tui_replica";
 
-/// Trigger native replication and wait for its task group. A failed task is an error; the
-/// caller reports canceled or skipped tasks from the returned group.
-pub async fn replicate_native(
-    c: &PulpClient,
-    upstream_href: &str,
-    on: &(dyn Fn(&TaskGroup) + Send + Sync),
-) -> Result<(TaskGroup, Vec<String>)> {
+/// Trigger native replication and wait for its task group. A failed task is an error;
+/// `on` gets each snapshot, whose `TaskGroup::outcome` tells canceled or skipped tasks.
+pub async fn replicate_native(c: &PulpClient, upstream_href: &str, on: &(dyn Fn(&TaskGroup) + Send + Sync)) -> Result<Vec<String>> {
     let Mutation::TaskGroup(g) = c.post(&format!("{upstream_href}replicate/"), &json!({})).await? else {
         bail!("replicate did not return a task group");
     };
@@ -45,7 +41,7 @@ pub async fn replicate_native(
     if group.failed > 0 {
         bail!("{}", lines.join("\n"));
     }
-    Ok((group, lines))
+    Ok(lines)
 }
 
 /// Refuse replicating a server into itself.

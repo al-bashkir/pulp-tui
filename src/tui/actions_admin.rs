@@ -418,8 +418,10 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
             ];
             let go = move |app: &mut App| {
                 app.job(format!("replicate {name}"), move |ctx| async move {
-                    let p = ctx.clone();
+                    let (p, task) = (ctx.clone(), ctx.on_task());
                     let on = move |g: &crate::pulp::models::TaskGroup| {
+                        // The Task Center shows, stores and re-attaches the group, and reports how it ended.
+                        task(&g.as_task());
                         p.progress(format!(
                             "tasks: {} done, {} running, {} waiting, {} failed",
                             g.completed, g.running, g.waiting, g.failed
@@ -427,14 +429,7 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                     };
                     let res = replication::replicate_native(&ctx.client, &href, &on).await;
                     ap(move |app| match res {
-                        Ok((g, lines)) => {
-                            match g.canceled + g.skipped {
-                                0 => app.ok(format!("replication of {name} completed")),
-                                _ => app.notify(Level::Warn, format!("replication of {name} not complete: {}", g.counts())),
-                            }
-                            app.text(format!("Replication of {name}"), lines);
-                            app.reload();
-                        }
+                        Ok(lines) => app.text(format!("Replication of {name}"), lines),
                         Err(e) => app.text(format!("Replication of {name} FAILED"), format!("{e:#}").lines().map(str::to_string).collect()),
                     })
                 });
@@ -659,6 +654,50 @@ mod tests {
         let (mut app, mut rx) = start_replication(&server).await;
         settle(&mut app, &mut rx).await;
         assert!(notices(&app).iter().any(|(l, t)| *l == Level::Ok && t.contains("completed")), "{:?}", notices(&app));
+    }
+
+    /// Apply job messages until `done` holds (at most 5 s).
+    async fn until(app: &mut App, rx: &mut UnboundedReceiver<Msg>, done: impl Fn(&App) -> bool) {
+        let wait = async {
+            while !done(app) {
+                let m = rx.recv().await.unwrap();
+                app.handle_msg(m);
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.expect("timed out");
+    }
+
+    #[tokio::test]
+    async fn a_replication_is_tracked_and_reattached_after_a_restart() {
+        let server = MockServer::start().await;
+        serve(&server, "GET", GROUP, 200, group("running")).await;
+        let (mut app, mut rx) = start_replication(&server).await;
+        let stored =
+            |app: &App| app.tasks.items.iter().any(|t| t.href == GROUP) && !app.jobs.iter().any(|j| j.label.starts_with("persist"));
+        until(&mut app, &mut rx, stored).await;
+        let row = &app.tasks.items[0];
+        assert_eq!((row.label.as_str(), row.state.as_str()), ("Replication of up", "running"), "visible in Tasks while it runs");
+        let store = app.store.clone();
+        let refs = store.tasks("lab", 10).await.unwrap();
+        assert_eq!((refs.len(), refs[0].href.as_str(), refs[0].state.as_str()), (1, GROUP, "running"));
+        drop((app, rx)); // quit while the replication runs
+
+        // The next start re-attaches it; a canceled task ends it with a warning, and the list reloads.
+        server.reset().await;
+        serve(&server, "GET", GROUP, 200, group("canceled")).await;
+        let (mut app, mut rx) = connected(&server, store.clone()).await;
+        assert!(notices(&app).contains(&(Level::Info, "re-attached to 1 unfinished task(s) from a previous session".into())));
+        app.open(crate::tui::app::Screen::List(crate::tui::kinds::Kind::UpstreamPulps));
+        settle(&mut app, &mut rx).await;
+        let generation = app.list.generation;
+        app.tick();
+        until(&mut app, &mut rx, |app| app.tasks.items[0].is_final()).await;
+        assert!(app.list.generation > generation, "the list reloads");
+        assert_eq!(app.tasks.items[0].state, "canceled");
+        let n = notices(&app);
+        assert!(n.iter().any(|(l, t)| *l == Level::Warn && t.contains("Replication of up") && t.contains("canceled 1")), "{n:?}");
+        settle(&mut app, &mut rx).await;
+        assert_eq!(store.tasks("lab", 10).await.unwrap()[0].state, "canceled", "stored final: not re-attached again");
     }
 
     #[test]

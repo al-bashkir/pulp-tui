@@ -491,7 +491,10 @@ live view of the task (state, progress reports, times, error, created resources)
 refreshes until the task ends; **i** details with all progress reports, **X** cancel on
 the server (confirmation), **z** dismiss finished tasks from the list (above 500 tracked
 tasks, the oldest finished one goes by itself). `t` switches to all
-server tasks (**a** tracks one; **W** tracks it and opens the live view).
+server tasks (**a** tracks one; **W** tracks it and opens the live view). A native
+replication is one row for its task group: the progress counts the finished tasks of the
+group, and a restart re-attaches it like a task. A task or group that ends canceled or
+skipped gives a warning; a failed one gives an error.
 
 ### Logs
 

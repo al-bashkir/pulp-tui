@@ -4,9 +4,9 @@
 mod common;
 
 use common::*;
-use pulp_tui::pulp::models::Distribution;
+use pulp_tui::pulp::models::{Distribution, TaskGroup};
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{Capabilities, Feature, PulpClient, RepoType};
+use pulp_tui::pulp::{Capabilities, Feature, Mutation, PulpClient, RepoType};
 use pulp_tui::replication::{self, PlanAction};
 use pulp_tui::repo_export;
 use pulp_tui::store::Store;
@@ -73,6 +73,45 @@ async fn downstream_has(c: &PulpClient, dist_name: &str, nevra: &str) -> bool {
     ops::content_keys(c, RepoType::Rpm, Some(&version)).await.unwrap().contains(nevra)
 }
 
+/// An Upstream Pulp on pulp1 for the pulp2 distributions named `prefix*`, policy `nodelete` where the server has it.
+async fn upstream_pulp(dst: &PulpClient, caps: &Capabilities, prefix: &str) -> String {
+    let mut body = json!({
+        "name": prefix, "base_url": upstream_from_downstream(), "api_root": "pulp/",
+        "username": "admin", "password": std::env::var("PULP_TUI_TEST_PASSWORD").unwrap_or_else(|_| "password".into()),
+        "q_select": format!("name__startswith=\"{prefix}\""),
+    });
+    if caps.supports(Feature::ReplicationPolicy) {
+        body["policy"] = "nodelete".into();
+    }
+    ops::create(dst, &dst.api("upstream-pulps/"), &body, "/upstream-pulps/", &no_progress).await.unwrap()
+}
+
+/// A canceled replication ends (its Task Center row becomes final) and is never reported as completed.
+#[tokio::test]
+async fn canceled_native_replication_is_not_complete() {
+    if !live_enabled() {
+        return;
+    }
+    let dst = client();
+    let caps = Capabilities::detect(&dst).await.unwrap();
+    if !caps.supports(Feature::NativeReplication) {
+        eprintln!("native replication unsupported by this server; skipping");
+        return;
+    }
+    let upstream_href = upstream_pulp(&dst, &caps, &unique("natc")).await;
+    let Mutation::TaskGroup(g) = dst.post(&format!("{upstream_href}replicate/"), &json!({})).await.unwrap() else {
+        panic!("replicate did not return a task group");
+    };
+    let started: TaskGroup = dst.get(&g, &[]).await.unwrap();
+    let canceled = dst.patch(started.tasks[0]["pulp_href"].as_str().unwrap(), &json!({ "state": "canceled" })).await;
+    let row = ops::wait_task_group(&dst, &g, &|_| {}).await.unwrap().as_task();
+    match canceled {
+        Ok(_) => assert!(row.state != "completed" && row.error.is_some(), "{row:?}"),
+        Err(e) => eprintln!("replicate_distributions ended before the cancel ({e}): {row:?}"),
+    }
+    cleanup(&dst, &[&upstream_href]).await;
+}
+
 #[tokio::test]
 async fn native_replication() {
     if !live_enabled() {
@@ -86,19 +125,16 @@ async fn native_replication() {
     }
     let prefix = unique("nat");
     let (rpm_repo, _) = upstream_content(&up, &prefix).await;
-    let mut body = json!({
-        "name": prefix, "base_url": upstream_from_downstream(), "api_root": "pulp/",
-        "username": "admin", "password": std::env::var("PULP_TUI_TEST_PASSWORD").unwrap_or_else(|_| "password".into()),
-        "q_select": format!("name__startswith=\"{prefix}\""),
-    });
-    if caps.supports(Feature::ReplicationPolicy) {
-        body["policy"] = "nodelete".into();
-    }
-    let upstream_href = ops::create(&dst, &dst.api("upstream-pulps/"), &body, "/upstream-pulps/", &no_progress).await.unwrap();
+    let upstream_href = upstream_pulp(&dst, &caps, &prefix).await;
 
-    let (group, lines) = replication::replicate_native(&dst, &upstream_href, &|_| {}).await.unwrap();
+    let last = std::sync::Mutex::new(None);
+    let lines =
+        replication::replicate_native(&dst, &upstream_href, &|g: &TaskGroup| *last.lock().unwrap() = Some(g.as_task())).await.unwrap();
     assert!(lines[0].contains("Replication of"), "{lines:?}");
-    assert_eq!((group.canceled, group.skipped), (0, 0), "{lines:?}");
+    // The Task Center row ends completed, also when a restart re-attaches it (a poll with get_task).
+    let row = last.into_inner().unwrap().unwrap();
+    assert_eq!((row.state.as_str(), &row.error), ("completed", &None), "{lines:?}");
+    assert_eq!(ops::get_task(&dst, &row.pulp_href).await.unwrap(), row);
     assert!(downstream_has(&dst, &format!("{prefix}-os"), "fixture-alpha-1.0-1.noarch").await);
     let docs: Distribution =
         ops::find_by_name(&dst, &dst.api(RepoType::File.distributions()), &format!("{prefix}-docs")).await.unwrap().unwrap();

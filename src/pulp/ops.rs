@@ -55,6 +55,14 @@ pub async fn wait_task(c: &PulpClient, href: &str, on: OnTask<'_>) -> Result<Tas
     }
 }
 
+/// GET a task for the Task Center; a task group (native replication) comes as one task.
+pub async fn get_task(c: &PulpClient, href: &str) -> Result<Task> {
+    if href.contains("/task-groups/") {
+        return Ok(c.get::<TaskGroup>(href, &[]).await?.as_task());
+    }
+    c.get(href, &[]).await
+}
+
 /// Await whatever a mutation returned. Returns the finished task when there was one.
 pub async fn settle(c: &PulpClient, m: Mutation, on: OnTask<'_>) -> Result<Option<Task>> {
     match m {

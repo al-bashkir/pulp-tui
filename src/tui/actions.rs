@@ -1790,7 +1790,7 @@ fn task_action(app: &mut App, act: Act, item: Value) {
             app.confirm("Cancel server task", lines, move |app| {
                 app.job("cancel task", move |ctx| async move {
                     let res = ctx.client.patch(&href, &json!({ "state": "canceled" })).await;
-                    let t: Task = ctx.client.get(&href, &[]).await?;
+                    let t = ops::get_task(&ctx.client, &href).await?;
                     ap(move |app| {
                         match res {
                             Ok(_) => app.notify(Level::Info, format!("cancel requested; Pulp reports state {}", t.state)),
@@ -2985,6 +2985,62 @@ mod tests {
         assert_eq!(typed.as_deref(), Some("r@v3"));
         assert_eq!(lines[0], "Delete repository version 3 (r@v3) and its 0 publication(s).");
         assert!(!lines.iter().any(|l| l.contains("stop serving") || l.contains("switch")), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn the_task_center_tracks_watches_cancels_and_dismisses_a_replication_group() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let (group, task) = (format!("{API}task-groups/1/"), format!("{API}tasks/2/"));
+        // After the cancel, Pulp reports the group with its sync canceled; the task had ended before the cancel.
+        let tasks = json!([{ "name": "pulp_rpm.app.tasks.synchronizing.synchronize", "state": "canceled" }]);
+        let g =
+            json!({ "pulp_href": group, "description": "Replication of up", "all_tasks_dispatched": true, "canceled": 1, "tasks": tasks });
+        get(&server, &group, g).await;
+        get(&server, &task, json!({ "pulp_href": task, "name": "sync", "state": "completed" })).await;
+        for (href, status) in [(&group, 200), (&task, 409)] {
+            wiremock::Mock::given(method("PATCH"))
+                .and(path(href.as_str()))
+                .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(json!({ "detail": "task already finished" })))
+                .mount(&server)
+                .await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        app.open(Screen::List(Kind::Tasks));
+        let texts = |app: &App| app.notices.iter().map(|n| (n.level, n.text.clone())).collect::<Vec<_>>();
+
+        task_action(&mut app, Act::TrackTask, json!({ "pulp_href": group, "name": "Replication of up" }));
+        assert_eq!(texts(&app).last(), Some(&(Level::Ok, "tracking task".into())));
+        // A server task has a name, no label.
+        task_action(&mut app, Act::WatchTask, json!({ "pulp_href": task, "name": "sync" }));
+        let Some(Modal::Text { title, watch, .. }) = app.modal.take() else { panic!("no watch view") };
+        assert_eq!((title.as_str(), watch.as_deref()), ("Watch task sync", Some(task.as_str())));
+        let rows = |app: &App| app.tasks.items.iter().map(|t| (t.href.clone(), t.state.clone())).collect::<Vec<_>>();
+        assert_eq!(rows(&app), [(task.clone(), "waiting".into()), (group.clone(), "waiting".into())], "the newest on top");
+
+        for href in [&group, &task] {
+            task_action(&mut app, Act::CancelTask, json!({ "pulp_href": href }));
+            let Some(Modal::Confirm { title, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirmation") };
+            assert_eq!(title, "Cancel server task");
+            yes(&mut app);
+            settle(&mut app, &mut rx).await;
+        }
+        let patches: Vec<_> = server.received_requests().await.unwrap().into_iter().filter(|r| r.method.as_str() == "PATCH").collect();
+        assert!(patches.iter().all(|r| r.body_json::<Value>().unwrap() == json!({ "state": "canceled" })), "{patches:?}");
+        assert_eq!(patches.iter().map(|r| r.url.path()).collect::<Vec<_>>(), [group.as_str(), task.as_str()]);
+        // The group is read as one task: its state, and the counts as the error of a canceled group.
+        let n = texts(&app);
+        assert!(n.contains(&(Level::Info, "cancel requested; Pulp reports state canceled".into())), "{n:?}");
+        let counts = "completed 0  failed 0  canceled 1  skipped 0";
+        assert!(n.contains(&(Level::Warn, format!("task canceled: Replication of up: {counts}"))), "{n:?}");
+        let refused = n.iter().find(|(l, t)| *l == Level::Error && t.starts_with("Pulp refused cancellation (")).expect("refusal");
+        assert!(refused.1.ends_with("); task state is completed"), "{refused:?}");
+        assert_eq!(rows(&app), [(task.clone(), "completed".into()), (group.clone(), "canceled".into())]);
+
+        task_action(&mut app, Act::DismissTasks, Value::Null);
+        assert_eq!(texts(&app).last(), Some(&(Level::Ok, "dismissed 2 finished task(s) from the list (Pulp keeps its records)".into())));
+        assert!(app.tasks.items.is_empty() && app.list.items.is_empty());
     }
 
     #[tokio::test]

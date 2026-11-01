@@ -89,11 +89,12 @@ impl TaskCenter {
         }
     }
 
-    /// Apply a task snapshot. Returns true when the task just reached a final state.
+    /// Apply a task snapshot. Returns true when the task just reached a final state, also when
+    /// a workflow reports it for the first time already final.
     pub fn update(&mut self, task: Task, driven: bool) -> bool {
         let now = Instant::now();
         if !self.items.iter().any(|t| t.href == task.pulp_href) {
-            self.track(&task.pulp_href, &task.name, &task.state);
+            self.track(&task.pulp_href, &task.name, "waiting");
         }
         let (min, max) = (self.min, self.max);
         let Some(t) = self.items.iter_mut().find(|t| t.href == task.pulp_href) else { return false };
@@ -190,6 +191,7 @@ mod tests {
         tc.gone("/t/2/");
         assert_eq!(tc.active(), 3, "a task the server does not have is final");
         assert_eq!(tc.dismiss_finished(), 1);
+        assert!(tc.update(task("/t/new/", "canceled"), true), "a workflow reports it final at once: it just ended");
     }
 
     #[test]

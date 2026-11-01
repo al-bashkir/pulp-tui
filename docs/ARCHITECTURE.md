@@ -61,6 +61,18 @@ group says all tasks were dispatched, a task failed, or the replication finalize
 completed. pulpcore 3.123 leaves `all_tasks_dispatched` false after a replication, so an
 idle group whose counts stay the same for three polls is also treated as final.
 
+A task group is one Task Center row. Its href goes into the same task references (the href
+tells a group from a task, so the store has no extra column), and `ops::get_task` reads it
+as one task (`TaskGroup::as_task`): the description is the label, the finished tasks of the
+group are the progress, and the final state is `failed`, `canceled` or `skipped` when a task
+of the group ended so, else `completed`, with the counts as the error. The replication job
+reports each snapshot to the Task Center, so the row exists while it runs, the final notice
+and the list reload come from the Task Center, and a restart re-attaches the group. A task
+that a workflow reports for the first time already final also gives its final notice. A
+task or group that ends `canceled` or `skipped` gives a warning, a `failed` one an error.
+Only the three-poll rule above is not in `as_task`: such a group would stay `running` in the
+Task Center (no supported pulpcore needs the rule, see COMPATIBILITY.md).
+
 ## Native Pulp concepts versus application-managed concepts
 
 | Concept                                                                                                               | Owner        | Notes                                                                                                                                                                                                      |
