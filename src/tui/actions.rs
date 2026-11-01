@@ -138,7 +138,7 @@ pub(super) fn caps(app: &App) -> Option<std::sync::Arc<Capabilities>> {
 }
 
 /// The connected server lacks `f`: report "not supported by this server: ..." and return true.
-fn unsupported(app: &mut App, f: Feature) -> bool {
+pub(super) fn unsupported(app: &mut App, f: Feature) -> bool {
     let Some(Err(e)) = caps(app).map(|c| c.require(f)) else { return false };
     app.error(e.to_string());
     true

@@ -101,22 +101,32 @@ Task Center (no supported pulpcore needs the rule, see COMPATIBILITY.md).
      (`structured: true`: the release, component and architecture records of the copied
      packages come with them; `dependency_solving: false`);
   3. record the new repository version (or the latest one if the content did not change);
-  4. give the derived repository the publish settings of the source (RPM) or the signing
-     choice (Deb: `signing_service` and `signing_service_release_overrides`, only the fields
-     that differ, and only fields the server has);
+  4. give the derived repository the publish settings of the source (RPM; File: `manifest`)
+     or the signing choice (Deb: `signing_service` and `signing_service_release_overrides`),
+     only the fields that differ, and only fields the server has;
   5. RPM and File: reuse or create the publication of that version; after a PATCH of step 4,
      always create one, because a publication keeps the settings that the repository had
      when it was made (an unchanged selection records the version of the previous publish).
+     So does *Resume* when an earlier run recorded the version of step 3: that run can have
+     sent the PATCH and stopped before the publication.
      Deb: always create one, because a publication signed with repository keys stores
      `signing_service: null` and cannot be told apart from an unsigned one.
 
   Every step writes a checkpoint. The href of a submitted copy task is stored before
   waiting, so an interrupted publish **re-attaches to the same task** and does not submit
   it again. A copy task that failed or was canceled is cleared from the checkpoint, so the
-  next *Resume* submits the copy again (it starts from an empty base). A publication task
-  that is always created uses the same checkpoint column (`pending_task`): with no derived version recorded it
+  next *Resume* submits the copy again (it starts from an empty base). So does a completed
+  copy without filters that made no version, or whose new version is gone (404): a newer
+  publish can change the latest version in the meantime, and it deletes the versions that no
+  Content View version records. A recorded copy or publication task that answers 404 (an
+  administrator purged it with `tasks/purge/`, or it belongs to another Pulp user) is
+  cleared, and *Resume* sends that step again in the same run (`CvService::reattach`): Pulp
+  purges only finished tasks, but what the task made is unknown. Under the view's lock the
+  copy is idempotent, and an extra publication is harmless. A filtered snapshot sends only the batches that the latest
+  version lacks; with none left, it records the latest version. A publication task
+  (every publication that is not reused) uses the same checkpoint column (`pending_task`): with no derived version recorded it
   is the copy task, with one it is the publication task (the copy step clears it in the same
-  write that records the version).
+  write that records the version). *Watch task* (**W**) on a version opens this task.
 * RPM filters select packages by name glob, architecture glob and EVR comparison
   (`rpmvercmp` port, tested with rpm's own cases). An advisory is kept only when every
   package it references that exists in the source is selected. Other metadata (comps,
@@ -137,7 +147,13 @@ Task Center (no supported pulpcore needs the rule, see COMPATIBILITY.md).
   *Resume* does so only when the version is the newest published one of the view: a resumed
   older version is published, and Library keeps the newer version (`bind_library`). When the
   Library step fails, the version stays published and the error is a warning, so auto
-  publish still runs.
+  publish still runs. The version is stored `published` before the Library step, so a
+  client that stops in that step leaves the Library binding `(version, promoting)`
+  (`CvService::library_interrupted`; under the view's lock such a row is an interrupted one).
+  *Resume* of that published version runs the Library step again, then auto publish; of
+  any other published version it says "version is already published". Not covered: a stop
+  between `published` and the `promoting` row. Library then still serves the older version,
+  which cannot be told apart from a deliberate rollback.
 * **Promote** binds a version to an environment. The version must be active in the prior
   environment. Each (view, environment, repository) has a stable distribution
   `pulp-tui-cv-<view>-<env>-<repo>` at `<env label>/<view>/<repo>` (`cv::base_path`). An
@@ -158,11 +174,15 @@ Task Center (no supported pulpcore needs the rule, see COMPATIBILITY.md).
   path and is reported; a rerun with the same label continues with the rows that are left
   (a row whose `PATCH` finished before the crash is saved without a second `PATCH`). A row
   of a view bound after the locks were taken is reported as failed and not touched. The
-  audit entry is `env.relabel`.
+  relabel lists the rows once, so a promotion that read the old label and saves a row after
+  that list checks the label again at its end and stores `partial` with `<env> was relabeled
+  <label> during the promotion` (a rerun of the relabel moves the row). The audit entry is
+  `env.relabel`.
 * **Rollback** is a promotion of any earlier published version. Newer versions are never
   deleted.
 * **Unpromote** deletes the view's distributions in one environment (one of another
-  database is kept), then the served rows and the binding (`Store::delete_binding`, last,
+  database, or one without the labels of the view and environment, is kept), then the
+  served rows and the binding (`Store::delete_binding`, last,
   so a rerun deletes what is left). It is refused while a later environment on the path
   still has the view. The audit entry is `cv.unpromote`.
 * **Verify / drift**: for every binding, check that the distribution serves the expected
@@ -211,7 +231,9 @@ Task Center (no supported pulpcore needs the rule, see COMPATIBILITY.md).
   `delete_view` of a composite removes its distributions only. The composite takes its own
   lock only; it reads the component versions and never changes them. `auto_publish`
   (`CvService::auto_publish`) runs after a component publish or resume, outside the lock of
-  the component: for every composite with the flag that lists the component as `latest`
+  the component. After *Resume* it runs only when the resumed version is the newest
+  published version of the component: composites follow that one, so an older version gives
+  them nothing new. For every composite with the flag that lists the component as `latest`
   (`Store::auto_composites`) it takes the composite's lock and publishes, and returns one
   result per composite, so a locked or failing composite does not undo the component's
   publish. It never promotes beyond Library, and publishes nothing while Library is
@@ -223,7 +245,10 @@ Task Center (no supported pulpcore needs the rule, see COMPATIBILITY.md).
   database (<id>)", and deleting a Content View keeps such objects (it logs them). The check
   also runs on hrefs recorded earlier: Resume stops before copying into a derived repository
   that another database adopted, deleting a version keeps the publication and snapshot of
-  such a repository, and a promotion does not unbind such a distribution. An object
+  such a repository, and a promotion does not unbind such a distribution. On these recorded
+  hrefs the same rule applies to the ownership labels (`CvService::not_ours`): a derived
+  repository must carry `pulp_tui_cv=<view>`, a distribution also `pulp_tui_env=<env>`;
+  otherwise the reason is "... is not labeled <key>=<value>". An object
   without the label, or with an id in this database's aliases (`meta` keys `alias:<id>`),
   is adopted: the label is set to this database's id when the workflow touches it.
 

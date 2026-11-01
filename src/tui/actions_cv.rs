@@ -1,6 +1,6 @@
 //! Content View, CV version and lifecycle environment actions.
 
-use super::actions::{ap, caps, confirm_mirror, sync_policies};
+use super::actions::{ap, caps, confirm_mirror, sync_policies, unsupported};
 use super::app::{App, Ctx, Level, NO_PROFILE, unavailable};
 use super::form::{Field, FieldKind, Form, PickItem, Source};
 use super::kinds::{Act, Kind, s};
@@ -488,8 +488,13 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             ap(move |app| app.text(format!("Preview of {name} (draft vs latest published)"), lines))
         }),
         Act::CvPublish => {
+            let deb = item["repos"].as_array().into_iter().flatten().any(|r| r["type"] == "deb");
+            // Every Deb copy step uses `deb/copy/`.
+            if deb && unsupported(app, crate::pulp::Feature::DebCopy) {
+                return;
+            }
             let mut fields = vec![Field::text("notes", "Change notes")];
-            if item["repos"].as_array().into_iter().flatten().any(|r| r["type"] == "deb") {
+            if deb {
                 let choices = vec!["same as source".into(), "none".into(), "service".into()];
                 fields.push(Field::new("signing", "Deb signing", FieldKind::Choice(choices)));
                 fields.push(
@@ -635,6 +640,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
         }
         Act::CvDrift => app.job(format!("verify {name}"), move |ctx| async move {
             let (svc, mut lines) = (ctx.cv()?, vec![]);
+            let running = svc.store.lock_live(id, crate::cv::unix_now()).await?;
             for e in svc.store.environments(&svc.scope).await? {
                 if let Some(b) = svc.store.binding(e.id, id).await? {
                     let n = svc.store.version(b.version_id).await?.number;
@@ -642,7 +648,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                     lines.push(format!(
                         "{}: v{n} ({}) {}",
                         e.name,
-                        b.state,
+                        crate::cv::shown_state(&b.state, running),
                         if issues.is_empty() { "OK - served content matches" } else { "DRIFT" }
                     ));
                     lines.extend(issues.into_iter().map(|i| format!("    {i}")));
@@ -748,7 +754,10 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
         let v = st.version(vid).await?;
         let current = st.binding(e.id, cv).await?;
         let cur_num = match &current {
-            Some(b) => format!("v{} ({})", st.version(b.version_id).await?.number, b.state),
+            Some(b) => {
+                let running = st.lock_live(cv, crate::cv::unix_now()).await?;
+                format!("v{} ({})", st.version(b.version_id).await?.number, crate::cv::shown_state(&b.state, running))
+            }
             None => "nothing".into(),
         };
         let mut lines = vec![format!("{name}: {env} now serves {cur_num}; will serve v{}", v.number), String::new()];
@@ -842,11 +851,15 @@ fn unpromote_preview(app: &mut App, cv: i64, name: String, env: String) {
 fn resume(app: &mut App, cv: i64, name: String, vid: i64, number: String) {
     app.job(format!("resume {name} v{number}"), move |ctx| async move {
         let svc = ctx.cv()?.locked(cv, &format!("resume v{number}")).await?;
-        // A stale list can show a published version as failed: resume returns at once, nothing new to auto publish.
-        let was_published = svc.store.version(vid).await?.state == "published";
+        // Published with its Library step done (another session can finish it after the check): resume returns at
+        // once, nothing new to auto publish. A stopped Library step also stopped the auto publish after it.
+        let before = svc.store.version(vid).await?;
+        let was_published = before.state == "published" && !svc.library_interrupted(&before).await?;
         let (v, note) = svc.resume(vid, &ctx.log(), &ctx.on_task()).await?;
+        // Composites follow the newest version: an older one gives them nothing new.
+        let newest = svc.store.versions(cv).await?.into_iter().find(|n| n.state == "published").is_some_and(|n| n.id == v.id);
         drop(svc); // release the lock of this view; composites take their own
-        let auto = if was_published { vec![] } else { ctx.cv()?.auto_publish(cv, &ctx.log(), &ctx.on_task()).await };
+        let auto = if was_published || !newest { vec![] } else { ctx.cv()?.auto_publish(cv, &ctx.log(), &ctx.on_task()).await };
         ap(move |app| {
             let (level, text) = auto_notice(format!("{name} v{} published", v.number), note, auto);
             app.notify(level, text);
@@ -893,47 +906,57 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
             });
         }
         Act::Resume => {
-            if item["state"] == "published" {
-                app.notify(Level::Info, "version is already published");
-                return;
-            }
             let lines = vec![format!("Resume {name} v{number}: it becomes active in Library unless a newer version is published.")];
-            app.load_job(format!("read {LIBRARY}"), move |ctx| async move {
-                let protected = ctx.cv()?.library_protected().await?;
+            app.load_job(format!("check resume of {name} v{number}"), move |ctx| async move {
+                let svc = ctx.cv()?;
+                let v = svc.store.version(vid).await?;
+                if v.state == "published" && !svc.library_interrupted(&v).await? {
+                    return ap(|app| app.notify(Level::Info, "version is already published"));
+                }
+                // As for Publish: every Deb copy step uses `deb/copy/`.
+                if svc.store.version_repos(vid).await?.iter().any(|r| r.repo().repo_type == RepoType::Deb) {
+                    ctx.caps.require(crate::pulp::Feature::DebCopy)?;
+                }
+                let protected = svc.library_protected().await?;
                 ap(move |app| guard_library(app, protected, lines, None, move |app| resume(app, cv, name, vid, number)))
             });
         }
-        Act::Delete => {
+        Act::Delete => app.load_job(format!("read what deleting {name} v{number} removes"), move |ctx| async move {
+            let objects = ctx.cv()?.delete_version_impact(vid).await?;
             // Only a composite version has components; it borrows their snapshots and publications.
             let mut lines = if item["components"].as_array().is_some_and(|c| !c.is_empty()) {
                 vec![
                     format!("Delete {name} version {number}: only this composite version is removed."),
-                    "The snapshots and publications of its component versions are NOT touched. Refused while bound to an environment."
-                        .into(),
+                    "The snapshots and publications of its component versions are NOT touched.".into(),
                 ]
+            } else if objects.is_empty() {
+                vec![format!("Delete {name} version {number}. Nothing in Pulp is deleted.")]
             } else {
-                vec![
-                    format!("Delete {name} version {number}: its snapshot version and publication are removed"),
-                    "from Pulp unless shared with another version. Refused while bound to an environment.".into(),
-                ]
+                vec![format!("Delete {name} version {number}. In Pulp:")]
             };
+            lines.extend(objects.into_iter().map(|(repo, href, keep)| match keep {
+                None => format!("  {repo}: delete {href}"),
+                Some(why) => format!("  {repo}: keep {href} ({why})"),
+            }));
             lines.push("The version number is never reused.".into());
-            app.confirm_danger(format!("Delete {name} v{number}"), lines, &format!("v{number}"), move |app| {
-                app.job(format!("delete {name} v{number}"), move |ctx| async move {
-                    ctx.cv()?.locked(cv, &format!("delete v{number}")).await?.delete_version(vid, &ctx.log(), &ctx.on_task()).await?;
-                    ap(move |app| {
-                        app.ok("version deleted");
-                        app.reload();
-                    })
+            ap(move |app| {
+                app.confirm_danger(format!("Delete {name} v{number}"), lines, &format!("v{number}"), move |app| {
+                    app.job(format!("delete {name} v{number}"), move |ctx| async move {
+                        ctx.cv()?.locked(cv, &format!("delete v{number}")).await?.delete_version(vid, &ctx.log(), &ctx.on_task()).await?;
+                        ap(move |app| {
+                            app.ok("version deleted");
+                            app.reload();
+                        })
+                    });
                 });
-            });
-        }
+            })
+        }),
         Act::WatchTask => {
             let Some(st) = cv_store(app) else { return };
             // Read again: the list is stale while another operator publishes.
             app.spawn("read pending task".into(), true, async move {
                 // Repositories publish one at a time, so at most one row has a pending task.
-                // With a derived version, the task is the publication of a Deb repository.
+                // With a derived version, the task is the publication.
                 let pending = st.version_repos(vid).await?.into_iter().find_map(|r| {
                     let step = if r.derived_version.is_some() { "publish" } else { "copy" };
                     Some((step, r.repo().repo_name.clone(), r.pending_task?))
@@ -942,7 +965,10 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                     Some((step, repo, h)) => app.watch_task(&h, &format!("{name} v{number}: {step} {repo}")),
                     None => app.notify(
                         Level::Info,
-                        format!("v{number} has no pending Pulp task now (only the copy step and a Deb publication store one)"),
+                        format!(
+                            "v{number} has no copy or publication task now. W watches only these two steps; \
+                             the session that runs the publish shows the others (settings, cleanup, Library) in Tasks"
+                        ),
                     ),
                 })
             });
@@ -1311,6 +1337,44 @@ mod tests {
         assert_eq!(submit(&mut app, &form), Err("pick a signing service".to_string()));
     }
 
+    /// Connect `app` to `server` as pulp_deb without `deb/copy/` in its OpenAPI schema.
+    fn connect_without_deb_copy(app: &mut App, server: &MockServer) {
+        let mut caps = crate::pulp::Capabilities::default();
+        caps.versions.insert("deb".into(), "2.20.0".into());
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/repositories/deb/apt/": {} } }));
+        app.conn = Some(crate::tui::app::Conn { client: client(server), caps: Arc::new(caps), scope: "lab".into() });
+    }
+
+    #[tokio::test]
+    async fn resume_of_a_deb_version_needs_the_deb_copy_api() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        connect_without_deb_copy(&mut app, &server);
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let apt = CvRepo { repo_href: format!("{REPOS}deb/apt/2/"), repo_name: "apt".into(), repo_type: RepoType::Deb, filters: vec![] };
+        let v = st.begin_version(web, "", &[apt]).await.unwrap();
+        st.finish_version(v.id, "failed", Some("copy failed")).await.unwrap();
+        version_action(&mut app, "lab", web, "web".into(), Act::Resume, json!({ "id": v.id, "number": v.number, "state": "failed" }));
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "stopped before the confirmation");
+        let (level, text) = last_notice(&app);
+        assert!(level == Level::Error && text.ends_with(": not supported by this server: Deb copy API (deb/copy/)"), "{text}");
+        assert!(server.received_requests().await.unwrap().is_empty(), "nothing sent");
+        assert_eq!(st.version(v.id).await.unwrap().state, "failed");
+    }
+
+    #[tokio::test]
+    async fn cv_publish_of_a_deb_view_needs_the_deb_copy_api() {
+        let server = MockServer::start().await;
+        let mut app = test_app().await;
+        connect_without_deb_copy(&mut app, &server);
+        let deb = json!({ "name": "apt", "type": "deb", "href": format!("{REPOS}deb/apt/2/") });
+        cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": 1, "name": "web", "repos": [deb] }));
+        assert!(app.modal.is_none(), "stopped before the publish form");
+        assert_eq!(last_notice(&app), (Level::Error, "not supported by this server: Deb copy API (deb/copy/)"));
+        assert!(server.received_requests().await.unwrap().is_empty(), "nothing sent");
+    }
+
     #[tokio::test]
     async fn cv_sync_form_marks_every_repository() {
         let mut app = test_app().await;
@@ -1461,7 +1525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_opens_the_pending_copy_task_of_a_version() {
+    async fn watch_opens_the_pending_copy_or_publication_task_of_a_version() {
         let (mut app, mut rx, st) = composite_app().await;
         let cv = st.create_cv("lab", "web", "").await.unwrap();
         let v = st.begin_version(cv, "", &[cv_repo("os", "rpm", "1")]).await.unwrap();
@@ -1469,10 +1533,9 @@ mod tests {
         version_action(&mut app, "lab", cv, "web".into(), Act::WatchTask, row.clone());
         drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none());
-        assert_eq!(
-            last_notice(&app),
-            (Level::Info, "v1 has no pending Pulp task now (only the copy step and a Deb publication store one)")
-        );
+        let none = "v1 has no copy or publication task now. W watches only these two steps; \
+                    the session that runs the publish shows the others (settings, cleanup, Library) in Tasks";
+        assert_eq!(last_notice(&app), (Level::Info, none));
 
         let mut vr = st.version_repos(v.id).await.unwrap().remove(0);
         vr.pending_task = Some(format!("{TASKS}7/"));
@@ -1483,7 +1546,7 @@ mod tests {
         assert_eq!((title.as_str(), watch.clone()), ("Watch task web v1: copy os", Some(format!("{TASKS}7/"))));
         assert_eq!(app.tasks.items[0].href, format!("{TASKS}7/"), "tracked, so the Task Center polls it");
 
-        // After the copy, a pending task is the publication (Deb).
+        // After the copy, a pending task is the publication.
         vr.derived_version = Some("/dv/1/".into());
         st.save_version_repo(&vr).await.unwrap();
         app.modal = None; // the operator closes the first view (an open one would keep the second waiting)
@@ -1575,12 +1638,16 @@ mod tests {
         let v2 = publish_empty(&st, web).await;
         let lib = st.ensure_library("lab").await.unwrap();
         st.set_binding(lib, web, v2.id, "active").await.unwrap();
+        let c = st.create_composite("lab", "rocky9", "").await.unwrap();
+        st.set_component(c, web, None).await.unwrap();
+        st.set_auto_publish(c, true).await.unwrap();
         app.push(Kind::CvVersions { cv: web, name: "web".into() });
         let item = json!({ "id": v1.id, "number": 1, "state": "failed" });
         version_action(&mut app, "lab", web, "web".into(), Act::Resume, item);
         drain(&mut app, &mut rx).await;
         assert_eq!(last_notice(&app), (Level::Warn, "web v1 published; Library not changed: v2 is newer (use Rollback to serve v1)"));
         assert_eq!(st.binding(lib, web).await.unwrap().unwrap().version_id, v2.id);
+        assert!(st.versions(c).await.unwrap().is_empty(), "composites follow v2: nothing new to auto publish");
     }
 
     #[tokio::test]
@@ -1874,7 +1941,35 @@ mod tests {
         let item = json!({ "id": v.id, "number": v.number, "state": "failed" });
         version_action(&mut app, "lab", extras, "extras".into(), Act::Resume, item);
         drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Info, "version is already published"));
         assert!(st.versions(c).await.unwrap().is_empty(), "no composite version for a version that was already published");
+    }
+
+    #[tokio::test]
+    async fn resume_finishes_an_interrupted_library_step_and_auto_publishes() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        let lib = st.ensure_library("lab").await.unwrap();
+        st.set_binding(lib, web, v.id, "promoting").await.unwrap(); // the client stopped in the Library step
+        let c = st.create_composite("lab", "rocky9", "").await.unwrap();
+        st.set_component(c, web, None).await.unwrap();
+        st.set_auto_publish(c, true).await.unwrap();
+        app.push(Kind::CvVersions { cv: web, name: "web".into() });
+        let item = json!({ "id": v.id, "number": 1, "state": "published" });
+        version_action(&mut app, "lab", web, "web".into(), Act::Resume, item.clone());
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Ok, "web v1 published; auto publish: rocky9 v1 published"));
+        let b = st.binding(lib, web).await.unwrap().unwrap();
+        assert_eq!((b.version_id, b.state.as_str()), (v.id, "active"));
+        assert_eq!(st.versions(c).await.unwrap().len(), 1);
+        // Library is active now: nothing is left to do.
+        version_action(&mut app, "lab", web, "web".into(), Act::Resume, item);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Info, "version is already published"));
+        assert_eq!(st.versions(c).await.unwrap().len(), 1, "no second composite version");
     }
 
     fn confirm_lines(app: &mut App) -> Vec<String> {
@@ -1882,6 +1977,24 @@ mod tests {
             Some(Modal::Confirm { lines, .. }) => lines,
             _ => panic!("no confirmation"),
         }
+    }
+
+    #[tokio::test]
+    async fn preview_and_drift_show_an_interrupted_promotion() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let dev = st.create_env("lab", "Dev", st.ensure_library("lab").await.unwrap(), false).await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        st.set_binding(dev, web, v.id, "promoting").await.unwrap(); // no live lock: the client that ran it ended
+        promote_preview(&mut app, web, "web".into(), v.id, "Dev".into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(confirm_lines(&mut app)[0], "web: Dev now serves v1 (interrupted); will serve v1");
+        cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
+        assert_eq!(lines[..2], ["Dev: v1 (interrupted) DRIFT", "    binding state is interrupted"]);
     }
 
     #[tokio::test]
@@ -1965,15 +2078,95 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("its snapshot repositories (with their versions and publications)")));
         assert_eq!(lines.last().unwrap(), &format!("  {:<12} /prod/web/os  (protected)", "Prod"));
         assert_eq!(typed.as_deref(), Some("web Prod"));
+    }
 
-        let version = |components: Value| json!({ "id": 5, "number": 2, "state": "published", "components": components });
-        version_action(&mut app, "lab", 1, "rocky9".into(), Act::Delete, version(json!(["os v1"])));
-        let lines = confirm_lines(&mut app);
-        assert!(
-            lines.iter().any(|l| l.contains("NOT touched")) && !lines.iter().any(|l| l.contains("snapshot version and publication")),
-            "{lines:?}"
+    #[tokio::test]
+    async fn delete_version_shows_what_it_deletes_or_why_it_is_refused() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let derived = format!("{REPOS}rpm/rpm/2/");
+        let pubs = "/pulp/api/v3/publications/rpm/rpm/";
+        // v1 and v2 of web: one snapshot version (the selection did not change), a publication each.
+        let mut versions = vec![];
+        for n in 1..=2 {
+            let v = st.begin_version(web, "", &[cv_repo("os", "rpm", "1")]).await.unwrap();
+            let mut vr = st.version_repos(v.id).await.unwrap().remove(0);
+            (vr.derived_repo, vr.derived_version) = (Some(derived.clone()), Some(format!("{derived}versions/1/")));
+            vr.publication = Some(format!("{pubs}{n}/"));
+            st.save_version_repo(&vr).await.unwrap();
+            st.finish_version(v.id, "published", None).await.unwrap();
+            versions.push((v, vr));
+        }
+        let (v1, row) = versions.remove(0);
+        let labels = json!({ "pulp_labels": { crate::cv::LABEL_CV: "web", crate::cv::LABEL_DB: st.db_id() } });
+        serve(&server, "GET", derived.clone(), 200, labels).await;
+        let item = json!({ "id": v1.id, "number": v1.number, "state": "published", "components": [] });
+        let lib = st.ensure_library("lab").await.unwrap();
+        st.set_binding(lib, web, v1.id, "active").await.unwrap();
+        version_action(&mut app, "lab", web, "web".into(), Act::Delete, item.clone());
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "refused: no confirmation");
+        assert_eq!(last_notice(&app), (Level::Error, "read what deleting web v1 removes: version 1 is bound to Library"));
+
+        st.delete_binding(lib, web).await.unwrap();
+        version_action(&mut app, "lab", web, "web".into(), Act::Delete, item);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, on_yes, .. }) = app.modal.take() else { panic!("no confirmation") };
+        assert_eq!(
+            lines,
+            [
+                "Delete web version 1. In Pulp:".to_string(),
+                format!("  os: delete {pubs}1/"),
+                format!("  os: keep {derived}versions/1/ (shared with another version)"),
+                "The version number is never reused.".into(),
+            ]
         );
-        version_action(&mut app, "lab", 1, "web".into(), Act::Delete, version(json!([])));
-        assert!(confirm_lines(&mut app).iter().any(|l| l.contains("its snapshot version and publication are removed")));
+        assert_eq!(typed.as_deref(), Some("v1"));
+        let sent = server.received_requests().await.unwrap();
+        assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed before the confirmation: {sent:?}");
+        Mock::given(method("DELETE"))
+            .and(path(row.publication.unwrap()))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        on_yes.unwrap()(&mut app);
+        drain(&mut app, &mut rx).await;
+        assert!(app.notices.iter().any(|n| n.text == "version deleted"));
+        assert_eq!(st.version(v1.id).await.unwrap().state, "deleted");
+
+        // A composite version borrows the snapshots of its components: nothing in Pulp is deleted.
+        let (v2, row2) = versions.remove(0);
+        let c = st.create_composite("lab", "rocky9", "").await.unwrap();
+        let cv1 = st.begin_composite_version(c, "", &[v2.id], &[row2]).await.unwrap();
+        let item = json!({ "id": cv1.id, "number": cv1.number, "state": "publishing", "components": ["web v2"] });
+        version_action(&mut app, "lab", c, "rocky9".into(), Act::Delete, item);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(
+            confirm_lines(&mut app),
+            [
+                "Delete rocky9 version 1: only this composite version is removed.",
+                "The snapshots and publications of its component versions are NOT touched.",
+                "The version number is never reused.",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_version_says_when_nothing_in_pulp_is_deleted() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        // The publish failed before it made the derived repository: the row has no Pulp objects.
+        let v = st.begin_version(web, "", &[cv_repo("os", "rpm", "1")]).await.unwrap();
+        st.finish_version(v.id, "failed", Some("stopped")).await.unwrap();
+        let item = json!({ "id": v.id, "number": v.number, "state": "failed", "components": [] });
+        version_action(&mut app, "lab", web, "web".into(), Act::Delete, item);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(confirm_lines(&mut app), ["Delete web version 1. Nothing in Pulp is deleted.", "The version number is never reused."]);
+        assert!(server.received_requests().await.unwrap().is_empty(), "no derived repository to read");
     }
 }

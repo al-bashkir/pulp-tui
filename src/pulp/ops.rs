@@ -213,11 +213,22 @@ pub async fn ensure_publication(
     signing_service: Option<&str>,
     on: OnTask<'_>,
 ) -> Result<String> {
-    let all: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository_version", version.into())], 1_000).await?;
-    if let Some(pubn) = all.into_iter().find(|p| p.signing_service.as_deref() == signing_service) {
-        return Ok(pubn.pulp_href);
+    if let Some(p) = find_publication(c, t, version, signing_service).await? {
+        return Ok(p);
     }
     create_publication(c, t, version, signing_service, on).await
+}
+
+/// A publication of the version made with the same signing service and, for File, with the manifest name
+/// that a new one would get (the reuse of `ensure_publication`).
+pub async fn find_publication(c: &PulpClient, t: RepoType, version: &str, signing_service: Option<&str>) -> Result<Option<String>> {
+    let all: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository_version", version.into())], 1_000).await?;
+    let manifest = match t {
+        RepoType::File if !all.is_empty() => Some(publication_body(c, t, version, None).await?["manifest"].as_str().map(str::to_string)),
+        _ => None,
+    };
+    let same = |p: &Publication| p.signing_service.as_deref() == signing_service && manifest.as_ref().is_none_or(|m| p.manifest == *m);
+    Ok(all.into_iter().find(same).map(|p| p.pulp_href))
 }
 
 /// A new publication of `version`, made with the repository settings of now. `signing_service` is sent
@@ -229,6 +240,12 @@ pub async fn create_publication(
     signing_service: Option<&str>,
     on: OnTask<'_>,
 ) -> Result<String> {
+    let body = publication_body(c, t, version, signing_service).await?;
+    create(c, &c.api(t.publications()), &body, "/publications/", on).await
+}
+
+/// The request body of `create_publication`.
+pub async fn publication_body(c: &PulpClient, t: RepoType, version: &str, signing_service: Option<&str>) -> Result<Value> {
     let mut body = json!({ "repository_version": version });
     if let Some(s) = signing_service {
         body["signing_service"] = s.into();
@@ -243,7 +260,7 @@ pub async fn create_publication(
         }
         RepoType::Rpm | RepoType::Deb => {}
     }
-    create(c, &c.api(t.publications()), &body, "/publications/", on).await
+    Ok(body)
 }
 
 /// Create or re-point a distribution. Refuses to take over a base path owned by a

@@ -162,7 +162,7 @@ async fn fallback_replication() {
     let (dst, up) = (client(), upstream_client());
     assert!(replication::guard_self("http://localhost:8080", "http://localhost:8080").is_err());
     let prefix = unique("fb");
-    let (rpm_repo, _) = upstream_content(&up, &prefix).await;
+    let (rpm_repo, file_repo) = upstream_content(&up, &prefix).await;
     let store = Store::open_in_memory().await.unwrap();
 
     // Dry run, then execute.
@@ -173,13 +173,22 @@ async fn fallback_replication() {
     assert!(res.iter().all(|l| l.starts_with("completed")), "{res:?}");
     assert!(downstream_has(&dst, &format!("{prefix}-os"), "fixture-beta-2.0-1.noarch").await);
 
-    // Rerun is idempotent (Update), and picks up upstream changes.
+    // Rerun is idempotent (Update), and picks up upstream changes: new packages, and a new manifest name
+    // that the replica publishes under too, although its File content is the same.
     update_upstream_rpm(&up, &prefix, &rpm_repo).await;
+    let m = up.patch(&file_repo, &json!({ "manifest": "CUSTOM_MANIFEST" })).await.unwrap();
+    ops::settle(&up, m, &no_progress).await.unwrap();
+    let p = ops::create_publication(&up, RepoType::File, &latest(&up, &file_repo).await, None, &no_progress).await.unwrap();
+    let (docs, docs_path) = (format!("{prefix}-docs"), format!("{prefix}/docs"));
+    ops::ensure_distribution(&up, RepoType::File, &docs, &docs_path, Some(&p), &json!({}), None, &no_progress).await.unwrap();
     let plan = replication::plan(&up, &dst, &RepoType::ALL, &prefix, None).await.unwrap();
     assert!(plan.iter().all(|p| p.action == PlanAction::Update), "{plan:?}");
     let res = replication::run(&dst, &store, up.profile(), &plan, false, &|_| {}, &no_progress).await.unwrap();
     assert!(res.iter().all(|l| l.starts_with("completed")), "{res:?}");
     assert!(downstream_has(&dst, &format!("{prefix}-os"), "fixture-alpha-1.1-1.noarch").await);
+    let replica = |f: &str| format!("http://127.0.0.1:8080/pulp/content/{docs_path}/{f}");
+    assert_eq!(served(&dst, &replica("CUSTOM_MANIFEST")).await.0, 200);
+    assert_eq!(served(&dst, &replica("PULP_MANIFEST")).await.0, 404, "the publication of the first run is not reused");
     assert_eq!(store.last_replications(dst.profile(), up.profile()).await.unwrap().len(), 2);
 
     // Loop guard: distributions served by the destination itself are skipped.

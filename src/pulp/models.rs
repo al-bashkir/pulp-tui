@@ -505,6 +505,9 @@ pub struct Publication {
     pub pulp_created: Option<String>,
     #[serde(default)]
     pub signing_service: Option<String>,
+    /// File only: the manifest name it serves (`None`: no manifest, or another type).
+    #[serde(default)]
+    pub manifest: Option<String>,
     /// Newer pulpcore (checkpoint publications); older servers lack the field.
     #[serde(default)]
     pub checkpoint: bool,

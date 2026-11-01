@@ -225,6 +225,33 @@ async fn environment_relabel_moves_served_paths() {
     cleanup(&c, &[&repo, &remote]).await;
 }
 
+/// A File view serves its files under the manifest name of the source repository.
+#[tokio::test]
+async fn a_file_view_serves_the_manifest_name_of_its_source() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvmf");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let m = c.patch(&repo, &json!({ "manifest": "CUSTOM_MANIFEST" })).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
+    let cv = store.create_cv(&profile, &id, "").await.unwrap();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    store.set_cv_repo(cv, &docs).await.unwrap();
+    svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let url = |f: &str| format!("http://127.0.0.1:8080/pulp/content/{}/{f}", base_path(&id, "library", "docs"));
+    assert_eq!(served(&c, &url("CUSTOM_MANIFEST")).await.0, 200);
+    assert_eq!(served(&c, &url("PULP_MANIFEST")).await.0, 404, "the default name is not served");
+    let lib = store.ensure_library(&profile).await.unwrap();
+    assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
 /// Resuming an older failed version publishes it; Library keeps serving the newer version.
 #[tokio::test]
 async fn resume_of_an_older_version_keeps_library_on_the_newer_one() {

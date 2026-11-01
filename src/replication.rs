@@ -9,10 +9,10 @@
 //!   never deletes destination objects. Objects are matched by name and owned via the
 //!   `pulp_tui_replica` label, so reruns are idempotent and foreign objects are not touched.
 
-use crate::pulp::RepoType;
 use crate::pulp::client::{Mutation, PulpClient};
 use crate::pulp::models::{Distribution, Repository, TaskGroup};
 use crate::pulp::ops::{self, OnTask};
+use crate::pulp::{Capabilities, RepoType};
 use crate::store::Store;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -65,6 +65,8 @@ pub struct PlanItem {
     pub name: String,
     pub base_path: String,
     pub remote_url: String,
+    /// File: the manifest name that the upstream publication serves; the replica publishes under it too.
+    pub manifest: Option<String>,
     pub action: PlanAction,
     pub note: String,
 }
@@ -89,6 +91,16 @@ fn labels_of(o: &Value) -> std::collections::BTreeMap<String, String> {
     serde_json::from_value(o["pulp_labels"].clone()).unwrap_or_default()
 }
 
+/// Refused unless the server of `c` (the `side` of the replication) has the plugin of each of `types`.
+async fn require_plugins(c: &PulpClient, types: &[RepoType], side: &str) -> Result<()> {
+    let mut caps = Capabilities::default();
+    caps.set_status(c.get(&c.api("status/"), &[]).await?);
+    for t in types {
+        caps.require(t.feature()).map_err(|e| anyhow!("{} ({side}): {e}", c.profile()))?;
+    }
+    Ok(())
+}
+
 /// Dry run: what the fallback would do for each upstream distribution.
 pub async fn plan(
     src: &PulpClient,
@@ -97,6 +109,8 @@ pub async fn plan(
     name_filter: &str,
     dst_content_base: Option<&str>,
 ) -> Result<Vec<PlanItem>> {
+    require_plugins(src, types, "source").await?;
+    require_plugins(dst, types, "destination").await?;
     let src_name = src.profile();
     let mut out = vec![];
     for &t in types {
@@ -111,6 +125,7 @@ pub async fn plan(
                 name: d.name.clone(),
                 base_path: d.base_path.clone(),
                 remote_url: String::new(),
+                manifest: None,
                 action: PlanAction::Skip,
                 note: String::new(),
             };
@@ -131,7 +146,9 @@ pub async fn plan(
                 RepoType::Rpm => base,
                 RepoType::File => {
                     let served = ops::served_publication(src, t, &serde_json::to_value(&d)?).await.ok().flatten();
-                    format!("{base}{}", served.as_ref().and_then(|p| p["manifest"].as_str()).unwrap_or("PULP_MANIFEST"))
+                    let m = served.as_ref().and_then(|p| p["manifest"].as_str()).unwrap_or("PULP_MANIFEST");
+                    it.manifest = Some(m.into());
+                    format!("{base}{m}")
                 }
                 RepoType::Deb => {
                     it.note = "Deb replication is not supported".into();
@@ -207,42 +224,8 @@ async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror:
         (RepoType::Deb, _) => bail!("Deb replication is not supported"),
     };
     let labels = json!({ LABEL_REPLICA: src_profile });
-    // Checked again here: an object with this name may have been created since the dry run.
-    let foreign = |kind: &str| anyhow!("a local {kind} named {} exists and is not managed by this replication", it.name);
-    let remote = match ops::find_by_name::<Value>(c, &c.api(t.remotes()), &it.name).await? {
-        Some(r) if !owned(&labels_of(&r), src_profile) => return Err(foreign("remote")),
-        Some(r) => {
-            let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
-            if r["url"].as_str() != Some(it.remote_url.as_str()) {
-                ops::settle(c, c.patch(&h, &json!({ "url": it.remote_url })).await?, on).await?;
-            }
-            h
-        }
-        None => {
-            ops::create(
-                c,
-                &c.api(t.remotes()),
-                &json!({ "name": it.name, "url": it.remote_url, "policy": "immediate", "pulp_labels": labels }),
-                "/remotes/",
-                on,
-            )
-            .await?
-        }
-    };
-    let repo = match ops::find_by_name::<Repository>(c, &c.api(t.repositories()), &it.name).await? {
-        Some(r) if !owned(&r.pulp_labels, src_profile) => return Err(foreign("repository")),
-        Some(r) => r.pulp_href,
-        None => {
-            ops::create(
-                c,
-                &c.api(t.repositories()),
-                &json!({ "name": it.name, "remote": remote, "pulp_labels": labels }),
-                "/repositories/",
-                on,
-            )
-            .await?
-        }
-    };
+    let remote = replica_remote(c, src_profile, it, &labels, on).await?;
+    let repo = replica_repo(c, src_profile, it, &remote, &labels, on).await?;
     ops::settle(c, ops::sync(c, t, &repo, Some(&remote), policy).await?, on).await?;
     let r: Repository = c.get(&repo, &[]).await?;
     let version = r.latest_version_href.ok_or_else(|| anyhow!("no repository version after sync"))?;
@@ -252,6 +235,52 @@ async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror:
     let p: Value = c.get(&publication, &[]).await?;
     let check = ops::verify_served(c, t, d.base_url.as_deref().unwrap_or_default(), &version, &p).await?;
     Ok(format!("{} served at {} ({check})", short_version(&version), d.base_url.unwrap_or_default()))
+}
+
+/// Checked again at run time: an object with the name of `it` may have been created since the dry run.
+fn foreign(kind: &str, it: &PlanItem) -> anyhow::Error {
+    anyhow!("a local {kind} named {} exists and is not managed by this replication", it.name)
+}
+
+/// The replica remote of `it`, pointed at the upstream URL.
+async fn replica_remote(c: &PulpClient, src_profile: &str, it: &PlanItem, labels: &Value, on: OnTask<'_>) -> Result<String> {
+    match ops::find_by_name::<Value>(c, &c.api(it.t.remotes()), &it.name).await? {
+        Some(r) if !owned(&labels_of(&r), src_profile) => Err(foreign("remote", it)),
+        Some(r) => {
+            let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
+            if r["url"].as_str() != Some(it.remote_url.as_str()) {
+                ops::settle(c, c.patch(&h, &json!({ "url": it.remote_url })).await?, on).await?;
+            }
+            Ok(h)
+        }
+        None => {
+            let body = json!({ "name": it.name, "url": it.remote_url, "policy": "immediate", "pulp_labels": labels });
+            Ok(ops::create(c, &c.api(it.t.remotes()), &body, "/remotes/", on).await?)
+        }
+    }
+}
+
+/// The replica repository of `it`. File: it publishes under the manifest name that upstream serves
+/// (`ensure_publication` reuses only a publication with the repository's name).
+async fn replica_repo(c: &PulpClient, src_profile: &str, it: &PlanItem, remote: &str, labels: &Value, on: OnTask<'_>) -> Result<String> {
+    let manifest = it.manifest.as_ref().map(|m| json!({ "manifest": m }));
+    match ops::find_by_name::<Value>(c, &c.api(it.t.repositories()), &it.name).await? {
+        Some(r) if !owned(&labels_of(&r), src_profile) => Err(foreign("repository", it)),
+        Some(r) => {
+            let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
+            if let Some(m) = manifest.filter(|m| r["manifest"] != m["manifest"]) {
+                ops::settle(c, c.patch(&h, &m).await?, on).await?;
+            }
+            Ok(h)
+        }
+        None => {
+            let mut body = json!({ "name": it.name, "remote": remote, "pulp_labels": labels });
+            if let Some(m) = &it.manifest {
+                body["manifest"] = m.as_str().into();
+            }
+            Ok(ops::create(c, &c.api(it.t.repositories()), &body, "/repositories/", on).await?)
+        }
+    }
 }
 
 fn short_version(v: &str) -> String {
@@ -285,6 +314,7 @@ mod tests {
             name: "os".into(),
             base_path: "os".into(),
             remote_url: "https://up/os/".into(),
+            manifest: None,
             action: PlanAction::Create,
             note: String::new(),
         };
@@ -299,6 +329,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let p = crate::config::Profile { url: server.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
         let c = PulpClient::new("up", &p, &crate::config::Settings::default()).unwrap();
+        serve_status(&server, &["deb"]).await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/pulp/api/v3/distributions/deb/apt/"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null,
@@ -315,6 +346,45 @@ mod tests {
         assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed: {sent:?}");
     }
 
+    fn client(s: &wiremock::MockServer, name: &str) -> PulpClient {
+        let p = crate::config::Profile { url: s.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
+        PulpClient::new(name, &p, &crate::config::Settings::default()).unwrap()
+    }
+
+    /// `status/` of a server with `plugins` (before any catch-all mock).
+    async fn serve_status(s: &wiremock::MockServer, plugins: &[&str]) {
+        let versions: Vec<Value> = plugins.iter().map(|p| json!({ "component": p, "version": "3.0.0" })).collect();
+        wiremock::Mock::given(wiremock::matchers::path("/pulp/api/v3/status/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "versions": versions })))
+            .with_priority(1)
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_plugin_missing_on_one_side_stops_the_plan() {
+        let (up, down) = (wiremock::MockServer::start().await, wiremock::MockServer::start().await);
+        serve_status(&up, &["core", "rpm", "file"]).await;
+        serve_status(&down, &["core", "rpm"]).await;
+        let empty = json!({ "count": 0, "next": null, "results": [] });
+        for s in [&up, &down] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(empty.clone()))
+                .mount(s)
+                .await;
+        }
+        let both = [RepoType::Rpm, RepoType::File];
+        let e = plan(&client(&up, "up"), &client(&down, "down"), &both, "", None).await.unwrap_err();
+        assert_eq!(e.to_string(), "down (destination): not supported by this server: pulp_file plugin");
+        let e = plan(&client(&down, "down"), &client(&up, "up"), &both, "", None).await.unwrap_err();
+        assert_eq!(e.to_string(), "down (source): not supported by this server: pulp_file plugin");
+        for s in [&up, &down] {
+            let sent = s.received_requests().await.unwrap();
+            assert!(sent.iter().all(|r| r.url.path() == "/pulp/api/v3/status/"), "nothing listed or changed: {sent:?}");
+        }
+        assert_eq!(plan(&client(&up, "up"), &client(&down, "down"), &[RepoType::Rpm], "", None).await.unwrap().len(), 0);
+    }
+
     #[tokio::test]
     async fn a_skipped_sync_is_not_published_or_reported_as_done() {
         use wiremock::matchers::{method, path};
@@ -328,7 +398,9 @@ mod tests {
         let r = json!({ "pulp_href": remote, "name": "files", "url": "https://up/files/PULP_MANIFEST", "pulp_labels": labels.clone() });
         wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/remotes/file/file/")).respond_with(ok(one(r))).mount(&server).await;
         // The repository has the version of an earlier run.
-        let r = json!({ "pulp_href": repo, "name": "files", "latest_version_href": format!("{repo}versions/1/"), "pulp_labels": labels });
+        let v1 = format!("{repo}versions/1/");
+        let r =
+            json!({ "pulp_href": repo, "name": "files", "latest_version_href": v1, "manifest": "PULP_MANIFEST", "pulp_labels": labels });
         wiremock::Mock::given(method("GET"))
             .and(path("/pulp/api/v3/repositories/file/file/"))
             .respond_with(ok(one(r.clone())))
@@ -347,6 +419,7 @@ mod tests {
             name: "files".into(),
             base_path: "files".into(),
             remote_url: "https://up/files/PULP_MANIFEST".into(),
+            manifest: Some("PULP_MANIFEST".into()),
             action: PlanAction::Update,
             note: String::new(),
         };
@@ -361,10 +434,8 @@ mod tests {
     async fn a_file_replica_syncs_from_the_manifest_the_upstream_serves() {
         use wiremock::matchers::{method, path, query_param};
         let (up, down) = (wiremock::MockServer::start().await, wiremock::MockServer::start().await);
-        let client = |s: &wiremock::MockServer, name| {
-            let p = crate::config::Profile { url: s.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
-            PulpClient::new(name, &p, &crate::config::Settings::default()).unwrap()
-        };
+        serve_status(&up, &["file"]).await;
+        serve_status(&down, &["file"]).await;
         let page = |r: Value| json!({ "count": r.as_array().map_or(0, Vec::len), "next": null, "results": r });
         let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
         let repo = "/pulp/api/v3/repositories/file/file/1/";
@@ -385,5 +456,68 @@ mod tests {
         wiremock::Mock::given(method("GET")).respond_with(ok(page(json!([])))).mount(&down).await;
         let plan = plan(&client(&up, "up"), &client(&down, "down"), &[RepoType::File], "", None).await.unwrap();
         assert_eq!((plan[0].remote_url.as_str(), &plan[0].action), ("https://up/pulp/content/files/CUSTOM", &PlanAction::Create));
+        assert_eq!(plan[0].manifest.as_deref(), Some("CUSTOM"), "the replica publishes under that name too");
+    }
+
+    #[tokio::test]
+    async fn a_file_replica_publishes_under_the_upstream_manifest_name() {
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let c = client(&server, "dst");
+        let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+        let task = |n: u32| wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("/pulp/api/v3/tasks/{n}/") }));
+        let (remote, repo) = ("/pulp/api/v3/remotes/file/file/1/", "/pulp/api/v3/repositories/file/file/1/");
+        let one = |o: Value| json!({ "count": 1, "next": null, "results": [o] });
+        let labels = json!({ LABEL_REPLICA: "up" });
+        let url = "https://up/files/CUSTOM";
+        let r = json!({ "pulp_href": remote, "name": "files", "url": url, "pulp_labels": labels.clone() });
+        wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/remotes/file/file/")).respond_with(ok(one(r))).mount(&server).await;
+        // A replica of an earlier run: it publishes PULP_MANIFEST, and its latest version has such a publication.
+        let v1 = format!("{repo}versions/1/");
+        let r =
+            json!({ "pulp_href": repo, "name": "files", "latest_version_href": v1, "manifest": "PULP_MANIFEST", "pulp_labels": labels });
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/repositories/file/file/"))
+            .respond_with(ok(one(r.clone())))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("GET")).and(path(repo)).respond_with(ok(r)).mount(&server).await;
+        wiremock::Mock::given(method("PATCH")).and(path(repo)).respond_with(ok(json!({}))).mount(&server).await;
+        // After the PATCH, the repository names the upstream manifest.
+        wiremock::Mock::given(method("GET"))
+            .and(path(repo))
+            .and(query_param("fields", "manifest"))
+            .respond_with(ok(json!({ "manifest": "CUSTOM" })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // The sync finds no change: no new version.
+        wiremock::Mock::given(method("POST")).and(path(format!("{repo}sync/"))).respond_with(task(1)).mount(&server).await;
+        let done = |n: u32, made: Value| json!({ "pulp_href": format!("/pulp/api/v3/tasks/{n}/"), "state": "completed", "created_resources": made });
+        let get_task = |n: u32, made: Value| {
+            wiremock::Mock::given(method("GET")).and(path(format!("/pulp/api/v3/tasks/{n}/"))).respond_with(ok(done(n, made)))
+        };
+        get_task(1, json!([])).mount(&server).await;
+        let pubs = "/pulp/api/v3/publications/file/file/";
+        let old = json!({ "pulp_href": format!("{pubs}1/"), "repository_version": v1, "manifest": "PULP_MANIFEST" });
+        wiremock::Mock::given(method("GET")).and(path(pubs)).respond_with(ok(one(old))).mount(&server).await;
+        wiremock::Mock::given(method("POST")).and(path(pubs)).respond_with(task(2)).mount(&server).await;
+        get_task(2, json!([format!("{pubs}2/")])).mount(&server).await;
+        let it = PlanItem {
+            t: RepoType::File,
+            name: "files".into(),
+            base_path: "files".into(),
+            remote_url: url.into(),
+            manifest: Some("CUSTOM".into()),
+            action: PlanAction::Update,
+            note: String::new(),
+        };
+        replicate_one(&c, "up", &it, false, &ops::no_progress).await.unwrap_err(); // the distribution step is not served
+        let sent = server.received_requests().await.unwrap();
+        let bodies = |m: &str, p: &str| -> Vec<Value> {
+            sent.iter().filter(|r| r.method.as_str() == m && r.url.path() == p).map(|r| r.body_json().unwrap()).collect()
+        };
+        assert_eq!(bodies("PATCH", repo), [json!({ "manifest": "CUSTOM" })]);
+        assert_eq!(bodies("POST", pubs), [json!({ "repository_version": v1, "manifest": "CUSTOM" })], "the old publication is not reused");
     }
 }

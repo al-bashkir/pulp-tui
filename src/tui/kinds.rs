@@ -702,6 +702,14 @@ fn sum_counts(v: &Value) -> String {
     v.as_object().map(|m| m.values().filter_map(|x| x["count"].as_u64()).sum::<u64>().to_string()).unwrap_or_default()
 }
 
+/// ` (state)` after a binding that is not `active`.
+fn binding_note(state: &str, running: bool) -> String {
+    match crate::cv::shown_state(state, running) {
+        "active" => String::new(),
+        s => format!(" ({s})"),
+    }
+}
+
 /// Load one page of a screen. API screens query Pulp; Content View screens read the CV store
 /// (`cv`: the store or why it is unavailable) under `scope`; `profile` marks the active server.
 #[allow(clippy::too_many_arguments)]
@@ -762,13 +770,14 @@ pub async fn load(
                 };
                 let versions = store.versions(cv.id).await?;
                 let numbers: std::collections::HashMap<i64, i64> = versions.iter().map(|v| (v.id, v.number)).collect();
+                let running = store.lock_live(cv.id, crate::cv::unix_now()).await?;
                 let bound: Vec<String> = store
                     .bindings_for_cv(cv.id)
                     .await?
                     .iter()
                     .filter_map(|b| {
                         let e = envs.iter().find(|e| e.id == b.env_id)?;
-                        let st = if b.state == "active" { String::new() } else { format!(" ({})", b.state) };
+                        let st = binding_note(&b.state, running);
                         Some((
                             envs.iter().position(|x| x.id == e.id),
                             format!("{}:v{}{st}", e.name, numbers.get(&b.version_id).copied().unwrap_or(0)),
@@ -800,7 +809,7 @@ pub async fn load(
                     "repos": repos, "bound": bound.join("  "),
                     "latest": versions.iter().find(|v| v.state == "published").map(|v| format!("v{}", v.number)),
                     "versions": versions.iter().filter(|v| v.state != "deleted").map(|v| json!({
-                        "number": v.number, "state": v.state, "notes": v.notes, "created_at": v.created_at, "error": v.error
+                        "number": v.number, "state": crate::cv::shown_state(&v.state, running), "notes": v.notes, "created_at": v.created_at, "error": v.error
                     })).collect::<Vec<_>>(),
                     "audit": audit.iter().filter(about).take(10)
                         .map(|a| format!("{} {} {}{}", a.at, a.action, a.detail, if a.actor.is_empty() { String::new() } else { format!(" by {}", a.actor) }))
@@ -813,11 +822,11 @@ pub async fn load(
             let store = store?;
             let envs = store.environments(scope).await?;
             let bindings = store.bindings_for_cv(*cv).await?;
-            // No live lock: the client that ran a `publishing` version ended; Resume continues it.
+            // Resume continues an interrupted version.
             let running = store.lock_live(*cv, crate::cv::unix_now()).await?;
             let mut out = vec![];
             for v in store.versions(*cv).await? {
-                let state = if v.state == "publishing" && !running { "interrupted" } else { v.state.as_str() };
+                let state = crate::cv::shown_state(&v.state, running);
                 let in_envs: Vec<String> = bindings
                     .iter()
                     .filter(|b| b.version_id == v.id)
@@ -849,13 +858,14 @@ pub async fn load(
             let store = store?;
             store.ensure_library(scope).await?;
             let envs = store.environments(scope).await?;
-            // Two queries per view, not two per environment and view.
+            // Three queries per view, not three per environment and view.
             let mut bound: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
             for cv in store.content_views(scope).await? {
                 let numbers: std::collections::HashMap<i64, i64> = store.versions(cv.id).await?.iter().map(|v| (v.id, v.number)).collect();
+                let running = store.lock_live(cv.id, crate::cv::unix_now()).await?;
                 for b in store.bindings_for_cv(cv.id).await? {
                     if let Some(n) = numbers.get(&b.version_id) {
-                        bound.entry(b.env_id).or_default().push(format!("{}:v{n}", cv.name));
+                        bound.entry(b.env_id).or_default().push(format!("{}:v{n}{}", cv.name, binding_note(&b.state, running)));
                     }
                 }
             }
@@ -997,7 +1007,7 @@ mod tests {
         st.set_binding(lib, web, w1.id, "partial").await.unwrap();
         let (rows, _) = load(&Kind::Environments, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap();
         let bound: Vec<(String, String)> = rows.iter().map(|r| (s(r, "name"), s(r, "bound"))).collect();
-        assert_eq!(bound, [("Library".to_string(), "os:v2, web:v1".to_string()), ("Dev".to_string(), "os:v1".to_string())]);
+        assert_eq!(bound, [("Library".to_string(), "os:v2, web:v1 (partial)".to_string()), ("Dev".to_string(), "os:v1".to_string())]);
     }
 
     #[tokio::test]
@@ -1006,13 +1016,32 @@ mod tests {
         let cv = st.create_cv("lab", "os", "").await.unwrap();
         st.begin_version(cv, "", &[]).await.unwrap();
         let k = Kind::CvVersions { cv, name: "os".into() };
-        let state = async || load(&k, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap().0[0]["state"].clone();
+        let row = async |k: &Kind| load(k, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap().0.remove(0);
+        let state = async || {
+            let (v, view) = (row(&k).await, row(&Kind::ContentViews).await);
+            assert_eq!(v["state"], view["versions"][0]["state"], "the details of the view show the same state");
+            v["state"].clone()
+        };
         assert_eq!(state().await, "interrupted", "no lock: the client that ran it ended");
         let now = crate::cv::unix_now();
         st.try_lock(cv, "a@h", "t1", "publish", now).await.unwrap().unwrap();
         assert_eq!(state().await, "publishing");
         st.renew_lock(cv, "t1", now - crate::store::LOCK_TTL_SECS - 1).await.unwrap();
         assert_eq!(state().await, "interrupted", "lock expired");
+    }
+
+    #[tokio::test]
+    async fn a_promoting_binding_without_a_live_lock_shows_interrupted() {
+        let (st, cfg) = (Store::open_in_memory().await.unwrap(), Config::default());
+        let lib = st.ensure_library("lab").await.unwrap();
+        let cv = st.create_cv("lab", "os", "").await.unwrap();
+        let v = st.begin_version(cv, "", &[]).await.unwrap();
+        st.set_binding(lib, cv, v.id, "promoting").await.unwrap();
+        let bound = async |k: Kind| s(&load(&k, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap().0[0], "bound");
+        let both = async || (bound(Kind::ContentViews).await, bound(Kind::Environments).await);
+        assert_eq!(both().await, ("Library:v1 (interrupted)".into(), "os:v1 (interrupted)".into()), "quit, crash or Connect");
+        st.try_lock(cv, "a@h", "t1", "promote to Library", crate::cv::unix_now()).await.unwrap().unwrap();
+        assert_eq!(both().await, ("Library:v1 (promoting)".into(), "os:v1 (promoting)".into()), "the promotion still runs");
     }
 
     #[tokio::test]

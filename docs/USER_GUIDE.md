@@ -354,7 +354,8 @@ that upstream version). The same rules filter the copy action (**C**) of a repos
 A Content View can hold Deb repositories, also together with RPM and File repositories (then
 without filter rules). Publish copies the selected packages with a structured copy
 (`deb/copy/`): it also copies the Release, component and architecture records of these
-packages, so apt finds the same distributions and components. Without filter rules, all
+packages, so apt finds the same distributions and components. A server without this API
+stops Publish before its form and Resume of such a version before it sends anything: `not supported by this server: Deb copy API (deb/copy/)`. Without filter rules, all
 content is copied. A filtered snapshot has only the selected binary packages: source packages
 and the upstream index files are not copied, and the publication makes new indices.
 
@@ -436,7 +437,8 @@ extras.
 * **Auto publish.** Off by default, set per composite with `e`. When a component publishes
   (Publish, or *Resume* that finishes), every composite with auto publish that lists this
   component on `latest` publishes too, each under its own lock. A component that is pinned
-  does not trigger it. The result is part of the notice, for example `rocky9-extras version
+  does not trigger it. *Resume* of an older version does not trigger it either: composites
+  use the newest published version. The result is part of the notice, for example `rocky9-extras version
   2 published and active in Library; auto publish: rocky9 v2 published`. If a composite
   fails (for example, it is locked), the component stays published and the notice is a
   warning that names the composite and the reason. Auto publish never promotes: the new
@@ -465,14 +467,23 @@ publish that failed or was interrupted (continues from checkpoints and re-attach
 submitted task; with a shared database it can also continue a publish that another
 operator started; the version becomes active in Library only when no newer version is
 published, else the warning says `Library not changed: v5 is newer (use Rollback to serve
-v4)`; when Library is protected, you type `Library` first), **W** watch the pending copy task of a publishing version (see Tasks;
-only the copy step, and the publication of a Deb repository, store their task, so during
-other steps W says that no task is pending),
-**d** delete (refused while bound, and while a composite uses it),
+v4)`; when Library is protected, you type `Library` first; on a published version whose
+Library step stopped (Library shows it `interrupted`), it runs the Library step and auto
+publish again, else it says `version is already published`), **W** watch the task of the copy
+step or the publication step of a publishing version (see Tasks; only these two steps store
+their task, so during the other steps (settings, cleanup of unused snapshot versions, the
+Library step) W says that no copy or publication task runs, and the session that runs the
+publish shows their tasks in Tasks),
+**d** delete (refused while bound, and while a composite uses it; the confirmation lists each
+publication and snapshot version it deletes, and each one it keeps with the reason),
 **i** details (source versions, snapshot versions, publications, unit counts; for a
 composite version, the component versions). A `publishing` version shows as `interrupted`
-when nobody holds a live lock on the view: the client that ran it ended (quit, crash), so
-nothing continues it until you press **R**. Compare of two composite versions shows the
+when nobody holds a live lock on the view: the client that ran it ended (quit, crash,
+Connect), so nothing continues it until you press **R**. The same rule applies to a
+`promoting` binding wherever pulp-tui shows its state: the *environments* column of
+Content Views, the *bound views* column of Lifecycle Environments (`Dev:v3
+(interrupted)`), the promote and rollback preview, and Verify. Promote or roll back that
+version again. Compare of two composite versions shows the
 component versions first (`rocky9-extras: v1 -> v2`), then the added and removed content of
 each repository.
 
@@ -481,7 +492,8 @@ each repository.
 Library exists automatically. **c** creates an environment after an existing one
 (paths can branch). **L** toggles protection: to change what a protected environment
 serves, you type its name (promote, roll back; for Library also publish and *Resume*). **d** deletes an unused environment. With a
-shared database, environments belong to the server and every operator sees them.
+shared database, environments belong to the server and every operator sees them. The
+*bound views* column shows the state of a binding that is not active (`web:v2 (partial)`).
 
 Each environment has a **label**, the part of the served path that names it (column
 *label*). A new environment gets its name in lower case as the label (`Dev` gives `dev`).
@@ -494,7 +506,9 @@ moved, and the drift check of each bound view. The distribution names do not cha
 and is named in the result; run Edit again with the same label to move the rest. A relabel
 locks every view that is bound in the environment (see "Locks"), and stops with the
 holder's name if another operator holds one of them. A view bound in the environment during
-the relabel is not moved; run Edit again. A label must not overlap the base path of another distribution (for example a repository distributed at
+the relabel is not moved; the relabel result names it, or, when the promotion saved it
+later, the promotion fails as `partial` with `Dev was relabeled qa during the promotion;
+edit Dev again with label qa`. Run Edit again. A label must not overlap the base path of another distribution (for example a repository distributed at
 `dev`, or at `dev/tools`): Pulp refuses a path that is equal to, a parent of, or a child of
 another path, and the rows that fail stay as described above.
 
@@ -508,7 +522,10 @@ confirmation). **R** replicates and shows the task group result; canceled or ski
 give a warning with the counts. **H** shows recent
 replication task groups. **F** starts the fallback: choose another configured profile as
 source, types, a name filter and additive or mirror mode; a dry run lists
-CREATE / SYNC / SKIP per distribution before anything changes; reruns are safe. The
+CREATE / SYNC / SKIP per distribution before anything changes; reruns are safe. Both
+servers must have the plugin of each chosen type: else the dry run stops with, for example,
+`pulp2 (destination): not supported by this server: pulp_file plugin`. A File replica
+serves its files under the manifest name of the upstream publication. The
 fallback does not follow an upstream label change: a distribution that the source moved to
 another base path is reported as a 409 conflict, and the replica stays at its old path.
 Delete the replica distribution, or move it by hand, to make it follow.
@@ -845,7 +862,9 @@ Each CV database (the local file too) has a random ID. Derived repositories and 
 View distributions carry it as the label `pulp_tui_db=<id>`. pulp-tui refuses to change an
 object with the ID of another database: `... is owned by another pulp-tui database (<id>)`.
 Objects without the label (made by an older pulp-tui) are adopted and labeled on the next
-change. This stops two databases that manage the same Pulp server from taking over each
+change. pulp-tui also refuses an object that does not carry the labels of its view and
+environment (`pulp_tui_cv`, `pulp_tui_env`): `... is not labeled pulp_tui_env=Dev`. Delete,
+*Delete version* and *Unpromote* keep such an object and log it. This stops two databases that manage the same Pulp server from taking over each
 other's objects, for example an old local file after you moved to a shared database.
 
 ### SQLite as the shared database
