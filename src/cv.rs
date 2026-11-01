@@ -414,7 +414,15 @@ impl CvService {
 
     /// Create a new numbered version from the current definition and publish it. `signing` applies to every
     /// Deb repository: "" = same as source, "none", or a signing service href (a composite ignores it).
-    pub async fn publish(&self, cv_id: i64, notes: &str, signing: &str, log: Log<'_>, on: OnTask<'_>) -> Result<CvVersion> {
+    /// Returns what `resume` returns.
+    pub async fn publish(
+        &self,
+        cv_id: i64,
+        notes: &str,
+        signing: &str,
+        log: Log<'_>,
+        on: OnTask<'_>,
+    ) -> Result<(CvVersion, Option<String>)> {
         let cv = self.store.content_view(cv_id).await?;
         if cv.composite {
             return self.publish_composite(&cv, notes, log, on).await;
@@ -485,7 +493,7 @@ impl CvService {
 
     /// A composite version borrows the rows of its component versions: nothing is copied or published
     /// in Pulp; `resume` then binds Library at the composite's own paths.
-    async fn publish_composite(&self, cv: &ContentView, notes: &str, log: Log<'_>, on: OnTask<'_>) -> Result<CvVersion> {
+    async fn publish_composite(&self, cv: &ContentView, notes: &str, log: Log<'_>, on: OnTask<'_>) -> Result<(CvVersion, Option<String>)> {
         let parts = self.resolve_components(cv).await?;
         let used: Vec<i64> = parts.iter().map(|(_, v, _)| v.id).collect();
         let rows: Vec<CvVersionRepo> = parts.iter().flat_map(|(_, _, r)| r.iter().cloned()).collect();
@@ -516,19 +524,21 @@ impl CvService {
                 CvService { lock: None, ..self.clone() }.locked(c.id, "auto publish").await?.publish(c.id, &notes, "", log, on).await
             };
             out.push(match res.await {
-                Ok(v) => Ok(format!("{} v{} published", c.name, v.number)),
+                Ok((v, None)) => Ok(format!("{} v{} published", c.name, v.number)),
+                Ok((v, Some(note))) => Err(format!("{} v{} published; {note}", c.name, v.number)),
                 Err(e) => Err(format!("{}: {e:#}", c.name)),
             });
         }
         out
     }
 
-    /// Run (or continue) the publish workflow of a version from its checkpoints.
-    pub async fn resume(&self, version_id: i64, log: Log<'_>, on: OnTask<'_>) -> Result<CvVersion> {
+    /// Run (or continue) the publish workflow of a version from its checkpoints. With the version, why
+    /// Library does not serve it (`None`: it is active there, or it was published before).
+    pub async fn resume(&self, version_id: i64, log: Log<'_>, on: OnTask<'_>) -> Result<(CvVersion, Option<String>)> {
         let v = self.store.version(version_id).await?;
         let cv = self.store.content_view(v.cv_id).await?;
         if v.state == "published" {
-            return Ok(v);
+            return Ok((v, None));
         }
         if v.state == "deleted" {
             bail!("version {} was deleted", v.number);
@@ -551,9 +561,8 @@ impl CvService {
                 self.store.finish_version(v.id, "published", None).await?;
                 self.audit("cv.publish.done", &format!("{} version {}", cv.name, v.number)).await;
                 log(format!("{} v{} published", cv.name, v.number));
-                let lib = self.store.ensure_library(&self.scope).await?;
-                self.promote(v.cv_id, v.id, lib, Mode::Rollback, log, on).await?;
-                Ok(self.store.version(v.id).await?)
+                let note = self.bind_library(&v, log, on).await?;
+                Ok((self.store.version(v.id).await?, note))
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -568,6 +577,18 @@ impl CvService {
                 Err(e)
             }
         }
+    }
+
+    /// Make the just-published `v` active in Library, unless a newer version is published: resuming an
+    /// older version must not take Library back from it. Returns why Library does not serve `v`.
+    async fn bind_library(&self, v: &CvVersion, log: Log<'_>, on: OnTask<'_>) -> Result<Option<String>> {
+        let newest = self.store.versions(v.cv_id).await?.into_iter().find(|n| n.state == "published");
+        if let Some(n) = newest.filter(|n| n.id != v.id) {
+            return Ok(Some(format!("Library not changed: v{} is newer (use Rollback to serve v{})", n.number, v.number)));
+        }
+        let lib = self.store.ensure_library(&self.scope).await?;
+        self.promote(v.cv_id, v.id, lib, Mode::Rollback, log, on).await?;
+        Ok(None)
     }
 
     async fn publish_repo(&self, cv: &str, vr: &mut CvVersionRepo, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
@@ -2392,7 +2413,7 @@ mod tests {
         let done = json!({ "pulp_href": t, "state": "completed", "created_resources": [DIST] });
         Mock::given(method("GET")).and(path(t)).respond_with(ResponseTemplate::new(200).set_body_json(done)).mount(&server).await;
 
-        let v = svc.publish(c, "", "", &|_| {}, &ops::no_progress).await.unwrap();
+        let (v, _) = svc.publish(c, "", "", &|_| {}, &ops::no_progress).await.unwrap();
         assert_eq!((v.number, v.state.as_str()), (1, "published"));
         let posts: Vec<_> = server.received_requests().await.unwrap().into_iter().filter(|r| r.method.as_str() == "POST").collect();
         assert_eq!(
@@ -2547,6 +2568,26 @@ mod tests {
             assert!(s.versions(c).await.unwrap().is_empty());
         }
         assert_eq!(s.version(v.id).await.unwrap().state, "published", "the component's publish stays");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_of_an_older_version_keeps_the_newer_one_in_library() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let s = &svc.store;
+        let web = s.create_cv("k", "web", "").await.unwrap();
+        // Versions without repositories: resume and the Library binding send nothing to Pulp.
+        let v1 = s.begin_version(web, "", &[]).await.unwrap();
+        s.finish_version(v1.id, "failed", Some("copy failed")).await.unwrap();
+        let v2 = s.begin_version(web, "", &[]).await.unwrap();
+        assert_eq!(svc.resume(v2.id, &|_| {}, &ops::no_progress).await.unwrap().1, None, "the newest version goes to Library");
+        let lib = s.ensure_library("k").await.unwrap();
+        assert_eq!(s.binding(lib, web).await.unwrap().unwrap().version_id, v2.id);
+
+        let (v1, note) = svc.resume(v1.id, &|_| {}, &ops::no_progress).await.unwrap();
+        assert_eq!(v1.state, "published");
+        assert_eq!(note.as_deref(), Some("Library not changed: v2 is newer (use Rollback to serve v1)"));
+        assert_eq!(s.binding(lib, web).await.unwrap().unwrap().version_id, v2.id, "Library keeps the newer v2");
     }
 
     #[test]

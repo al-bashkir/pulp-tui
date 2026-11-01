@@ -160,14 +160,13 @@ fn pin_form(app: &mut App, composite: i64, name: String, parts: Parts) {
     });
 }
 
-/// The notice of a publish with the results of the auto publish that followed: a warning when one failed.
-fn auto_notice(msg: String, auto: Vec<Result<String, String>>) -> (Level, String) {
-    if auto.is_empty() {
-        return (Level::Ok, msg);
-    }
-    let level = if auto.iter().any(Result::is_err) { Level::Warn } else { Level::Ok };
+/// The notice of a publish with `note` (why Library does not serve the version) and the results of the auto
+/// publish that followed: a warning when there is a note or one failed.
+fn auto_notice(msg: String, note: Option<String>, auto: Vec<Result<String, String>>) -> (Level, String) {
+    let level = if note.is_some() || auto.iter().any(Result::is_err) { Level::Warn } else { Level::Ok };
     let results: Vec<String> = auto.into_iter().map(|r| r.unwrap_or_else(|e| e)).collect();
-    (level, format!("{msg}; auto publish: {}", results.join("; ")))
+    let auto = (!results.is_empty()).then(|| format!("auto publish: {}", results.join("; ")));
+    (level, [Some(msg), note, auto].into_iter().flatten().collect::<Vec<_>>().join("; "))
 }
 
 /// What happened to one repository of a "Sync repositories" run.
@@ -509,7 +508,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                     ap(move |app| {
                         app.confirm(format!("Publish {name}"), lines, move |app| {
                             app.job(format!("publish {name}"), move |ctx| async move {
-                                let v = ctx
+                                let (v, note) = ctx
                                     .cv()?
                                     .locked(id, "publish")
                                     .await?
@@ -518,8 +517,8 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                                 // After the lock of this view is released; composites take their own locks.
                                 let auto = ctx.cv()?.auto_publish(id, &ctx.log(), &ctx.on_task()).await;
                                 ap(move |app| {
-                                    let (level, text) =
-                                        auto_notice(format!("{name} version {} published and active in Library", v.number), auto);
+                                    let active = if note.is_none() { " and active in Library" } else { "" };
+                                    let (level, text) = auto_notice(format!("{name} version {} published{active}", v.number), note, auto);
                                     app.notify(level, text);
                                     app.reload();
                                 })
@@ -876,11 +875,11 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                 let svc = ctx.cv()?.locked(cv, &format!("resume v{number}")).await?;
                 // A stale list can show a published version as failed: resume returns at once, nothing new to auto publish.
                 let was_published = svc.store.version(vid).await?.state == "published";
-                let v = svc.resume(vid, &ctx.log(), &ctx.on_task()).await?;
+                let (v, note) = svc.resume(vid, &ctx.log(), &ctx.on_task()).await?;
                 drop(svc); // release the lock of this view; composites take their own
                 let auto = if was_published { vec![] } else { ctx.cv()?.auto_publish(cv, &ctx.log(), &ctx.on_task()).await };
                 ap(move |app| {
-                    let (level, text) = auto_notice(format!("{name} v{} published", v.number), auto);
+                    let (level, text) = auto_notice(format!("{name} v{} published", v.number), note, auto);
                     app.notify(level, text);
                     app.reload();
                 })
@@ -1532,15 +1531,38 @@ mod tests {
     #[test]
     fn auto_publish_results_extend_the_publish_notice() {
         let ok = |s: &str| Ok(s.to_string());
-        assert_eq!(auto_notice("x published".into(), vec![]), (Level::Ok, "x published".into()));
+        assert_eq!(auto_notice("x published".into(), None, vec![]), (Level::Ok, "x published".into()));
         assert_eq!(
-            auto_notice("x published".into(), vec![ok("a v2 published"), ok("b v1 published")]),
+            auto_notice("x published".into(), None, vec![ok("a v2 published"), ok("b v1 published")]),
             (Level::Ok, "x published; auto publish: a v2 published; b v1 published".into())
         );
         assert_eq!(
-            auto_notice("x published".into(), vec![ok("a v2 published"), Err("b: locked".into())]),
+            auto_notice("x published".into(), None, vec![ok("a v2 published"), Err("b: locked".into())]),
             (Level::Warn, "x published; auto publish: a v2 published; b: locked".into())
         );
+        assert_eq!(
+            auto_notice("x published".into(), Some("Library not changed".into()), vec![ok("a v2 published")]),
+            (Level::Warn, "x published; Library not changed; auto publish: a v2 published".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_of_an_older_version_says_library_keeps_the_newer_one() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v1 = st.begin_version(web, "", &[]).await.unwrap();
+        st.finish_version(v1.id, "failed", Some("copy failed")).await.unwrap();
+        let v2 = publish_empty(&st, web).await;
+        let lib = st.ensure_library("lab").await.unwrap();
+        st.set_binding(lib, web, v2.id, "active").await.unwrap();
+        app.push(Kind::CvVersions { cv: web, name: "web".into() });
+        let item = json!({ "id": v1.id, "number": 1, "state": "failed" });
+        version_action(&mut app, "lab", web, "web".into(), Act::Resume, item);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Warn, "web v1 published; Library not changed: v2 is newer (use Rollback to serve v1)"));
+        assert_eq!(st.binding(lib, web).await.unwrap().unwrap().version_id, v2.id);
     }
 
     #[tokio::test]

@@ -171,7 +171,7 @@ async fn rocky9_baseos_real() {
     let (svc, cv, lib) = content_view(&c, &name, &baseos).await;
     let preview = svc.preview(cv, None).await.unwrap().join("\n");
     assert!(preview.contains("+ kernel-") && !preview.contains("+ bash-"), "{preview}");
-    let v1 = svc.publish(cv, "v1", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, "v1", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
     let snapshot = svc.store.version_repos(v1.id).await.unwrap().remove(0).derived_version.unwrap();
     eprintln!("{name}: {} advisories in the snapshot, {} in the source", advisories(&c, &snapshot).await, advisories(&c, &v).await);

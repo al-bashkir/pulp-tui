@@ -422,7 +422,9 @@ extras.
 **M** promote, **b** roll back, **m** compare with the marked version, **R** resume a
 publish that failed or was interrupted (continues from checkpoints and re-attaches to a
 submitted task; with a shared database it can also continue a publish that another
-operator started), **W** watch the pending copy task of a publishing version (see Tasks;
+operator started; the version becomes active in Library only when no newer version is
+published, else the warning says `Library not changed: v5 is newer (use Rollback to serve
+v4)`), **W** watch the pending copy task of a publishing version (see Tasks;
 only the copy step, and the publication of a Deb repository, store their task, so during
 other steps W says that no task is pending),
 **d** delete (refused while bound, and while a composite uses it),
