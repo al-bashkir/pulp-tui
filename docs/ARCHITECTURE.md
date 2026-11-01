@@ -120,7 +120,9 @@ idle group whose counts stay the same for three polls is also treated as final.
 * **Lifecycle environments** form paths from `Library`, for example
   `Library -> Dev -> Test -> Prod`. Publishing makes the new version active in Library.
   *Resume* does so only when the version is the newest published one of the view: a resumed
-  older version is published, and Library keeps the newer version (`bind_library`).
+  older version is published, and Library keeps the newer version (`bind_library`). When the
+  Library step fails, the version stays published and the error is a warning, so auto
+  publish still runs.
 * **Promote** binds a version to an environment. The version must be active in the prior
   environment. Each (view, environment, repository) has a stable distribution
   `pulp-tui-cv-<view>-<env>-<repo>` at `<env label>/<view>/<repo>` (`cv::base_path`). An

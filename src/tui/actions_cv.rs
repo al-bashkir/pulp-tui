@@ -1566,6 +1566,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_library_step_keeps_the_version_published_and_auto_publishes() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let extras = st.create_cv("lab", "extras", "").await.unwrap();
+        let v1 = st.begin_version(extras, "", &[]).await.unwrap();
+        let c = st.create_composite("lab", "rocky9", "").await.unwrap();
+        st.set_component(c, extras, None).await.unwrap();
+        st.set_auto_publish(c, true).await.unwrap();
+        // Library still serves "old" of extras; its distribution belongs to another database, so the unbind fails.
+        let lib = st.ensure_library("lab").await.unwrap();
+        let dist = "/pulp/api/v3/distributions/rpm/rpm/1/";
+        let row = crate::store::BindingRepo {
+            env_id: lib,
+            cv_id: extras,
+            repo_href: format!("{REPOS}rpm/rpm/9/"),
+            repo_name: "old".into(),
+            repo_type: RepoType::Rpm,
+            distribution: dist.into(),
+            base_path: "library/extras/old".into(),
+            publication: Some("/p/1/".into()),
+        };
+        st.save_binding_repo(&row).await.unwrap();
+        serve(&server, "GET", dist.into(), 200, json!({ "pulp_labels": { crate::cv::LABEL_DB: "other" } })).await;
+        app.push(Kind::CvVersions { cv: extras, name: "extras".into() });
+        version_action(&mut app, "lab", extras, "extras".into(), Act::Resume, json!({ "id": v1.id, "number": 1, "state": "failed" }));
+        drain(&mut app, &mut rx).await;
+        let (level, text) = last_notice(&app);
+        assert_eq!(level, Level::Warn);
+        assert!(text.starts_with("extras v1 published; Library step failed: extras in Library: failed: unbind old: "), "{text}");
+        assert!(text.ends_with("; promote v1 to Library; auto publish: rocky9 v1 published"), "{text}");
+        assert_eq!(st.version(v1.id).await.unwrap().state, "published");
+        assert_eq!(st.versions(c).await.unwrap().len(), 1, "the composite auto published");
+    }
+
+    #[tokio::test]
     async fn create_makes_a_composite_view_on_request() {
         let (mut app, mut rx, st) = composite_app().await;
         for (composite, msg) in [

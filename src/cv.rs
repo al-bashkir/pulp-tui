@@ -561,7 +561,11 @@ impl CvService {
                 self.store.finish_version(v.id, "published", None).await?;
                 self.audit("cv.publish.done", &format!("{} version {}", cv.name, v.number)).await;
                 log(format!("{} v{} published", cv.name, v.number));
-                let note = self.bind_library(&v, log, on).await?;
+                // The version stays published: the error is a note, so auto publish still runs.
+                let note = match self.bind_library(&v, log, on).await {
+                    Ok(note) => note,
+                    Err(e) => Some(format!("Library step failed: {e:#}; promote v{} to Library", v.number)),
+                };
                 Ok((self.store.version(v.id).await?, note))
             }
             Err(e) => {
