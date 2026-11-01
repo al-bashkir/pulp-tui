@@ -210,7 +210,8 @@ point a distribution to it (rollback, with preview; Deb: the new publication kee
 signing service of the publication that the distribution serves now), **m** compare
 with the marked version (`Space` on one, `m` on the other; shows added/removed units of every
 content type that the Content browser lists, each line starts with its type, such as
-`+ advisory RHSA-2024:0001`; older → newer), **d** delete (names the distributions that serve the version or its
+`+ advisory RHSA-2024:0001`; older → newer; a `warning:` line says when Pulp counts more or
+fewer units in a version than the compare lists), **d** delete (names the distributions that serve the version or its
 publications, and you type the version id; refused for Content View snapshots; never needed
 for rollback), **R** restore as latest (below).
 
@@ -242,8 +243,12 @@ deleted content again. A read-only profile does not allow it. A server without
 
 Opened from a repository or version. `t` cycles the content types of the repository type.
 RPM: packages, advisories, modulemds, package groups, distribution trees, repo metadata
-files. Deb: packages (package, version, architecture, sha256), releases (distribution,
-codename, suite, version), release components, source packages. `/`
+files, modulemd defaults, modulemd obsoletes, package categories, package environments,
+package langpacks. Deb: packages (package, version, architecture, sha256), releases
+(distribution, codename, suite, version), release components, source packages, generic
+contents, installer packages, installer file indices, package indices, source indices,
+release architectures, release files, package release components, source release
+components. `/`
 searches package names (on the RPM and Deb packages lists) or file paths. **i** shows all metadata of a unit (requires,
 provides, files, advisory package lists, …). **x** removes the marked (or selected)
 units from the repository; **a** adds them to another repository (Deb: a structured copy,

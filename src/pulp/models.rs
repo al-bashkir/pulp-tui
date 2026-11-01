@@ -148,6 +148,16 @@ fn typed<'a, T: Deserialize<'a>>(v: &'a Value, key: impl Fn(T) -> String) -> Str
     T::deserialize(v).map_or_else(|_| v.to_string(), key)
 }
 
+/// Last part of the unit's `pulp_href`: it keeps units apart whose API shows no unique field.
+fn unit_id(v: &Value) -> String {
+    text(v, "pulp_href").trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_string()
+}
+
+/// `relative_path` and the unit id: the API shows no digest of these units (or one that is `null` until download).
+fn path_id(v: &Value) -> String {
+    format!("{}  ({})", text(v, "relative_path"), unit_id(v))
+}
+
 const RPM_TYPES: &[ContentType] = &[
     ContentType {
         label: "packages",
@@ -183,6 +193,36 @@ const RPM_TYPES: &[ContentType] = &[
         fields: "data_type,checksum",
         key: |v| format!("repo metadata file {}  ({:.12})", text(v, "data_type"), text(v, "checksum")),
     },
+    ContentType {
+        label: "modulemd defaults",
+        path: "content/rpm/modulemd_defaults/",
+        fields: "module,stream",
+        key: |v| format!("modulemd defaults {} (stream {})", text(v, "module"), text(v, "stream")),
+    },
+    ContentType {
+        label: "modulemd obsoletes",
+        path: "content/rpm/modulemd_obsoletes/",
+        fields: "module_name,module_stream,modified",
+        key: |v| format!("modulemd obsolete {}:{} (modified {})", text(v, "module_name"), text(v, "module_stream"), text(v, "modified")),
+    },
+    ContentType {
+        label: "package categories",
+        path: "content/rpm/packagecategories/",
+        fields: "id",
+        key: |v| format!("package category {}", text(v, "id")),
+    },
+    ContentType {
+        label: "package environments",
+        path: "content/rpm/packageenvironments/",
+        fields: "id",
+        key: |v| format!("package environment {}", text(v, "id")),
+    },
+    ContentType {
+        label: "package langpacks",
+        path: "content/rpm/packagelangpacks/",
+        fields: "digest",
+        key: |v| format!("package langpacks {:.12}", text(v, "digest")),
+    },
 ];
 
 const FILE_TYPES: &[ContentType] = &[ContentType {
@@ -217,6 +257,61 @@ const DEB_TYPES: &[ContentType] = &[
         path: "content/deb/source_packages/",
         fields: "source,version,artifacts",
         key: |v| format!("source package {}_{}", text(v, "source"), text(v, "version")),
+    },
+    ContentType {
+        label: "generic contents",
+        path: "content/deb/generic_contents/",
+        fields: "relative_path,pulp_href",
+        key: |v| format!("generic content {}", path_id(v)),
+    },
+    ContentType {
+        label: "installer packages",
+        path: "content/deb/installer_packages/",
+        fields: "pulp_href,package,version,architecture",
+        key: |v| format!("installer package {}", typed(v, |p: DebPackage| p.key())),
+    },
+    ContentType {
+        label: "installer file indices",
+        path: "content/deb/installer_file_indices/",
+        fields: "relative_path,pulp_href",
+        key: |v| format!("installer file index {}", path_id(v)),
+    },
+    ContentType {
+        label: "package indices",
+        path: "content/deb/package_indices/",
+        fields: "relative_path,pulp_href",
+        key: |v| format!("package index {}", path_id(v)),
+    },
+    ContentType {
+        label: "source indices",
+        path: "content/deb/source_indices/",
+        fields: "relative_path,pulp_href",
+        key: |v| format!("source index {}", path_id(v)),
+    },
+    ContentType {
+        label: "release architectures",
+        path: "content/deb/release_architectures/",
+        fields: "distribution,architecture",
+        key: |v| format!("release architecture {}/{}", text(v, "distribution"), text(v, "architecture")),
+    },
+    ContentType {
+        label: "release files",
+        path: "content/deb/release_files/",
+        fields: "relative_path,pulp_href",
+        key: |v| format!("release file {}", path_id(v)),
+    },
+    // A package can have one record per index architecture, and the API does not show that field.
+    ContentType {
+        label: "package release components",
+        path: "content/deb/package_release_components/",
+        fields: "pulp_href",
+        key: |v| format!("package release component {}", unit_id(v)),
+    },
+    ContentType {
+        label: "source release components",
+        path: "content/deb/source_release_components/",
+        fields: "pulp_href",
+        key: |v| format!("source release component {}", unit_id(v)),
     },
 ];
 
@@ -384,6 +479,13 @@ pub struct ContentSummary {
     pub present: BTreeMap<String, CountHref>,
 }
 
+impl ContentSummary {
+    /// Units in the version, of every content type.
+    pub fn present_count(&self) -> u64 {
+        self.present.values().map(|x| x.count).sum()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RepoVersion {
     pub pulp_href: String,
@@ -544,12 +646,47 @@ mod tests {
             assert_eq!(v.as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>(), asked, "{label}");
             (ct.key)(&v)
         };
-        let labels = |t: RepoType| t.content_types().iter().map(|c| c.label).collect::<Vec<_>>();
+        // Every content type of the plugin's OpenAPI (pulp_rpm 3.39, pulp_deb 3.11), so a compare misses no unit.
+        let paths = |t: RepoType, plugin: &str| {
+            t.content_types().iter().map(|c| c.path.strip_prefix(&format!("content/{plugin}/")).unwrap()).collect::<Vec<_>>().join(" ")
+        };
+        assert_eq!(paths(RepoType::File, "file"), "files/");
+        let rpm = "packages/ advisories/ modulemds/ packagegroups/ distribution_trees/ repo_metadata_files/ modulemd_defaults/ \
+                   modulemd_obsoletes/ packagecategories/ packageenvironments/ packagelangpacks/";
+        assert_eq!(paths(RepoType::Rpm, "rpm"), rpm);
+        let deb = "packages/ releases/ release_components/ source_packages/ generic_contents/ installer_packages/ \
+                   installer_file_indices/ package_indices/ source_indices/ release_architectures/ release_files/ \
+                   package_release_components/ source_release_components/";
+        assert_eq!(paths(RepoType::Deb, "deb"), deb);
+        let defaults = json!({ "module": "nodejs", "stream": "18" });
+        assert_eq!(key(RepoType::Rpm, "modulemd defaults", defaults), "modulemd defaults nodejs (stream 18)");
+        let obsolete = json!({ "module_name": "nodejs", "module_stream": "16", "modified": "202401010000" });
+        assert_eq!(key(RepoType::Rpm, "modulemd obsoletes", obsolete), "modulemd obsolete nodejs:16 (modified 202401010000)");
+        assert_eq!(key(RepoType::Rpm, "package categories", json!({ "id": "base-system" })), "package category base-system");
+        assert_eq!(key(RepoType::Rpm, "package environments", json!({ "id": "server" })), "package environment server");
+        let langpacks = json!({ "digest": "0123456789abcdef" });
+        assert_eq!(key(RepoType::Rpm, "package langpacks", langpacks), "package langpacks 0123456789ab");
+        // The API shows no digest of these units (or one that is `null` until download): the unit id keeps them apart.
+        let at = |kind: &str, path: &str| json!({ "relative_path": path, "pulp_href": format!("/pulp/api/v3/content/deb/{kind}/01a1/") });
+        assert_eq!(key(RepoType::Deb, "generic contents", at("generic_contents", "x.txt")), "generic content x.txt  (01a1)");
+        let udeb = json!({ "pulp_href": "/d/", "package": "di-utils", "version": "1.1", "architecture": "amd64" });
+        assert_eq!(key(RepoType::Deb, "installer packages", udeb), "installer package di-utils_1.1_amd64");
+        let sums = at("installer_file_indices", "dists/b/main/installer-amd64/current/images/SHA256SUMS");
         assert_eq!(
-            labels(RepoType::Rpm),
-            ["packages", "advisories", "modulemds", "package groups", "distribution trees", "repo metadata files"]
+            key(RepoType::Deb, "installer file indices", sums),
+            "installer file index dists/b/main/installer-amd64/current/images/SHA256SUMS  (01a1)"
         );
-        assert_eq!((labels(RepoType::File), labels(RepoType::Deb).len()), (vec!["files"], 4));
+        let index = at("package_indices", "dists/b/main/binary-amd64/Packages");
+        assert_eq!(key(RepoType::Deb, "package indices", index), "package index dists/b/main/binary-amd64/Packages  (01a1)");
+        let sources = at("source_indices", "dists/b/main/source/Sources");
+        assert_eq!(key(RepoType::Deb, "source indices", sources), "source index dists/b/main/source/Sources  (01a1)");
+        let arch = json!({ "distribution": "bookworm", "architecture": "amd64" });
+        assert_eq!(key(RepoType::Deb, "release architectures", arch), "release architecture bookworm/amd64");
+        assert_eq!(key(RepoType::Deb, "release files", at("release_files", "dists/b/Release")), "release file dists/b/Release  (01a1)");
+        let prc = json!({ "pulp_href": "/pulp/api/v3/content/deb/package_release_components/01a1/" });
+        assert_eq!(key(RepoType::Deb, "package release components", prc), "package release component 01a1");
+        let sprc = json!({ "pulp_href": "/pulp/api/v3/content/deb/source_release_components/01a1/" });
+        assert_eq!(key(RepoType::Deb, "source release components", sprc), "source release component 01a1");
         let pkg = json!({ "pulp_href": "/p/", "name": "bash", "epoch": "0", "version": "5.2", "release": "1.el9", "arch": "x86_64" });
         assert_eq!(key(RepoType::Rpm, "packages", pkg), "package bash-5.2-1.el9.x86_64");
         assert_eq!(key(RepoType::Rpm, "advisories", json!({ "id": "RHSA-2024:0001" })), "advisory RHSA-2024:0001");

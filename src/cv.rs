@@ -722,7 +722,7 @@ impl CvService {
                 }
             };
             let rv: RepoVersion = c.get(&version, &[]).await?;
-            vr.content_count = Some(rv.content_summary.present.values().map(|x| x.count as i64).sum());
+            vr.content_count = Some(rv.content_summary.present_count() as i64);
             vr.derived_version = Some(version.clone());
             vr.pending_task = None;
             self.alive()?;

@@ -7,7 +7,7 @@ use super::kinds::{Act, Kind, s, short};
 use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile, database_keyring_user};
 use crate::filters::{Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
-use crate::pulp::models::{Distribution, Publication, Task};
+use crate::pulp::models::{Distribution, Publication, RepoVersion, Task};
 use crate::pulp::ops::{self, repo_of_version, version_number};
 use crate::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::Store;
@@ -1364,6 +1364,26 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
 
 // ---- versions and content ------------------------------------------------------------------
 
+/// The units added and removed from version `a` to `b`, with a warning for a version of which Pulp
+/// counts other units than the compare lists (a content type it does not know, or two units with one key).
+async fn compare_versions(c: &PulpClient, t: RepoType, a: &str, b: &str) -> anyhow::Result<Vec<String>> {
+    let (ka, kb) = (ops::all_content_keys(c, t, a).await?, ops::all_content_keys(c, t, b).await?);
+    let mut lines = ops::diff(&ka, &kb).lines(&short(a), &short(b));
+    let mut warnings = vec![];
+    for (v, keys) in [(a, &ka), (b, &kb)] {
+        let n = c.get::<RepoVersion>(v, &[]).await?.content_summary.present_count();
+        if n != keys.len() as u64 {
+            warnings.push(format!(
+                "warning: Pulp counts {n} units in {}, this compare lists {}: the difference can be incomplete",
+                short(v),
+                keys.len()
+            ));
+        }
+    }
+    lines.splice(1..1, warnings);
+    Ok(lines)
+}
+
 fn version_action(app: &mut App, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let Some(t) = RepoType::from_href(&href) else {
@@ -1408,9 +1428,7 @@ fn version_action(app: &mut App, act: Act, item: Value) {
             app.job("compare versions", move |ctx| async move {
                 // Always show older -> newer.
                 let (a, b) = if version_number(&other) <= version_number(&href) { (other, href) } else { (href, other) };
-                let ka = ops::all_content_keys(&ctx.client, t, &a).await?;
-                let kb = ops::all_content_keys(&ctx.client, t, &b).await?;
-                let lines = ops::diff(&ka, &kb).lines(&short(&a), &short(&b));
+                let lines = compare_versions(&ctx.client, t, &a, &b).await?;
                 ap(move |app| app.text("Version comparison", lines))
             });
         }
@@ -3593,6 +3611,46 @@ mod tests {
         version_action(&mut app, Act::Compare, json!({ "pulp_href": format!("{API}repositories/rpm/rpm/r/versions/2/"), "number": 2 }));
         assert!(app.jobs.is_empty(), "a compare job started");
         assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("compare needs two versions of one repository type"));
+    }
+
+    /// Pulp counts every unit of a version: a compare that lists fewer says so, not only `+0 added`.
+    #[tokio::test]
+    async fn compare_warns_when_pulp_counts_units_it_does_not_list() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        let server = wiremock::MockServer::start().await;
+        let r = format!("{API}repositories/rpm/rpm/r/");
+        let (v1, v2) = (format!("{r}versions/1/"), format!("{r}versions/2/"));
+        let pkg = json!({ "pulp_href": "/p/", "name": "bash", "epoch": "0", "version": "5.2", "release": "1", "arch": "x86_64" });
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}content/rpm/packages/")))
+            .and(query_param("repository_version", v2.as_str()))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([pkg]))))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("GET"))
+            .and(path_regex("/content/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([]))))
+            .mount(&server)
+            .await;
+        let count = |n: u64| json!({ "count": n, "href": "/c/" });
+        get(&server, &v1, json!({ "pulp_href": v1, "number": 1, "content_summary": { "present": {} } })).await;
+        let present = json!({ "rpm.package": count(1), "rpm.unknown": count(2) });
+        get(&server, &v2, json!({ "pulp_href": v2, "number": 2, "content_summary": { "present": present } })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.marked = [v1.clone()].into();
+        version_action(&mut app, Act::Compare, json!({ "pulp_href": v2, "number": 2 }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no comparison") };
+        assert_eq!(
+            lines[..4],
+            [
+                "r@v1 -> r@v2: +1 added, -0 removed",
+                "warning: Pulp counts 3 units in r@v2, this compare lists 1: the difference can be incomplete",
+                "",
+                "+ package bash-5.2-1.x86_64"
+            ]
+        );
     }
 
     #[tokio::test]

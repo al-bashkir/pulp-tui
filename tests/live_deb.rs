@@ -8,7 +8,7 @@ use common::*;
 use pulp_tui::cv::{CvService, Mode, base_path};
 use pulp_tui::filters::{Selector, parse_rules};
 use pulp_tui::pulp::client::Page;
-use pulp_tui::pulp::models::DebPackage;
+use pulp_tui::pulp::models::{DebPackage, RepoVersion};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{PulpClient, RepoType, deb};
 use pulp_tui::store::{CvRepo, Store};
@@ -35,11 +35,20 @@ async fn deb_mirror_copy_publish_verify() {
     let keys = ops::content_keys(&c, t, Some(&v1)).await.unwrap();
     assert_eq!(keys.len(), 4, "{keys:?}");
     assert!(keys.contains("fixture-beta-dbg_2.0-1_amd64"), "{keys:?}");
-    // Versions -> Compare also lists the release records (and asks for source packages: none here).
+    // Versions -> Compare lists every unit that Pulp counts: also the release records, indices and the Release
+    // file (and asks for the types that this sync does not make, such as source packages).
     let all = ops::all_content_keys(&c, t, &v1).await.unwrap();
-    let records: Vec<&String> = all.iter().filter(|k| !k.starts_with("package ")).collect();
-    assert_eq!(records, ["release component fixture/main", "release fixture (codename fixture, suite fixture)"]);
-    assert!(all.contains("package fixture-beta-dbg_2.0-1_amd64") && all.len() == 6, "{all:?}");
+    let rv: RepoVersion = c.get(&v1, &[]).await.unwrap();
+    assert_eq!(all.len() as u64, rv.content_summary.present_count(), "{all:?}");
+    // Without the unit id that some keys end with.
+    let records: Vec<&str> = all.iter().filter(|k| k.starts_with("release")).map(|k| k.split("  (").next().unwrap()).collect();
+    let release = "release fixture (codename fixture, suite fixture)";
+    assert_eq!(
+        records,
+        ["release architecture fixture/amd64", "release component fixture/main", "release file dists/fixture/Release", release]
+    );
+    assert!(all.contains("package fixture-beta-dbg_2.0-1_amd64"), "{all:?}");
+    assert!(all.iter().any(|k| k.starts_with("package index dists/fixture/main/binary-amd64/Packages  (")), "{all:?}");
 
     // A second repository gets the packages that pass the filter; the structured copy brings
     // the release and component records with them.
@@ -126,7 +135,12 @@ async fn a_removed_deb_package_is_no_longer_served() {
     let m = ops::restore_version(&c, &repo, &v1).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
     let v3 = latest(&c, &repo).await;
-    assert_eq!(ops::all_content_keys(&c, t, &v3).await.unwrap(), ops::all_content_keys(&c, t, &v1).await.unwrap());
+    // pulp_deb removes the upstream metadata units from every new version; only a sync adds them.
+    let synced_only = ["release file ", "package index ", "installer file index "];
+    let mut want = ops::all_content_keys(&c, t, &v1).await.unwrap();
+    assert!(want.iter().any(|k| k.starts_with("package index ")), "the sync stored the index: {want:?}");
+    want.retain(|k| !synced_only.iter().any(|p| k.starts_with(p)));
+    assert_eq!(ops::all_content_keys(&c, t, &v3).await.unwrap(), want);
     let publication = ops::create_publication(&c, t, &v3, None, &no_progress).await.unwrap();
     ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let index = served(&c, &format!("{base}dists/fixture/main/binary-amd64/Packages")).await.1;

@@ -507,7 +507,8 @@ impl Kind {
                     col("context", 10, |v| s(v, "context")),
                     col("arch", 8, |v| s(v, "arch")),
                 ],
-                (Some(RepoType::Rpm), 3) => vec![col("id", 30, |v| s(v, "id")), col("name", 40, |v| s(v, "name"))],
+                // Package groups, categories and environments.
+                (Some(RepoType::Rpm), 3 | 8 | 9) => vec![col("id", 30, |v| s(v, "id")), col("name", 40, |v| s(v, "name"))],
                 (Some(RepoType::File), _) => vec![
                     col("relative_path", 50, |v| s(v, "relative_path")),
                     col("sha256", 20, |v| s(v, "sha256").chars().take(16).collect()),
@@ -1048,7 +1049,7 @@ mod tests {
         let names = |k: &Kind| k.columns().iter().map(|c| c.title).collect::<Vec<_>>();
         let content = |ctype| Kind::Content { version: "/pulp/api/v3/repositories/deb/apt/1/versions/1/".into(), ctype };
         assert_eq!(
-            RepoType::Deb.content_types().iter().map(|c| c.path).collect::<Vec<_>>(),
+            RepoType::Deb.content_types()[..4].iter().map(|c| c.path).collect::<Vec<_>>(),
             ["content/deb/packages/", "content/deb/releases/", "content/deb/release_components/", "content/deb/source_packages/"]
         );
         assert_eq!(names(&content(0)), ["package", "version", "architecture", "sha256"]);
@@ -1062,6 +1063,15 @@ mod tests {
         assert_eq!(content(0).columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["p", "1.0-1", "amd64", "0123456789ab"]);
         let pubs = Kind::Publications(RepoType::Deb).columns();
         assert!(pubs.iter().all(|c| c.title != "distributions"), "the Deb publication has no distributions field");
+    }
+
+    #[test]
+    fn rpm_comps_content_shows_id_and_name() {
+        let content = |ctype| Kind::Content { version: "/pulp/api/v3/repositories/rpm/rpm/1/versions/1/".into(), ctype };
+        for (ctype, label) in [(3, "package groups"), (8, "package categories"), (9, "package environments")] {
+            assert_eq!(content(ctype).title(), format!("Content {label} of 1@v1  [t: type]"));
+            assert_eq!(content(ctype).columns().iter().map(|c| c.title).collect::<Vec<_>>(), ["id", "name"], "{label}");
+        }
     }
 
     #[test]

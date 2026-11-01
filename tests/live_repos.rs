@@ -44,7 +44,9 @@ async fn rpm_lifecycle() {
     assert_eq!(rv.content_summary.present["rpm.advisory"].count, 1);
     // Versions -> Compare covers every content type: the sync (v0 -> v1) also added the advisory.
     let v0 = format!("{repo}versions/0/");
-    let d = ops::diff(&ops::all_content_keys(&c, t, &v0).await.unwrap(), &ops::all_content_keys(&c, t, &v1).await.unwrap());
+    let k1 = ops::all_content_keys(&c, t, &v1).await.unwrap();
+    assert_eq!(rv.content_summary.present_count(), k1.len() as u64, "Pulp counts the units the compare lists");
+    let d = ops::diff(&ops::all_content_keys(&c, t, &v0).await.unwrap(), &k1);
     assert_eq!(
         d.added,
         [
@@ -104,6 +106,46 @@ async fn rpm_lifecycle() {
     assert_eq!(ops::all_content_keys(&c, t, &v3).await.unwrap(), ops::all_content_keys(&c, t, &v1).await.unwrap());
 
     cleanup(&c, &[&dist, &repo, &local, &remote]).await;
+}
+
+/// A comps-only change (`rpm/comps/` upload) shows in the version compare, and Pulp counts the units it lists.
+#[tokio::test]
+async fn rpm_compare_lists_comps_units() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Rpm;
+    let name = unique("it-comps");
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    // Ids with the unique name, so a rerun does not find the units of an earlier run.
+    let comps = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE comps PUBLIC "-//Red Hat, Inc.//DTD Comps info//EN" "comps.dtd">
+<comps>
+  <group><id>{name}-group</id><name>G</name><description>g</description><default>false</default><uservisible>true</uservisible>
+    <packagelist><packagereq type="mandatory">fixture-alpha</packagereq></packagelist></group>
+  <category><id>{name}-category</id><name>C</name><description>c</description>
+    <grouplist><groupid>{name}-group</groupid></grouplist></category>
+  <environment><id>{name}-env</id><name>E</name><description>e</description>
+    <grouplist><groupid>{name}-group</groupid></grouplist><optionlist></optionlist></environment>
+  <langpacks><match install="{name}-%s" name="{name}"/></langpacks>
+</comps>
+"#
+    );
+    let m =
+        c.post_form(&c.api("rpm/comps/"), &[("repository", repo.clone())], Some(("comps.xml".into(), comps.into_bytes()))).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let (v0, v1) = (format!("{repo}versions/0/"), latest(&c, &repo).await);
+    let keys = ops::all_content_keys(&c, t, &v1).await.unwrap();
+    let d = ops::diff(&ops::all_content_keys(&c, t, &v0).await.unwrap(), &keys);
+    let langpacks = d.added.iter().find(|k| k.starts_with("package langpacks ")).cloned().unwrap_or_default();
+    let want =
+        [format!("package category {name}-category"), format!("package environment {name}-env"), format!("package group {name}-group")];
+    assert_eq!(d.added, [&want[..], &[langpacks]].concat(), "the compare lists every comps unit");
+    let v: RepoVersion = c.get(&v1, &[]).await.unwrap();
+    assert_eq!(v.content_summary.present_count(), keys.len() as u64, "Pulp counts the units the compare lists");
+    cleanup(&c, &[&repo]).await;
 }
 
 #[tokio::test]

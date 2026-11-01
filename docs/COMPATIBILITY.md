@@ -93,7 +93,10 @@ server gives the final answer; the dashboard shows a warning.
   images), so pulp-tui does not check for it. The new
   version starts from the content of the latest version, then removes what the base version
   lacks and adds what it has (`Repository.new_version`); so it has every content type of the
-  base version, also the Deb release records. A version without a change is deleted at once
+  base version, also the Deb release records. Exception: pulp_deb 3.11.1 removes the upstream
+  metadata units (`ReleaseFile`, `PackageIndex`, `InstallerFileIndex`) from every new version
+  (`AptRepository.initialize_new_version`); only a sync adds them again. A restored Deb version
+  therefore lacks them; an APT publication does not use them. A version without a change is deleted at once
   (`RepositoryVersion.__exit__`): the task completes with no created version. A new version
   runs the retention cleanup (`retain_repo_versions`) and autopublish (`on_new_version`), as
   a sync does. Verified in `live_repos` (File, RPM) and `live_deb` (3.123.1).
@@ -152,6 +155,12 @@ server gives the final answer; the dashboard shows a warning.
   repository's `manifest` with every File publication it creates, and Verify fetches the
   manifest that the served publication names (with none, it reports that it compared no
   files).
+* **RPM content types.** pulp_rpm 3.39.5 has 11 content types (OpenAPI
+  `content/rpm/...`). A `rpm/comps/` upload adds package groups, categories, environments and
+  langpacks; langpacks have no id (`unique_together` is the digest), so the compare keys
+  them by `digest`. The version compare and the Content browser cover all 11 types. Compare
+  also reads `content_summary.present` of both versions and warns when Pulp counts other
+  units than it lists.
 * **`sha256` of RPM packages and File content** comes from the stored file (pulpcore
   `ContentChecksumSerializer`; read in pulp_rpm 3.39.3 and pulp_file 3.123.0), so it is
   `null` for `on_demand` and `streamed` content until a client downloads it. Verify then
@@ -244,6 +253,14 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
   value without `artifacts`, even for an empty page: `DscFileSerializer.__init__` sets
   `self.fields["artifacts"].read_only` (`serializers/content_serializers.py`). The version
   compare asks for `source,version,artifacts`. Seen live in `live_deb`.
+* pulp_deb 3.11.1 has 13 content types (OpenAPI `content/deb/...`). A sync makes one PRC per
+  package, component and index architecture (`models/content/structure_content.py`
+  `unique_together` has `index_architecture`), and the API does not show
+  `index_architecture`. The index and Release file units (`package_indices`, `source_indices`,
+  `installer_file_indices`, `release_files`) show `relative_path` and `artifacts`, not the
+  `sha256` that makes them unique. The version compare therefore keys these units, and the
+  PRCs, by their unit id. With these keys the compare lists as many units as
+  `content_summary.present` counts (checked in `live_deb` on the fixture).
 * `dependency_solving: true` is not implemented: the task fails with
   `FeatureNotImplementedError`. pulp-tui always sends `false`.
 * `dest_base_version: 0` starts the new version from the empty version 0 of the destination
