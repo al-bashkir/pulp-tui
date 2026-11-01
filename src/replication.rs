@@ -145,10 +145,23 @@ pub async fn plan(
             it.remote_url = match t {
                 RepoType::Rpm => base,
                 RepoType::File => {
-                    let served = ops::served_publication(src, t, &serde_json::to_value(&d)?).await.ok().flatten();
-                    let m = served.as_ref().and_then(|p| p["manifest"].as_str()).unwrap_or("PULP_MANIFEST");
-                    it.manifest = Some(m.into());
-                    format!("{base}{m}")
+                    // pulp_file serves only from publications: only a served manifest name makes a remote URL.
+                    let m = match ops::served_publication(src, t, &serde_json::to_value(&d)?).await {
+                        Err(e) => Err(format!("upstream publication not readable: {e}")),
+                        Ok(None) => Err("upstream distribution serves nothing (no publication)".to_string()),
+                        Ok(Some(p)) => p["manifest"].as_str().map(str::to_string).ok_or("upstream publication has no manifest".to_string()),
+                    };
+                    match m {
+                        Ok(m) => {
+                            it.manifest = Some(m.clone());
+                            format!("{base}{m}")
+                        }
+                        Err(note) => {
+                            it.note = note;
+                            out.push(it);
+                            continue;
+                        }
+                    }
                 }
                 RepoType::Deb => {
                     it.note = "Deb replication is not supported".into();
@@ -457,6 +470,63 @@ mod tests {
         let plan = plan(&client(&up, "up"), &client(&down, "down"), &[RepoType::File], "", None).await.unwrap();
         assert_eq!((plan[0].remote_url.as_str(), &plan[0].action), ("https://up/pulp/content/files/CUSTOM", &PlanAction::Create));
         assert_eq!(plan[0].manifest.as_deref(), Some("CUSTOM"), "the replica publishes under that name too");
+    }
+
+    /// Only a manifest that the upstream serves makes a remote URL; the plan goes on with the other distributions.
+    #[tokio::test]
+    async fn a_file_distribution_without_a_served_manifest_is_skipped_with_the_reason() {
+        use wiremock::matchers::{method, path};
+        let (up, down) = (wiremock::MockServer::start().await, wiremock::MockServer::start().await);
+        serve_status(&up, &["file"]).await;
+        serve_status(&down, &["file"]).await;
+        let page = |r: Value| json!({ "count": r.as_array().map_or(0, Vec::len), "next": null, "results": r });
+        let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+        let dist = |name: &str, k: &str, v: &str| {
+            json!({ "pulp_href": format!("/pulp/api/v3/distributions/file/file/{name}/"), "name": name, "base_path": name,
+                "base_url": format!("https://up/pulp/content/{name}/"), k: v })
+        };
+        let dists = json!([
+            dist("a", "publication", "/pulp/api/v3/publications/file/file/denied/"),
+            dist("b", "repository", "/pulp/api/v3/repositories/file/file/empty/"),
+            dist("c", "publication", "/pulp/api/v3/publications/file/file/nomf/"),
+            dist("d", "publication", "/pulp/api/v3/publications/file/file/ok/"),
+        ]);
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/distributions/file/file/"))
+            .respond_with(ok(page(dists)))
+            .mount(&up)
+            .await;
+        let forbidden = wiremock::ResponseTemplate::new(403).set_body_json(json!({ "detail": "no access" }));
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/publications/file/file/denied/"))
+            .respond_with(forbidden)
+            .mount(&up)
+            .await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/publications/file/file/"))
+            .respond_with(ok(page(json!([]))))
+            .mount(&up)
+            .await;
+        for (p, m) in [("nomf", Value::Null), ("ok", json!("CUSTOM"))] {
+            let body = json!({ "pulp_href": format!("/pulp/api/v3/publications/file/file/{p}/"), "manifest": m });
+            wiremock::Mock::given(method("GET"))
+                .and(path(format!("/pulp/api/v3/publications/file/file/{p}/")))
+                .respond_with(ok(body))
+                .mount(&up)
+                .await;
+        }
+        wiremock::Mock::given(method("GET")).respond_with(ok(page(json!([])))).mount(&down).await;
+        let plan = plan(&client(&up, "up"), &client(&down, "down"), &[RepoType::File], "", None).await.unwrap();
+        let rows: Vec<_> = plan.iter().map(|i| (i.name.as_str(), &i.action, i.note.as_str(), i.remote_url.as_str())).collect();
+        assert_eq!(
+            rows,
+            [
+                ("a", &PlanAction::Skip, "upstream publication not readable: permission denied [403]: no access", ""),
+                ("b", &PlanAction::Skip, "upstream distribution serves nothing (no publication)", ""),
+                ("c", &PlanAction::Skip, "upstream publication has no manifest", ""),
+                ("d", &PlanAction::Create, "new remote + repository + distribution", "https://up/pulp/content/d/CUSTOM"),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -270,7 +270,10 @@ failed publish keeps its checkpoints; *Resume* continues from them.
   upstream RPM/File distribution it creates or updates a remote (pointing at the published
   upstream URL), a repository and a pinned distribution with the same name and base path,
   labeled `pulp_tui_replica=<source profile>`. A dry run shows CREATE / SYNC / SKIP per
-  item. Objects without this label are conflicts and are skipped. The run checks the label
+  item. Objects without this label are conflicts and are skipped. A File item is skipped
+  with the reason when the served upstream publication cannot be read, does not exist, or
+  has no manifest: the remote URL is the manifest that the upstream serves, never a guess.
+  The run checks the label
   of an existing remote and repository again, so an object created after the dry run is
   refused, not changed. The fallback never deletes anything and does not copy content
   guards, labels or other Pulp metadata.

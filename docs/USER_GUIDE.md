@@ -531,7 +531,10 @@ source, types, a name filter and additive or mirror mode; a dry run lists
 CREATE / SYNC / SKIP per distribution before anything changes; reruns are safe. Both
 servers must have the plugin of each chosen type: else the dry run stops with, for example,
 `pulp2 (destination): not supported by this server: pulp_file plugin`. A File replica
-serves its files under the manifest name of the upstream publication. The
+serves its files under the manifest name of the upstream publication. A File distribution
+is a SKIP row with the reason when its upstream publication cannot be read (for example
+`permission denied [403]`), when it serves no publication (pulp_file serves only from
+publications), or when the publication has no manifest; the other rows go on. The
 fallback does not follow an upstream label change: a distribution that the source moved to
 another base path is reported as a 409 conflict, and the replica stays at its old path.
 Delete the replica distribution, or move it by hand, to make it follow.
