@@ -44,6 +44,9 @@ pub enum Feature {
     Users,
     Roles,
     TaskGroupCancel,
+    PulpExport,
+    FilesystemExport,
+    PulpImport,
 }
 
 impl Feature {
@@ -60,6 +63,9 @@ impl Feature {
             Feature::Users => "users API",
             Feature::Roles => "roles API",
             Feature::TaskGroupCancel => "task group cancel (PATCH on a task group)",
+            Feature::PulpExport => "Pulp export (exporters/core/pulp/)",
+            Feature::FilesystemExport => "filesystem export (exporters/core/filesystem/)",
+            Feature::PulpImport => "Pulp import (importers/core/pulp/, import-check/)",
         }
     }
 }
@@ -181,6 +187,9 @@ impl Capabilities {
             Feature::Users => self.has_endpoint("users/"),
             Feature::Roles => self.has_endpoint("roles/"),
             Feature::TaskGroupCancel => self.has_operation("{task_group_href}", "patch"),
+            Feature::PulpExport => self.has_endpoint("exporters/core/pulp/"),
+            Feature::FilesystemExport => self.has_endpoint("exporters/core/filesystem/"),
+            Feature::PulpImport => self.has_endpoint("importers/core/pulp/") && self.has_endpoint("importers/core/pulp/import-check/"),
         }
     }
 

@@ -15,6 +15,9 @@ the Pulp REST API:
   them through an optional PostgreSQL database, with a lock per Content View.
 * **Replication** from an upstream Pulp: native Upstream Pulp replication (tech preview)
   and a content-sync fallback with dry run and idempotent reruns.
+* **Disconnected export and import**: Pulp exporters, full exports (optionally in chunks)
+  with the TOC file to import, export records; filesystem exports of a publication or
+  version; Pulp importers with a repository mapping, an import check before each import.
 * **Users, groups and roles** with escalation and self-lockout warnings.
 * **Task Center**: tracks Pulp tasks with adaptive polling, survives restarts, and
   separates client cancellation from server-side task cancellation.
@@ -90,7 +93,7 @@ podman run --rm -it --read-only \
 ```sh
 cargo test                     # unit + mock HTTP tests (live tests skip themselves)
 tests/run-live.sh              # starts Pulp in Podman/Docker, runs all live scenarios
-tests/run-live.sh repos cv     # selected scenarios (repos cv rbac failures replication shared_db deb)
+tests/run-live.sh repos cv     # selected scenarios (repos cv rbac failures replication shared_db deb export)
 tests/run-live.sh real         # real Debian main and Rocky 9 repositories (needs internet; not in "all")
 tests/env/pulp-env.sh up-all     # start pulp1, pulp2, PostgreSQL and the fixture http server
 tests/env/pulp-env.sh down-all   # remove all of them (containers and volumes)

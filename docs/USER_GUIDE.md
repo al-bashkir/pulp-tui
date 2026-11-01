@@ -609,6 +609,71 @@ retries, and the total, connect, socket connect and socket read timeouts (whole 
 Pulp copies them to the remotes that replication creates. Create sends only the filled
 fields; a field cleared on edit returns to the server default.
 
+### Exporters
+
+Disconnected export with the exporters of pulpcore. The Pulp server writes the files to a
+directory on its own disk. That directory must be in the `ALLOWED_EXPORT_PATHS` setting of
+the server (empty by default); else Pulp refuses the exporter with "... is not an allowed
+export path".
+
+**c**/**e** create/edit a Pulp exporter: name, directory on the Pulp server, and its RPM,
+File and Deb repositories (a picker with more than one choice). **E** loads the
+repositories and the last export of the exporter, then opens the form. Its note lists each
+repository with its latest version and its version in the last export, and the time of the
+last export. The export is one file or chunks of at most the given size (`1GB`). By default
+it is a full export of the latest version of each repository. **Incremental** exports only
+the content added since the last export (Pulp still writes the full content list of each
+version, so import it on a server that has the content of the earlier exports). **Start
+versions** (`web=3,os=7`, incremental only) starts there instead; a repository that is not
+named starts at its version in the last export. The form refuses an incremental export when
+a repository has no start version: the exporter has no last export, or the repository is
+not in it (it was added to the exporter later). Give its start version or make a full
+export first.
+**Versions** (`web=3,os=7`) exports these version numbers instead of the latest ones; a
+repository that is not named gets its latest version (Pulp needs one version of each
+repository of the exporter). The form refuses a name that is not a repository of the
+exporter and a version that is not a number. pulp-tui waits for the task (the Task Center shows it),
+then shows the TOC file (`<directory>/export-<id>-<time>-toc.json`) and the output files.
+Copy them to the disconnected server and import the TOC there. **o** shows the exports of
+the exporter (time, number of exported repository versions, TOC); **d** on an export
+deletes its record. **d** on an exporter loads the number of its exports and then asks for
+the exporter name. Pulp deletes only the records: the export files stay on the disk of the
+server.
+
+`t` switches to the filesystem exporters, which write the plain files of one publication
+or repository version (for example to serve them with another web server). **c**/**e**:
+name, directory, and the method (`write`, `hardlink` or `symlink`; the choices come from
+the server). **E**: a repository, a version number (empty = latest) and what to export:
+the publication (the newest publication of that version; pulp-tui stops when there is
+none) or the repository version. Pulp makes the directory itself, so it must not exist: a
+second export into it fails ("Cannot export to directories that contain existing data", or
+"File exists" for a version). Edit the directory before the next export.
+
+### Importers
+
+Disconnected import of a Pulp export with the Pulp importers of pulpcore. Copy the export
+files to a directory of the Pulp server that is in its `ALLOWED_IMPORT_PATHS` setting
+(empty by default). Pulp must be able to write to that directory.
+
+**c**/**e** create/edit an importer: name and repository mapping, as
+`source=destination,...` (a repository name in the export, then a repository of this
+server). Every destination must exist: pulp-tui checks each name before it sends the form,
+because pulpcore answers an edit with an unknown destination with HTTP 500 and has then lost
+the old mapping. A repository of the export without a pair goes to the repository of the
+same name; Pulp skips it when there is none.
+
+**I** imports: type the path of the `-toc.json` file on the Pulp server. pulp-tui first
+sends the import check (`import-check/`) and shows its result: when the TOC or the mapping
+is not valid, it shows the messages of Pulp ("file ... does not exist", "directory ... must
+allow pulp write-access") and imports nothing. Else the confirmation shows the check and
+the mapping (on a production profile, type the importer name). The import is a task group:
+the Task Center shows it, and pulp-tui shows each task of the group when it ends. Each
+imported repository gets a new version with exactly the exported content; its older
+versions stay. When Pulp found no destination repository, the import completes without a
+repository task, and pulp-tui gives a warning. **o** shows the imports of the importer
+(time, TOC, task). **d** loads the number of imports and asks for the importer name; the
+imported repository versions stay.
+
 ### Users, Groups, Roles
 
 Users: **R** roles, **c**/**e** create/edit, **w** set password (Pulp's local users

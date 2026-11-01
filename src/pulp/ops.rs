@@ -107,6 +107,53 @@ pub async fn wait_task_group(c: &PulpClient, href: &str, on: &(dyn Fn(&TaskGroup
     }
 }
 
+/// Wait for task group `g`, then its description and counts, and one line per task (a failed one with its error).
+pub async fn group_report(c: &PulpClient, g: &str, on: &(dyn Fn(&TaskGroup) + Send + Sync)) -> Result<(TaskGroup, Vec<String>)> {
+    let group = wait_task_group(c, g, on).await?;
+    let mut lines = vec![format!("{} ({})", group.description, g), group.counts(), String::new()];
+    for t in &group.tasks {
+        let name = t["name"].as_str().unwrap_or_default().rsplit('.').next().unwrap_or_default().to_string();
+        let mut line = format!("  {:<10} {name}  {}", t["state"].as_str().unwrap_or_default(), t["pulp_href"].as_str().unwrap_or_default());
+        if t["state"] == "failed"
+            && let Some(h) = t["pulp_href"].as_str()
+            && let Ok(full) = c.get::<Task>(h, &[]).await
+        {
+            line.push_str(&format!("\n      error: {}", full.error_message().unwrap_or_default()));
+        }
+        lines.push(line);
+    }
+    Ok((group, lines))
+}
+
+/// `import-check/` of a TOC file and a mapping: whether every checked value is valid, and one line per value and message.
+pub async fn import_check(c: &PulpClient, toc: &str, mapping: &Value) -> Result<(bool, Vec<String>)> {
+    let body = json!({ "toc": toc, "repo_mapping": mapping.to_string() });
+    let Mutation::Object(v) = c.post(&c.api("importers/core/pulp/import-check/"), &body).await? else {
+        return Err(PulpError::Decode("import-check returned no evaluation".into()));
+    };
+    let (mut ok, mut lines) = (true, vec![]);
+    for k in ["toc", "repo_mapping"] {
+        let valid = v[k]["is_valid"] == true;
+        ok &= valid;
+        lines.push(format!("{k}: {}", if valid { "valid" } else { "NOT valid" }));
+        lines.extend(v[k]["messages"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|m| format!("  {m}")));
+    }
+    Ok((ok, lines))
+}
+
+/// Import the Pulp export of `toc` with `importer` (a task group), as `group_report`.
+pub async fn pulp_import(
+    c: &PulpClient,
+    importer: &str,
+    toc: &str,
+    on: &(dyn Fn(&TaskGroup) + Send + Sync),
+) -> Result<(TaskGroup, Vec<String>)> {
+    let Mutation::TaskGroup(g) = c.post(&format!("{importer}imports/"), &json!({ "toc": toc })).await? else {
+        return Err(PulpError::Decode("the import returned no task group".into()));
+    };
+    group_report(c, &g, on).await
+}
+
 /// Href of the object a mutation created: synchronous object or task's created resource.
 pub fn created_href(m_obj: Option<&Value>, task: Option<&Task>, needle: &str) -> Result<String> {
     if let Some(h) = m_obj.and_then(|o| o["pulp_href"].as_str()) {

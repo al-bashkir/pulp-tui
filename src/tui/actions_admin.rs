@@ -1,12 +1,12 @@
-//! Users, groups, roles (Pulp RBAC) and replication actions.
+//! Users, groups, roles (Pulp RBAC), replication, and export and import actions.
 
 use super::actions::{ap, caps, submit, url_with_scheme};
 use super::app::{App, Level};
-use super::form::{Field, FieldKind, Form, Source};
-use super::kinds::{Act, Kind, s};
-use crate::pulp::{PulpClient, RepoType};
+use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
+use super::kinds::{Act, Kind, s, short};
+use crate::pulp::{PulpClient, RepoType, ops};
 use crate::replication::{self, PlanAction};
-use anyhow::Context;
+use anyhow::{Context, bail};
 use serde_json::{Value, json};
 
 pub fn run(app: &mut App, act: Act, item: Value) {
@@ -18,6 +18,9 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         Kind::GroupUsers { group, name } => member_action(app, act, item, group, name),
         Kind::Roles => role_action(app, act, item),
         Kind::UpstreamPulps => upstream_action(app, act, item),
+        Kind::PulpExporters | Kind::FsExporters => exporter_action(app, act, item),
+        Kind::Exports { .. } => export_action(app, act, item),
+        Kind::Importers => importer_action(app, act, item),
         _ => {}
     }
 }
@@ -597,6 +600,381 @@ pub fn fallback(app: &mut App) {
     });
 }
 
+// ---- export and import ---------------------------------------------------------------
+
+fn exporter_action(app: &mut App, act: Act, item: Value) {
+    let (href, name, path) = (s(&item, "pulp_href"), s(&item, "name"), s(&item, "path"));
+    let fs = app.list.kind == Kind::FsExporters;
+    match act {
+        Act::Exports => app.push(Kind::Exports { exporter: href, name }),
+        Act::Create | Act::Edit => exporter_form(app, fs, act == Act::Edit, &item),
+        Act::Export if fs => fs_export(app, href, name, path),
+        Act::Export => pulp_export(app, href, name, &item),
+        Act::Delete => app.job(format!("impact of deleting exporter {name}"), move |ctx| async move {
+            let n = ctx.client.list::<Value>(&format!("{href}exports/"), &[("limit", "1".into())]).await?.count;
+            let lines = vec![
+                format!("Delete exporter {name} and the records of its {n} export(s)."),
+                format!("The export files in {path} on the Pulp server stay."),
+            ];
+            ap(move |app| {
+                app.confirm_danger(format!("Delete exporter {name}"), lines, &name.clone(), move |app| {
+                    submit(app, format!("delete exporter {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+                })
+            })
+        }),
+        _ => {}
+    }
+}
+
+/// A Pulp exporter has repositories; a filesystem exporter (`fs`) has a method instead.
+fn exporter_form(app: &mut App, fs: bool, edit: bool, item: &Value) {
+    let href = s(item, "pulp_href");
+    let mut fields = vec![
+        Field::text("name", "Name").required().value(s(item, "name")),
+        Field::text("path", "Directory on the Pulp server").required().value(s(item, "path")).help("inside its ALLOWED_EXPORT_PATHS"),
+    ];
+    let caps = caps(app);
+    if !fs {
+        let repos: Vec<&str> = item["repositories"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let mut pick = Field::pick("repositories", "Repositories", Source::Repos(None)).multi().required().value(repos.join("\n"));
+        if !repos.is_empty() {
+            pick.shown = format!("{} selected", repos.len());
+        }
+        fields.push(pick);
+    } else if caps.as_ref().is_none_or(|c| c.has_field("FilesystemExporter", "method")) {
+        let methods = caps
+            .as_ref()
+            .and_then(|c| c.field_enum("FilesystemExporter", "method").map(<[String]>::to_vec))
+            .unwrap_or_else(|| ["write", "hardlink", "symlink"].map(String::from).to_vec());
+        let method = Field::new("method", "Method", FieldKind::Choice(methods)).help("hardlink and symlink need Pulp's file storage");
+        fields.push(if edit { method.value(s(item, "method")) } else { method });
+    }
+    let (kind, collection, note) = match fs {
+        false => ("Pulp", "exporters/core/pulp/", "An export writes a .tar file (or chunks) and a -toc.json file into this directory."),
+        true => (
+            "filesystem",
+            "exporters/core/filesystem/",
+            "An export makes this directory and writes the files of one publication or version into it.",
+        ),
+    };
+    let title = if edit { format!("Edit exporter {}", s(item, "name")) } else { format!("New {kind} exporter") };
+    app.form(Form::new(title, fields).note(note), move |app, f| {
+        let mut b = json!({});
+        for fld in f.fields.iter().filter(|x| !edit || x.changed()) {
+            let k = fld.key.as_str();
+            b[k] = match k {
+                "repositories" => f.get(k).split('\n').filter(|v| !v.is_empty()).collect::<Vec<_>>().into(),
+                _ => f.get(k).into(),
+            };
+        }
+        let href = href.clone();
+        submit(app, format!("{} exporter {}", if edit { "update" } else { "create" }, f.get("name")), move |c| async move {
+            Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api(collection), &b).await? })
+        });
+        Ok(())
+    });
+}
+
+/// A repository of a Pulp exporter: its latest version, and its version in the exporter's last export.
+struct ExportRepo {
+    href: String,
+    name: String,
+    latest: String,
+    last: Option<String>,
+}
+
+/// The form opens after the repositories and the last export of the exporter are loaded: its note
+/// shows the start point of an incremental export, and it refuses what Pulp would refuse.
+fn pulp_export(app: &mut App, href: String, name: String, item: &Value) {
+    let hrefs: Vec<String> = item["repositories"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
+    let (last, path) = (s(item, "last_export"), s(item, "path"));
+    app.job(format!("load exporter {name}"), move |ctx| async move {
+        let c = &ctx.client;
+        let last = if last.is_empty() { None } else { Some(c.get::<Value>(&last, &[]).await?) };
+        let exported: Vec<&str> =
+            last.iter().flat_map(|e| e["exported_resources"].as_array().into_iter().flatten()).filter_map(Value::as_str).collect();
+        let mut repos = vec![];
+        for repo in hrefs {
+            let r: Value = c.get(&repo, &[]).await?;
+            let last = exported.iter().find(|v| ops::repo_of_version(v) == repo).map(|v| v.to_string());
+            repos.push(ExportRepo { name: s(&r, "name"), latest: s(&r, "latest_version_href"), last, href: repo });
+        }
+        let since = last.map(|e| s(&e, "pulp_created"));
+        ap(move |app| pulp_export_form(app, href, name, path, repos, since))
+    });
+}
+
+/// Full or incremental export; the result names the TOC file to import.
+fn pulp_export_form(app: &mut App, href: String, name: String, path: String, repos: Vec<ExportRepo>, since: Option<String>) {
+    let has = |field: &str| caps(app).is_none_or(|c| c.has_field("PulpExport", field));
+    let (incremental, versions) = (has("full"), has("versions"));
+    let start_field = incremental && has("start_versions");
+    let mut fields = vec![Field::text("chunk_size", "Chunk size").help("e.g. 1GB: files of at most this size; empty = one file")];
+    if incremental {
+        fields.push(Field::new("incremental", "Incremental", FieldKind::Bool).help("only the content added since the start versions"));
+    }
+    if versions {
+        fields.push(Field::text("versions", "Versions").help("repository=number,...; a repository not named: its latest version"));
+    }
+    if start_field {
+        fields.push(
+            Field::text("start_versions", "Start versions").help("incremental: repository=number,...; not named: its last export version"),
+        );
+    }
+    let mut form = Form::new(format!("Export {name}"), fields)
+        .note(format!("Export of the {} repositories of {name} into {path} on the Pulp server:", repos.len()));
+    // shortcut: the note lists 8 repositories at most, show a scrollable list when exporters get many.
+    for r in repos.iter().take(8) {
+        let last = match (&since, &r.last) {
+            (None, _) => String::new(),
+            (Some(_), Some(v)) => format!(", last export version {}", ops::version_number(v)),
+            (Some(_), None) => ", not in the last export".into(),
+        };
+        form = form.note(format!("  {}: latest version {}{last}", r.name, ops::version_number(&r.latest)));
+    }
+    if repos.len() > 8 {
+        form = form.note(format!("  ... and {} more", repos.len() - 8));
+    }
+    if incremental {
+        form = form.note(match &since {
+            Some(at) => format!("Last export: {at}. Incremental: only the content added since it."),
+            None if start_field => "No previous export: an incremental export needs start versions.".into(),
+            None => "No previous export: only a full export can start here.".into(),
+        });
+    }
+    if versions {
+        form = form.note("Versions: empty = the latest version of each repository.");
+    }
+    if start_field {
+        form = form.note("Start versions: empty = the versions of the last export.");
+    }
+    app.form(form, move |app, f| {
+        let mut b = json!({});
+        if let Some(size) = f.opt("chunk_size") {
+            b["chunk_size"] = size.into();
+        }
+        let chosen = chosen_versions(f.get("versions"), &name, &repos).map_err(|e| format!("Versions: {e}"))?;
+        if chosen.iter().any(Option::is_some) {
+            // Pulp needs exactly one version of each repository of the exporter (serializers/exporter.py).
+            b["versions"] = repos.iter().zip(chosen).map(|(r, v)| v.unwrap_or_else(|| r.latest.clone())).collect();
+        }
+        let chosen = chosen_versions(f.get("start_versions"), &name, &repos).map_err(|e| format!("Start versions: {e}"))?;
+        let some_chosen = chosen.iter().any(Option::is_some);
+        if some_chosen && !f.bool("incremental") {
+            return Err("Start versions: only for an incremental export".into());
+        }
+        if f.bool("incremental") {
+            // Pulp answers 400 without a previous export or start versions (serializers/exporter.py validate),
+            // and the task fails with a KeyError for a repository without a start version (tasks/export.py _version_match).
+            let starts: Vec<Option<String>> = repos.iter().zip(chosen).map(|(r, v)| v.or_else(|| r.last.clone())).collect();
+            if let Some((r, _)) = repos.iter().zip(&starts).find(|(_, v)| v.is_none()) {
+                let why = match since {
+                    None => format!("{name} has no previous export"),
+                    Some(_) => format!("{} is not in the last export of {name}", r.name),
+                };
+                let give = if start_field { format!("give the start version of {} or ", r.name) } else { String::new() };
+                return Err(format!("Incremental: {why}; {give}make a full export first"));
+            }
+            b["full"] = false.into();
+            if some_chosen {
+                // Pulp needs exactly one start version of each repository, like `versions`.
+                b["start_versions"] = starts.into_iter().flatten().collect();
+            }
+        }
+        let (href, name) = (href.clone(), name.clone());
+        app.job(format!("export {name}"), move |ctx| async move {
+            let c = &ctx.client;
+            let export = ops::create(c, &format!("{href}exports/"), &b, "/exports/", &ctx.on_task()).await?;
+            let v: Value = c.get(&export, &[]).await?;
+            let mut lines = vec![format!("TOC: {}", s(&v["toc_info"], "file")), String::new(), "Files:".into()];
+            lines.extend(v["output_file_info"].as_object().into_iter().flatten().map(|(f, _)| format!("  {f}")));
+            lines.push(String::new());
+            lines.push("Copy the files to the other server, then import the TOC there (Importers, I).".into());
+            ap(move |app| app.text(format!("Export of {name}"), lines))
+        });
+        Ok(())
+    });
+}
+
+/// `name=number,...` -> per repository of `exporter` (in its order) the href of the named version.
+fn chosen_versions(text: &str, exporter: &str, repos: &[ExportRepo]) -> Result<Vec<Option<String>>, String> {
+    let pairs = parse_labels(text)?;
+    let pairs = pairs.as_object().cloned().unwrap_or_default();
+    if let Some(k) = pairs.keys().find(|k| !repos.iter().any(|r| &&r.name == k)) {
+        let names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
+        return Err(format!("{k} is not a repository of {exporter} ({})", names.join(", ")));
+    }
+    let version = |r: &ExportRepo, n: &str| match n.parse::<u64>() {
+        Ok(n) => Ok(Some(format!("{}versions/{n}/", r.href))),
+        Err(_) => Err(format!("the version of {} must be a number, not {n:?}", r.name)),
+    };
+    repos.iter().map(|r| pairs.get(&r.name).and_then(Value::as_str).map_or(Ok(None), |n| version(r, n))).collect()
+}
+
+/// Export the files of one publication (the newest of the version) or of one repository version.
+fn fs_export(app: &mut App, href: String, name: String, path: String) {
+    let what = vec!["publication".to_string(), "repository version".to_string()];
+    let form = Form::new(
+        format!("Export {name}"),
+        vec![
+            Field::pick("repo", "Repository", Source::Repos(None)).required(),
+            Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
+            Field::new("what", "Export", FieldKind::Choice(what)).help("publication: the newest publication of the version"),
+        ],
+    )
+    .note(format!("Pulp makes {path} on the Pulp server and writes the files into it."))
+    .note("It must not exist yet: for the next export, edit the exporter's directory first.");
+    app.form(form, move |app, f| {
+        let repo = f.get("repo").to_string();
+        let t = RepoType::from_href(&repo).ok_or("pick an RPM, File or Deb repository")?;
+        let (number, publication) = (f.number("number"), f.get("what") == "publication");
+        let (href, name, path) = (href.clone(), name.clone(), path.clone());
+        app.job(format!("export {name}"), move |ctx| async move {
+            let c = &ctx.client;
+            let v = match number {
+                Some(n) => format!("{repo}versions/{n}/"),
+                None => s(&c.get::<Value>(&repo, &[]).await?, "latest_version_href"),
+            };
+            let body = if publication {
+                let q = [("repository_version", v.clone()), ("ordering", "-pulp_created".into()), ("limit", "1".into())];
+                let newest = c.list::<Value>(&c.api(t.publications()), &q).await?.results.first().map(|p| s(p, "pulp_href"));
+                let p = newest
+                    .ok_or_else(|| anyhow::anyhow!("{} has no publication: publish it, or export the repository version", short(&v)))?;
+                json!({ "publication": p })
+            } else {
+                json!({ "repository_version": v })
+            };
+            ops::create(c, &format!("{href}exports/"), &body, "/exports/", &ctx.on_task()).await?;
+            let what = if publication { "publication" } else { "repository version" };
+            ap(move |app| app.ok(format!("export {name}: {what} written to {path}")))
+        });
+        Ok(())
+    });
+}
+
+/// An export record: Pulp deletes the record only, never the files.
+fn export_action(app: &mut App, act: Act, item: Value) {
+    if act != Act::Delete {
+        return;
+    }
+    let href = s(&item, "pulp_href");
+    let (id, toc) = (short(&href), s(&item["toc_info"], "file"));
+    let toc = if toc.is_empty() { String::new() } else { format!(" (TOC {toc})") };
+    let lines = vec![
+        format!("Delete the record of export {id}{toc}."),
+        "The export files stay on the Pulp server; delete them there when they are no longer needed.".into(),
+    ];
+    app.confirm_danger("Delete export", lines, &id.clone(), move |app| {
+        submit(app, format!("delete export {id}"), move |c| async move { Ok(c.delete(&href).await?) })
+    });
+}
+
+fn importer_action(app: &mut App, act: Act, item: Value) {
+    let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
+    match act {
+        Act::Imports => app.push(Kind::Imports { importer: href, name }),
+        Act::Create | Act::Edit => importer_form(app, act == Act::Edit, &item),
+        Act::Import => import_form(app, href, name, item["repo_mapping"].clone()),
+        Act::Delete => app.job(format!("impact of deleting importer {name}"), move |ctx| async move {
+            let n = ctx.client.list::<Value>(&format!("{href}imports/"), &[("limit", "1".into())]).await?.count;
+            let lines = vec![
+                format!("Delete importer {name} and the records of its {n} import(s)."),
+                "The imported repository versions stay.".into(),
+            ];
+            ap(move |app| {
+                app.confirm_danger(format!("Delete importer {name}"), lines, &name.clone(), move |app| {
+                    submit(app, format!("delete importer {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+                })
+            })
+        }),
+        _ => {}
+    }
+}
+
+fn importer_form(app: &mut App, edit: bool, item: &Value) {
+    let href = s(item, "pulp_href");
+    let fields = vec![
+        Field::text("name", "Name").required().value(s(item, "name")),
+        Field::text("repo_mapping", "Repository mapping")
+            .value(format_labels(&item["repo_mapping"]))
+            .help("source=destination,...: a repository of the export, then one of this server"),
+    ];
+    let title = if edit { format!("Edit importer {}", s(item, "name")) } else { "New Pulp importer".into() };
+    let form = Form::new(title, fields)
+        .note("Every destination repository must exist. A repository of the export without a pair goes")
+        .note("to the repository of the same name; Pulp skips it when there is none.");
+    app.form(form, move |app, f| {
+        let mapping = parse_labels(f.get("repo_mapping")).map_err(|e| format!("Repository mapping: {e}"))?;
+        let mut b = json!({});
+        if !edit || f.changed("name") {
+            b["name"] = f.get("name").into();
+        }
+        if !edit || f.changed("repo_mapping") {
+            b["repo_mapping"] = mapping;
+        }
+        let dests: Vec<String> =
+            b["repo_mapping"].as_object().into_iter().flatten().filter_map(|(_, d)| d.as_str().map(str::to_string)).collect();
+        let href = href.clone();
+        submit(app, format!("{} importer {}", if edit { "update" } else { "create" }, f.get("name")), move |c| async move {
+            // pulpcore 3.123 answers 500 to a PATCH with an unknown destination, and has dropped the old mapping then.
+            for d in &dests {
+                if ops::find_by_name::<Value>(&c, &c.api("repositories/"), d).await?.is_none() {
+                    bail!("no repository named {d}: every destination must exist");
+                }
+            }
+            Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api("importers/core/pulp/"), &b).await? })
+        });
+        Ok(())
+    });
+}
+
+/// The import check is the preview; the import runs only after the confirmation.
+fn import_form(app: &mut App, href: String, name: String, mapping: Value) {
+    let toc = Field::text("toc", "TOC file on the Pulp server").required().help("the -toc.json of the export, inside ALLOWED_IMPORT_PATHS");
+    let form = Form::new(format!("Import with {name}"), vec![toc])
+        .note("Pulp checks the file and the mapping first; nothing is imported before you confirm.");
+    app.form(form, move |app, f| {
+        let toc = f.get("toc").to_string();
+        let (href, name, mapping) = (href.clone(), name.clone(), mapping.clone());
+        app.job(format!("import check {toc}"), move |ctx| async move {
+            let (ok, lines) = ops::import_check(&ctx.client, &toc, &mapping).await?;
+            ap(move |app| match ok {
+                true => confirm_import(app, href, name, toc, &mapping, lines),
+                false => app.text(format!("Import check of {toc} failed"), lines),
+            })
+        });
+        Ok(())
+    });
+}
+
+fn confirm_import(app: &mut App, href: String, name: String, toc: String, mapping: &Value, mut lines: Vec<String>) {
+    lines.push(String::new());
+    lines.push("Each repository of the export gets a new version in its destination repository:".into());
+    lines.extend(mapping.as_object().into_iter().flatten().map(|(src, dst)| format!("  {src} -> {}", dst.as_str().unwrap_or_default())));
+    lines.push("  any other: the repository of the same name (Pulp skips it when there is none)".into());
+    lines.push("The new version holds exactly the exported content; older versions stay.".into());
+    app.confirm_prod(format!("Import {toc}?"), lines, &name.clone(), move |app| {
+        app.job(format!("import {name}"), move |ctx| async move {
+            let (p, task) = (ctx.clone(), ctx.on_task());
+            let on = move |g: &crate::pulp::models::TaskGroup| {
+                // The Task Center shows, stores and re-attaches the group, and reports how it ended.
+                task(&g.as_task());
+                p.progress(format!("tasks: {} done, {} running, {} waiting, {} failed", g.completed, g.running, g.waiting, g.failed))
+            };
+            let (group, mut lines) = ops::pulp_import(&ctx.client, &href, &toc, &on).await?;
+            let repos = group.tasks.iter().filter(|t| t["name"].as_str().is_some_and(|n| n.ends_with("import_repository_version"))).count();
+            ap(move |app| {
+                let done = group.outcome() == "completed";
+                if done && repos == 0 {
+                    lines.insert(0, "WARNING: no repository was imported: Pulp found no destination repository.".into());
+                    app.notify(Level::Warn, format!("import {name}: no repository was imported"));
+                }
+                app.text(format!("Import of {toc}{}", if done { "" } else { " FAILED" }), lines)
+            })
+        })
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use crate::pulp::RepoType;
@@ -624,6 +1002,7 @@ mod tests {
     }
 
     use crate::tui::app::{App, Level, Modal, Msg};
+    use crate::tui::kinds::Kind;
     use serde_json::{Value, json};
     use std::sync::Arc;
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -961,5 +1340,484 @@ mod tests {
         assert!(super::is_powerful("rpm.rpmrepository_owner"));
         assert!(super::is_powerful("core.task_admin"));
         assert!(!super::is_powerful("rpm.rpmrepository_viewer"));
+    }
+
+    const EXP: &str = "/pulp/api/v3/exporters/core/pulp/1/";
+
+    /// The form that `act` on the current screen opens for `item`.
+    fn open_form(app: &mut App, act: crate::tui::kinds::Act, item: Value) -> (super::Form, crate::tui::app::Submit) {
+        super::run(app, act, item);
+        let Some(Modal::Form { form, submit }) = app.modal.take() else { panic!("no form: {:?}", notices(app)) };
+        (form, submit)
+    }
+
+    fn set(f: &mut super::Form, k: &str, v: &str) {
+        f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+    }
+
+    /// Bodies of the requests that are not GET, with their method and path.
+    async fn sent(server: &MockServer) -> Vec<(String, String, Value)> {
+        let reqs = server.received_requests().await.unwrap();
+        reqs.iter()
+            .filter(|r| r.method.as_str() != "GET")
+            .map(|r| (r.method.to_string(), r.url.path().to_string(), r.body_json().unwrap_or(Value::Null)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pulp_exporter_create_edit_and_delete_send_what_the_operator_set() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        serve(&server, "POST", "/pulp/api/v3/exporters/core/pulp/", 201, json!({ "pulp_href": EXP })).await;
+        serve(&server, "PATCH", EXP, 202, json!({ "task": "/pulp/api/v3/tasks/1/" })).await;
+        serve(&server, "GET", &format!("{EXP}exports/"), 200, json!({ "count": 3, "next": null, "results": [] })).await;
+        serve(&server, "DELETE", EXP, 202, json!({ "task": "/pulp/api/v3/tasks/2/" })).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::PulpExporters;
+
+        let (mut f, mut submit) = open_form(&mut app, Act::Create, Value::Null);
+        assert_eq!(f.fields.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(), ["name", "path", "repositories"]);
+        for (k, v) in [("name", "dvd"), ("path", "/var/lib/pulp/exports/dvd"), ("repositories", "/r/1/\n/r/2/")] {
+            set(&mut f, k, v);
+        }
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        let item = json!({ "pulp_href": EXP, "name": "dvd", "path": "/var/lib/pulp/exports/dvd", "repositories": ["/r/1/", "/r/2/"] });
+        let (mut f, mut submit) = open_form(&mut app, Act::Edit, item.clone());
+        let repos = f.fields.iter().find(|x| x.key == "repositories").unwrap();
+        assert_eq!((repos.value.as_str(), repos.shown.as_str()), ("/r/1/\n/r/2/", "2 selected"), "as stored");
+        set(&mut f, "path", "/var/lib/pulp/exports/dvd2");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        // The impact first, then the typed name.
+        super::run(&mut app, Act::Delete, item);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed: Some(typed), on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed, "dvd");
+        assert_eq!(
+            lines,
+            [
+                "Delete exporter dvd and the records of its 3 export(s).",
+                "The export files in /var/lib/pulp/exports/dvd on the Pulp server stay."
+            ]
+        );
+        assert_eq!(sent(&server).await.len(), 2, "nothing deleted before the confirmation");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+
+        let repos = json!(["/r/1/", "/r/2/"]);
+        assert_eq!(
+            sent(&server).await,
+            [
+                (
+                    "POST".into(),
+                    "/pulp/api/v3/exporters/core/pulp/".into(),
+                    json!({ "name": "dvd", "path": "/var/lib/pulp/exports/dvd", "repositories": repos })
+                ),
+                ("PATCH".into(), EXP.into(), json!({ "path": "/var/lib/pulp/exports/dvd2" })),
+                ("DELETE".into(), EXP.into(), Value::Null),
+            ]
+        );
+        assert!(app.tasks.items.iter().any(|t| t.href == "/pulp/api/v3/tasks/2/"), "the delete task is tracked");
+    }
+
+    /// The Export form of a Pulp exporter: it opens after its repositories and last export are loaded.
+    async fn open_export(app: &mut App, rx: &mut UnboundedReceiver<Msg>, item: Value) -> (super::Form, crate::tui::app::Submit) {
+        (app.list.kind, app.modal) = (Kind::PulpExporters, None);
+        super::run(app, crate::tui::kinds::Act::Export, item);
+        settle(app, rx).await;
+        let Some(Modal::Form { form, submit }) = app.modal.take() else { panic!("no form: {:?}", notices(app)) };
+        (form, submit)
+    }
+
+    const R1: &str = "/pulp/api/v3/repositories/file/file/1/";
+    const R2: &str = "/pulp/api/v3/repositories/file/file/2/";
+
+    /// Repository `web` (R1, latest version 5) and `os` (R2, latest version 2).
+    async fn export_repos(server: &MockServer) {
+        serve(server, "GET", R1, 200, json!({ "name": "web", "latest_version_href": format!("{R1}versions/5/") })).await;
+        serve(server, "GET", R2, 200, json!({ "name": "os", "latest_version_href": format!("{R2}versions/2/") })).await;
+    }
+
+    /// A server with `export_repos` and a last export `EXP/exports/8/` of web version 3, whose export POST completes as a task.
+    async fn export_server() -> MockServer {
+        let server = MockServer::start().await;
+        export_repos(&server).await;
+        let last = format!("{EXP}exports/8/");
+        let exported =
+            json!({ "pulp_href": last, "pulp_created": "2026-11-01T10:00:00Z", "exported_resources": [format!("{R1}versions/3/")] });
+        serve(&server, "GET", &last, 200, exported).await;
+        serve(&server, "POST", &format!("{EXP}exports/"), 202, json!({ "task": "/pulp/api/v3/tasks/7/" })).await;
+        let done = json!({ "pulp_href": "/pulp/api/v3/tasks/7/", "state": "completed", "created_resources": [format!("{EXP}exports/9/")] });
+        serve(&server, "GET", "/pulp/api/v3/tasks/7/", 200, done).await;
+        serve(&server, "GET", &format!("{EXP}exports/9/"), 200, json!({ "toc_info": { "file": "t" } })).await;
+        server
+    }
+
+    /// Exporter `dvd` of `repos`; `last`: with the last export of `export_server`.
+    fn exporter(repos: &[&str], last: bool) -> Value {
+        let last = if last { format!("{EXP}exports/8/").into() } else { Value::Null };
+        json!({ "pulp_href": EXP, "name": "dvd", "path": "/x", "repositories": repos, "last_export": last })
+    }
+
+    #[tokio::test]
+    async fn an_incremental_pulp_export_starts_at_the_last_export() {
+        let server = export_server().await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+
+        // No previous export: Pulp answers 400, so the form refuses it first.
+        let (mut f, mut submit) = open_export(&mut app, &mut rx, exporter(&[R1], false)).await;
+        assert_eq!(f.notes[1..3], ["  web: latest version 5", "No previous export: an incremental export needs start versions."]);
+        set(&mut f, "incremental", "true");
+        let e = submit(&mut app, &f).unwrap_err();
+        assert_eq!(e, "Incremental: dvd has no previous export; give the start version of web or make a full export first");
+
+        // A repository added after the last export: the task would fail late, so the form refuses it.
+        let (mut f, mut submit) = open_export(&mut app, &mut rx, exporter(&[R1, R2], true)).await;
+        assert_eq!(
+            f.notes[1..4],
+            [
+                "  web: latest version 5, last export version 3",
+                "  os: latest version 2, not in the last export",
+                "Last export: 2026-11-01T10:00:00Z. Incremental: only the content added since it.",
+            ]
+        );
+        set(&mut f, "incremental", "true");
+        let e = submit(&mut app, &f).unwrap_err();
+        assert_eq!(e, "Incremental: os is not in the last export of dvd; give the start version of os or make a full export first");
+        assert!(sent(&server).await.is_empty(), "nothing sent");
+
+        let (mut f, mut submit) = open_export(&mut app, &mut rx, exporter(&[R1], true)).await;
+        set(&mut f, "incremental", "true");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(sent(&server).await, [("POST".into(), format!("{EXP}exports/"), json!({ "full": false }))]);
+    }
+
+    #[tokio::test]
+    async fn an_incremental_pulp_export_can_start_at_chosen_versions() {
+        let server = export_server().await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let (mut f, mut submit) = open_export(&mut app, &mut rx, exporter(&[R1, R2], true)).await;
+        assert!(f.notes.contains(&"Start versions: empty = the versions of the last export.".to_string()), "{:?}", f.notes);
+        set(&mut f, "start_versions", "os=1");
+        assert_eq!(submit(&mut app, &f).unwrap_err(), "Start versions: only for an incremental export");
+        set(&mut f, "incremental", "true");
+        set(&mut f, "start_versions", "os=one");
+        assert_eq!(submit(&mut app, &f).unwrap_err(), "Start versions: the version of os must be a number, not \"one\"");
+        assert!(sent(&server).await.is_empty(), "nothing sent");
+        // Pulp needs one start version of each repository: web keeps the version of the last export.
+        set(&mut f, "start_versions", "os=1");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        // No previous export: every repository needs its start version.
+        let (mut f, mut submit) = open_export(&mut app, &mut rx, exporter(&[R1], false)).await;
+        set(&mut f, "incremental", "true");
+        set(&mut f, "start_versions", "web=2");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let starts = json!([format!("{R1}versions/3/"), format!("{R2}versions/1/")]);
+        let exports = format!("{EXP}exports/");
+        assert_eq!(
+            sent(&server).await,
+            [
+                ("POST".into(), exports.clone(), json!({ "full": false, "start_versions": starts })),
+                ("POST".into(), exports, json!({ "full": false, "start_versions": [format!("{R1}versions/2/")] })),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pulp_export_of_chosen_versions_sends_one_version_per_repository() {
+        let server = export_server().await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let item = json!({ "pulp_href": EXP, "name": "dvd", "path": "/x", "repositories": [R1, R2] });
+        let (mut f, mut submit) = open_export(&mut app, &mut rx, item).await;
+        assert!(f.notes.contains(&"Versions: empty = the latest version of each repository.".to_string()), "{:?}", f.notes);
+        for (text, error) in [
+            ("web=x", "Versions: the version of web must be a number, not \"x\""),
+            ("gone=1", "Versions: gone is not a repository of dvd (web, os)"),
+            ("web", "Versions: label \"web\" must be key=value"),
+        ] {
+            set(&mut f, "versions", text);
+            assert_eq!(submit(&mut app, &f).unwrap_err(), error);
+        }
+        assert!(sent(&server).await.is_empty(), "nothing sent");
+        // Pulp needs one version of each repository of the exporter: the others are their latest.
+        set(&mut f, "versions", " web = 3 ");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let versions = json!([format!("{R1}versions/3/"), format!("{R2}versions/2/")]);
+        assert_eq!(sent(&server).await, [("POST".into(), format!("{EXP}exports/"), json!({ "versions": versions }))]);
+    }
+
+    #[tokio::test]
+    async fn a_pulp_export_waits_for_its_task_and_shows_the_toc() {
+        let (task, export) = ("/pulp/api/v3/tasks/7/", format!("{EXP}exports/9/"));
+        let toc = "/var/lib/pulp/exports/dvd/export-9-20261102_1000-toc.json";
+        let item = json!({ "pulp_href": EXP, "name": "dvd", "path": "/var/lib/pulp/exports/dvd", "repositories": [R1] });
+        for state in ["completed", "failed"] {
+            let server = MockServer::start().await;
+            serve(&server, "POST", &format!("{EXP}exports/"), 202, json!({ "task": task })).await;
+            let done = json!({ "pulp_href": task, "state": state, "created_resources": [export], "error": { "description": "disk full" } });
+            serve(&server, "GET", task, 200, done).await;
+            let files = json!({ "/var/lib/pulp/exports/dvd/export-9-20261102_1000.tar.0000": "ab", toc: "cd" });
+            serve(&server, "GET", &export, 200, json!({ "pulp_href": export, "toc_info": { "file": toc }, "output_file_info": files }))
+                .await;
+            export_repos(&server).await;
+            let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+            let (mut f, mut submit) = open_export(&mut app, &mut rx, item.clone()).await;
+            assert_eq!(f.notes[0], "Export of the 1 repositories of dvd into /var/lib/pulp/exports/dvd on the Pulp server:");
+            set(&mut f, "chunk_size", "1GB");
+            submit(&mut app, &f).unwrap();
+            settle(&mut app, &mut rx).await;
+            assert_eq!(sent(&server).await, [("POST".into(), format!("{EXP}exports/"), json!({ "chunk_size": "1GB" }))]);
+            let shown = match &app.modal {
+                Some(Modal::Text { title, lines, .. }) => Some((title.clone(), lines.clone())),
+                _ => None,
+            };
+            if state == "failed" {
+                assert_eq!(shown, None, "no result for a failed task");
+                assert!(notices(&app).iter().any(|(l, t)| *l == Level::Error && t.contains("disk full")), "{:?}", notices(&app));
+                continue;
+            }
+            let (title, lines) = shown.expect("the result");
+            assert_eq!(title, "Export of dvd");
+            assert_eq!(lines[0], format!("TOC: {toc}"));
+            assert!(lines.contains(&"  /var/lib/pulp/exports/dvd/export-9-20261102_1000.tar.0000".to_string()), "{lines:?}");
+            assert!(app.tasks.items.iter().any(|t| t.href == task), "the export task is in the Task Center");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_an_export_names_it_and_keeps_its_files() {
+        use crate::tui::kinds::Act;
+        let export = format!("{EXP}exports/0190abcd-1234-5678/");
+        let server = MockServer::start().await;
+        serve(&server, "DELETE", &export, 204, Value::Null).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Exports { exporter: EXP.into(), name: "dvd".into() };
+        let item = json!({ "pulp_href": export, "toc_info": { "file": "/var/lib/pulp/exports/dvd/export-1-toc.json" } });
+        super::run(&mut app, Act::Delete, item);
+        let Some(Modal::Confirm { lines, typed: Some(typed), on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed, "0190abcd-1234");
+        assert_eq!(
+            lines,
+            [
+                "Delete the record of export 0190abcd-1234 (TOC /var/lib/pulp/exports/dvd/export-1-toc.json).",
+                "The export files stay on the Pulp server; delete them there when they are no longer needed."
+            ]
+        );
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(sent(&server).await, [("DELETE".to_string(), export, Value::Null)]);
+    }
+
+    const FS: &str = "/pulp/api/v3/exporters/core/filesystem/1/";
+
+    #[tokio::test]
+    async fn a_filesystem_exporter_takes_the_methods_of_the_schema() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        serve(&server, "POST", "/pulp/api/v3/exporters/core/filesystem/", 201, json!({ "pulp_href": FS })).await;
+        serve(&server, "PATCH", FS, 202, json!({ "task": "/pulp/api/v3/tasks/1/" })).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let mut caps = crate::pulp::Capabilities::default();
+        // `MethodEnum` today: the generated name can change, the property's `$ref` does not.
+        caps.load_openapi(&json!({ "components": { "schemas": {
+            "FilesystemExporter": { "properties": { "name": {}, "path": {}, "method": { "allOf": [{ "$ref": "#/components/schemas/Method1Enum" }] } } },
+            "Method1Enum": { "enum": ["write", "hardlink", "symlink", "reflink"] }
+        } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        app.list.kind = Kind::FsExporters;
+
+        let (mut f, mut submit) = open_form(&mut app, Act::Create, Value::Null);
+        assert_eq!(f.fields.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(), ["name", "path", "method"]);
+        let method = f.fields.iter().find(|x| x.key == "method").unwrap();
+        assert_eq!(method.kind, super::FieldKind::Choice(["write", "hardlink", "symlink", "reflink"].map(String::from).to_vec()));
+        for (k, v) in [("name", "web"), ("path", "/var/lib/pulp/exports/web"), ("method", "hardlink")] {
+            set(&mut f, k, v);
+        }
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let item = json!({ "pulp_href": FS, "name": "web", "path": "/var/lib/pulp/exports/web", "method": "hardlink" });
+        let (mut f, mut submit) = open_form(&mut app, Act::Edit, item);
+        assert_eq!(f.get("method"), "hardlink", "as stored");
+        set(&mut f, "method", "symlink");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let body = json!({ "name": "web", "path": "/var/lib/pulp/exports/web", "method": "hardlink" });
+        assert_eq!(
+            sent(&server).await,
+            [
+                ("POST".into(), "/pulp/api/v3/exporters/core/filesystem/".into(), body),
+                ("PATCH".into(), FS.into(), json!({ "method": "symlink" })),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_filesystem_export_sends_the_publication_or_the_repository_version() {
+        use crate::tui::kinds::Act;
+        use wiremock::matchers::query_param;
+        const REPO: &str = "/pulp/api/v3/repositories/file/file/1/";
+        const PUBS: &str = "/pulp/api/v3/publications/file/file/";
+        let (task, v3) = ("/pulp/api/v3/tasks/5/", format!("{REPO}versions/3/"));
+        let server = MockServer::start().await;
+        serve(&server, "GET", REPO, 200, json!({ "pulp_href": REPO, "latest_version_href": v3 })).await;
+        let newest = json!({ "count": 2, "results": [{ "pulp_href": format!("{PUBS}9/") }] });
+        let by_version = |v: &str| Mock::given(method("GET")).and(path(PUBS)).and(query_param("repository_version", v));
+        by_version(&v3).respond_with(ResponseTemplate::new(200).set_body_json(newest)).mount(&server).await;
+        let none = ResponseTemplate::new(200).set_body_json(json!({ "count": 0, "results": [] }));
+        by_version(&format!("{REPO}versions/2/")).respond_with(none).mount(&server).await;
+        serve(&server, "POST", &format!("{FS}exports/"), 202, json!({ "task": task })).await;
+        let done = json!({ "pulp_href": task, "state": "completed", "created_resources": [format!("{FS}exports/1/")] });
+        serve(&server, "GET", task, 200, done).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::FsExporters;
+        let item = json!({ "pulp_href": FS, "name": "web", "path": "/var/lib/pulp/exports/web", "method": "write" });
+        let mut export = async |what: &str, number: &str| {
+            let (mut f, mut submit) = open_form(&mut app, Act::Export, item.clone());
+            for (k, v) in [("repo", REPO), ("number", number), ("what", what)] {
+                set(&mut f, k, v);
+            }
+            submit(&mut app, &f).unwrap();
+            settle(&mut app, &mut rx).await;
+            notices(&app).pop().unwrap()
+        };
+        assert_eq!(export("publication", "").await, (Level::Ok, "export web: publication written to /var/lib/pulp/exports/web".into()));
+        let (level, text) = export("publication", "2").await;
+        assert!(level == Level::Error && text.contains("1@v2 has no publication"), "{text}");
+        assert_eq!(export("repository version", "2").await.0, Level::Ok);
+        let posts: Vec<Value> = sent(&server).await.into_iter().map(|(_, _, b)| b).collect();
+        assert_eq!(
+            posts,
+            [json!({ "publication": format!("{PUBS}9/") }), json!({ "repository_version": format!("{REPO}versions/2/") })],
+            "the newest publication of the latest version; nothing for a version without one"
+        );
+    }
+
+    const IMP: &str = "/pulp/api/v3/importers/core/pulp/1/";
+
+    /// `GET repositories/?name=` answers each of `names` with one repository, and `gone` with none.
+    async fn repositories_named(server: &MockServer, names: &[&str]) {
+        use wiremock::matchers::query_param;
+        let named = |n: &str| Mock::given(method("GET")).and(path("/pulp/api/v3/repositories/")).and(query_param("name", n));
+        for n in names {
+            let one = json!({ "count": 1, "results": [{ "name": n, "pulp_href": format!("/r/{n}/") }] });
+            named(n).respond_with(ResponseTemplate::new(200).set_body_json(one)).mount(server).await;
+        }
+        let none = ResponseTemplate::new(200).set_body_json(json!({ "count": 0, "results": [] }));
+        named("gone").respond_with(none).mount(server).await;
+    }
+
+    #[tokio::test]
+    async fn a_pulp_importer_maps_sources_to_destinations_that_exist() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        serve(&server, "POST", "/pulp/api/v3/importers/core/pulp/", 201, json!({ "pulp_href": IMP })).await;
+        serve(&server, "PATCH", IMP, 200, json!({ "pulp_href": IMP })).await;
+        serve(&server, "GET", &format!("{IMP}imports/"), 200, json!({ "count": 2, "next": null, "results": [] })).await;
+        serve(&server, "DELETE", IMP, 204, Value::Null).await;
+        repositories_named(&server, &["web-copy", "os"]).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Importers;
+
+        let (mut f, mut submit) = open_form(&mut app, Act::Create, Value::Null);
+        assert_eq!(f.fields.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(), ["name", "repo_mapping"]);
+        set(&mut f, "name", "dvd");
+        set(&mut f, "repo_mapping", "web");
+        assert_eq!(submit(&mut app, &f), Err("Repository mapping: label \"web\" must be key=value".into()));
+        set(&mut f, "repo_mapping", "web = web-copy, os=os");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        let item = json!({ "pulp_href": IMP, "name": "dvd", "repo_mapping": { "os": "os", "web": "web-copy" } });
+        let (mut f, mut submit) = open_form(&mut app, Act::Edit, item.clone());
+        assert_eq!(f.get("repo_mapping"), "os=os,web=web-copy", "as stored");
+        // pulpcore answers 500 to a PATCH with an unknown destination and has then dropped the old mapping.
+        set(&mut f, "repo_mapping", "os=os,web=gone");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let n = notices(&app);
+        assert!(n.iter().any(|(l, t)| *l == Level::Error && t.contains("no repository named gone")), "{n:?}");
+        set(&mut f, "repo_mapping", "os=os");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        super::run(&mut app, Act::Delete, item);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed: Some(typed), on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed, "dvd");
+        assert_eq!(lines, ["Delete importer dvd and the records of its 2 import(s).", "The imported repository versions stay."]);
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let mapping = json!({ "web": "web-copy", "os": "os" });
+        assert_eq!(
+            sent(&server).await,
+            [
+                ("POST".into(), "/pulp/api/v3/importers/core/pulp/".into(), json!({ "name": "dvd", "repo_mapping": mapping })),
+                ("PATCH".into(), IMP.into(), json!({ "repo_mapping": { "os": "os" } })),
+                ("DELETE".into(), IMP.into(), Value::Null),
+            ],
+            "nothing sent for the unknown destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_import_is_checked_first_and_runs_as_a_task_group_after_the_confirmation() {
+        use crate::tui::kinds::Act;
+        const GROUP: &str = "/pulp/api/v3/task-groups/3/";
+        let toc = "/var/lib/pulp/exports/dvd/export-9-20261102_1000-toc.json";
+        let item = json!({ "pulp_href": IMP, "name": "dvd", "repo_mapping": { "web": "web-copy" } });
+        let check = |valid: bool, messages: Value| {
+            json!({ "toc": { "context": toc, "is_valid": valid, "messages": messages },
+                "repo_mapping": { "context": "{\"web\":\"web-copy\"}", "is_valid": true, "messages": [] } })
+        };
+        let server = MockServer::start().await;
+        let check_path = "/pulp/api/v3/importers/core/pulp/import-check/";
+        serve(&server, "POST", check_path, 200, check(false, json!([format!("file {toc} does not exist")]))).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Importers;
+        let (mut f, mut submit) = open_form(&mut app, Act::Import, item.clone());
+        set(&mut f, "toc", toc);
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no check result: {:?}", notices(&app)) };
+        assert_eq!(title, format!("Import check of {toc} failed"));
+        assert_eq!(lines[..2], ["toc: NOT valid".to_string(), format!("  file {toc} does not exist")]);
+        assert_eq!(sent(&server).await.len(), 1, "no import without a valid check");
+
+        server.reset().await;
+        serve(&server, "POST", check_path, 200, check(true, json!([]))).await;
+        serve(&server, "POST", &format!("{IMP}imports/"), 202, json!({ "task_group": GROUP })).await;
+        let group = json!({ "pulp_href": GROUP, "description": format!("Import of {toc}"), "all_tasks_dispatched": false, "completed": 2,
+            "tasks": [{ "name": "pulpcore.app.tasks.importer.pulp_import", "state": "completed", "pulp_href": "/t/1/" },
+                      { "name": "pulpcore.app.tasks.importer.import_repository_version", "state": "completed", "pulp_href": "/t/2/" }] });
+        serve(&server, "GET", GROUP, 200, group).await;
+        let (mut f, mut submit) = open_form(&mut app, Act::Import, item);
+        set(&mut f, "toc", toc);
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
+        assert_eq!(lines[..2], ["toc: valid", "repo_mapping: valid"]);
+        assert!(lines.contains(&"  web -> web-copy".to_string()), "{lines:?}");
+        assert_eq!(sent(&server).await.len(), 1, "only the check before the confirmation");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no result: {:?}", notices(&app)) };
+        assert_eq!(title, format!("Import of {toc}"));
+        assert!(lines.iter().any(|l| l.contains("completed  import_repository_version")), "{lines:?}");
+        assert_eq!(
+            sent(&server).await.into_iter().map(|(_, p, b)| (p, b)).collect::<Vec<_>>(),
+            [
+                (check_path.to_string(), json!({ "toc": toc, "repo_mapping": "{\"web\":\"web-copy\"}" })),
+                (format!("{IMP}imports/"), json!({ "toc": toc }))
+            ]
+        );
+        let row = app.tasks.items.iter().find(|t| t.href == GROUP).expect("the group is in the Task Center");
+        assert_eq!((row.label.as_str(), row.state.as_str()), ("import dvd", "completed"), "final without all_tasks_dispatched");
     }
 }

@@ -25,19 +25,7 @@ pub async fn replicate_native(c: &PulpClient, upstream_href: &str, on: &(dyn Fn(
     let Mutation::TaskGroup(g) = c.post(&format!("{upstream_href}replicate/"), &json!({})).await? else {
         bail!("replicate did not return a task group");
     };
-    let group = ops::wait_task_group(c, &g, on).await?;
-    let mut lines = vec![format!("{} ({})", group.description, g), group.counts(), String::new()];
-    for t in &group.tasks {
-        let name = t["name"].as_str().unwrap_or_default().rsplit('.').next().unwrap_or_default().to_string();
-        let mut line = format!("  {:<10} {name}  {}", t["state"].as_str().unwrap_or_default(), t["pulp_href"].as_str().unwrap_or_default());
-        if t["state"] == "failed"
-            && let Some(h) = t["pulp_href"].as_str()
-            && let Ok(full) = c.get::<crate::pulp::models::Task>(h, &[]).await
-        {
-            line.push_str(&format!("\n      error: {}", full.error_message().unwrap_or_default()));
-        }
-        lines.push(line);
-    }
+    let (group, lines) = ops::group_report(c, &g, on).await?;
     if group.failed > 0 {
         bail!("{}", lines.join("\n"));
     }

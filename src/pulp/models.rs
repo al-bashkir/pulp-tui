@@ -418,10 +418,11 @@ impl TaskGroup {
         format!("completed {}  failed {}  canceled {}  skipped {}", self.completed, self.failed, self.canceled, self.skipped)
     }
     /// `all_tasks_dispatched` is not reliable (pulpcore 3.123 leaves it false after a
-    /// replication), so a failure or the replication finalizer also ends the group.
+    /// replication or an import), so a failure, the replication finalizer or the completed
+    /// `pulp_import` (it dispatches every repository task of the import) also ends the group.
     pub fn is_final(&self) -> bool {
-        let finalized =
-            self.tasks.iter().any(|t| t["name"].as_str().is_some_and(|n| n.ends_with("finalize_replication")) && t["state"] == "completed");
+        let last = |n: &str| n.ends_with("finalize_replication") || n.ends_with("importer.pulp_import");
+        let finalized = self.tasks.iter().any(|t| t["name"].as_str().is_some_and(last) && t["state"] == "completed");
         self.active() == 0 && self.done() > 0 && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized)
     }
     /// How a final group ended: a failed task fails it; a canceled or skipped task is not a success either.
@@ -778,5 +779,25 @@ mod tests {
         let t = group(json!({ "completed": 1, "running": 1 })).as_task();
         assert_eq!((t.pulp_href.as_str(), t.name.as_str()), ("/g/1/", "Replication of up"));
         assert_eq!((t.progress_reports[0].done, t.progress_reports[0].total), (Some(1), Some(2)), "finished of all tasks");
+    }
+
+    #[test]
+    fn an_import_group_ends_when_pulp_import_completed_and_nothing_runs() {
+        use serde_json::json;
+        // pulpcore 3.123 never sets `all_tasks_dispatched` on an import group; `pulp_import` dispatches every repository task.
+        let group = |main: &str, repo: Option<&str>, counts: Value| -> TaskGroup {
+            let mut tasks = vec![json!({ "name": "pulpcore.app.tasks.importer.pulp_import", "state": main })];
+            tasks.extend(repo.map(|s| json!({ "name": "pulpcore.app.tasks.importer.import_repository_version", "state": s })));
+            let mut g =
+                json!({ "pulp_href": "/g/2/", "description": "Import of /x-toc.json", "all_tasks_dispatched": false, "tasks": tasks });
+            g.as_object_mut().unwrap().extend(counts.as_object().unwrap().clone());
+            serde_json::from_value(g).unwrap()
+        };
+        let state = |g: TaskGroup| (g.is_final(), g.as_task().state);
+        assert_eq!(state(group("running", None, json!({ "running": 1 }))), (false, "running".into()));
+        assert_eq!(state(group("completed", Some("running"), json!({ "completed": 1, "running": 1 }))), (false, "running".into()));
+        assert_eq!(state(group("completed", Some("completed"), json!({ "completed": 2 }))), (true, "completed".into()));
+        assert_eq!(state(group("completed", None, json!({ "completed": 1 }))), (true, "completed".into()), "no destination found");
+        assert_eq!(state(group("failed", None, json!({ "failed": 1 }))), (true, "failed".into()));
     }
 }

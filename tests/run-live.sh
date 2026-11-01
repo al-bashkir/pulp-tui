@@ -4,7 +4,7 @@
 # PostgreSQL only for shared_db; deb registers the test Deb signing service on pulp1.
 #
 #   tests/run-live.sh            all scenarios
-#   tests/run-live.sh repos cv   selected scenarios (repos cv rbac failures replication shared_db deb)
+#   tests/run-live.sh repos cv   selected scenarios (repos cv rbac failures replication shared_db deb export)
 #   tests/run-live.sh real       real Debian main and Rocky 9 upstreams (needs internet; not in "all")
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -21,7 +21,7 @@ export PULP_TUI_TEST_PG_PASSWORD=${PULP_TUI_TEST_PG_PASSWORD:-${PG_PASSWORD:-pul
 echo "== unit + mock HTTP tests"
 cargo test --lib --test mock_http
 
-scenarios=${*:-repos cv rbac failures replication shared_db deb}
+scenarios=${*:-repos cv rbac failures replication shared_db deb export}
 for s in $scenarios; do
   [ "$s" = replication ] && $ENV up pulp2
   [ "$s" = shared_db ] && $ENV pg-up

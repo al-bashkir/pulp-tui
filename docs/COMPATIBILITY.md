@@ -62,6 +62,9 @@ something the server does not have.
 | Publication options (Publications **c**)                                                    | fields of `rpm.RpmPublication`, `file.FilePublication`, `deb.AptPublication`                | field hidden; the choices of checksum, compression and layout come from the enum of the property's `$ref` (else only empty: the server default)                                                       |
 | Current user                                                                                | `login/`, else (pulpcore without it, e.g. 3.63) `users/?username=` with the Basic-auth name | header shows "anonymous": no `login/` and the user cannot read `users/`, or bearer auth                                                                                                               |
 | Users/groups/roles                                                                          | OpenAPI `users/`, `roles/`                                                                  | screen shows not supported                                                                                                                                                                            |
+| Pulp exporters                                                                              | OpenAPI `exporters/core/pulp/`                                                              | screen shows not supported                                                                                                                                                                            |
+| Filesystem exporters; their methods                                                         | OpenAPI `exporters/core/filesystem/`; the enum of the `$ref` of `FilesystemExporter.method` | screen shows not supported; the choices default to write / hardlink / symlink                                                                                                                         |
+| Pulp importers and the import check                                                         | OpenAPI `importers/core/pulp/` and `importers/core/pulp/import-check/`                      | screen shows not supported                                                                                                                                                                            |
 | Domain scope of a role assignment                                                           | `status/` `domain_enabled: true`                                                            | the Assign role form has no Domain field                                                                                                                                                              |
 
 If the OpenAPI document cannot be read (for example a 403), checks are optimistic and the
@@ -81,6 +84,9 @@ server gives the final answer; the dashboard shows a warning.
 | Native replication: select by `q_select`, nodelete policy, rerun, upstream update                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | verified               |
 | Fallback replication: dry run, create, idempotent rerun, upstream update, conflict with native-replicated objects, loop guard, self-replication guard                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | verified               |
 | Repository and remote definitions (`export-repos` on pulp2, `import-repos` on pulp1): RPM and Deb remotes with their repositories and a File repository, no secret in the file, the repository's remote found by name, idempotent rerun                                                                                                                                                                                                                                                                                                                                                                                                                 | verified               |
+| Pulp export (`live_export`): full export of the latest version of a File repository, the TOC and output files, the exporter's `last_export`, export record delete (204), exporter delete (task); incremental export: 400 without a previous export; after a full export and a new file it exports the latest version, and its import gives the copy the new file; an export of a chosen older version (`versions`) exports that version; an incremental export with `start_versions` exports the latest version, and `start_versions` without `full: false` answers 400                                                                                 | verified               |
+| Filesystem export (`live_export`): a File publication found as the newest of the latest version and exported; a second export into the same directory fails (publication and version), an export after a PATCH of the directory works                                                                                                                                                                                                                                                                                                                                                                                                                   | verified               |
+| Pulp import (`live_export`, on the server of the export): import check valid, and not valid for a missing TOC; import of the File export through an importer mapping into another repository: the task group ends (without `all_tasks_dispatched`) with one `import_repository_version` task, and the copy has the content count of the exported version; the imports list names the TOC; importer delete (204)                                                                                                                                                                                                                                         | verified               |
 | Orphan cleanup (**O** on Repository Versions, TUI on pulp1, 1440 minutes): count, typed confirm, `orphan_cleanup` task, notice from its progress reports                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | verified once (manual) |
 | RBAC: 401 on wrong password (any authenticated endpoint; pulpcore 3.63 has no `login/`), 403 without role, no self-escalation, model-level creator role, group object role, role removal                                                                                                                                                                                                                                                                                                                                                                                                                                                                | verified               |
 | Task cancellation (waiting and running), 409 on completed task, TLS errors, unreadable CA bundle                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | verified               |
@@ -235,7 +241,7 @@ server gives the final answer; the dashboard shows a warning.
   `tasks` exist on 3.63 too. Every supported version ends a replication group by a rule of
   `TaskGroup::is_final` (3.63: `all_tasks_dispatched`; 3.95 and 3.123: the
   `finalize_replication` task, or a failed or canceled task), never only by the three-poll
-  rule. Cancel of a group (`PATCH {task_group_href}`, `task_groups_cancel`) exists on 3.95
+  rule; an import group ends by its completed `pulp_import` task (see "Pulp import"). Cancel of a group (`PATCH {task_group_href}`, `task_groups_cancel`) exists on 3.95
   and 3.123, not on 3.63. pulp-tui reads the `patch` operation of `{task_group_href}` from
   the OpenAPI: without it, **X** on a replication row says "not supported by this server" and sends
   nothing; with it, the confirmation reads the group first (description, unfinished tasks).
@@ -273,6 +279,65 @@ server gives the final answer; the dashboard shows a warning.
   when it became an orphan: on pulp1, 142,224 units were orphans at `orphaned_for=0` and none
   at 1440, because all of them were created that day. The old `DELETE orphans/` still
   exists; pulp-tui does not use it.
+* **Pulp export** (pulpcore 3.123.1, `serializers/exporter.py`, `tasks/export.py`). The
+  `path` of an exporter must start (after `realpath`) with an entry of
+  `ALLOWED_EXPORT_PATHS`, which is empty by default: then Pulp refuses every exporter with
+  "Path '...' is not an allowed export path". The export task creates the directory. A full
+  export without `versions` exports the latest version of each repository of the exporter
+  and becomes its `last_export`. It writes `export-<id>-<YYYYMMDD_HHMM>.tar` (with
+  `chunk_size`: `.tar.0000`, `.tar.0001`, ...) and `export-<id>-<YYYYMMDD_HHMM>-toc.json`
+  (file names and CRC32 checksums). A PATCH or DELETE of an exporter answers 202 with a
+  task; a DELETE of an export answers 204. Deleting an export, or an exporter with its
+  exports, deletes only the database records, never the files. Only a successful export
+  becomes `last_export`; deleting that export record sets `last_export` to null.
+* **Incremental Pulp export** (`full: false`, same files). Without `start_versions`, Pulp
+  starts at the versions of the exporter's `last_export` (its `exported_resources`). With
+  neither, the POST answers 400 "Incremental export can only be requested when there is a
+  previous export or start_versions= has been specified." (`PulpExportSerializer.validate`).
+  When a repository was added to the exporter after the last export, the POST answers 202
+  but the task fails with only the repository as the error (`<Repository ...: pk=...>`, a
+  `KeyError` in `tasks/export.py` `_version_match`; verified live). The export holds only
+  the artifacts that the start version lacks, but the content metadata of the whole
+  version, so its import into the same server sets the full content (verified live).
+* **Pulp export `versions` and `start_versions`** (same files,
+  `_validate_versions_to_repos`). Each list must have exactly one version per repository of
+  the exporter: a count that differs answers 400 "Number of versions (N) does not match the
+  number of Repositories (M)" (pulpcore puts the two numbers in the wrong order), and a set
+  of repositories that differs (a version of another repository, or two versions of one)
+  answers 400 "Requested RepositoryVersions must belong to the Repositories named by the
+  Exporter!". A version that does not exist answers 400 "Invalid hyperlink - Object does
+  not exist." (all verified live). `start_versions` with `full` true (the default) answers
+  400 "start_versions is only valid for incremental exports (full=False)"; with
+  `full: false` it replaces the versions of `last_export`, so it also works without a
+  previous export.
+* **Filesystem export** (same files). The export takes exactly one of `publication` and
+  `repository_version`, and the exporter path must be in `ALLOWED_EXPORT_PATHS` (checked
+  again when the export is posted). The task makes the directory with `os.makedirs` without
+  `exist_ok`, so the directory must not exist: a second export into it fails, for a
+  publication with "Cannot export to directories that contain existing data", for a
+  repository version with "[Errno 17] File exists" (verified live). `hardlink` falls back
+  to `write` when the export directory is on another file system than the Pulp storage;
+  `hardlink` and `symlink` need the file system storage.
+* **Pulp import** (pulpcore 3.123.1, `serializers/importer.py`, `views/importer.py`,
+  `tasks/importer.py`, `models/importer.py`). `toc` and `path` must start (after `realpath`)
+  with an entry of `ALLOWED_IMPORT_PATHS` (empty by default). `import-check/` answers 200
+  with `is_valid` and `messages` per value: for the TOC it checks the allowed path, that the
+  file exists and can be read, and that Pulp can write to its directory; for
+  `repo_mapping` (a JSON string) only that it is JSON. The import (`{importer}imports/`)
+  answers 202 with a task group `Import of <toc>`: `pulp_import` checks the chunks, imports
+  the artifacts and dispatches one `import_repository_version` task per repository of the
+  export before it completes. The group never gets `all_tasks_dispatched` (only a cancel
+  sets it; verified live), so `TaskGroup::is_final` also ends a group whose `pulp_import`
+  task completed when no task waits or runs. Each repository task sets the content of a new
+  version of the destination to exactly the exported content (`set_content`). The
+  destination is the pair of `repo_mapping`, else the repository of the same name; a
+  missing one is skipped with only a log line, so such an import completes without a
+  repository task. The mapping: a create with an unknown destination is refused (400,
+  "Failed to find repositories from repo_mapping"); only `create` handles it, so a PATCH
+  with an unknown destination answers 500 and leaves `repo_mapping` empty (verified live).
+  Deleting a destination repository removes its pair from the mapping (cascade).
+  `create_repositories` is refused together with a mapping; pulp-tui does not send it. A
+  DELETE of an importer answers 204 and deletes its import records.
 
 ## pulp_deb
 

@@ -57,6 +57,9 @@ up() {
 CONTENT_ORIGIN = "$(origin_of "$name")"
 SECRET_KEY = "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 TOKEN_AUTH_DISABLED = True
+# Exporters write here and importers read here (the pulp user owns the storage volume).
+ALLOWED_EXPORT_PATHS = ["/var/lib/pulp/exports"]
+ALLOWED_IMPORT_PATHS = ["/var/lib/pulp/exports"]
 EOF
   local extra=()
   # Podman provides host.containers.internal; Docker on Linux needs an explicit mapping.

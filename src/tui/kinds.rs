@@ -1,6 +1,7 @@
 //! Screen definitions: what each list shows, where it loads from, and which actions it offers.
 
 use super::app::{Ctx, PAGE};
+use super::form::format_labels;
 use crate::config::Config;
 use crate::filters::format_rules;
 use crate::pulp::{Capabilities, Feature, RepoType};
@@ -30,6 +31,19 @@ pub enum Kind {
     },
     Environments,
     UpstreamPulps,
+    PulpExporters,
+    FsExporters,
+    /// Exports of one exporter (href, name).
+    Exports {
+        exporter: String,
+        name: String,
+    },
+    Importers,
+    /// Imports of one importer (href, name).
+    Imports {
+        importer: String,
+        name: String,
+    },
     Users,
     UserRoles {
         user: String,
@@ -65,6 +79,8 @@ pub const NAV: &[(&str, Kind)] = &[
     ("Content Views", Kind::ContentViews),
     ("Lifecycle Envs", Kind::Environments),
     ("Replication", Kind::UpstreamPulps),
+    ("Exporters", Kind::PulpExporters),
+    ("Importers", Kind::Importers),
     ("Users", Kind::Users),
     ("Groups", Kind::Groups),
     ("Roles", Kind::Roles),
@@ -167,6 +183,11 @@ pub enum Act {
     Members,
     BreakLock,
     PruneOrphans,
+    Export,
+    Exports,
+    /// Import check, then the import.
+    Import,
+    Imports,
     /// In no `actions()` list: offered on Connect and save; here so that `mutates` classifies them.
     MigrateDb,
     CopyDb,
@@ -183,7 +204,7 @@ impl Act {
             Sync | CvSyncRepos => 'f',
             SyncHistory | ReplicationHistory => 'H',
             Versions | CvVersions => 'v',
-            Content | Connect | Members => 'o',
+            Content | Connect | Members | Exports | Imports => 'o',
             Upload | Unpromote => 'u',
             Publish | CvPublish => 'P',
             Distribute | CvDrift => 'D',
@@ -199,8 +220,8 @@ impl Act {
             WatchTask => 'W',
             TestProfile => 'T',
             StoreSecret => 'K',
-            ExportCv => 'E',
-            ImportCv => 'I',
+            ExportCv | Export => 'E',
+            ImportCv | Import => 'I',
             CvFilters | FallbackReplicate => 'F',
             CvPreview | Password => 'w',
             Promote | MigrateDb => 'M',
@@ -267,6 +288,10 @@ impl Act {
             Members => "Members",
             BreakLock => "Break lock",
             PruneOrphans => "Prune orphan content (whole server)",
+            Export => "Export now",
+            Exports => "Exports",
+            Import => "Import (check first)",
+            Imports => "Imports",
             MigrateDb => "Migrate database",
             CopyDb => "Copy Content View data",
         }
@@ -303,6 +328,8 @@ impl Act {
                     | ReplicationHistory
                     | CvPreview
                     | CvDrift
+                    | Exports
+                    | Imports
             ),
         }
     }
@@ -334,6 +361,11 @@ impl Kind {
             Kind::CvVersions { name, .. } => format!("Content View {name}: versions"),
             Kind::Environments => "Lifecycle Environments (pulp-tui)".into(),
             Kind::UpstreamPulps => "Replication: Upstream Pulps (native, tech preview)".into(),
+            Kind::PulpExporters => "Pulp Exporters (disconnected export)  [t: toggle type]".into(),
+            Kind::FsExporters => "Filesystem Exporters (files of a publication or version)  [t: toggle type]".into(),
+            Kind::Exports { name, .. } => format!("Exports of {name}"),
+            Kind::Importers => "Pulp Importers (disconnected import)".into(),
+            Kind::Imports { name, .. } => format!("Imports of {name}"),
             Kind::Users => "Users".into(),
             Kind::UserRoles { name, .. } => format!("Roles of user {name}"),
             Kind::Groups => "Groups".into(),
@@ -360,6 +392,9 @@ impl Kind {
         let f = match self {
             Kind::Repos(t, _) | Kind::Remotes(t) | Kind::Publications(t) | Kind::Distributions(t) => t.feature(),
             Kind::UpstreamPulps => Feature::NativeReplication,
+            Kind::PulpExporters => Feature::PulpExport,
+            Kind::FsExporters => Feature::FilesystemExport,
+            Kind::Importers => Feature::PulpImport,
             Kind::Users | Kind::UserRoles { .. } | Kind::Groups | Kind::GroupUsers { .. } | Kind::GroupRoles { .. } => Feature::Users,
             Kind::Roles => Feature::Roles,
             _ => return None,
@@ -385,6 +420,8 @@ impl Kind {
             }
             Kind::Tasks => Kind::ServerTasks,
             Kind::ServerTasks => Kind::Tasks,
+            Kind::PulpExporters => Kind::FsExporters,
+            Kind::FsExporters => Kind::PulpExporters,
             Kind::Logs { polls } => Kind::Logs { polls: !polls },
             _ => return None,
         })
@@ -435,6 +472,11 @@ impl Kind {
             Kind::Publications(t) => (t.publications().into(), vec![("ordering", "-pulp_created".into())], None),
             Kind::Distributions(t) => (t.distributions().into(), vec![("ordering", "name".into())], name),
             Kind::UpstreamPulps => ("upstream-pulps/".into(), vec![], name),
+            Kind::PulpExporters => ("exporters/core/pulp/".into(), vec![("ordering", "name".into())], name),
+            Kind::FsExporters => ("exporters/core/filesystem/".into(), vec![("ordering", "name".into())], name),
+            Kind::Exports { exporter, .. } => (format!("{exporter}exports/"), vec![], None),
+            Kind::Importers => ("importers/core/pulp/".into(), vec![("ordering", "name".into())], name),
+            Kind::Imports { importer, .. } => (format!("{importer}imports/"), vec![], None),
             Kind::Users => ("users/".into(), vec![("ordering", "username".into())], Some("username__icontains")),
             Kind::UserRoles { user, .. } => (format!("{user}roles/"), vec![], None),
             Kind::Groups => ("groups/".into(), vec![("ordering", "name".into())], name),
@@ -589,6 +631,26 @@ impl Kind {
                 col("policy", 9, |v| s(v, "policy")),
                 col("last replication", 19, |v| ts(v, "last_replication")),
             ],
+            Kind::PulpExporters => vec![
+                col("name", 24, |v| s(v, "name")),
+                col("path", 40, |v| s(v, "path")),
+                col("repos", 5, |v| v["repositories"].as_array().map(|a| a.len().to_string()).unwrap_or_default()),
+            ],
+            Kind::FsExporters => {
+                vec![col("name", 24, |v| s(v, "name")), col("path", 40, |v| s(v, "path")), col("method", 9, |v| s(v, "method"))]
+            }
+            Kind::Exports { .. } => vec![
+                col("created", 19, |v| ts(v, "pulp_created")),
+                col("exported", 8, |v| v["exported_resources"].as_array().map(|a| a.len().to_string()).unwrap_or_default()),
+                col("toc", 60, |v| s(&v["toc_info"], "file")),
+            ],
+            Kind::Importers => vec![col("name", 24, |v| s(v, "name")), col("mapping", 50, |v| format_labels(&v["repo_mapping"]))],
+            // pulp_import keeps the TOC path as `params.path`.
+            Kind::Imports { .. } => vec![
+                col("created", 19, |v| ts(v, "pulp_created")),
+                col("toc", 60, |v| s(&v["params"], "path")),
+                col("task", 13, |v| short(&s(v, "task"))),
+            ],
             Kind::Users => vec![
                 col("username", 20, |v| s(v, "username")),
                 col("staff", 5, |v| s(v, "is_staff")),
@@ -673,6 +735,10 @@ impl Kind {
             Kind::CvVersions { .. } => vec![Promote, Rollback, Compare, Resume, WatchTask, Delete, Inspect],
             Kind::Environments => vec![Create, Edit, ToggleProtected, Delete],
             Kind::UpstreamPulps => vec![Replicate, ReplicationHistory, FallbackReplicate, Create, Edit, Delete, Inspect],
+            Kind::PulpExporters | Kind::FsExporters => vec![Export, Exports, Create, Edit, Delete, Inspect],
+            Kind::Exports { .. } => vec![Delete, Inspect],
+            Kind::Importers => vec![Import, Imports, Create, Edit, Delete, Inspect],
+            Kind::Imports { .. } => vec![Inspect],
             Kind::Users => vec![Roles, Create, Edit, Password, ToggleActive, Delete, Inspect],
             Kind::UserRoles { .. } | Kind::GroupRoles { .. } | Kind::GroupUsers { .. } => vec![Create, Delete],
             Kind::Groups => vec![Members, Roles, Create, Delete, Inspect],
@@ -902,6 +968,9 @@ mod tests {
             Kind::GroupUsers { group: "g".into(), name: "g".into() },
             Kind::GroupRoles { group: "g".into(), name: "g".into() },
             Kind::ServerTasks,
+            Kind::Exports { exporter: "/e/".into(), name: "e".into() },
+            Kind::FsExporters,
+            Kind::Imports { importer: "/i/".into(), name: "i".into() },
         ]);
         for k in kinds {
             // A Content View row is a normal or a composite view: the actions differ, so check both.
@@ -1170,6 +1239,74 @@ mod tests {
         assert!(!Act::ImportCv.mutates(&Kind::Profiles, false));
         assert!(Act::MigrateDb.mutates(&Kind::Profiles, false) && Act::CopyDb.mutates(&Kind::Profiles, false));
         assert!(!Kind::Profiles.actions().iter().any(|a| matches!(a, Act::MigrateDb | Act::CopyDb)), "offered on Connect and save only");
+    }
+
+    #[test]
+    fn exporter_screens_list_exporters_and_their_exports() {
+        let k = Kind::PulpExporters;
+        assert!(NAV.iter().any(|(l, n)| *l == "Exporters" && *n == k));
+        assert_eq!(k.source().unwrap().0, "exporters/core/pulp/");
+        assert!(k.searchable());
+        assert_eq!(k.actions(), [Act::Export, Act::Exports, Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
+        assert!(Act::Export.mutates(&k, false) && !Act::Exports.mutates(&k, false));
+        let cells = |k: &Kind, row: Value| k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>();
+        let row = json!({ "name": "dvd", "path": "/var/lib/pulp/exports/dvd", "repositories": ["/r/1/", "/r/2/"] });
+        assert_eq!(cells(&k, row), ["dvd", "/var/lib/pulp/exports/dvd", "2"]);
+
+        let e = Kind::Exports { exporter: "/pulp/api/v3/exporters/core/pulp/1/".into(), name: "dvd".into() };
+        assert_eq!(e.title(), "Exports of dvd");
+        assert_eq!(e.source().unwrap().0, "/pulp/api/v3/exporters/core/pulp/1/exports/", "the href, not below the API root");
+        assert_eq!(e.actions(), [Act::Delete, Act::Inspect]);
+        let row = json!({ "pulp_created": "2026-11-02T10:00:00.123Z", "exported_resources": ["/v/1/", "/v/2/"],
+            "toc_info": { "file": "/var/lib/pulp/exports/dvd/export-9-toc.json" } });
+        assert_eq!(cells(&e, row), ["2026-11-02 10:00:00", "2", "/var/lib/pulp/exports/dvd/export-9-toc.json"]);
+
+        let mut caps = Capabilities::default();
+        caps.paths.insert("status/".into());
+        assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: Pulp export (exporters/core/pulp/)"));
+        caps.paths.insert("exporters/core/pulp/".into());
+        assert_eq!(k.unsupported(&caps), None);
+    }
+
+    #[test]
+    fn filesystem_exporters_are_the_other_type_of_the_exporters_screen() {
+        let k = Kind::FsExporters;
+        assert_eq!((Kind::PulpExporters.toggle(), k.toggle()), (Some(Kind::FsExporters), Some(Kind::PulpExporters)));
+        assert!(Kind::PulpExporters.title().ends_with("[t: toggle type]") && k.title().ends_with("[t: toggle type]"));
+        assert_eq!(k.source().unwrap().0, "exporters/core/filesystem/");
+        assert_eq!(k.actions(), Kind::PulpExporters.actions());
+        let row = json!({ "name": "web", "path": "/var/lib/pulp/exports/web", "method": "hardlink" });
+        assert_eq!(k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["web", "/var/lib/pulp/exports/web", "hardlink"]);
+        let mut caps = Capabilities::default();
+        caps.paths.insert("exporters/core/pulp/".into());
+        let e = k.unsupported(&caps);
+        assert_eq!(e.as_deref(), Some("not supported by this server: filesystem export (exporters/core/filesystem/)"));
+        caps.paths.insert("exporters/core/filesystem/".into());
+        assert_eq!(k.unsupported(&caps), None);
+    }
+
+    #[test]
+    fn importer_screens_list_importers_and_their_imports() {
+        let k = Kind::Importers;
+        assert!(NAV.iter().any(|(l, n)| *l == "Importers" && *n == k));
+        assert_eq!(k.source().unwrap().0, "importers/core/pulp/");
+        assert_eq!(k.actions(), [Act::Import, Act::Imports, Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
+        assert!(Act::Import.mutates(&k, false) && !Act::Imports.mutates(&k, false));
+        let cells = |k: &Kind, row: Value| k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>();
+        assert_eq!(cells(&k, json!({ "name": "dvd", "repo_mapping": { "web": "web-copy", "os": "os" } })), ["dvd", "os=os,web=web-copy"]);
+
+        let i = Kind::Imports { importer: "/pulp/api/v3/importers/core/pulp/1/".into(), name: "dvd".into() };
+        assert_eq!((i.title(), i.source().unwrap().0), ("Imports of dvd".into(), "/pulp/api/v3/importers/core/pulp/1/imports/".into()));
+        assert_eq!(i.actions(), [Act::Inspect]);
+        let row = json!({ "pulp_created": "2026-11-02T10:00:00Z", "params": { "path": "/x/export-1-toc.json" }, "task": "/t/0190abcd-1234-5678/" });
+        assert_eq!(cells(&i, row), ["2026-11-02 10:00:00", "/x/export-1-toc.json", "0190abcd-1234"]);
+
+        let mut caps = Capabilities::default();
+        caps.paths.insert("importers/core/pulp/".into());
+        let e = k.unsupported(&caps);
+        assert_eq!(e.as_deref(), Some("not supported by this server: Pulp import (importers/core/pulp/, import-check/)"));
+        caps.paths.insert("importers/core/pulp/import-check/".into());
+        assert_eq!(k.unsupported(&caps), None);
     }
 
     #[test]

@@ -60,9 +60,10 @@ one background list read (`tasks/?pulp_href__in=...&fields=pulp_href,started_at`
 dialog), keeps the `created_at` of the stored reference. A task that the server answers with 404 (purged) gets the final state `gone`. A poll answer for a task
 that is not tracked (sent to the previous server before a Connect) is dropped.
 
-Task groups (native replication) are final when no task is waiting or running and the
-group says all tasks were dispatched, a task failed, or the replication finalizer
-completed. pulpcore 3.123 leaves `all_tasks_dispatched` false after a replication, so an
+Task groups (native replication, import) are final when no task is waiting or running and
+the group says all tasks were dispatched, a task failed, the replication finalizer
+completed, or the `pulp_import` task completed (it dispatches every task of an import).
+pulpcore 3.123 leaves `all_tasks_dispatched` false after a replication and an import, so an
 idle group whose counts stay the same for three polls is also treated as final.
 
 A task group is one Task Center row. Its href goes into the same task references (the href
@@ -81,10 +82,10 @@ Task Center (no supported pulpcore needs the rule, see COMPATIBILITY.md).
 
 ## Native Pulp concepts versus application-managed concepts
 
-| Concept                                                                                                               | Owner        | Notes                                                                                                                                                                                                      |
-| --------------------------------------------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Repository, Remote, Repository Version, Publication, Distribution, Task, Task Group, User, Group, Role, Upstream Pulp | **Pulp**     | Used as documented. The Repository and the Remote are separate objects.                                                                                                                                    |
-| Content View, Content View Version, Lifecycle Environment, Promotion, Binding                                         | **pulp-tui** | Not a Pulp API and not Katello. Stored in the local SQLite file, or in the external database of the profile (its own `database`, else `[database]`; see "Storage"), and built from the Pulp objects above. |
+| Concept                                                                                                                                                   | Owner        | Notes                                                                                                                                                                                                      |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Repository, Remote, Repository Version, Publication, Distribution, Task, Task Group, User, Group, Role, Upstream Pulp, Exporter, Export, Importer, Import | **Pulp**     | Used as documented. The Repository and the Remote are separate objects.                                                                                                                                    |
+| Content View, Content View Version, Lifecycle Environment, Promotion, Binding                                                                             | **pulp-tui** | Not a Pulp API and not Katello. Stored in the local SQLite file, or in the external database of the profile (its own `database`, else `[database]`; see "Storage"), and built from the Pulp objects above. |
 
 ### Content View implementation
 
@@ -289,6 +290,30 @@ failed publish keeps its checkpoints; *Resume* continues from them.
   guards, labels or other Pulp metadata.
 * Guards: source and destination must be different servers; upstream distributions whose
   content URL is on the destination's content origin are skipped as loops.
+
+## Disconnected export and import
+
+pulp-tui manages the exporters of pulpcore and starts their exports; Pulp writes the files
+on its own disk (`ALLOWED_EXPORT_PATHS`). The Exporters screen (`Kind::PulpExporters`,
+`actions_admin::exporter_action`) creates, edits and deletes Pulp exporters. *Export* posts
+`{exporter}exports/` (a full export of the latest version of each repository, an optional
+`chunk_size`) and waits for the task in a job (`ops::create`, the task goes to the Task
+Center); then it reads the export and shows its TOC file. `Kind::Exports` lists the exports
+of an exporter. Deletes load the impact first (the number of exports of an exporter) and
+need the typed name. `t` switches to the filesystem exporters (`Kind::FsExporters`): their
+*Export* resolves the repository and version number of the form to a version href and, for
+a publication, to the newest publication of that version, then posts exactly one of them.
+
+The Importers screen (`Kind::Importers`, `actions_admin::importer_action`) manages Pulp
+importers. Before a create or edit with a mapping, the job finds every destination by name
+and sends nothing when one is missing (pulpcore loses the mapping on such a PATCH, see
+COMPATIBILITY.md). *Import* is two jobs: `ops::import_check` (the preview: a check that is
+not valid ends there), then, after `confirm_prod`, `ops::pulp_import`, which posts
+`{importer}imports/` with the TOC and waits for the task group (`ops::group_report`, which
+native replication uses too). Like replication, the job reports each snapshot of the group
+to the Task Center (`TaskGroup::as_task`), so a restart re-attaches it. An import that
+completes without an `import_repository_version` task gives a warning.
+`Kind::Imports` lists the imports of an importer.
 
 ## Storage
 
