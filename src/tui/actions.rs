@@ -144,11 +144,11 @@ pub(super) fn unsupported(app: &mut App, f: Feature) -> bool {
     true
 }
 
-/// The sync policies of a repository type: the server's `SyncPolicyEnum` for RPM, if it has one.
+/// The sync policies of a repository type: for RPM, the enum of the server's `sync_policy` property, if it has one.
 pub fn sync_policies(caps: Option<&Capabilities>, t: RepoType) -> Vec<String> {
     match t {
         RepoType::Rpm => caps
-            .and_then(|c| c.enum_values("SyncPolicyEnum").map(|e| e.to_vec()))
+            .and_then(|c| c.field_enum("RpmRepositorySyncURL", "sync_policy").map(|e| e.to_vec()))
             .unwrap_or_else(|| vec!["additive".into(), "mirror_complete".into(), "mirror_content_only".into()]),
         RepoType::File | RepoType::Deb => vec!["additive".into(), "mirror".into()],
     }
@@ -644,12 +644,21 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
 
 // ---- repositories --------------------------------------------------------------------
 
+/// Empty (the server default) and the values of the enum that property `k` of `schema` refers to, without the
+/// checksums Pulp refuses to publish. Through the `$ref`: generated enum names (`LayoutD5aEnum`) can change.
+fn enum_choices(caps: Option<&Capabilities>, schema: &str, k: &str) -> Vec<String> {
+    let e = caps.and_then(|c| c.field_enum(schema, k)).unwrap_or_default();
+    let usable = e.iter().filter(|x| !matches!(x.as_str(), "unknown" | "md5" | "sha1")).cloned();
+    std::iter::once(String::new()).chain(usable).collect()
+}
+
 /// Repository form fields that only some plugins have.
 fn repo_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec<Field> {
     let has = |f: &str| caps.is_none_or(|c| c.has_field(t.repository_schema(), f));
     let mut fields = Vec::new();
     match t {
         RepoType::Rpm => {
+            let choices = |k: &str| enum_choices(caps, t.repository_schema(), k);
             if has("retain_package_versions") {
                 fields.push(
                     Field::new("retain_package_versions", "Retain package versions", FieldKind::Number)
@@ -657,18 +666,31 @@ fn repo_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec
                         .help("0 = keep all"),
                 );
             }
-            if has("checksum_type") {
-                let mut c: Vec<String> =
-                    caps.and_then(|c| c.enum_values("PackageChecksumTypeEnum")).map(|e| e.to_vec()).unwrap_or_default();
-                c.retain(|x| !matches!(x.as_str(), "unknown" | "md5" | "sha1"));
-                c.insert(0, String::new());
-                fields.push(Field::new("checksum_type", "Checksum type", FieldKind::Choice(c)).value(s(v, "checksum_type")));
+            for (k, label) in
+                [("checksum_type", "Checksum type"), ("compression_type", "Metadata compression"), ("layout", "Package layout")]
+            {
+                if has(k) {
+                    fields.push(Field::new(k, label, FieldKind::Choice(choices(k))).value(s(v, k)).help("empty = server default"));
+                }
+            }
+            if has("repo_config") {
+                let shown = v["repo_config"].as_object().filter(|m| !m.is_empty()).map(|_| v["repo_config"].to_string());
+                let help = r#"the generated .repo file, e.g. {"gpgcheck": 1, "repo_gpgcheck": 1}"#;
+                fields.push(Field::text("repo_config", "Repo config (JSON)").value(shown.unwrap_or_default()).help(help));
             }
             if has("metadata_signing_service") {
                 fields.push(
                     Field::pick("metadata_signing_service", "Metadata signing service", Source::SigningServices)
                         .value(s(v, "metadata_signing_service")),
                 );
+            }
+            if has("package_signing_service") {
+                let f = Field::pick("package_signing_service", "Package signing service", Source::SigningServices);
+                fields.push(f.value(s(v, "package_signing_service")));
+            }
+            if has("package_signing_fingerprint") {
+                let f = Field::text("package_signing_fingerprint", "Package signing fingerprint");
+                fields.push(f.value(s(v, "package_signing_fingerprint")).help("v4:<hex fingerprint> or keyid:<16 hex>"));
             }
         }
         RepoType::File => {
@@ -681,6 +703,10 @@ fn repo_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec
             }
         }
         RepoType::Deb => fields.extend(deb_repo_fields(&has, v)),
+    }
+    if has("retain_checkpoints") {
+        let f = Field::new("retain_checkpoints", "Retain checkpoints", FieldKind::Number);
+        fields.push(f.value(s(v, "retain_checkpoints")).help("checkpoint publications to keep; empty = all"));
     }
     fields
 }
@@ -731,6 +757,12 @@ fn release_overrides(new: &str, old: &str, removed: Value) -> Result<Value, Stri
     Ok(out)
 }
 
+/// `v` as a JSON object; empty is the empty object.
+fn json_object(v: &str) -> Result<Value, String> {
+    let o: Value = if v.is_empty() { json!({}) } else { serde_json::from_str(v).map_err(|e| format!("invalid JSON: {e}"))? };
+    if o.is_object() { Ok(o) } else { Err(r#"must be a JSON object, e.g. {"gpgcheck": 1}"#.into()) }
+}
+
 /// `remote` is the name of the repository's default remote ("" = none, or not readable).
 fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>, remote: &str) -> Form {
     let v = item.cloned().unwrap_or(Value::Null);
@@ -779,8 +811,11 @@ fn repo_body(f: &Form, edit: bool) -> Result<Value, String> {
             ("excluded_package_metadata_fields", _) if !v.is_empty() || edit => {
                 v.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>().into()
             }
+            ("repo_config", _) if !v.is_empty() || edit => json_object(v).map_err(|e| format!("{}: {e}", fld.label))?,
             (_, FieldKind::Bool) => Value::Bool(v == "true"),
-            (_, FieldKind::Number) if v.is_empty() && edit && fld.key == "retain_repo_versions" => Value::Null,
+            (_, FieldKind::Number) if v.is_empty() && edit && matches!(fld.key.as_str(), "retain_repo_versions" | "retain_checkpoints") => {
+                Value::Null
+            }
             (_, FieldKind::Number) if v.is_empty() => continue,
             (_, FieldKind::Number) => v.parse::<i64>().map_err(|_| format!("{} must be a number", fld.label))?.into(),
             (_, _) if v.is_empty() && edit => Value::Null,
@@ -837,7 +872,7 @@ fn sync_fields(t: RepoType, caps: Option<&Capabilities>) -> Vec<Field> {
         fields.push(Field::new("optimize", "Optimize", FieldKind::Bool).value("true").help(help));
     }
     if t == RepoType::Rpm && has("skip_types") {
-        let types = caps.and_then(|c| c.enum_values("SkipTypesEnum")).map(<[String]>::to_vec);
+        let types = caps.and_then(|c| c.field_enum(schema, "skip_types")).map(<[String]>::to_vec);
         for ty in types.unwrap_or_else(|| vec!["srpm".into(), "treeinfo".into()]) {
             fields.push(Field::new(&format!("skip_{ty}"), &format!("Skip {ty}"), FieldKind::Bool));
         }
@@ -864,6 +899,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
     let default = item["remote"].as_str().map(str::to_string);
     let note = if default.is_some() { "repository has a default remote" } else { "repository has NO default remote: pick one" };
     let label = format!("remote of {name}");
+    let (autopublish, retain) = (item["autopublish"] == true, item["retain_package_versions"].as_u64().unwrap_or(0));
     let open = move |app: &mut App, current: String| {
         let mut fields = vec![
             Field::pick("remote", "Remote", Source::Remotes(t)).help("empty = the repository's default remote").value(current),
@@ -873,9 +909,19 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
         app.form(Form::new(format!("Sync {name}"), fields).note(note), move |app, f| {
             let (remote, policy) = (f.opt("remote").map(str::to_string), f.get("policy").to_string());
             let (href, name, options) = (href.clone(), name.clone(), sync_options(f));
-            // pulp_rpm sync() answers HTTP 400 to this pair; say it before any request.
+            // pulp_rpm sync() answers HTTP 400 to these pairs; say it before any request.
             if policy == "mirror_complete" && options.get("skip_types").is_some() {
                 return Err("Pulp refuses skip types with mirror_complete: clear the Skip fields or choose another sync policy".into());
+            }
+            if policy == "mirror_complete" && autopublish {
+                return Err(
+                    "Pulp refuses mirror_complete with autopublish: turn autopublish off (Edit) or choose another sync policy".into()
+                );
+            }
+            if matches!(policy.as_str(), "mirror_complete" | "mirror_content_only") && retain > 0 {
+                return Err(
+                    "Pulp refuses mirror policies with retain_package_versions above 0: set it to 0 (Edit) or choose additive".into()
+                );
             }
             let go = move |app: &mut App| {
                 submit(app, format!("sync {name} ({policy})"), move |c| async move {
@@ -1130,6 +1176,58 @@ fn signing_field(app: &App, t: RepoType) -> Option<Field> {
     }
 }
 
+/// Publication options of the server's publication schema. Each starts empty: the repository setting or the server default.
+fn publication_fields(caps: Option<&Capabilities>, t: RepoType) -> Vec<Field> {
+    let schema = t.publication_schema();
+    let default = "empty = repository setting or server default";
+    let choice = |k: &str, label: &str| Field::new(k, label, FieldKind::Choice(enum_choices(caps, schema, k))).help(default);
+    // Not Bool: empty must stay "not sent", and Pulp's default differs per flag.
+    let flag =
+        |k: &str, label: &str| Field::new(k, label, FieldKind::Choice(["", "true", "false"].map(String::from).to_vec())).help(default);
+    let mut all = match t {
+        RepoType::Rpm => vec![
+            choice("checksum_type", "Checksum type"),
+            choice("compression_type", "Metadata compression"),
+            choice("layout", "Package layout"),
+            Field::text("repo_config", "Repo config (JSON)").help(r#"e.g. {"gpgcheck": 1}; empty = repository setting"#),
+        ],
+        RepoType::File => vec![],
+        RepoType::Deb => vec![
+            flag("simple", "Simple (all packages in one component)"),
+            flag("structured", "Structured (the upstream components)"),
+            flag("publish_legacy_release_files", "Legacy Release files"),
+            choice("layout", "Package layout"),
+            flag("publish_upstream_release_fields", "Publish upstream Release fields"),
+            Field::text("excluded_package_metadata_fields", "Excluded package metadata fields")
+                .help("field,...; empty = repository setting"),
+        ],
+    };
+    all.push(flag("checkpoint", "Checkpoint").help("true = a checkpoint publication of the latest version; empty = no"));
+    all.into_iter().filter(|f| caps.is_none_or(|c| c.has_field(schema, &f.key))).collect()
+}
+
+/// The publication options (and signing service) that the operator set; empty ones are not sent.
+fn publication_options(f: &Form) -> Result<Value, String> {
+    let mut b = json!({});
+    for fld in f.fields.iter().filter(|x| !matches!(x.key.as_str(), "repo" | "number")) {
+        let v = fld.value.trim();
+        if v.is_empty() {
+            continue;
+        }
+        b[fld.key.as_str()] = match fld.key.as_str() {
+            "repo_config" => json_object(v).map_err(|e| format!("{}: {e}", fld.label))?,
+            "excluded_package_metadata_fields" => v.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>().into(),
+            _ if v == "true" || v == "false" => (v == "true").into(),
+            _ => v.into(),
+        };
+    }
+    // pulp_deb refuses a publication with neither mode (HTTP 400); `simple` is off by default.
+    if b["structured"] == false && b["simple"] != true {
+        return Err("Structured: off needs Simple on (Pulp publishes in at least one mode)".into());
+    }
+    Ok(b)
+}
+
 /// Run `go` with the signing service of a publish: asked first when `signing_field` offers one, else `None`.
 fn publish_form(app: &mut App, t: RepoType, title: String, go: impl Fn(&mut App, Option<String>) + 'static) {
     match signing_field(app, t) {
@@ -1240,11 +1338,27 @@ fn remote_url_help(t: RepoType) -> &'static str {
     }
 }
 
-/// Remote form fields that only some plugins have; `v` is the remote being edited (`Null` on create).
+/// Remote form fields that only some servers or plugins have; `v` is the remote being edited (`Null` on create).
 fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec<Field> {
     let has = |f: &str| caps.is_none_or(|c| c.has_field(t.remote_schema(), f));
     let write_only = if v.is_null() { "" } else { WRITE_ONLY };
-    match t {
+    // Floats on the server: `s()` would show `3600.0`, which is not a whole number.
+    // shortcut: whole seconds only (a Number field); a fractional server value must be retyped on edit. Add a decimal kind when needed.
+    let secs = |k: &str, label: &str, help: &str| {
+        let f = Field::new(k, label, FieldKind::Number).value(v[k].as_f64().map(|x| x.to_string()).unwrap_or_default());
+        f.help(help)
+    };
+    let headers = if v.is_null() { "Name: value; Name: value" } else { "Name: value; ...; empty = unchanged, - = clear" };
+    let common = [
+        secs("total_timeout", "Total timeout (s)", "seconds one download may take (large packages need more); empty = server default"),
+        secs("connect_timeout", "Connect timeout (s)", "seconds; empty = server default"),
+        secs("sock_connect_timeout", "Socket connect timeout (s)", "seconds; empty = server default"),
+        secs("sock_read_timeout", "Socket read timeout (s)", "seconds; empty = server default"),
+        Field::new("max_retries", "Max retries", FieldKind::Number).value(s(v, "max_retries")).help("empty = server default (3)"),
+        // Readable on the server, but it can hold an Authorization token: never shown, as the password.
+        Field::new("headers", "Headers", FieldKind::Secret).help(headers),
+    ];
+    let mut fields: Vec<Field> = match t {
         RepoType::Rpm => {
             if has("sles_auth_token") {
                 vec![Field::new("sles_auth_token", "SLES auth token", FieldKind::Secret).help(write_only)]
@@ -1256,6 +1370,8 @@ fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> V
         RepoType::Deb => {
             let text = |k: &str, label: &str| Field::text(k, label).value(s(v, k));
             let flag = |k: &str, label: &str| Field::new(k, label, FieldKind::Bool).value(if v[k] == true { "true" } else { "false" });
+            let names: Vec<&str> =
+                v["excluded_package_metadata_fields"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
             let all = [
                 text("distributions", "Distributions").required().help("space-separated, e.g. bookworm bookworm-updates"),
                 text("components", "Components").help("space-separated; empty = all"),
@@ -1265,10 +1381,32 @@ fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> V
                 flag("sync_installer", "Sync installer files"),
                 flag("ignore_missing_package_indices", "Ignore missing package indices"),
                 Field::text("gpgkey", "GPG public key (file path)").help(write_only),
+                Field::text("excluded_package_metadata_fields", "Excluded package metadata fields")
+                    .value(names.join(","))
+                    .help("field,...: dropped from the package indices at sync (Package, Version, ... never)"),
             ];
             all.into_iter().filter(|f| has(&f.key)).collect()
         }
+    };
+    fields.extend(common.into_iter().filter(|f| has(&f.key)));
+    fields
+}
+
+/// `Name: value; Name: value` as Pulp's remote headers: one object per header. An error never shows the value.
+// shortcut: a value cannot hold `;` (a Cookie with several pairs); accept JSON when someone needs it.
+fn parse_headers(v: &str) -> Result<Value, String> {
+    let token = |k: &str| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c));
+    let mut out = vec![];
+    for (i, part) in v.split(';').map(str::trim).filter(|p| !p.is_empty()).enumerate() {
+        match part.split_once(':').map(|(k, v)| (k.trim(), v.trim())) {
+            Some((k, v)) if token(k) => out.push(json!({ k: v })),
+            _ => return Err(format!("header {} must be Name: value (separate headers with ;)", i + 1)),
+        }
     }
+    if out.is_empty() {
+        return Err("header 1 must be Name: value (separate headers with ;)".into());
+    }
+    Ok(out.into())
 }
 
 /// JSON body from a remote form, and the (field, file path) pairs whose file content goes into it.
@@ -1288,6 +1426,12 @@ fn remote_body(f: &Form, edit: bool) -> Result<(Value, Vec<(String, String)>), S
         }
         match (fld.key.as_str(), &fld.kind) {
             ("labels", _) => b["pulp_labels"] = parse_labels(&val)?,
+            // pulpcore: `headers` is not nullable; an empty list removes them.
+            ("headers", _) if val.trim() == "-" => b["headers"] = json!([]),
+            ("headers", _) => b["headers"] = parse_headers(&val).map_err(|e| format!("{}: {e}", fld.label))?,
+            ("excluded_package_metadata_fields", _) => {
+                b[fld.key.as_str()] = val.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>().into()
+            }
             // The server accepts null for all of them (allow_null).
             _ if (secretish || file) && val == "-" => b[fld.key.as_str()] = Value::Null,
             _ if file => files.push((fld.key.clone(), val)),
@@ -1354,10 +1498,6 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 Field::new("proxy_password", "Proxy password", FieldKind::Secret).help(write_only),
                 Field::new("download_concurrency", "Download concurrency", FieldKind::Number).value(s(&v, "download_concurrency")),
                 Field::new("rate_limit", "Rate limit (req/s)", FieldKind::Number).value(s(&v, "rate_limit")),
-                // A float on the server: `s()` would show `3600.0`, which is not a whole number.
-                Field::new("total_timeout", "Total timeout (s)", FieldKind::Number)
-                    .value(v["total_timeout"].as_f64().map(|x| x.to_string()).unwrap_or_default())
-                    .help("seconds one download may take (large packages need more); empty = server default"),
                 Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
             ];
             fields.extend(remote_extra_fields(t, caps.as_deref(), &v));
@@ -1738,10 +1878,15 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
             ];
             fields.extend(signing_field(app, t));
+            fields.extend(publication_fields(caps(app).as_deref(), t));
             let form = Form::new(format!("New {} publication", t.label()), fields);
             app.form(form, move |app, f| {
-                let (repo, number) = (f.get("repo").to_string(), f.number("number"));
-                let signing = f.opt("signing_service").map(str::to_string);
+                let (repo, number, options) = (f.get("repo").to_string(), f.number("number"), publication_options(f)?);
+                // Pulp takes `checkpoint` only with `repository`, and then publishes the latest version.
+                let checkpoint = options["checkpoint"] == true;
+                if checkpoint && number.is_some() {
+                    return Err("Checkpoint publishes the latest version: leave Version number empty".into());
+                }
                 app.job(format!("publish {repo}"), move |ctx| async move {
                     let c = &ctx.client;
                     let r: Value =
@@ -1750,7 +1895,13 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         Some(n) => version_of(&s(&r, "pulp_href"), n),
                         None => r["latest_version_href"].as_str().ok_or_else(|| anyhow!("no versions"))?.to_string(),
                     };
-                    let p = ops::create_publication(c, t, &v, signing.as_deref(), &ctx.on_task()).await?;
+                    let mut body = ops::publication_body(c, t, &v, None).await?;
+                    if checkpoint {
+                        body.as_object_mut().expect("an object").remove("repository_version");
+                        body["repository"] = s(&r, "pulp_href").into();
+                    }
+                    body.as_object_mut().expect("an object").extend(options.as_object().cloned().unwrap_or_default());
+                    let p = ops::create(c, &c.api(t.publications()), &body, "/publications/", &ctx.on_task()).await?;
                     ap(move |app| {
                         app.ok(format!("publication {} of {}", short(&p), short(&v)));
                         app.reload();
@@ -1791,6 +1942,13 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         _ => {}
     }
 }
+
+/// Distribution flags (key, label, help), each shown when the server's distribution schema has it.
+const DIST_FLAGS: [(&str, &str, &str); 3] = [
+    ("hidden", "Hidden", "not listed by the content app; the URL still serves"),
+    ("checkpoint", "Checkpoint", "serves the repository's checkpoint publications at <base path>/<timestamp>/"),
+    ("generate_repo_config", "Serve config.repo", "RPM: a .repo file for clients"),
+];
 
 fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
@@ -1863,6 +2021,15 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 Field::pick("content_guard", "Content guard", Source::ContentGuards).value(s(&v, "content_guard")),
                 Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
             ]);
+            let caps = caps(app);
+            for (k, label, help) in DIST_FLAGS {
+                if caps.as_ref().is_none_or(|c| c.has_field(t.distribution_schema(), k))
+                    && (k != "generate_repo_config" || t == RepoType::Rpm)
+                {
+                    let on = if v[k] == true { "true" } else { "false" };
+                    fields.push(Field::new(k, label, FieldKind::Bool).value(on).help(help));
+                }
+            }
             let mut form =
                 Form::new(if edit { format!("Edit distribution {name}") } else { format!("New {} distribution", t.label()) }, fields)
                     .note("Changing the base path or binding changes what consumers receive at this URL.");
@@ -1885,7 +2052,19 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 if !edit || f.changed("labels") {
                     b["pulp_labels"] = parse_labels(f.get("labels"))?;
                 }
+                for (k, ..) in DIST_FLAGS {
+                    // Create: only what is on (off is Pulp's default).
+                    if if edit { f.changed(k) } else { f.bool(k) } {
+                        b[k] = f.bool(k).into();
+                    }
+                }
                 let (mode, repo, n) = (f.get("mode").to_string(), f.opt("repo").map(str::to_string), f.number("number"));
+                // Pulp refuses it with a publication or version binding (HTTP 400).
+                if f.bool("checkpoint") && !mode.starts_with("follow") {
+                    return Err(
+                        "Checkpoint needs Serve = follow repository latest: Pulp serves the checkpoint publications of a repository".into(),
+                    );
+                }
                 let signing = f.opt("signing_service").map(str::to_string);
                 if repo.is_none() && mode != "none" && !edit {
                     return Err("repository is required".into());
@@ -2236,7 +2415,7 @@ mod tests {
         let keys = |f: &[Field]| f.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
         let all = ["signing_service", "signing_service_release_overrides", "package_signing_service", "package_signing_fingerprint"];
         let more = ["package_signing_fingerprint_release_overrides", "publish_upstream_release_fields", "excluded_package_metadata_fields"];
-        let all = [&all[..], &more[..]].concat();
+        let all = [&all[..], &more[..], &["retain_checkpoints"]].concat();
         assert_eq!(keys(&repo_extra_fields(RepoType::Deb, None, &Value::Null)), all);
         // pulp_deb before package signing (3.5, 3.8) has only the Release signing fields.
         let mut caps = Capabilities::default();
@@ -2307,6 +2486,110 @@ mod tests {
     }
 
     #[test]
+    fn rpm_repository_fields_follow_the_server_schema() {
+        let keys = |f: &[Field]| f.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
+        let mut caps = Capabilities::default();
+        // Generated enum names (`LayoutD5aEnum` on pulp_rpm 3.39) can change: the choices come through the property's `$ref`.
+        caps.load_openapi(&json!({ "components": { "schemas": {
+            "rpm.RpmRepository": { "properties": {
+                "checksum_type": { "allOf": [{ "$ref": "#/components/schemas/PackageChecksumType1aEnum" }], "nullable": true },
+                "compression_type": { "allOf": [{ "$ref": "#/components/schemas/CompressionType2bEnum" }], "nullable": true },
+                "layout": { "allOf": [{ "$ref": "#/components/schemas/Layout3cEnum" }], "nullable": true },
+                "repo_config": {}, "package_signing_service": { "type": "string" }, "package_signing_fingerprint": { "type": "string" },
+                "retain_checkpoints": { "type": "integer" } } },
+            "PackageChecksumType1aEnum": { "enum": ["unknown", "md5", "sha1", "sha256", "sha512"] },
+            "CompressionType2bEnum": { "enum": ["zstd", "gz", "none"] },
+            "Layout3cEnum": { "enum": ["nested_alphabetically", "flat"] }
+        } } }));
+        let fields = repo_extra_fields(RepoType::Rpm, Some(&caps), &Value::Null);
+        let new = ["checksum_type", "compression_type", "layout", "repo_config", "package_signing_service", "package_signing_fingerprint"];
+        assert_eq!(keys(&fields), [&new[..], &["retain_checkpoints"]].concat());
+        let choices = |k: &str| fields.iter().find(|f| f.key == k).unwrap().kind.clone();
+        let c = |v: &[&str]| FieldKind::Choice(v.iter().map(|x| x.to_string()).collect());
+        assert_eq!(choices("checksum_type"), c(&["", "sha256", "sha512"]), "empty = server default; no weak checksums");
+        assert_eq!(choices("compression_type"), c(&["", "zstd", "gz", "none"]));
+        assert_eq!(choices("layout"), c(&["", "nested_alphabetically", "flat"]));
+        assert!(matches!(choices("package_signing_service"), FieldKind::Pick { source: Source::SigningServices, .. }));
+        // pulp_rpm before these fields: none of them is shown.
+        let mut old = Capabilities::default();
+        old.schemas.insert("rpm.RpmRepository".into(), ["name", "retain_package_versions"].map(String::from).into());
+        assert_eq!(keys(&repo_extra_fields(RepoType::Rpm, Some(&old), &Value::Null)), ["retain_package_versions"]);
+    }
+
+    #[test]
+    fn rpm_repository_body_sends_the_publish_and_signing_settings() {
+        let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+        let mut new = repo_form(RepoType::Rpm, None, None, "");
+        set(&mut new, "name", "os");
+        let b = repo_body(&new, false).unwrap();
+        for k in
+            ["compression_type", "layout", "repo_config", "package_signing_service", "package_signing_fingerprint", "retain_checkpoints"]
+        {
+            assert!(b.get(k).is_none(), "empty on create: {k} not sent: {b}");
+        }
+        for (k, v) in [("compression_type", "zstd"), ("layout", "flat"), ("repo_config", r#"{"gpgcheck": 1, "repo_gpgcheck": 0}"#)] {
+            set(&mut new, k, v);
+        }
+        for (k, v) in [("package_signing_service", "/s/3/"), ("package_signing_fingerprint", "v4:AB"), ("retain_checkpoints", "2")] {
+            set(&mut new, k, v);
+        }
+        let b = repo_body(&new, false).unwrap();
+        assert_eq!(
+            [&b["compression_type"], &b["layout"], &b["repo_config"], &b["package_signing_service"], &b["package_signing_fingerprint"]],
+            [&json!("zstd"), &json!("flat"), &json!({ "gpgcheck": 1, "repo_gpgcheck": 0 }), &json!("/s/3/"), &json!("v4:AB")]
+        );
+        assert_eq!(b["retain_checkpoints"], 2);
+
+        let item = json!({ "name": "os", "compression_type": "gz", "layout": "flat", "repo_config": { "gpgcheck": 1 },
+            "package_signing_service": "/s/3/", "package_signing_fingerprint": "v4:AB", "retain_checkpoints": 3, "pulp_labels": {} });
+        let mut f = repo_form(RepoType::Rpm, None, Some(&item), "");
+        assert_eq!((f.get("repo_config"), f.get("retain_checkpoints")), (r#"{"gpgcheck":1}"#, "3"), "as stored");
+        assert_eq!(repo_body(&f, true).unwrap(), json!({}), "untouched: nothing is sent");
+        set(&mut f, "layout", "nested_alphabetically");
+        assert_eq!(repo_body(&f, true).unwrap(), json!({ "layout": "nested_alphabetically" }), "only the change");
+        for k in
+            ["compression_type", "layout", "repo_config", "package_signing_service", "package_signing_fingerprint", "retain_checkpoints"]
+        {
+            set(&mut f, k, "");
+        }
+        // pulp_rpm: `repo_config` is not nullable (an empty document is its default); the others are.
+        assert_eq!(
+            repo_body(&f, true).unwrap(),
+            json!({ "compression_type": null, "layout": null, "repo_config": {}, "package_signing_service": null,
+                "package_signing_fingerprint": null, "retain_checkpoints": null })
+        );
+        set(&mut f, "repo_config", "gpgcheck=1");
+        let e = repo_body(&f, true).unwrap_err();
+        assert!(e.starts_with("Repo config (JSON): "), "{e}");
+        set(&mut f, "repo_config", "[1]");
+        assert_eq!(repo_body(&f, true).unwrap_err(), "Repo config (JSON): must be a JSON object, e.g. {\"gpgcheck\": 1}");
+        set(&mut f, "repo_config", "");
+        set(&mut f, "retain_checkpoints", "two");
+        assert_eq!(repo_body(&f, true).unwrap_err(), "Retain checkpoints must be a number");
+    }
+
+    #[test]
+    fn every_repository_type_with_the_field_retains_checkpoints() {
+        let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+        for t in [RepoType::Rpm, RepoType::File, RepoType::Deb] {
+            let mut new = repo_form(t, None, None, "");
+            set(&mut new, "name", "r");
+            assert!(repo_body(&new, false).unwrap().get("retain_checkpoints").is_none(), "{t:?}: empty on create is not sent");
+            set(&mut new, "retain_checkpoints", "4");
+            assert_eq!(repo_body(&new, false).unwrap()["retain_checkpoints"], 4, "{t:?}");
+            let item = json!({ "name": "r", "retain_checkpoints": 4, "pulp_labels": {} });
+            let mut f = repo_form(t, None, Some(&item), "");
+            assert_eq!(repo_body(&f, true).unwrap(), json!({}), "{t:?}: untouched");
+            set(&mut f, "retain_checkpoints", "");
+            assert_eq!(repo_body(&f, true).unwrap(), json!({ "retain_checkpoints": null }), "{t:?}: cleared = keep all");
+            // A server without checkpoints: no field.
+            let mut caps = Capabilities::default();
+            caps.schemas.insert(t.repository_schema().into(), ["name"].map(String::from).into());
+            assert!(repo_form(t, Some(&caps), None, "").fields.iter().all(|f| f.key != "retain_checkpoints"), "{t:?}");
+        }
+    }
+
+    #[test]
     fn remote_body_on_create_sends_only_the_filled_fields() {
         let f = Form::new(
             "t",
@@ -2322,6 +2605,83 @@ mod tests {
         let (b, files) = remote_body(&f, false).unwrap();
         assert_eq!(b, json!({ "name": "r", "url": "https://h/repo/", "tls_validation": false }));
         assert!(files.is_empty());
+    }
+
+    /// A remote form of type `t` for `v` (`Null` = create) with the fields that depend on the server.
+    fn remote_form(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Form {
+        let mut fields = vec![Field::text("name", "Name").value("r"), Field::text("url", "URL").value("https://h/")];
+        fields.extend(remote_extra_fields(t, caps, v));
+        Form::new("t", fields)
+    }
+
+    #[test]
+    fn remote_timeouts_retries_and_headers_follow_the_server_schema() {
+        let keys = |f: &Form| f.fields.iter().map(|x| x.key.clone()).collect::<Vec<_>>();
+        let common = ["total_timeout", "connect_timeout", "sock_connect_timeout", "sock_read_timeout", "max_retries", "headers"];
+        assert_eq!(keys(&remote_form(RepoType::File, None, &Value::Null))[2..], common);
+        let deb = keys(&remote_form(RepoType::Deb, None, &Value::Null));
+        assert_eq!((deb[2].as_str(), &deb[deb.len() - 6..]), ("distributions", &common.map(String::from)[..]), "Deb fields first");
+        assert!(deb.contains(&"excluded_package_metadata_fields".to_string()));
+        // A server without these fields: none of them.
+        let mut caps = Capabilities::default();
+        caps.schemas.insert("file.FileRemote".into(), ["name", "url"].map(String::from).into());
+        assert_eq!(keys(&remote_form(RepoType::File, Some(&caps), &Value::Null)), ["name", "url"]);
+        // Edit: the values as stored, but never the headers (they can hold an Authorization token).
+        let item = json!({ "name": "r", "url": "https://h/", "connect_timeout": 10.0, "sock_read_timeout": null, "max_retries": 5,
+            "headers": [{ "Authorization": "Bearer t" }], "excluded_package_metadata_fields": ["X-A", "X-B"] });
+        let f = remote_form(RepoType::Deb, None, &item);
+        assert_eq!(
+            ["connect_timeout", "sock_read_timeout", "max_retries", "headers", "excluded_package_metadata_fields"].map(|k| f.get(k)),
+            ["10", "", "5", "", "X-A,X-B"]
+        );
+        assert_eq!(f.fields.iter().find(|x| x.key == "headers").unwrap().kind, FieldKind::Secret);
+    }
+
+    #[test]
+    fn remote_body_sends_timeouts_retries_headers_and_excluded_fields() {
+        let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+        let mut new = remote_form(RepoType::Deb, None, &Value::Null);
+        set(&mut new, "distributions", "bookworm");
+        let (b, _) = remote_body(&new, false).unwrap();
+        for k in
+            ["connect_timeout", "sock_connect_timeout", "sock_read_timeout", "max_retries", "headers", "excluded_package_metadata_fields"]
+        {
+            assert!(b.get(k).is_none(), "empty on create: {k} not sent: {b}");
+        }
+        set(&mut new, "connect_timeout", "5");
+        set(&mut new, "max_retries", "2");
+        set(&mut new, "headers", "Authorization: Bearer t; X-Org: a:b;");
+        set(&mut new, "excluded_package_metadata_fields", "Phased-Update-Percentage, X-Note,");
+        let (b, _) = remote_body(&new, false).unwrap();
+        assert_eq!(
+            [&b["connect_timeout"], &b["max_retries"], &b["headers"], &b["excluded_package_metadata_fields"]],
+            [
+                &json!(5),
+                &json!(2),
+                &json!([{ "Authorization": "Bearer t" }, { "X-Org": "a:b" }]),
+                &json!(["Phased-Update-Percentage", "X-Note"])
+            ]
+        );
+        assert!(b.get("sock_read_timeout").is_none());
+
+        let item = json!({ "name": "r", "url": "https://h/", "distributions": "bookworm", "connect_timeout": 10.0, "max_retries": 5,
+            "headers": [{ "Authorization": "Bearer t" }], "excluded_package_metadata_fields": ["X-A"] });
+        let mut f = remote_form(RepoType::Deb, None, &item);
+        assert_eq!(remote_body(&f, true).unwrap().0, json!({}), "untouched, and empty headers keep the server value");
+        set(&mut f, "connect_timeout", "");
+        set(&mut f, "max_retries", "");
+        set(&mut f, "excluded_package_metadata_fields", "");
+        set(&mut f, "headers", "-");
+        // pulpcore: the headers list is not nullable; `[]` removes all.
+        assert_eq!(
+            remote_body(&f, true).unwrap().0,
+            json!({ "connect_timeout": null, "max_retries": null, "excluded_package_metadata_fields": [], "headers": [] })
+        );
+        for bad in ["Bearer secret-token", ": x", "Bad Name: x"] {
+            set(&mut f, "headers", bad);
+            let e = remote_body(&f, true).unwrap_err();
+            assert_eq!(e, "Headers: header 1 must be Name: value (separate headers with ;)");
+        }
     }
 
     #[test]
@@ -2477,12 +2837,29 @@ mod tests {
     }
 
     #[test]
+    fn sync_form_reads_its_enums_through_the_properties() {
+        // The schema generator can name an enum by a hash: only the property name is stable.
+        let mut caps = Capabilities::default();
+        caps.load_openapi(&json!({ "components": { "schemas": {
+            "RpmRepositorySyncURL": { "properties": {
+                "sync_policy": { "allOf": [{ "$ref": "#/components/schemas/SyncPolicy1a2Enum" }] },
+                "skip_types": { "type": "array", "items": { "$ref": "#/components/schemas/SkipTypes3b4Enum" } }
+            } },
+            "SyncPolicy1a2Enum": { "enum": ["additive", "mirror_complete", "mirror_content_only", "later"] },
+            "SkipTypes3b4Enum": { "enum": ["srpm", "treeinfo", "later"] }
+        } } }));
+        assert_eq!(sync_policies(Some(&caps), RepoType::Rpm), ["additive", "mirror_complete", "mirror_content_only", "later"]);
+        let keys: Vec<String> = sync_fields(RepoType::Rpm, Some(&caps)).into_iter().map(|f| f.key).collect();
+        assert_eq!(keys, ["skip_srpm", "skip_treeinfo", "skip_later"]);
+    }
+
+    #[test]
     fn deb_remote_fields_follow_the_server_schema_and_prefill_on_edit() {
         let keys = |f: &[Field]| f.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
         let all = ["distributions", "components", "architectures", "sync_sources", "sync_udebs", "sync_installer"];
-        let all = [&all[..], &["ignore_missing_package_indices", "gpgkey"]].concat();
+        let all = [&all[..], &["ignore_missing_package_indices", "gpgkey", "excluded_package_metadata_fields"]].concat();
         let fields = remote_extra_fields(RepoType::Deb, None, &Value::Null);
-        assert_eq!(keys(&fields), all);
+        assert_eq!(keys(&fields)[..all.len()], all, "then the fields of all remote types");
         assert!(fields[0].required && !fields[1].required);
         assert_eq!(remote_url_help(RepoType::Deb), "Debian archive base URL (the directory that holds dists/)");
 
@@ -2990,7 +3367,7 @@ mod tests {
         };
         publication_action(&mut app, RepoType::Deb, Act::Create, Value::Null);
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
-        assert_eq!(keys(&form), ["repo", "number", "signing_service"]);
+        assert_eq!(keys(&form)[..3], ["repo", "number", "signing_service"], "then the publication options");
         set(&mut form, &[("repo", "r"), ("signing_service", "/ss/1/")]);
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
@@ -3004,6 +3381,97 @@ mod tests {
         let sent = posts_to(&server, &format!("{API}publications/deb/apt/")).await;
         let service = |s: &str| json!({ "repository_version": "/v/", "signing_service": s });
         assert_eq!(sent, [service("/ss/1/"), service("/ss/2/")]);
+    }
+
+    #[tokio::test]
+    async fn publication_options_follow_the_server_schema_and_send_only_what_is_set() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let (rpm, deb) = (format!("{API}repositories/rpm/rpm/r/"), format!("{API}repositories/deb/apt/r/"));
+        for (t, r) in [("rpm/rpm", &rpm), ("deb/apt", &deb)] {
+            let repo = json!({ "pulp_href": r, "name": "r", "latest_version_href": format!("{r}versions/2/") });
+            get(&server, &format!("{API}repositories/{t}/"), page(json!([repo]))).await;
+            wiremock::Mock::given(method("POST"))
+                .and(path(format!("{API}publications/{t}/")))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{API}publications/{t}/9/") })),
+                )
+                .mount(&server)
+                .await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        let mut caps = Capabilities::default();
+        // Generated enum names (`LayoutD5aEnum`, `LayoutDa3Enum`) can change: the choices come through the property's `$ref`.
+        caps.load_openapi(&json!({ "components": { "schemas": {
+            "rpm.RpmPublication": { "properties": { "repository_version": {}, "checkpoint": { "type": "boolean" }, "repo_config": {},
+                "checksum_type": { "allOf": [{ "$ref": "#/components/schemas/Checksum1Enum" }] },
+                "compression_type": { "allOf": [{ "$ref": "#/components/schemas/Compression2Enum" }] },
+                "layout": { "allOf": [{ "$ref": "#/components/schemas/Layout3Enum" }] } } },
+            "file.FilePublication": { "properties": { "repository_version": {}, "manifest": {}, "checkpoint": {} } },
+            "Checksum1Enum": { "enum": ["unknown", "md5", "sha1", "sha256"] },
+            "Compression2Enum": { "enum": ["zstd", "gz"] },
+            "Layout3Enum": { "enum": ["nested_alphabetically", "flat"] }
+        } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let open = |app: &mut App, t: RepoType| {
+            publication_action(app, t, Act::Create, Value::Null);
+            let Some(Modal::Form { form, submit }) = app.modal.take() else { panic!("no form") };
+            (form, submit)
+        };
+        let (mut form, mut submit) = open(&mut app, RepoType::Rpm);
+        assert_eq!(keys(&form), ["repo", "number", "checksum_type", "compression_type", "layout", "repo_config", "checkpoint"]);
+        let kind = |f: &Form, k: &str| f.fields.iter().find(|x| x.key == k).unwrap().kind.clone();
+        let c = |v: &[&str]| FieldKind::Choice(v.iter().map(|x| x.to_string()).collect());
+        assert_eq!(kind(&form, "checksum_type"), c(&["", "sha256"]));
+        assert_eq!(kind(&form, "layout"), c(&["", "nested_alphabetically", "flat"]));
+        assert_eq!(kind(&form, "checkpoint"), c(&["", "true", "false"]), "empty = server default");
+        assert!(form.fields[2..].iter().all(|f| f.value.is_empty()), "every option starts at the server default");
+        assert_eq!(keys(&open(&mut app, RepoType::File).0), ["repo", "number", "checkpoint"]);
+
+        let set = |form: &mut Form, values: &[(&str, &str)]| {
+            for (k, v) in values {
+                form.fields.iter_mut().find(|f| f.key == *k).unwrap().value = v.to_string();
+            }
+        };
+        set(&mut form, &[("repo", "r")]);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        set(&mut form, &[("compression_type", "zstd"), ("layout", "flat"), ("repo_config", r#"{"gpgcheck": 1}"#), ("checkpoint", "false")]);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        set(&mut form, &[("repo_config", "gpgcheck=1")]);
+        assert!(submit(&mut app, &form).unwrap_err().starts_with("Repo config (JSON): "));
+        // Pulp takes `checkpoint` only with `repository` and then publishes the latest version.
+        set(&mut form, &[("repo_config", ""), ("layout", ""), ("compression_type", ""), ("checkpoint", "true"), ("number", "1")]);
+        assert_eq!(submit(&mut app, &form).unwrap_err(), "Checkpoint publishes the latest version: leave Version number empty");
+        set(&mut form, &[("number", "")]);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let v2 = format!("{rpm}versions/2/");
+        assert_eq!(
+            posts_to(&server, &format!("{API}publications/rpm/rpm/")).await,
+            [
+                json!({ "repository_version": v2 }),
+                json!({ "repository_version": v2, "compression_type": "zstd", "layout": "flat", "repo_config": { "gpgcheck": 1 }, "checkpoint": false }),
+                json!({ "repository": rpm, "checkpoint": true }),
+            ]
+        );
+
+        app.conn.as_mut().unwrap().caps = Default::default();
+        let (mut form, mut submit) = open(&mut app, RepoType::Deb);
+        let deb_keys = ["simple", "structured", "publish_legacy_release_files", "layout", "publish_upstream_release_fields"];
+        assert_eq!(keys(&form)[3..], [&deb_keys[..], &["excluded_package_metadata_fields", "checkpoint"]].concat());
+        set(&mut form, &[("repo", "r"), ("structured", "false")]);
+        assert_eq!(submit(&mut app, &form).unwrap_err(), "Structured: off needs Simple on (Pulp publishes in at least one mode)");
+        set(&mut form, &[("simple", "true"), ("publish_legacy_release_files", "true"), ("excluded_package_metadata_fields", "X-A, X-B,")]);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(
+            posts_to(&server, &format!("{API}publications/deb/apt/")).await,
+            [json!({ "repository_version": format!("{deb}versions/2/"), "simple": true, "structured": false,
+                "publish_legacy_release_files": true, "excluded_package_metadata_fields": ["X-A", "X-B"] })]
+        );
     }
 
     #[tokio::test]
@@ -3620,6 +4088,33 @@ mod tests {
         }
     }
 
+    /// pulp_rpm `viewsets/repository.py` refuses these repository settings with a mirror policy (HTTP 400).
+    #[tokio::test]
+    async fn rpm_sync_form_refuses_mirror_policies_that_the_repository_settings_forbid() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (mut app, _rx) = connected(&server).await;
+        let autopublish = "Pulp refuses mirror_complete with autopublish: turn autopublish off (Edit) or choose another sync policy";
+        let retain = "Pulp refuses mirror policies with retain_package_versions above 0: set it to 0 (Edit) or choose additive";
+        for (settings, policy, want) in [
+            (json!({ "autopublish": true }), "mirror_complete", Some(autopublish)),
+            (json!({ "autopublish": true }), "mirror_content_only", None),
+            (json!({ "retain_package_versions": 2 }), "mirror_complete", Some(retain)),
+            (json!({ "retain_package_versions": 2 }), "mirror_content_only", Some(retain)),
+            (json!({ "retain_package_versions": 0 }), "mirror_content_only", None),
+        ] {
+            let mut item = json!({ "pulp_href": format!("{API}repositories/rpm/rpm/r/"), "name": "os", "remote": null });
+            item.as_object_mut().unwrap().extend(settings.as_object().unwrap().clone());
+            repo_action(&mut app, RepoType::Rpm, Act::Sync, item);
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            form.fields.iter_mut().find(|f| f.key == "policy").unwrap().value = policy.into();
+            let got = submit(&mut app, &form);
+            app.modal = None; // the mirror confirm of an accepted form
+            assert_eq!(got, want.map_or(Ok(()), |e| Err(e.into())), "{settings} {policy}");
+        }
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "a sync was sent");
+    }
+
     #[tokio::test]
     async fn repo_edit_shows_and_clears_the_default_remote() {
         use crate::tui::app::Modal;
@@ -3667,6 +4162,68 @@ mod tests {
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
         assert!(app.notices.iter().any(|n| n.text == "update distribution replica: done"));
+    }
+
+    #[tokio::test]
+    async fn distribution_hidden_checkpoint_and_repo_config_follow_the_schema_and_send_only_changes() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let (d, rpm) = (format!("{API}distributions/file/file/1/"), format!("{API}distributions/rpm/rpm/"));
+        for (verb, p) in [("PATCH", d.clone()), ("POST", rpm.clone())] {
+            wiremock::Mock::given(method(verb))
+                .and(path(p))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": d })))
+                .mount(&server)
+                .await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        let flags = |app: &mut App, t: RepoType| {
+            distribution_action(app, t, Act::Create, Value::Null);
+            let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+            keys(&form).into_iter().filter(|k| ["hidden", "checkpoint", "generate_repo_config"].contains(&k.as_str())).collect::<Vec<_>>()
+        };
+        assert_eq!(flags(&mut app, RepoType::Rpm), ["hidden", "checkpoint", "generate_repo_config"]);
+        assert_eq!(flags(&mut app, RepoType::File), ["hidden", "checkpoint"], "generate_repo_config is RPM only");
+        let mut caps = Capabilities::default();
+        caps.schemas.insert("file.FileDistribution".into(), ["name", "base_path"].map(String::from).into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        assert!(flags(&mut app, RepoType::File).is_empty(), "a server without the fields");
+        app.conn.as_mut().unwrap().caps = Default::default();
+
+        let set = |form: &mut Form, k: &str, v: &str| form.fields.iter_mut().find(|f| f.key == k).unwrap().value = v.into();
+        let item = json!({ "pulp_href": d, "name": "docs", "base_path": "docs", "repository": "/r/", "hidden": true,
+            "checkpoint": false, "pulp_labels": {} });
+        distribution_action(&mut app, RepoType::File, Act::Edit, item);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
+        assert_eq!((form.get("hidden"), form.get("checkpoint")), ("true", "false"), "as stored");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        set(&mut form, "hidden", "false");
+        set(&mut form, "checkpoint", "true");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        // Pulp refuses `checkpoint` without a repository binding (HTTP 400): say it before any request.
+        set(&mut form, "mode", "publication of a repository version");
+        set(&mut form, "repo", "r");
+        let e = submit(&mut app, &form).unwrap_err();
+        assert_eq!(e, "Checkpoint needs Serve = follow repository latest: Pulp serves the checkpoint publications of a repository");
+
+        distribution_action(&mut app, RepoType::Rpm, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        for (k, v) in [("name", "el9"), ("base_path", "el9"), ("mode", "none"), ("generate_repo_config", "true")] {
+            set(&mut form, k, v);
+        }
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        let sent = server.received_requests().await.unwrap();
+        let bodies: Vec<Value> = sent.iter().filter(|r| r.method.as_str() != "GET").map(|r| r.body_json().unwrap()).collect();
+        let flag = |b: &Value| ["hidden", "checkpoint", "generate_repo_config"].map(|k| b.get(k).cloned());
+        assert_eq!(flag(&bodies[0]), [None, None, None], "untouched edit: not sent");
+        assert_eq!(flag(&bodies[1]), [Some(json!(false)), Some(json!(true)), None], "the changes");
+        assert_eq!(flag(&bodies[2]), [None, None, Some(json!(true))], "create: only what is on");
+        assert_eq!(bodies.len(), 3);
     }
 
     #[tokio::test]

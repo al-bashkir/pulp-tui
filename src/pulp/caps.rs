@@ -125,8 +125,8 @@ impl Capabilities {
                 if let Some(props) = s["properties"].as_object() {
                     self.schemas.insert(name.clone(), props.keys().cloned().collect());
                     for (prop, p) in props {
-                        // drf-spectacular puts a reference with its own description in `allOf`.
-                        if let Some(r) = p["$ref"].as_str().or(p["allOf"][0]["$ref"].as_str()) {
+                        // drf-spectacular puts a reference with its own description in `allOf`, an array one in `items`.
+                        if let Some(r) = p["$ref"].as_str().or(p["allOf"][0]["$ref"].as_str()).or(p["items"]["$ref"].as_str()) {
                             self.refs.insert((name.clone(), prop.clone()), r.trim_start_matches("#/components/schemas/").into());
                         }
                     }
@@ -251,11 +251,14 @@ mod tests {
         c.load_openapi(&json!({ "components": { "schemas": {
             "UpstreamPulp": { "properties": { "policy": { "$ref": "#/components/schemas/PolicyE1fEnum" }, "name": { "type": "string" } } },
             "rpm.RpmRemote": { "properties": { "policy": { "allOf": [{ "$ref": "#/components/schemas/Policy0a2Enum" }] } } },
+            "RpmRepositorySyncURL": { "properties": { "skip_types": { "type": "array", "items": { "$ref": "#/components/schemas/SkipTypes9c8Enum" } } } },
+            "SkipTypes9c8Enum": { "enum": ["srpm", "treeinfo"] },
             "PolicyE1fEnum": { "enum": ["all", "labeled", "nodelete"] },
             "Policy0a2Enum": { "enum": ["immediate", "on_demand", "streamed"] }
         } } }));
         assert_eq!(c.field_enum("UpstreamPulp", "policy").unwrap(), ["all", "labeled", "nodelete"]);
         assert_eq!(c.field_enum("rpm.RpmRemote", "policy").unwrap(), ["immediate", "on_demand", "streamed"]);
+        assert_eq!(c.field_enum("RpmRepositorySyncURL", "skip_types").unwrap(), ["srpm", "treeinfo"]);
         assert_eq!(c.field_enum("UpstreamPulp", "name"), None);
     }
 }

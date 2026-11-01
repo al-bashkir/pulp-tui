@@ -157,6 +157,7 @@ pub fn slug(s: &str) -> String {
 /// set them (Deb: `deb_signing_patch`).
 fn publish_fields(t: RepoType) -> &'static [&'static str] {
     match t {
+        // Not package_signing_*: pulp_rpm signs the packages that `modify/` adds, so the snapshot would get other packages.
         RepoType::Rpm => &["metadata_signing_service", "checksum_type", "repo_config", "compression_type", "layout"],
         RepoType::File => &["manifest"], // sent with each publication request (`ops::publication_body`)
         RepoType::Deb => &[],
@@ -1659,11 +1660,16 @@ mod tests {
     #[test]
     fn snapshots_get_the_publish_settings_of_their_source() {
         let src = json!({ "name": "os", "metadata_signing_service": "/s/1/", "checksum_type": "sha256", "repo_config": { "gpgcheck": 1 },
-            "layout": "nested_alphabetically", "retain_repo_versions": 3 });
-        let dst =
-            json!({ "name": "web-os", "metadata_signing_service": null, "checksum_type": "sha256", "layout": "nested_alphabetically" });
+            "layout": "nested_alphabetically", "compression_type": "zstd", "retain_repo_versions": 3,
+            "package_signing_service": "/s/2/", "package_signing_fingerprint": "v4:AB", "retain_checkpoints": 2 });
+        let dst = json!({ "name": "web-os", "metadata_signing_service": null, "checksum_type": "sha256", "layout": "nested_alphabetically",
+            "compression_type": null, "package_signing_service": null, "package_signing_fingerprint": null, "retain_checkpoints": null });
         let patch = publish_settings(RepoType::Rpm, &src, &dst);
-        assert_eq!(Value::Object(patch), json!({ "metadata_signing_service": "/s/1/", "repo_config": { "gpgcheck": 1 } }));
+        // Package signing would re-sign the packages that the snapshot gets through `modify/`.
+        assert_eq!(
+            Value::Object(patch),
+            json!({ "metadata_signing_service": "/s/1/", "repo_config": { "gpgcheck": 1 }, "compression_type": "zstd" })
+        );
         assert!(publish_settings(RepoType::Rpm, &src, &src).is_empty(), "nothing to send when they agree");
         let old = json!({ "name": "old server" });
         assert!(publish_settings(RepoType::Rpm, &old, &dst).is_empty(), "fields the server lacks are never sent");

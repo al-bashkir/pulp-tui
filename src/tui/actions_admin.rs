@@ -348,6 +348,33 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                     "nodelete".into()
                 }));
             }
+            // pulpcore copies these to the remotes that replication creates (`_build_remote_settings`).
+            if has("remote_policy") {
+                let mut p = caps
+                    .as_ref()
+                    .and_then(|c| c.field_enum("UpstreamPulp", "remote_policy").map(<[String]>::to_vec))
+                    .unwrap_or_else(|| ["immediate", "on_demand", "streamed"].map(String::from).to_vec());
+                p.insert(0, String::new());
+                let help = "of the remotes that replication creates; empty = server default (immediate)";
+                fields.push(
+                    Field::new("remote_policy", "Replica download policy", FieldKind::Choice(p)).value(s(&v, "remote_policy")).help(help),
+                );
+            }
+            let number = |k: &str, label: &str, value: String| {
+                Field::new(k, label, FieldKind::Number).value(value).help("for the replica remotes; empty = server default")
+            };
+            for (k, label) in [("download_concurrency", "Download concurrency"), ("max_retries", "Max retries")] {
+                fields.extend(has(k).then(|| number(k, label, s(&v, k))));
+            }
+            for (k, label) in [
+                ("total_timeout", "Total timeout (s)"),
+                ("connect_timeout", "Connect timeout (s)"),
+                ("sock_connect_timeout", "Socket connect timeout (s)"),
+                ("sock_read_timeout", "Socket read timeout (s)"),
+            ] {
+                // Floats on the server: `s()` would show `3600.0`, which is not a whole number.
+                fields.extend(has(k).then(|| number(k, label, v[k].as_f64().map(|x| x.to_string()).unwrap_or_default())));
+            }
             let form = Form::new(
                 if edit { format!("Edit upstream {name}") } else { "New Upstream Pulp (native replication, tech preview)".into() },
                 fields,
@@ -370,6 +397,9 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                         ("ca_cert" | "client_cert" | "client_key", _) => files.push((fld.key.clone(), val)),
                         (_, FieldKind::Bool) => b[fld.key.as_str()] = (val == "true").into(),
                         _ if val.is_empty() => b[fld.key.as_str()] = Value::Null,
+                        (_, FieldKind::Number) => {
+                            b[fld.key.as_str()] = val.parse::<i64>().map_err(|_| format!("{} must be a number", fld.label))?.into()
+                        }
                         _ => b[fld.key.as_str()] = val.into(),
                     }
                 }
@@ -771,6 +801,83 @@ mod tests {
         let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
         let policy = form.fields.iter().find(|f| f.key == "policy").unwrap();
         assert_eq!(policy.kind, super::FieldKind::Choice(["nodelete", "all", "labeled", "keep"].map(String::from).to_vec()));
+    }
+
+    #[tokio::test]
+    async fn upstream_download_settings_follow_the_schema_and_send_only_what_is_set() {
+        let server = MockServer::start().await;
+        serve(&server, "POST", "/pulp/api/v3/upstream-pulps/", 201, json!({ "pulp_href": UP })).await;
+        serve(&server, "PATCH", UP, 200, json!({ "pulp_href": UP })).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let new = ["download_concurrency", "max_retries", "total_timeout", "connect_timeout", "sock_connect_timeout", "sock_read_timeout"];
+        let mut props: serde_json::Map<String, Value> = new.iter().map(|k| (k.to_string(), json!({}))).collect();
+        props.insert("name".into(), json!({}));
+        // The generated name (`RemotePolicyEnum` today) can change: the choices come through the property's `$ref`.
+        props.insert("remote_policy".into(), json!({ "allOf": [{ "$ref": "#/components/schemas/RemotePolicy7Enum" }] }));
+        let mut caps = crate::pulp::Capabilities::default();
+        caps.load_openapi(&json!({ "components": { "schemas": {
+            "UpstreamPulp": { "properties": props },
+            "RemotePolicy7Enum": { "enum": ["immediate", "on_demand", "streamed", "later"] }
+        } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let form = |app: &mut App, act, item| {
+            super::upstream_action(app, act, item);
+            let Some(Modal::Form { form, submit }) = app.modal.take() else { panic!("no form") };
+            (form, submit)
+        };
+        let set = |f: &mut super::Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+        let (mut f, mut submit) = form(&mut app, crate::tui::kinds::Act::Create, Value::Null);
+        let keys: Vec<String> = f.fields.iter().map(|x| x.key.clone()).collect();
+        assert_eq!(keys[keys.len() - 7..], [&["remote_policy"], &new[..]].concat());
+        let policy = f.fields.iter().find(|x| x.key == "remote_policy").unwrap();
+        assert_eq!(policy.kind, super::FieldKind::Choice(["", "immediate", "on_demand", "streamed", "later"].map(String::from).to_vec()));
+        for (k, v) in [("name", "up"), ("base_url", "https://upstream.example.com"), ("remote_policy", "on_demand")] {
+            set(&mut f, k, v);
+        }
+        set(&mut f, "download_concurrency", "x");
+        assert_eq!(submit(&mut app, &f), Err("Download concurrency must be a number".into()));
+        set(&mut f, "download_concurrency", "4");
+        set(&mut f, "sock_read_timeout", "600");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        let item = json!({ "pulp_href": UP, "name": "up", "base_url": "https://upstream.example.com", "api_root": "pulp/",
+            "remote_policy": "streamed", "total_timeout": 3600.0, "max_retries": 5 });
+        let (mut f, mut submit) = form(&mut app, crate::tui::kinds::Act::Edit, item);
+        assert_eq!(["remote_policy", "total_timeout", "max_retries"].map(|k| f.get(k)), ["streamed", "3600", "5"], "as stored");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        set(&mut f, "remote_policy", "");
+        set(&mut f, "max_retries", "");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        let sent = server.received_requests().await.unwrap();
+        let bodies: Vec<Value> = sent.iter().filter(|r| r.method.as_str() != "GET").map(|r| r.body_json().unwrap()).collect();
+        let picked = |b: &Value| {
+            [&["remote_policy"], &new[..]].concat().into_iter().filter_map(|k| b.get(k).map(|v| (k, v.clone()))).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            picked(&bodies[0]),
+            [("remote_policy", json!("on_demand")), ("download_concurrency", json!(4)), ("sock_read_timeout", json!(600))],
+            "create: only what is filled"
+        );
+        assert_eq!(picked(&bodies[1]), [], "untouched edit");
+        assert_eq!(picked(&bodies[2]), [("remote_policy", Value::Null), ("max_retries", Value::Null)], "cleared = server default");
+        assert_eq!(bodies.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn upstream_without_download_settings_in_the_schema_shows_none() {
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let mut caps = crate::pulp::Capabilities::default();
+        caps.schemas.insert("UpstreamPulp".into(), ["name", "base_url", "api_root"].map(String::from).into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        super::upstream_action(&mut app, crate::tui::kinds::Act::Create, Value::Null);
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        let shown = ["remote_policy", "download_concurrency", "max_retries", "total_timeout", "sock_read_timeout"];
+        assert!(form.fields.iter().all(|f| !shown.contains(&f.key.as_str())));
     }
 
     #[tokio::test]

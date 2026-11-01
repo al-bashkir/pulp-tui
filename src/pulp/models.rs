@@ -69,6 +69,22 @@ impl RepoType {
             RepoType::Deb => "deb.AptRemote",
         }
     }
+    /// OpenAPI schema of the plugin's publication serializer.
+    pub fn publication_schema(self) -> &'static str {
+        match self {
+            RepoType::Rpm => "rpm.RpmPublication",
+            RepoType::File => "file.FilePublication",
+            RepoType::Deb => "deb.AptPublication",
+        }
+    }
+    /// OpenAPI schema of the plugin's distribution serializer.
+    pub fn distribution_schema(self) -> &'static str {
+        match self {
+            RepoType::Rpm => "rpm.RpmDistribution",
+            RepoType::File => "file.FileDistribution",
+            RepoType::Deb => "deb.AptDistribution",
+        }
+    }
     pub fn repositories(self) -> &'static str {
         match self {
             RepoType::Rpm => "repositories/rpm/rpm/",

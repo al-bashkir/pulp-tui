@@ -155,13 +155,35 @@ are visible.
 Edit sends only changed fields. Remote shows the default remote by name; clear it to remove
 the default remote. Edit, sync, upload, copy and content add/remove are refused
 on Content View snapshot repositories (a change of retention would prune their snapshots).
+**Retain checkpoints** (RPM, File and Deb, when the server has the field): how many
+checkpoint publications Pulp keeps; empty = all.
+
+RPM repository fields (create and edit; each is shown only when the server has it; the
+choices come from the server's schema; clear a field on edit to remove the setting):
+
+| Field                       | Meaning                                                                                                                                                     |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Checksum type               | checksum of the published metadata and packages (`sha256` and stronger); empty = server default                                                             |
+| Metadata compression        | `zstd`, `gz` or `none` for the published metadata files; empty = server default                                                                             |
+| Package layout              | where a publication puts the packages: `nested_alphabetically` (`Packages/<letter>/`), `flat` (`Packages/`) or `nested_by_digest`; empty = server default   |
+| Repo config (JSON)          | a JSON object for the `.repo` file that Pulp generates, for example `{"gpgcheck": 1, "repo_gpgcheck": 1}`; clear it on edit to remove it (Pulp stores `{}`) |
+| Metadata signing service    | signs `repomd.xml` of each publication                                                                                                                      |
+| Package signing service     | signs the packages that an upload or `modify/` adds (not a sync or a copy)                                                                                  |
+| Package signing fingerprint | the key that the package signing service uses: `v4:<hex fingerprint>` or `keyid:<16 hex>`                                                                   |
+
+A Content View snapshot gets the checksum type, compression, layout, repo config and metadata
+signing service of its source, so it publishes the same metadata. It does not get the
+package signing settings: Pulp would sign the packages that the snapshot gets, and the
+snapshot would then hold other packages than its source.
 
 Sync options (each is shown only when the server's sync request has it, and is sent only
 when you change it): **Optimize** (RPM, File and Deb) is on, Pulp's default. Turn it off for a
 full re-sync: Pulp then processes the upstream metadata also when it did not change.
 **Skip srpm** and **Skip treeinfo** (RPM) send `skip_types`: the sync does not download
 source packages or the distribution tree (`.treeinfo`). Pulp refuses skip types with
-`mirror_complete`, so the form refuses them before it sends the sync.
+`mirror_complete`, so the form refuses them before it sends the sync. It also refuses
+`mirror_complete` for a repository with autopublish on, and both mirror policies for a
+repository with **retain package versions** above 0, as Pulp does.
 
 Deb repositories use the same keys. Sync a Deb repository from a Deb remote, publish it
 (**P**) and distribute it (**D**) as for the other types. A Deb distribution is served
@@ -198,16 +220,26 @@ concurrency, rate limit, labels, SLES token (RPM). The edit form cannot show the
 certificates, key, credentials and token: empty keeps the server value, `-` clears it.
 Delete lists repositories that use the remote.
 
+Download fields of all remote types (each is shown only when the server has it; edit sends
+only changed fields, and a cleared field returns to the server default):
+
+| Field                                                  | Meaning                                                                                                                                                                                                               |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Total / connect / socket connect / socket read timeout | whole seconds for one download, to make the connection, to open the socket, and between two reads; empty = server default                                                                                             |
+| Max retries                                            | retries after a download failure; empty = server default (3)                                                                                                                                                          |
+| Headers                                                | extra HTTP headers of each download, `Name: value; Name: value`, for example `Authorization: Bearer <token>`. A header can hold a credential, so the form never shows them: on edit, empty keeps them, `-` clears all |
+
 Deb remote fields (each is shown only when the server has it):
 
-| Field                                          | Meaning                                                                                                                                                  |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Distributions                                  | required; space-separated releases to mirror, for example `bookworm bookworm-updates`                                                                    |
-| Components                                     | space-separated, for example `main contrib`; empty = all                                                                                                 |
-| Architectures                                  | space-separated, for example `amd64 arm64`; empty = all                                                                                                  |
-| Sync source packages / udebs / installer files | on or off (default off)                                                                                                                                  |
-| Ignore missing package indices                 | on or off; keeps a sync going when a `Packages` index is missing upstream                                                                                |
-| GPG public key                                 | path of a local file; its content is uploaded and Pulp uses it to check the `Release` signature. On edit, empty keeps the server value and `-` clears it |
+| Field                                          | Meaning                                                                                                                                                                                |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Distributions                                  | required; space-separated releases to mirror, for example `bookworm bookworm-updates`                                                                                                  |
+| Components                                     | space-separated, for example `main contrib`; empty = all                                                                                                                               |
+| Architectures                                  | space-separated, for example `amd64 arm64`; empty = all                                                                                                                                |
+| Sync source packages / udebs / installer files | on or off (default off)                                                                                                                                                                |
+| Ignore missing package indices                 | on or off; keeps a sync going when a `Packages` index is missing upstream                                                                                                              |
+| GPG public key                                 | path of a local file; its content is uploaded and Pulp uses it to check the `Release` signature. On edit, empty keeps the server value and `-` clears it                               |
+| Excluded package metadata fields               | `field,...`, for example `Phased-Update-Percentage`: custom package fields that the sync drops (core fields such as `Package` and `Version` stay). Clear it on edit to keep all fields |
 
 ### Repository Versions
 
@@ -276,6 +308,22 @@ repository settings at that moment. **D** distribute: serves exactly the selecte
 **d** delete (names the distributions that serve it, and you type the
 publication id; refused for publications of Content View snapshots).
 
+**c** also has the publication options of the server (each is shown only when the server's
+publication has it). Each starts empty, which means the repository setting or the server
+default, and only the options that you set are sent. **P** in Repositories and Versions
+publishes without options.
+
+| Field                               | Type     | Meaning                                                                                                                                                     |
+| ----------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Checksum type, Metadata compression | RPM      | as the repository fields of the same name, for this publication only                                                                                        |
+| Package layout                      | RPM, Deb | where the publication puts the packages; the choices come from the server                                                                                   |
+| Repo config (JSON)                  | RPM      | a JSON object for the generated `.repo` file, for example `{"gpgcheck": 1}`                                                                                 |
+| Simple / Structured                 | Deb      | `true` or `false`: publish all packages in one component (simple), or with the upstream components (structured, Pulp's default). One of them must be `true` |
+| Legacy Release files                | Deb      | `true` also writes the legacy `Release` file of each component and architecture                                                                             |
+| Publish upstream Release fields     | Deb      | `true` or `false` instead of the repository setting                                                                                                         |
+| Excluded package metadata fields    | Deb      | `field,...` instead of the repository setting                                                                                                               |
+| Checkpoint                          | all      | `true` makes a checkpoint publication, which a checkpoint distribution serves. Pulp then publishes the latest version, so the form refuses a version number |
+
 ### Distributions
 
 `t` switches RPM/File/Deb. Details say whether a distribution is **PINNED** (publication or
@@ -291,6 +339,15 @@ pinned publication), **d** delete. A distribution of a
 Content View (label `pulp_tui_cv`) cannot be re-pointed or re-bound here (use promote or
 roll back) or renamed, and its `pulp_tui_*` labels stay (promote finds it by name and
 labels); its base path and other labels can be edited, and delete warns.
+
+Distribution flags (create and edit; each is shown only when the server has it; create
+sends only the flags that are on, edit only the changed ones):
+
+| Field             | Meaning                                                                                                                                                                            |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hidden            | the content app does not list the distribution; its URL still serves                                                                                                               |
+| Checkpoint        | serves the checkpoint publications of the repository at `<base path>/<timestamp>/`. Needs Serve = follow repository latest: the form refuses it with a publication before it sends |
+| Serve config.repo | RPM only (`generate_repo_config`): Pulp serves a `.repo` file for clients at the distribution                                                                                      |
 
 ### Content Views
 
@@ -544,6 +601,13 @@ publications), or when the publication has no manifest; the other rows go on. Th
 fallback does not follow an upstream label change: a distribution that the source moved to
 another base path is reported as a 409 conflict, and the replica stays at its old path.
 Delete the replica distribution, or move it by hand, to make it follow.
+
+Download settings of an Upstream Pulp (create and edit; each is shown only when the
+server's `UpstreamPulp` has it): **Replica download policy** (`remote_policy`: `immediate`,
+`on_demand` or `streamed`; empty = server default, `immediate`), download concurrency, max
+retries, and the total, connect, socket connect and socket read timeouts (whole seconds).
+Pulp copies them to the remotes that replication creates. Create sends only the filled
+fields; a field cleared on edit returns to the server default.
 
 ### Users, Groups, Roles
 
