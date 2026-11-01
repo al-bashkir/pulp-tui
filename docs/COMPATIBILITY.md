@@ -240,6 +240,14 @@ Read in the test container (pulp_deb 3.11.1, `pulp_deb/app/`) and in its live Op
   distributions in the body change, a `null` value deletes that override, and `{}` changes
   nothing. So pulp-tui sends `null` for each per-release key that a Content View snapshot
   repository must lose (signing `none` or a service, or a key the source no longer has).
+  The Deb repository edit form does the same for each release that the operator removes.
+* Repository signing fields: `signing_service`, `signing_service_release_overrides` and
+  `publish_upstream_release_fields` (model default `true`) are in pulp_deb 3.5.4, 3.8.1 and
+  3.11.1. `package_signing_service`, `package_signing_fingerprint` (and the per-release
+  fingerprints, which pulp-tui does not show) are only in 3.11.1 (migration
+  `0035_package_signing`). `signing_service` accepts only an APT release signing service,
+  `package_signing_service` only an APT package signing service. The package signing service
+  signs packages on upload and `modify/` (`tasks/signing.py`), not on sync or `deb/copy/`.
 * `AptPublication` defaults are `structured=true` and `simple=false`.
 * `signing-services/` is the pulpcore endpoint for all plugins. It has no type filter (only
   `name`, `q`, `pulp_href__in` and similar), so a Deb signing service cannot be told from an

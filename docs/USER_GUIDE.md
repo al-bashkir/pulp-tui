@@ -167,6 +167,20 @@ index and compares the digest of the downloaded `.deb`. Deb repositories can be 
 Content Views (see "Deb repositories in Content Views"). The fallback replication handles RPM
 and File only.
 
+Deb repository fields (create and edit; each is shown only when the server has it):
+
+| Field                           | Meaning                                                                                                                                                                                                      |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Signing service (Release)       | signs the `Release` file of a publication made without its own signing service (**P** with the field empty)                                                                                                  |
+| Per-release signing services    | `release=signing service href,...`, for example `bookworm=/pulp/api/v3/signing-services/<id>/`; this service signs that release instead. On edit, a release that you remove from the list loses its override |
+| Package signing service         | signs the `.deb` packages that an upload or `modify/` adds (not a sync or a copy); not in pulp_deb 3.8 and older                                                                                             |
+| Package signing fingerprint     | the key that the package signing service uses: `v4:<hex fingerprint>` or `keyid:<16 hex>`                                                                                                                    |
+| Publish upstream Release fields | on (Pulp's default for a new repository): a publication uses the `Release` fields (version, origin, label, description) of the upstream                                                                      |
+
+A Release file is signed with the signing service of the publication, else the per-release
+service, else the repository's service. The pickers list the signing services of all
+plugins; Pulp refuses one of the wrong type. Clear a field on edit to remove the setting.
+
 ### Remotes
 
 `t` switches RPM/File/Deb. Create/edit: URL (File: URL of `PULP_MANIFEST`; Deb: the Debian

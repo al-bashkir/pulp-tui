@@ -124,6 +124,44 @@ async fn a_removed_deb_package_is_no_longer_served() {
     cleanup(&c, &[&dist, &repo, &remote]).await;
 }
 
+/// An operator repository with its own signing service: a publication without one is signed by the
+/// repository's service, and after the edit form clears it (`signing_service: null`) it is not.
+#[tokio::test]
+async fn deb_repository_signs_with_its_own_service() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Deb;
+    let name = unique("it-deb-sign");
+    let service: Value =
+        ops::find_by_name(&c, &c.api("signing-services/"), "pulp-tui-deb-test").await.unwrap().expect("Deb test signing service");
+    let url = format!("{}/deb/", upstream());
+    let body = json!({ "name": name, "url": url, "policy": "immediate", "distributions": "fixture" });
+    let remote = create(&c, t.remotes(), body, "/remotes/").await;
+    // The body of the create form with a signing service picked.
+    let body = json!({ "name": name, "remote": remote, "signing_service": service["pulp_href"], "publish_upstream_release_fields": true });
+    let repo = create(&c, t.repositories(), body, "/repositories/").await;
+    let m = ops::sync(&c, t, &repo, None, "mirror").await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let v1 = latest(&c, &repo).await;
+
+    // Publish (P) sends no signing service: the repository's own one signs.
+    let mut dists = vec![];
+    for (suffix, expect) in [("signed", true), ("plain", false)] {
+        let publication = ops::create_publication(&c, t, &v1, None, &no_progress).await.unwrap();
+        let n = format!("{name}-{suffix}");
+        let dist = ops::ensure_distribution(&c, t, &n, &n, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
+        let d: Value = c.get(&dist, &[]).await.unwrap();
+        assert_eq!(signed(&c, d["base_url"].as_str().unwrap()).await, expect, "{suffix}");
+        dists.push(dist);
+        // Edit cleared the signing service.
+        let m = c.patch(&repo, &json!({ "signing_service": null })).await.unwrap();
+        ops::settle(&c, m, &no_progress).await.unwrap();
+    }
+    cleanup(&c, &[&dists[0], &dists[1], &repo, &remote]).await;
+}
+
 fn quiet(_: String) {}
 
 /// What the distribution of `cv` in `env` serves at (ends with `/`).

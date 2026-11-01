@@ -686,9 +686,45 @@ fn repo_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec
                 }));
             }
         }
-        RepoType::Deb => {}
+        RepoType::Deb => fields.extend(deb_repo_fields(&has, v)),
     }
     fields
+}
+
+/// The Deb signing settings of repository `v`, each when the server has the field (`has`).
+fn deb_repo_fields(has: &dyn Fn(&str) -> bool, v: &Value) -> Vec<Field> {
+    let pick = |k: &str, label: &str| Field::pick(k, label, Source::SigningServices).value(s(v, k));
+    let mut fields = Vec::new();
+    if has("signing_service") {
+        fields.push(pick("signing_service", "Signing service (Release)"));
+    }
+    if has("signing_service_release_overrides") {
+        let f = Field::text("signing_service_release_overrides", "Per-release signing services");
+        let help = "release=signing service href,...; a release you remove loses its override";
+        fields.push(f.value(format_labels(&v["signing_service_release_overrides"])).help(help));
+    }
+    if has("package_signing_service") {
+        fields.push(pick("package_signing_service", "Package signing service"));
+    }
+    if has("package_signing_fingerprint") {
+        let f = Field::text("package_signing_fingerprint", "Package signing fingerprint");
+        fields.push(f.value(s(v, "package_signing_fingerprint")).help("v4:<hex fingerprint> or keyid:<16 hex>"));
+    }
+    if has("publish_upstream_release_fields") {
+        let on = if v["publish_upstream_release_fields"] == false { "false" } else { "true" };
+        fields.push(Field::new("publish_upstream_release_fields", "Publish upstream Release fields", FieldKind::Bool).value(on));
+    }
+    fields
+}
+
+/// `release=href,...` as Pulp's per-release overrides. pulp_deb changes only the releases that a request
+/// names, so each release of `old` (the value before the edit) that `new` lacks is sent as null (deleted).
+fn release_overrides(new: &str, old: &str) -> Result<Value, String> {
+    let mut out = parse_labels(old)?;
+    let m = out.as_object_mut().expect("parse_labels makes an object");
+    m.values_mut().for_each(|v| *v = Value::Null);
+    m.extend(parse_labels(new)?.as_object().cloned().unwrap_or_default());
+    Ok(out)
 }
 
 /// `remote` is the name of the repository's default remote ("" = none, or not readable).
@@ -728,6 +764,9 @@ fn repo_body(f: &Form, edit: bool) -> Result<Value, String> {
             ("labels", _) => {
                 b["pulp_labels"] = parse_labels(v)?;
                 continue;
+            }
+            ("signing_service_release_overrides", _) if !v.is_empty() || edit => {
+                release_overrides(v, &fld.initial).map_err(|e| format!("{}: {e}", fld.label))?
             }
             (_, FieldKind::Bool) => Value::Bool(v == "true"),
             (_, FieldKind::Number) if v.is_empty() && edit && fld.key == "retain_repo_versions" => Value::Null,
@@ -2061,6 +2100,54 @@ mod tests {
         assert!(repo_body(&new, false).unwrap().get("remote").is_none(), "create: empty is not sent");
         set(&mut new, "remote", "epel");
         assert_eq!(repo_body(&new, false).unwrap()["remote"], "epel");
+    }
+
+    #[test]
+    fn deb_repository_signing_fields_follow_the_server_schema() {
+        let keys = |f: &[Field]| f.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
+        let all = ["signing_service", "signing_service_release_overrides", "package_signing_service", "package_signing_fingerprint"];
+        let all = [&all[..], &["publish_upstream_release_fields"]].concat();
+        assert_eq!(keys(&repo_extra_fields(RepoType::Deb, None, &Value::Null)), all);
+        // pulp_deb before package signing (3.5, 3.8) has only the Release signing fields.
+        let mut caps = Capabilities::default();
+        let old = ["signing_service", "signing_service_release_overrides", "publish_upstream_release_fields"];
+        caps.schemas.insert("deb.AptRepository".into(), old.map(String::from).into());
+        assert_eq!(keys(&repo_extra_fields(RepoType::Deb, Some(&caps), &Value::Null)), old);
+    }
+
+    #[test]
+    fn deb_repository_body_sends_the_signing_settings_and_on_edit_only_the_changes() {
+        let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+        let mut new = repo_form(RepoType::Deb, None, None, "");
+        set(&mut new, "name", "apt");
+        assert_eq!(new.get("publish_upstream_release_fields"), "true", "Pulp's default for a new repository");
+        set(&mut new, "signing_service", "/s/1/");
+        set(&mut new, "signing_service_release_overrides", "bookworm=/s/2/");
+        let b = repo_body(&new, false).unwrap();
+        assert_eq!(
+            (&b["signing_service"], &b["signing_service_release_overrides"], &b["publish_upstream_release_fields"]),
+            (&json!("/s/1/"), &json!({ "bookworm": "/s/2/" }), &json!(true))
+        );
+        assert!(b.get("package_signing_service").is_none() && b.get("package_signing_fingerprint").is_none(), "{b}");
+
+        let item = json!({ "name": "apt", "signing_service": "/s/1/", "signing_service_release_overrides": { "bookworm": "/s/2/", "trixie": "/s/2/" },
+            "package_signing_fingerprint": "v4:AB", "publish_upstream_release_fields": false, "pulp_labels": {} });
+        let mut f = repo_form(RepoType::Deb, None, Some(&item), "");
+        assert_eq!(repo_body(&f, true).unwrap(), json!({}), "untouched: nothing is sent");
+        assert_eq!(f.get("signing_service_release_overrides"), "bookworm=/s/2/,trixie=/s/2/");
+        assert_eq!((f.get("publish_upstream_release_fields"), f.get("package_signing_fingerprint")), ("false", "v4:AB"), "as stored");
+        set(&mut f, "signing_service", "");
+        set(&mut f, "signing_service_release_overrides", "trixie=/s/3/");
+        set(&mut f, "package_signing_fingerprint", "");
+        // pulp_deb changes only the releases a PATCH names: a removed release is sent as null.
+        assert_eq!(
+            repo_body(&f, true).unwrap(),
+            json!({ "signing_service": null, "signing_service_release_overrides": { "bookworm": null, "trixie": "/s/3/" },
+                "package_signing_fingerprint": null })
+        );
+        set(&mut f, "signing_service_release_overrides", "trixie");
+        let e = repo_body(&f, true).unwrap_err();
+        assert!(e.starts_with("Per-release signing services: ") && e.contains("must be key=value"), "{e}");
     }
 
     #[test]
