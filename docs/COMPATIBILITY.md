@@ -145,6 +145,13 @@ server gives the final answer; the dashboard shows a warning.
   `compression_type`, `layout`) come from the repository when the publication request does
   not set them (pulp_rpm `viewsets/repository.py`). A Content View publish copies them from
   the source repository to the snapshot repository first.
+* **File publish takes no setting from the repository** (pulp_file of pulpcore 3.123.1,
+  `serializers.py` `FilePublicationSerializer`, `models.py` `FileRepository.on_new_version`):
+  a publication request without `manifest` gets `PULP_MANIFEST`; the repository `manifest`
+  is used only by autopublish. `manifest: null` publishes no manifest. pulp-tui sends the
+  repository's `manifest` with every File publication it creates, and Verify fetches the
+  manifest that the served publication names (with none, it reports that it compared no
+  files).
 * **`sha256` of RPM packages and File content** comes from the stored file (pulpcore
   `ContentChecksumSerializer`; read in pulp_rpm 3.39.3 and pulp_file 3.123.0), so it is
   `null` for `on_demand` and `streamed` content until a client downloads it. Verify then

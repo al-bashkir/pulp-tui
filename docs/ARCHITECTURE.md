@@ -165,8 +165,8 @@ Task Center (no supported pulpcore needs the rule, see COMPATIBILITY.md).
   still has the view. The audit entry is `cv.unpromote`.
 * **Verify / drift**: for every binding, check that the distribution serves the expected
   publication, that the publication belongs to the expected snapshot version, that the
-  snapshot still exists, and that served content matches (`PULP_MANIFEST` equal to the
-  snapshot for File; `repomd.xml` plus the smallest package with digest check for RPM;
+  snapshot still exists, and that served content matches (the manifest that the publication
+  names, `PULP_MANIFEST` by default, equal to the snapshot for File; `repomd.xml` plus the smallest package with digest check for RPM;
   `dists/<distribution>/Release` plus the smallest package, found in a `Packages` index,
   with digest check for Deb).
   Retention set on a derived repository is reported. Drift is reconciled by promoting the

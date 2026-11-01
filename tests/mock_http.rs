@@ -698,7 +698,7 @@ async fn rpm_and_file_verify_units_not_downloaded_yet() {
         Mock::given(method("GET")).and(path(format!("{API}content/file/files/"))).respond_with(page(files.clone())).mount(&server).await;
         served("PULP_MANIFEST", &manifest).mount(&server).await;
         let c = client(&server, |_, _| {});
-        let res = pulp_tui::pulp::file::verify(&c, &format!("{}/pulp/content/d/", server.uri()), "/v/").await;
+        let res = pulp_tui::pulp::file::verify(&c, &format!("{}/pulp/content/d/", server.uri()), "/v/", Some("PULP_MANIFEST")).await;
         assert_eq!(res.is_ok(), ok, "{files}: {res:?}");
     }
 }
@@ -726,9 +726,91 @@ async fn file_verify_reads_paths_with_commas() {
             .await;
         served("PULP_MANIFEST", &manifest).mount(&server).await;
         let c = client(&server, |_, _| {});
-        let res = pulp_tui::pulp::file::verify(&c, &format!("{}/pulp/content/d/", server.uri()), "/v/").await;
+        let res = pulp_tui::pulp::file::verify(&c, &format!("{}/pulp/content/d/", server.uri()), "/v/", Some("PULP_MANIFEST")).await;
         assert_eq!(res.is_ok(), ok, "{manifest}: {res:?}");
     }
+}
+
+/// pulp_file gives a publication `PULP_MANIFEST` unless the request names one; autopublish uses the repository's.
+#[tokio::test]
+async fn file_publication_takes_the_manifest_of_the_repository() {
+    let repo = format!("{API}repositories/file/file/1/");
+    let version = format!("{repo}versions/2/");
+    for manifest in [json!("CUSTOM"), Value::Null] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(&repo))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": repo, "manifest": manifest })))
+            .mount(&server)
+            .await;
+        let coll = format!("{API}publications/file/file/");
+        Mock::given(method("POST"))
+            .and(path(&coll))
+            .and(body_json(json!({ "repository_version": version, "manifest": manifest })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{coll}1/") })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = client(&server, |_, _| {});
+        assert_eq!(ops::create_publication(&c, RepoType::File, &version, None, &no_progress).await.unwrap(), format!("{coll}1/"));
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn file_verify_reads_the_manifest_of_the_publication() {
+    let server = MockServer::start().await;
+    let good = hex::encode(Sha256::digest(b"file bytes"));
+    let files = json!([{ "pulp_href": "/f/a/", "relative_path": "a.txt", "sha256": good }]);
+    Mock::given(method("GET"))
+        .and(path(format!("{API}content/file/files/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": files })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pulp/content/d/CUSTOM"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!("a.txt,{good},10\n")))
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+    let base = format!("{}/pulp/content/d/", server.uri());
+    let verify = |p: Value| {
+        let (c, base) = (&c, &base);
+        async move { ops::verify_served(c, RepoType::File, base, "/v/", &p).await }
+    };
+    assert_eq!(verify(json!({ "manifest": "CUSTOM" })).await.unwrap(), "CUSTOM matches 1 files");
+    assert!(verify(json!({ "manifest": "PULP_MANIFEST" })).await.unwrap_err().to_string().contains("PULP_MANIFEST returned HTTP 404"));
+    assert_eq!(verify(json!({ "manifest": null })).await.unwrap(), "the publication has no manifest: served files not compared");
+}
+
+#[tokio::test]
+async fn rpm_verify_reads_the_layout_of_the_publication() {
+    let server = MockServer::start().await;
+    let good = hex::encode(Sha256::digest(b"rpm bytes"));
+    let pkgs = json!([{ "location_href": "bash-5.2-1.x86_64.rpm", "sha256": good }]);
+    Mock::given(method("GET"))
+        .and(path(format!("{API}content/rpm/packages/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": pkgs })))
+        .mount(&server)
+        .await;
+    for (p, body) in [("repodata/repomd.xml", "<repomd/>"), ("Packages/bash-5.2-1.x86_64.rpm", "rpm bytes")] {
+        Mock::given(method("GET"))
+            .and(path(format!("/pulp/content/d/{p}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+    }
+    let c = client(&server, |_, _| {});
+    let base = format!("{}/pulp/content/d/", server.uri());
+    let verify = |p: Value| {
+        let (c, base) = (&c, &base);
+        async move { ops::verify_served(c, RepoType::Rpm, base, "/v/", &p).await }
+    };
+    let ok = "repomd.xml and Packages/bash-5.2-1.x86_64.rpm served with matching digest (1 packages)";
+    assert_eq!(verify(json!({ "layout": "flat" })).await.unwrap(), ok);
+    // Without a layout the package is looked for at the nested path (Pulp's default), where this one is not.
+    let e = verify(json!({})).await.unwrap_err().to_string();
+    assert!(e.contains("tried Packages/b/bash-5.2-1.x86_64.rpm, bash-5.2-1.x86_64.rpm"), "{e}");
 }
 
 #[tokio::test]

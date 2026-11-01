@@ -14,10 +14,11 @@ pub fn key(f: &FileContent) -> String {
     format!("{}  ({})", f.relative_path, f.sha256.as_deref().map(|s| &s[..s.len().min(12)]).unwrap_or("?"))
 }
 
-/// The served manifest must list exactly the version's files. `base` ends with `/`.
-pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String> {
+/// The served manifest (the publication's `manifest`; `None`: it has none) must list exactly the
+/// version's files. `base` ends with `/`.
+pub async fn verify(c: &PulpClient, base: &str, version: &str, manifest: Option<&str>) -> Result<String> {
     let fail = |m: String| Err(PulpError::Unsupported(m));
-    let probe = "PULP_MANIFEST";
+    let Some(probe) = manifest else { return Ok("the publication has no manifest: served files not compared".into()) };
     let (status, body) = c.fetch_content(&format!("{base}{probe}"), 64 << 20).await?;
     if status != 200 {
         return fail(format!("{probe} returned HTTP {status}"));
@@ -37,5 +38,5 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String>
     if differs || served.len() != want.len() {
         return fail(format!("served manifest differs from snapshot ({} served, {} expected)", served.len(), want.len()));
     }
-    Ok(format!("PULP_MANIFEST matches {} files", want.len()))
+    Ok(format!("{probe} matches {} files", want.len()))
 }

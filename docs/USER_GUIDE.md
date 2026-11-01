@@ -267,7 +267,7 @@ repository version) or **FOLLOWS LATEST** (repository). **y** copies the content
 (OSC 52 terminal clipboard; in tmux it needs `set -g allow-passthrough on` or
 `set -s set-clipboard on`), **V** verifies what is served (for a distribution that follows
 a repository: its newest publication, which is not the latest version when that version has
-no publication), **b** re-points to a version (preview first; Deb: with the signing service
+no publication; File: the manifest file name of that publication), **b** re-points to a version (preview first; Deb: with the signing service
 of the publication it serves now), **c**/**e** create/edit
 (name, base path, binding, content guard, labels; Deb: the optional signing service of a
 pinned publication), **d** delete. A distribution of a

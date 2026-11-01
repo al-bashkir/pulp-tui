@@ -123,20 +123,16 @@ fn served_by(ds: &[Distribution], serves: impl Fn(&Distribution) -> bool) -> Vec
 /// A repository binding serves the newest publication of the repository (pulpcore orders by repository
 /// version, then creation), which is not the latest version when that one has no publication.
 async fn served_now(c: &PulpClient, t: RepoType, d: &Value) -> anyhow::Result<Option<(String, Value, String)>> {
-    if let Some(p) = d["publication"].as_str() {
-        let pv: Value = c.get(p, &[]).await?;
-        return Ok(Some((s(&pv, "repository_version"), pv, format!("pinned to publication {}", short(p)))));
-    }
-    if let Some(v) = d["repository_version"].as_str() {
-        return Ok(Some((v.to_string(), Value::Null, "pinned to repository version".into())));
-    }
-    let Some(r) = d["repository"].as_str() else { return Ok(None) };
-    let pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository", r.into())], 100_000).await?;
-    let newest = pubs.into_iter().max_by_key(|p| (version_number(&s(p, "repository_version")), s(p, "pulp_created")));
-    Ok(newest.map(|p| {
-        let how = format!("follows repository {}: newest publication {}", short(r), short(&s(&p, "pulp_href")));
-        (s(&p, "repository_version"), p, how)
-    }))
+    let version = d["repository_version"].as_str();
+    let Some(p) = ops::served_publication(c, t, d).await? else {
+        return Ok(version.map(|v| (v.to_string(), Value::Null, "pinned to repository version".into())));
+    };
+    let how = match (d["publication"].as_str(), version) {
+        (Some(x), _) => format!("pinned to publication {}", short(x)),
+        (None, Some(_)) => "pinned to repository version".into(),
+        (None, None) => format!("follows repository {}: newest publication {}", short(&s(d, "repository")), short(&s(&p, "pulp_href"))),
+    };
+    Ok(Some((s(&p, "repository_version"), p, how)))
 }
 
 pub(super) fn caps(app: &App) -> Option<std::sync::Arc<Capabilities>> {
@@ -1520,7 +1516,7 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
                     let base = s(&d, "base_path");
                     ops::ensure_distribution(c, t, &dist, &base, Some(&p), &json!({}), None, &on).await?;
                     let pv: Value = c.get(&p, &[]).await?;
-                    let check = ops::verify_served(c, t, &s(&d, "base_url"), &version, &s(&pv, "layout")).await;
+                    let check = ops::verify_served(c, t, &s(&d, "base_url"), &version, &pv).await;
                     ap(move |app| {
                         match check {
                             Ok(m) => app.ok(format!("{dist} now serves {}: {m}", short(&version))),
@@ -1750,7 +1746,7 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             let Some((version, publication, how)) = served_now(c, t, &d).await? else {
                 bail!("distribution serves nothing (no binding, or its repository has no publication)");
             };
-            let res = ops::verify_served(c, t, &s(&d, "base_url"), &version, &s(&publication, "layout")).await;
+            let res = ops::verify_served(c, t, &s(&d, "base_url"), &version, &publication).await;
             let lines = vec![
                 format!("{name}: {how}"),
                 format!("expected content: {}", short(&version)),
@@ -3461,6 +3457,58 @@ mod tests {
         let served = served_now(c, RepoType::Rpm, &json!({ "repository": repo })).await.unwrap().unwrap();
         assert_eq!((served.0, s(&served.1, "layout").as_str()), (format!("{repo}versions/2/"), "flat"));
         assert_eq!(served_now(c, RepoType::Rpm, &json!({ "name": "unbound" })).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_version_binding_serves_the_newest_publication_of_that_version() {
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let v = format!("{API}repositories/file/file/r/versions/2/");
+        let pubs = page(json!([
+            { "pulp_href": "/p/old/", "repository_version": v, "pulp_created": "2026-01-01T00:00:00Z", "manifest": "OLD" },
+            { "pulp_href": "/p/new/", "repository_version": v, "pulp_created": "2026-01-02T00:00:00Z", "manifest": "CUSTOM" },
+        ]));
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}publications/file/file/")))
+            .and(query_param("repository_version", v.as_str()))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(pubs))
+            .mount(&server)
+            .await;
+        let (app, _rx) = connected(&server).await;
+        let c = &app.conn.as_ref().unwrap().client;
+        let (version, p, how) = served_now(c, RepoType::File, &json!({ "repository_version": v })).await.unwrap().unwrap();
+        assert_eq!((version, s(&p, "manifest"), how.as_str()), (v.clone(), "CUSTOM".into(), "pinned to repository version"));
+    }
+
+    #[tokio::test]
+    async fn verify_compares_the_manifest_that_the_distribution_serves() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let (repo, dist) = (format!("{API}repositories/file/file/r/"), format!("{API}distributions/file/file/d/"));
+        let base = format!("{}/pulp/content/docs/", server.uri());
+        get(&server, &dist, json!({ "pulp_href": dist, "name": "docs", "base_url": base, "repository": repo })).await;
+        // The repository was published with its custom manifest name.
+        let p = json!({ "pulp_href": "/p/1/", "repository_version": format!("{repo}versions/1/"), "pulp_created": "2026-01-01T00:00:00Z", "manifest": "CUSTOM" });
+        get(&server, &format!("{API}publications/file/file/"), page(json!([p]))).await;
+        get(
+            &server,
+            &format!("{API}content/file/files/"),
+            page(json!([{ "pulp_href": "/f/a/", "relative_path": "a.txt", "sha256": "ab" }])),
+        )
+        .await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/content/docs/CUSTOM"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("a.txt,ab,3\n"))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        distribution_action(&mut app, RepoType::File, Act::Verify, json!({ "pulp_href": dist, "name": "docs" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { title, lines, .. }) = &app.modal else { panic!("no result: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert_eq!(title, "Verify docs");
+        assert_eq!(lines.first().map(String::as_str), Some("docs: follows repository r: newest publication 1"), "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("OK: CUSTOM matches 1 files"), "{lines:?}");
     }
 
     #[tokio::test]

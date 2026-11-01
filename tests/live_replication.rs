@@ -69,7 +69,7 @@ async fn downstream_has(c: &PulpClient, dist_name: &str, nevra: &str) -> bool {
         _ if d.repository.is_some() => latest(c, d.repository.as_deref().unwrap()).await,
         _ => panic!("distribution {dist_name} serves nothing"),
     };
-    ops::verify_served(c, RepoType::Rpm, d.base_url.as_deref().unwrap(), &version, "").await.unwrap();
+    ops::verify_served(c, RepoType::Rpm, d.base_url.as_deref().unwrap(), &version, &Value::Null).await.unwrap();
     ops::content_keys(c, RepoType::Rpm, Some(&version)).await.unwrap().contains(nevra)
 }
 

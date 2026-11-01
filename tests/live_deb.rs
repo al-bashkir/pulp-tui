@@ -61,7 +61,7 @@ async fn deb_mirror_copy_publish_verify() {
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let d: Value = c.get(&dist, &[]).await.unwrap();
     let base = d["base_url"].as_str().unwrap().to_string();
-    let msg = ops::verify_served(&c, t, &base, &v2, "").await.unwrap();
+    let msg = ops::verify_served(&c, t, &base, &v2, &Value::Null).await.unwrap();
     assert!(msg.contains("matching digest"), "{msg}");
     let (status, index) = served(&c, &format!("{base}dists/fixture/main/binary-amd64/Packages")).await;
     let index = String::from_utf8_lossy(&index);

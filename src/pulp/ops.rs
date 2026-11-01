@@ -227,6 +227,16 @@ pub async fn create_publication(
     if let Some(s) = signing_service {
         body["signing_service"] = s.into();
     }
+    match t {
+        // pulp_file reads the repository `manifest` only for autopublish; a publish request defaults to PULP_MANIFEST.
+        RepoType::File => {
+            let r: Value = c.get(&repo_of_version(version), &[("fields", "manifest".into())]).await?;
+            if let Some(m) = r.get("manifest") {
+                body["manifest"] = m.clone();
+            }
+        }
+        RepoType::Rpm | RepoType::Deb => {}
+    }
     create(c, &c.api(t.publications()), &body, "/publications/", on).await
 }
 
@@ -411,14 +421,32 @@ pub async fn all_content_keys(c: &PulpClient, t: RepoType, version: &str) -> Res
     Ok(out)
 }
 
+/// The publication a distribution (JSON) serves, picked as pulpcore picks it: its own; else the newest
+/// one of its repository version; else the newest one of the newest published version of its repository.
+pub async fn served_publication(c: &PulpClient, t: RepoType, d: &Value) -> Result<Option<Value>> {
+    if let Some(p) = d["publication"].as_str() {
+        return Ok(Some(c.get(p, &[]).await?));
+    }
+    let q = match (d["repository_version"].as_str(), d["repository"].as_str()) {
+        (Some(v), _) => ("repository_version", v),
+        (None, Some(r)) => ("repository", r),
+        (None, None) => return Ok(None),
+    };
+    let pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &[(q.0, q.1.into())], 100_000).await?;
+    let key =
+        |p: &Value| (version_number(p["repository_version"].as_str().unwrap_or_default()), p["pulp_created"].as_str().map(str::to_string));
+    Ok(pubs.into_iter().max_by_key(key))
+}
+
 /// Fetch what a distribution actually serves and compare it with a repository version:
 /// File manifests must list exactly the version's files; RPM and Deb metadata must be served and
-/// the smallest package must be downloadable with the expected digest.
-pub async fn verify_served(c: &PulpClient, t: RepoType, base_url: &str, version: &str, layout: &str) -> Result<String> {
+/// the smallest package must be downloadable with the expected digest. `publication` is the served
+/// one: its RPM `layout` and File `manifest` say where the content is.
+pub async fn verify_served(c: &PulpClient, t: RepoType, base_url: &str, version: &str, publication: &Value) -> Result<String> {
     let base = if base_url.ends_with('/') { base_url.to_string() } else { format!("{base_url}/") };
     match t {
-        RepoType::Rpm => rpm::verify(c, &base, version, layout).await,
-        RepoType::File => file::verify(c, &base, version).await,
+        RepoType::Rpm => rpm::verify(c, &base, version, publication["layout"].as_str().unwrap_or_default()).await,
+        RepoType::File => file::verify(c, &base, version, publication["manifest"].as_str()).await,
         RepoType::Deb => deb::verify(c, &base, version).await,
     }
 }

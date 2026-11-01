@@ -1169,7 +1169,7 @@ impl CvService {
                 continue;
             };
             let dv = vr.derived_version.as_deref().unwrap_or_default();
-            if let Err(e) = ops::verify_served(c, br.repo_type, base, dv, p["layout"].as_str().unwrap_or_default()).await {
+            if let Err(e) = ops::verify_served(c, br.repo_type, base, dv, &p).await {
                 issues.push(format!("{}: {e}", br.repo_name));
             }
         }
@@ -2638,6 +2638,63 @@ mod tests {
         assert_eq!(v1.state, "published");
         assert_eq!(note.as_deref(), Some("Library not changed: v2 is newer (use Rollback to serve v1)"));
         assert_eq!(s.binding(lib, web).await.unwrap().unwrap().version_id, v2.id, "Library keeps the newer v2");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_reads_the_manifest_of_the_served_file_publication() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let s = &svc.store;
+        let cv = s.create_cv("k", "docs", "").await.unwrap();
+        let (src, derived) = ("/pulp/api/v3/repositories/file/file/1/", "/pulp/api/v3/repositories/file/file/2/");
+        let r = CvRepo { repo_href: src.into(), repo_name: "files".into(), repo_type: RepoType::File, filters: vec![] };
+        let v = s.begin_version(cv, "", std::slice::from_ref(&r)).await.unwrap();
+        let (dv, publication, dist) =
+            (format!("{derived}versions/1/"), "/pulp/api/v3/publications/file/file/1/", "/pulp/api/v3/distributions/file/file/1/");
+        let row = CvVersionRepo {
+            version_id: v.id,
+            repo: Some(r),
+            derived_repo: Some(derived.into()),
+            derived_version: Some(dv.clone()),
+            publication: Some(publication.into()),
+            ..Default::default()
+        };
+        s.save_version_repo(&row).await.unwrap();
+        s.finish_version(v.id, "published", None).await.unwrap();
+        let lib = s.ensure_library("k").await.unwrap();
+        s.set_binding(lib, cv, v.id, "active").await.unwrap();
+        let b = BindingRepo {
+            env_id: lib,
+            cv_id: cv,
+            repo_href: src.into(),
+            repo_name: "files".into(),
+            repo_type: RepoType::File,
+            distribution: dist.into(),
+            base_path: "library/docs/files".into(),
+            publication: Some(publication.into()),
+        };
+        s.save_binding_repo(&b).await.unwrap();
+        let get = |p: String, body: Value| {
+            let m = wiremock::Mock::given(wiremock::matchers::method("GET")).and(wiremock::matchers::path(p));
+            m.respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body)).mount(&server)
+        };
+        let base = format!("{}/pulp/content/library/docs/files/", server.uri());
+        get(
+            dist.into(),
+            json!({ "pulp_href": dist, "name": "d", "base_path": "library/docs/files", "base_url": base, "publication": publication }),
+        )
+        .await;
+        // The snapshot was published with the custom manifest name of its source repository.
+        get(publication.into(), json!({ "pulp_href": publication, "repository_version": dv, "manifest": "CUSTOM" })).await;
+        get(dv.clone(), json!({ "pulp_href": dv })).await;
+        let files = json!({ "count": 1, "next": null, "results": [{ "pulp_href": "/f/a/", "relative_path": "a.txt", "sha256": "ab" }] });
+        get("/pulp/api/v3/content/file/files/".into(), files).await;
+        let issues = svc.verify(cv, lib).await.unwrap();
+        assert_eq!(issues, ["files: not supported by this server: CUSTOM returned HTTP 404"], "the manifest of the publication is fetched");
+        let served = wiremock::ResponseTemplate::new(200).set_body_string("a.txt,ab,3\n");
+        let manifest = wiremock::Mock::given(wiremock::matchers::path("/pulp/content/library/docs/files/CUSTOM"));
+        manifest.respond_with(served).mount(&server).await;
+        assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new(), "served as bound");
     }
 
     #[test]
