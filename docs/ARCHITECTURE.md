@@ -60,11 +60,16 @@ one background list read (`tasks/?pulp_href__in=...&fields=pulp_href,started_at`
 dialog), keeps the `created_at` of the stored reference. A task that the server answers with 404 (purged) gets the final state `gone`. A poll answer for a task
 that is not tracked (sent to the previous server before a Connect) is dropped.
 
-Task groups (native replication, import) are final when no task is waiting or running and
-the group says all tasks were dispatched, a task failed, the replication finalizer
-completed, or the `pulp_import` task completed (it dispatches every task of an import).
-pulpcore 3.123 leaves `all_tasks_dispatched` false after a replication and an import, so an
-idle group whose counts stay the same for three polls is also treated as final.
+Task groups (native replication, import, ACS refresh) are final when no task is waiting or
+running and the group says all tasks were dispatched, a task failed, the replication
+finalizer completed, or the `pulp_import` task completed (it dispatches every task of an
+import). pulpcore 3.123 leaves `all_tasks_dispatched` false after a replication and an
+import, so an idle group whose counts stay the same for three polls is also treated as
+final. An ACS refresh never sets the flag either, but it dispatches all its tasks before it
+answers: a group whose description is the one of a refresh (`Refreshing ... alternate
+content source ...`, pulp_rpm, pulp_file and pulp_deb) is final when its tasks are.
+*Refresh* goes through `submit`, which gives a returned task group to the Task Center as it
+gives a task.
 
 A task group is one Task Center row. Its href goes into the same task references (the href
 tells a group from a task, so the store has no extra column), and `ops::get_task` reads it
@@ -541,5 +546,6 @@ ends in the same state. It never changes an existing object.
   `is_staff`, changing or removing one's own access) and refuses deleting the logged-in
   account. It never works around a 403.
 * Destructive operations show the impact first. Deleting repositories, distributions,
-  users, roles, Content Views and protected promotions requires typing the name.
+  users, roles, Content Views, alternate content sources and protected promotions, and
+  reclaiming the disk space of a repository require typing the name.
   Production profiles show a red banner and add a warning line to these dialogs.

@@ -36,14 +36,13 @@ where
     });
 }
 
-/// Report what a mutation returned, as `submit` does.
+/// Report what a mutation returned, as `submit` does. The Task Center polls a task group as one task.
 fn submitted(app: &mut App, m: Mutation, label: &str) {
     match m {
-        Mutation::Task(h) => {
+        Mutation::Task(h) | Mutation::TaskGroup(h) => {
             app.track_task(&h, label);
             app.notify(Level::Info, format!("submitted: {label} (see Tasks)"));
         }
-        Mutation::TaskGroup(g) => app.ok(format!("{label}: task group {g}")),
         _ => {
             app.ok(format!("{label}: done"));
             app.reload();
@@ -208,6 +207,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         (Kind::Profiles, _) => profile_action(app, act, item),
         (Kind::Repos(t, _), _) => repo_action(app, *t, act, item),
         (Kind::Remotes(t), _) => remote_action(app, *t, act, item),
+        (Kind::Acs(t), _) => acs_action(app, *t, act, item),
         (Kind::Versions(_), Act::PruneOrphans) => prune_orphans(app),
         (Kind::Versions(_), _) => version_action(app, act, item),
         (Kind::Content { version, .. }, _) => content_action(app, version.clone(), act),
@@ -952,7 +952,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
     if let Some(e) = snapshot_refusal(&item)
-        && matches!(act, Act::Sync | Act::Upload | Act::CopyContent | Act::Edit)
+        && matches!(act, Act::Sync | Act::Upload | Act::UploadComps | Act::UploadAdvisory | Act::CopyContent | Act::Reclaim | Act::Edit)
     {
         app.error(e);
         return;
@@ -1071,6 +1071,40 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 },
             );
         }
+        Act::Reclaim => reclaim(app, href),
+        Act::UploadComps | Act::UploadAdvisory => {
+            let comps = act == Act::UploadComps;
+            let (what, ep) = if comps { ("comps.xml", rpm::COMPS) } else { ("advisory", rpm::ADVISORIES) };
+            if caps(app).is_some_and(|c| !c.has_operation(ep, "post")) {
+                return app.error(format!("not supported by this server: {what} upload ({ep})"));
+            }
+            let mut fields = vec![Field::text("path", "Local file path").required()];
+            if comps {
+                fields.push(Field::new("replace", "Replace", FieldKind::Bool).help("on = first remove the comps units the repository has"));
+            }
+            let note = if comps {
+                "Adds the package groups, categories, environments and langpacks of the file."
+            } else {
+                "One advisory as JSON (updateinfo fields): id, issued and updated are required, and each package needs sum_type."
+            };
+            app.form(Form::new(format!("Upload {what} to {name}"), fields).note(note), move |app, f| {
+                let path = std::path::PathBuf::from(f.get("path"));
+                if !path.is_file() {
+                    return Err(format!("{} is not a readable file", path.display()));
+                }
+                let (href, replace, label) = (href.clone(), f.bool("replace"), format!("upload {what} to {name}"));
+                app.job(label.clone(), move |ctx| async move {
+                    let c = &ctx.client;
+                    let m = if comps {
+                        rpm::upload_comps(c, &path, &href, replace).await?
+                    } else {
+                        rpm::upload_advisory(c, &path, &href).await?
+                    };
+                    ap(move |app| follow(app, m, label.clone(), move |app, t| new_version(app, &label, &t)))
+                });
+                Ok(())
+            });
+        }
         Act::Publish => match item["latest_version_href"].as_str() {
             None => app.error("repository has no versions"),
             Some(v) => {
@@ -1161,6 +1195,73 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         }
         _ => {}
     }
+}
+
+/// Reclaim the disk space of `repo`: ask which versions keep their files, load the impact (its versions, its remote
+/// and the remote's policy), then the confirm typed with the repository name.
+fn reclaim(app: &mut App, repo: String) {
+    if caps(app).is_some_and(|c| !c.has_endpoint(ops::RECLAIM_SPACE)) {
+        return app.error(format!("not supported by this server: reclaim space ({})", ops::RECLAIM_SPACE));
+    }
+    let keep = Field::text("keep", "Keep versions").help("numbers, e.g. 3,4: these versions keep their files; empty = none");
+    app.form(Form::new("Reclaim disk space", vec![keep]), move |app, f| {
+        let keep: Vec<u64> = f
+            .get("keep")
+            .split([',', ' '])
+            .filter(|n| !n.is_empty())
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .map_err(|_| "Keep versions: version numbers, e.g. 3,4".to_string())?;
+        let repo = repo.clone();
+        app.job("impact of reclaiming space", move |ctx| async move {
+            let c = &ctx.client;
+            let r: Value = c.get(&repo, &[]).await?;
+            if let Some(e) = snapshot_refusal(&r) {
+                bail!(e);
+            }
+            let name = s(&r, "name");
+            let versions: Vec<Value> = c.list_all(&format!("{repo}versions/"), &[("fields", "number".into())], 100_000).await?;
+            let numbers: Vec<u64> = versions.iter().filter_map(|v| v["number"].as_u64()).collect();
+            if let Some(n) = keep.iter().find(|n| !numbers.contains(n)) {
+                bail!("refused: {name} has no version {n}");
+            }
+            let remote = match r["remote"].as_str() {
+                Some(h) => {
+                    let v: Value = c.get(h, &[("fields", "name,policy".into())]).await?;
+                    format!("Default remote: {} (policy {}).", s(&v, "name"), s(&v, "policy"))
+                }
+                None => "No default remote: a file comes again from the remote of the sync that added it.".into(),
+            };
+            let kept = match keep.as_slice() {
+                [] => "No version keeps its files.".to_string(),
+                k => format!("Versions that keep their files: {}", k.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")),
+            };
+            let lines = vec![
+                format!("Reclaim disk space of {name}: Pulp deletes the stored files of its synced content that no other repository has."),
+                format!("The content stays in all {} versions: a client request downloads a file again from its remote", numbers.len()),
+                "(on demand), so the upstream must still serve it. Uploaded content (no remote) keeps its files.".into(),
+                remote,
+                kept,
+            ];
+            let keep: Vec<String> = keep.iter().map(|n| version_of(&repo, *n as i64)).collect();
+            ap(move |app| {
+                app.confirm_danger(format!("Reclaim space of {name}"), lines, &name.clone(), move |app| {
+                    let label = format!("reclaim space of {name}");
+                    app.job(label.clone(), move |ctx| async move {
+                        let m = ops::reclaim_space(&ctx.client, &repo, &keep).await?;
+                        ap(move |app| follow(app, m, label.clone(), move |app, t| reclaimed(app, &label, &t)))
+                    })
+                })
+            })
+        });
+        Ok(())
+    });
+}
+
+/// The reclaim task ended: the files its progress report deleted.
+fn reclaimed(app: &mut App, label: &str, t: &Task) {
+    let done = t.progress_reports.iter().find(|r| r.code == "reclaim-space.artifact").and_then(|r| r.done).unwrap_or(0);
+    app.ok(format!("{label}: deleted {done} file(s)"));
 }
 
 /// The optional signing service of a Deb publication; `None` for other types and when the server's Deb
@@ -1535,6 +1636,131 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     }
 }
 
+// ---- alternate content sources -------------------------------------------------------------
+
+/// `path,...` (or space-separated) as the paths of an ACS; empty = the remote URL itself.
+fn acs_paths(v: &str) -> Vec<String> {
+    v.split([',', ' ']).map(str::trim).filter(|p| !p.is_empty()).map(str::to_string).collect()
+}
+
+fn acs_action(app: &mut App, t: RepoType, act: Act, item: Value) {
+    let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
+    match act {
+        Act::Create | Act::Edit => acs_edit(app, t, act == Act::Edit, item),
+        // A task group: the Task Center follows it and reports how it ended.
+        Act::Refresh => {
+            submit(app, format!("refresh ACS {name}"), move |c| async move { Ok(c.post(&format!("{href}refresh/"), &json!({})).await?) })
+        }
+        Act::Delete => {
+            let n = item["paths"].as_array().map_or(0, Vec::len);
+            let mut lines = vec![
+                format!("Delete alternate content source {name} and its {n} path(s). Its remote and the content stay."),
+                "Pulp also deletes the hidden repositories of its refreshes. Syncs then download from their remotes only.".into(),
+            ];
+            match t {
+                RepoType::Rpm | RepoType::File => {}
+                RepoType::Deb => {
+                    lines.push(format!("pulp_deb keeps its hidden repository {name}--repository; a new ACS {name} uses it again."))
+                }
+            }
+            app.confirm_danger(format!("Delete ACS {name}"), lines, &name.clone(), move |app| {
+                submit(app, format!("delete ACS {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+            });
+        }
+        _ => {}
+    }
+}
+
+/// ACS Create, or Edit of `item`. The remote field holds a name, as in the repository form.
+fn acs_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
+    let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
+    let current = item["remote"].as_str().filter(|_| edit).map(str::to_string);
+    let label = format!("remote of {name}");
+    let open = move |app: &mut App, remote: String| {
+        let paths: Vec<&str> = item["paths"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let mut fields = vec![
+            Field::text("name", "Name").required().value(s(&item, "name")),
+            Field::pick("remote", "Remote", Source::Remotes(t)).required().value(remote).help("Pulp takes only an on_demand remote"),
+        ];
+        match t {
+            RepoType::Rpm | RepoType::File => {
+                let help = "path,... added to the remote URL; empty = the remote URL";
+                fields.push(Field::text("paths", "Paths").value(paths.join(",")).help(help));
+            }
+            RepoType::Deb => {} // pulp_deb refreshes the remote URL and ignores paths
+        }
+        let title = if edit { format!("Edit ACS {name}") } else { format!("New {} alternate content source", t.label()) };
+        let form = Form::new(title, fields).note("Refresh (R) indexes the source; then syncs download the files it has from it.");
+        app.form(form, move |app, f| {
+            let mut b = json!({});
+            for k in ["name", "remote"] {
+                if !edit || f.changed(k) {
+                    b[k] = f.get(k).into();
+                }
+            }
+            let new = acs_paths(f.get("paths"));
+            let old = f.fields.iter().find(|x| x.key == "paths").map(|x| acs_paths(&x.initial)).unwrap_or_default();
+            if f.fields.iter().any(|x| x.key == "paths") && (!edit || f.changed("paths")) {
+                b["paths"] = new.clone().into();
+            }
+            let removed: Vec<String> = old.into_iter().filter(|p| !new.contains(p)).collect();
+            let (href, label) = (href.clone(), format!("{} ACS {}", if edit { "update" } else { "create" }, f.get("name")));
+            let me = href.clone();
+            let go = move |app: &mut App| {
+                submit(app, label, move |c| async move {
+                    if let Some(r) = b["remote"].as_str().map(str::to_string) {
+                        b["remote"] = href_by_name(&c, t.remotes(), &r).await?.into();
+                    }
+                    Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api(t.acs()), &b).await? })
+                })
+            };
+            if removed.is_empty() {
+                go(app);
+                return Ok(());
+            }
+            // pulpcore 3.123 deletes a removed path from every ACS with that path (`_update_paths`).
+            app.job("alternate content sources with the removed paths", move |ctx| async move {
+                let c = &ctx.client;
+                let mut lines = vec![];
+                for u in RepoType::ALL.into_iter().filter(|u| ctx.caps.supports(u.feature()) && ctx.caps.has_endpoint(u.acs())) {
+                    let all: Vec<Value> = c.list_all(&c.api(u.acs()), &[("fields", "pulp_href,name,paths".into())], 100_000).await?;
+                    for a in all.iter().filter(|a| s(a, "pulp_href") != me) {
+                        let lost: Vec<&str> = a["paths"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .filter(|p| removed.iter().any(|r| r == p))
+                            .collect();
+                        if !lost.is_empty() {
+                            lines.push(format!("  {} ({}): {}", s(a, "name"), u.label(), lost.join(", ")));
+                        }
+                    }
+                }
+                ap(move |app| {
+                    if lines.is_empty() {
+                        return go(app);
+                    }
+                    lines.insert(
+                        0,
+                        "Pulp deletes a removed path from every alternate content source that has it. These lose it too:".into(),
+                    );
+                    app.confirm("Remove ACS paths", lines, go);
+                })
+            });
+            Ok(())
+        });
+    };
+    match current {
+        // The picker holds names: read the current remote's name so the field shows it.
+        Some(r) => app.job(label, move |ctx| async move {
+            let v = ctx.client.get::<Value>(&r, &[("fields", "name".into())]).await?;
+            ap(move |app| open(app, s(&v, "name")))
+        }),
+        None => open(app, String::new()),
+    }
+}
+
 // ---- versions and content ------------------------------------------------------------------
 
 /// The units added and removed from version `a` to `b`, with a warning for a version of which Pulp
@@ -1587,6 +1813,7 @@ fn version_action(app: &mut App, act: Act, item: Value) {
             });
         }
         Act::Restore => restore_preview(app, t, href, number),
+        Act::Repair => repair(app, t, href, number),
         Act::Compare => {
             let marked: Vec<String> = app.list.marked.iter().filter(|m| **m != href).cloned().collect();
             let [other] = marked.as_slice() else {
@@ -1676,6 +1903,48 @@ fn orphans_pruned(app: &mut App, label: &str, t: &Task) {
     app.ok(format!("{label}: deleted {} content unit(s) and {} artifact(s)", done("clean-up.content"), done("clean-up.artifacts")));
 }
 
+/// Repair of `version`: ask how deep to check, show what the version has, then repair on confirmation.
+fn repair(app: &mut App, t: RepoType, version: String, number: String) {
+    if caps(app).is_some_and(|c| !c.has_endpoint(t.version_repair())) {
+        return app.error(format!("not supported by this server: repository version repair ({})", t.version_repair()));
+    }
+    let help = "on = read every file and compare its digest (slow); off = check only that each file exists";
+    let verify = Field::new("verify_checksums", "Verify checksums", FieldKind::Bool).value("true").help(help);
+    app.form(Form::new(format!("Repair version {number}"), vec![verify]), move |app, f| {
+        let (version, number, verify) = (version.clone(), number.clone(), f.bool("verify_checksums"));
+        app.job(format!("impact of repairing version {number}"), move |ctx| async move {
+            let n = ctx.client.get::<RepoVersion>(&version, &[]).await?.content_summary.present_count();
+            if n == 0 {
+                bail!("refused: version {number} has no content; Pulp would repair every file of the server");
+            }
+            let lines = vec![
+                format!("Repair version {number} ({}): Pulp checks the files of its {n} content unit(s).", short(&version)),
+                if verify { "It reads every file and compares its digest (slow)." } else { "It checks only that each file exists." }.into(),
+                "It downloads a missing or corrupt file again from a remote that has it,".into(),
+                "and deletes a corrupt file that no remote can give again.".into(),
+            ];
+            ap(move |app| {
+                app.confirm(format!("Repair version {number}"), lines, move |app| {
+                    let label = format!("repair version {number}");
+                    app.job(label.clone(), move |ctx| async move {
+                        let m = ops::repair_version(&ctx.client, &version, verify).await?;
+                        ap(move |app| follow(app, m, label.clone(), move |app, t| repaired(app, &label, &t)))
+                    })
+                })
+            })
+        });
+        Ok(())
+    });
+}
+
+/// The repair task ended: what its progress reports counted.
+fn repaired(app: &mut App, label: &str, t: &Task) {
+    let done = |code: &str| t.progress_reports.iter().find(|r| r.code == code).and_then(|r| r.done).unwrap_or(0);
+    let (missing, corrupt, fixed) = (done("repair.missing"), done("repair.corrupted"), done("repair.repaired"));
+    let text = format!("{label}: {missing} missing, {corrupt} corrupt, {fixed} repaired");
+    if fixed < missing + corrupt { app.notify(Level::Warn, format!("{text}; see the task for the others")) } else { app.ok(text) }
+}
+
 /// Show what a distribution serves now and what it will serve, then re-point on confirmation.
 fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
     app.job(format!("rollback preview {dist}"), move |ctx| async move {
@@ -1747,7 +2016,7 @@ fn restore_preview(app: &mut App, t: RepoType, version: String, number: String) 
                 let label = format!("restore {name} v{number} as latest");
                 app.job(label.clone(), move |ctx| async move {
                     let m = ops::restore_version(&ctx.client, &repo, &version).await?;
-                    ap(move |app| follow(app, m, label.clone(), move |app, t| restored(app, &label, &t)))
+                    ap(move |app| follow(app, m, label.clone(), move |app, t| new_version(app, &label, &t)))
                 })
             })
         })
@@ -1780,8 +2049,8 @@ fn restore_lines(t: RepoType, r: &Value, number: &str, diff: Vec<String>) -> Vec
     lines
 }
 
-/// The restore task ended: the new version, or none when the latest version already had that content.
-fn restored(app: &mut App, label: &str, t: &Task) {
+/// A task that changes a repository ended (restore, upload): the new version, or none when the latest one already had that content.
+fn new_version(app: &mut App, label: &str, t: &Task) {
     match t.created_matching("/versions/") {
         Some(v) => app.ok(format!("{label}: new version {}", version_number(&v))),
         None => app.ok(format!("{label}: no new version (the latest version already has this content)")),
@@ -3858,7 +4127,7 @@ mod tests {
         assert_eq!(posts_to(&server, &format!("{repo}modify/")).await, [json!({ "base_version": v(1) })]);
         assert_eq!(last(&app), "restore docs v1 as latest: new version 4");
         // pulpcore makes no version when the latest one already has that content.
-        restored(&mut app, "restore docs v2 as latest", &Task { state: "completed".into(), ..Default::default() });
+        new_version(&mut app, "restore docs v2 as latest", &Task { state: "completed".into(), ..Default::default() });
         assert_eq!(last(&app), "restore docs v2 as latest: no new version (the latest version already has this content)");
     }
 
@@ -4538,5 +4807,324 @@ mod tests {
         assert!(e.contains("serves old instead of new"), "{e}");
         let sent = server.received_requests().await.unwrap();
         assert!(!sent.iter().any(|r| r.method.as_str() == "PATCH"), "a PATCH was sent");
+    }
+
+    async fn answer(server: &wiremock::MockServer, verb: &str, p: &str, status: u16, body: Value) {
+        use wiremock::matchers::{method, path};
+        let r = wiremock::ResponseTemplate::new(status).set_body_json(body);
+        wiremock::Mock::given(method(verb)).and(path(p)).respond_with(r).mount(server).await;
+    }
+
+    fn set(f: &mut Form, k: &str, v: &str) {
+        f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+    }
+
+    #[tokio::test]
+    async fn acs_create_sends_the_remote_and_paths_and_a_refresh_ends_with_its_tasks() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (remote, acs, group) = (format!("{API}remotes/rpm/rpm/1/"), format!("{API}acs/rpm/rpm/1/"), format!("{API}task-groups/1/"));
+        get(&server, &format!("{API}remotes/rpm/rpm/"), page(json!([{ "pulp_href": remote, "name": "cdn" }]))).await;
+        answer(&server, "POST", &format!("{API}acs/rpm/rpm/"), 201, json!({ "pulp_href": acs })).await;
+        answer(&server, "POST", &format!("{acs}refresh/"), 202, json!({ "task_group": group })).await;
+        // pulp_rpm never sets `all_tasks_dispatched` on a refresh group.
+        let g = json!({ "pulp_href": group, "description": "Refreshing 2 alternate content source path(s).", "all_tasks_dispatched": false,
+            "completed": 2, "tasks": [{ "state": "completed" }, { "state": "completed" }] });
+        get(&server, &group, g).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Acs(RepoType::Deb);
+        run(&mut app, Act::Create, Value::Null);
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["name", "remote"], "pulp_deb refreshes the remote URL only");
+
+        app.list.kind = Kind::Acs(RepoType::Rpm);
+        run(&mut app, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["name", "remote", "paths"]);
+        assert!(form.fields[1].help.contains("on_demand"), "{}", form.fields[1].help);
+        for (k, v) in [("name", "cdn-acs"), ("remote", "cdn"), ("paths", "rpm/, rpm2/")] {
+            set(&mut form, k, v);
+        }
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let body = json!({ "name": "cdn-acs", "remote": remote, "paths": ["rpm/", "rpm2/"] });
+        assert_eq!(posts_to(&server, &format!("{API}acs/rpm/rpm/")).await, [body]);
+
+        run(&mut app, Act::Refresh, json!({ "pulp_href": acs, "name": "cdn-acs" }));
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &format!("{acs}refresh/")).await, [json!({})]);
+        let row = |app: &App| app.tasks.items.iter().find(|t| t.href == group).map(|t| (t.label.clone(), t.state.clone()));
+        assert_eq!(row(&app), Some(("refresh ACS cdn-acs".into(), "waiting".into())), "the Task Center tracks the group");
+        app.tick();
+        let wait = async {
+            while !app.tasks.items.iter().any(|t| t.href == group && t.is_final()) {
+                app.handle_msg(rx.recv().await.unwrap());
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.expect("the group never ended");
+        assert_eq!(row(&app), Some(("refresh ACS cdn-acs".into(), "completed".into())));
+        assert!(app.notices.iter().any(|n| n.level == Level::Ok && n.text == "task completed: refresh ACS cdn-acs"));
+    }
+
+    #[tokio::test]
+    async fn rpm_comps_and_advisory_uploads_send_the_file_and_report_the_new_version() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/rpm/rpm/r/");
+        for (n, coll, made) in
+            [(1, "rpm/comps/", "content/rpm/packagegroups/9/"), (2, "content/rpm/advisories/", "content/rpm/advisories/9/")]
+        {
+            answer(&server, "POST", &format!("{API}{coll}"), 202, json!({ "task": format!("{API}tasks/{n}/") })).await;
+            let created = json!([format!("{API}{made}"), format!("{repo}versions/{}/", n + 1)]);
+            get(
+                &server,
+                &format!("{API}tasks/{n}/"),
+                json!({ "pulp_href": format!("{API}tasks/{n}/"), "state": "completed", "created_resources": created }),
+            )
+            .await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (comps, advisory) = (dir.path().join("comps.xml"), dir.path().join("errata.json"));
+        std::fs::write(&comps, "<comps></comps>").unwrap();
+        std::fs::write(&advisory, r#"{"id": "X-1"}"#).unwrap();
+        let (mut app, mut rx) = connected(&server).await;
+        let item = json!({ "pulp_href": repo, "name": "os" });
+        let last = |app: &App| app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        for t in [RepoType::File, RepoType::Deb] {
+            assert!(!Kind::Repos(t, false).actions().iter().any(|a| matches!(a, Act::UploadComps | Act::UploadAdvisory)), "{t:?}");
+        }
+        let rpm = Kind::Repos(RepoType::Rpm, false).actions();
+        assert!(rpm.contains(&Act::UploadComps) && rpm.contains(&Act::UploadAdvisory));
+        assert!(Act::UploadComps.mutates(&Kind::Repos(RepoType::Rpm, false), false));
+        assert!(Act::UploadAdvisory.mutates(&Kind::Repos(RepoType::Rpm, false), false));
+
+        repo_action(&mut app, RepoType::Rpm, Act::UploadComps, item.clone());
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["path", "replace"]);
+        set(&mut form, "path", &dir.path().join("none.xml").display().to_string());
+        assert!(submit(&mut app, &form).unwrap_err().contains("is not a readable file"));
+        set(&mut form, "path", &comps.display().to_string());
+        set(&mut form, "replace", "true");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(last(&app), "upload comps.xml to os: new version 2");
+
+        repo_action(&mut app, RepoType::Rpm, Act::UploadAdvisory, item.clone());
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["path"]);
+        set(&mut form, "path", &advisory.display().to_string());
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(last(&app), "upload advisory to os: new version 3");
+
+        let sent = server.received_requests().await.unwrap();
+        let body = |p: &str| {
+            let r = sent.iter().find(|r| r.method.as_str() == "POST" && r.url.path() == format!("{API}{p}")).expect(p);
+            String::from_utf8_lossy(&r.body).replace("\r\n", "\n")
+        };
+        let field = |k: &str, v: &str| format!("name=\"{k}\"\n\n{v}\n");
+        let c = body("rpm/comps/");
+        assert!(c.contains(&field("repository", &repo)) && c.contains(&field("replace", "true")), "{c}");
+        assert!(c.contains("filename=\"comps.xml\"") && c.contains("<comps></comps>"), "{c}");
+        let a = body("content/rpm/advisories/");
+        assert!(a.contains(&field("repository", &repo)) && !a.contains("replace") && a.contains(r#"{"id": "X-1"}"#), "{a}");
+
+        // A server without the upload endpoint: refused before the form.
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/content/rpm/advisories/": { "get": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        for (act, want) in [
+            (Act::UploadComps, "not supported by this server: comps.xml upload (rpm/comps/)"),
+            (Act::UploadAdvisory, "not supported by this server: advisory upload (content/rpm/advisories/)"),
+        ] {
+            repo_action(&mut app, RepoType::Rpm, act, item.clone());
+            assert!(app.modal.is_none(), "{act:?}");
+            assert_eq!(last(&app), want);
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaim_space_shows_the_remote_and_kept_versions_before_the_typed_confirm() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (repo, remote) = (format!("{API}repositories/rpm/rpm/r/"), format!("{API}remotes/rpm/rpm/up/"));
+        let item = json!({ "pulp_href": repo, "name": "os", "remote": remote, "latest_version_href": format!("{repo}versions/3/") });
+        get(&server, &repo, item.clone()).await;
+        get(&server, &remote, json!({ "pulp_href": remote, "name": "up", "policy": "immediate" })).await;
+        get(&server, &format!("{repo}versions/"), page(json!([{ "number": 3 }, { "number": 2 }, { "number": 1 }, { "number": 0 }]))).await;
+        answer(&server, "POST", &format!("{API}repositories/reclaim_space/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        let reports = json!([{ "code": "reclaim-space.artifact", "message": "Reclaim disk space", "total": 5, "done": 5 }]);
+        get(
+            &server,
+            &format!("{API}tasks/1/"),
+            json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "progress_reports": reports }),
+        )
+        .await;
+        let (mut app, mut rx) = connected(&server).await;
+        let k = Kind::Repos(RepoType::Rpm, false);
+        app.list.kind = k.clone();
+        assert!(k.actions().contains(&Act::Reclaim) && Act::Reclaim.mutates(&k, false));
+        let last = |app: &App| app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        let reclaim = |app: &mut App, keep: &str| {
+            run(app, Act::Reclaim, item.clone());
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            assert_eq!(keys(&form), ["keep"]);
+            set(&mut form, "keep", keep);
+            submit(app, &form)
+        };
+        assert_eq!(reclaim(&mut app, "x"), Err("Keep versions: version numbers, e.g. 3,4".into()));
+        reclaim(&mut app, "2, 9").unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none());
+        assert!(last(&app).ends_with("refused: os has no version 9"), "{}", last(&app));
+
+        let posts = async || posts_to(&server, &format!("{API}repositories/reclaim_space/")).await;
+        for (keep, kept, body) in [
+            (
+                "2",
+                "Versions that keep their files: 2",
+                json!({ "repo_hrefs": [repo], "repo_versions_keeplist": [format!("{repo}versions/2/")] }),
+            ),
+            ("", "No version keeps its files.", json!({ "repo_hrefs": [repo] })),
+        ] {
+            reclaim(&mut app, keep).unwrap();
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { typed, lines, on_yes: Some(yes), .. }) = app.modal.take() else {
+                panic!("no confirm: {}", last(&app))
+            };
+            assert_eq!(typed.as_deref(), Some("os"));
+            for want in ["in all 4 versions", "up (policy immediate)", kept] {
+                assert!(lines.iter().any(|l| l.contains(want)), "{want}: {lines:?}");
+            }
+            let n = posts().await.len();
+            yes(&mut app);
+            settle(&mut app, &mut rx).await;
+            assert_eq!(posts().await[n..], [body]);
+            assert_eq!(last(&app), "reclaim space of os: deleted 5 file(s)");
+        }
+
+        let snapshot = json!({ "pulp_href": repo, "name": "s", "pulp_labels": { "pulp_tui_cv": "web" } });
+        run(&mut app, Act::Reclaim, snapshot);
+        assert!(app.modal.is_none() && last(&app).starts_with("refused: s is a snapshot repository"), "{}", last(&app));
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/repositories/": {} } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, Act::Reclaim, item.clone());
+        assert!(app.modal.is_none());
+        assert_eq!(last(&app), "not supported by this server: reclaim space (repositories/reclaim_space/)");
+    }
+
+    /// pulpcore 3.123 repairs every artifact of the domain for a version without content: such a version is refused.
+    #[tokio::test]
+    async fn repair_checks_the_version_first_and_reports_what_pulp_repaired() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/rpm/rpm/r/");
+        let (empty, full) = (format!("{repo}versions/0/"), format!("{repo}versions/2/"));
+        get(&server, &empty, json!({ "pulp_href": empty, "number": 0, "content_summary": { "present": {} } })).await;
+        let present = json!({ "rpm.package": { "count": 3, "href": "" } });
+        get(&server, &full, json!({ "pulp_href": full, "number": 2, "content_summary": { "present": present } })).await;
+        answer(&server, "POST", &format!("{full}repair/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        let reports = json!([
+            { "code": "repair.missing", "message": "Identify missing units", "done": 1 },
+            { "code": "repair.corrupted", "message": "Identify corrupted units", "done": 1 },
+            { "code": "repair.repaired", "message": "Repair corrupted units", "done": 1 },
+        ]);
+        get(
+            &server,
+            &format!("{API}tasks/1/"),
+            json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "progress_reports": reports }),
+        )
+        .await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Versions(None);
+        assert!(Kind::Versions(None).actions().contains(&Act::Repair) && Act::Repair.mutates(&Kind::Versions(None), false));
+        let last = |app: &App| app.notices.back().map(|n| (n.level, n.text.clone())).unwrap();
+        let repair = |app: &mut App, v: &str, n: u64| {
+            run(app, Act::Repair, json!({ "pulp_href": v, "number": n }));
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            assert_eq!((keys(&form), form.get("verify_checksums")), (vec!["verify_checksums".to_string()], "true"), "Pulp's default");
+            set(&mut form, "verify_checksums", "false");
+            submit(app, &form).unwrap();
+        };
+
+        repair(&mut app, &empty, 0);
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none());
+        assert_eq!(
+            last(&app).1,
+            "impact of repairing version 0: refused: version 0 has no content; Pulp would repair every file of the server"
+        );
+
+        repair(&mut app, &full, 2);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", last(&app)) };
+        assert_eq!(title, "Repair version 2");
+        assert!(lines[0].contains("its 3 content unit(s)") && lines[1].contains("only that each file exists"), "{lines:?}");
+        assert!(posts_to(&server, &format!("{full}repair/")).await.is_empty(), "nothing is sent before the confirm");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &format!("{full}repair/")).await, [json!({ "verify_checksums": false })]);
+        assert_eq!(last(&app), (Level::Warn, "repair version 2: 1 missing, 1 corrupt, 1 repaired; see the task for the others".into()));
+
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "{file_file_repository_version_href}repair/": {} } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, Act::Repair, json!({ "pulp_href": full, "number": 2 }));
+        assert!(app.modal.is_none());
+        assert_eq!(last(&app).1, "not supported by this server: repository version repair ({rpm_rpm_repository_version_href}repair/)");
+    }
+
+    /// pulpcore 3.123 deletes a path that an edit removes from every ACS that has the same path.
+    #[tokio::test]
+    async fn acs_edit_names_the_other_sources_that_lose_a_removed_path() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (remote, acs) = (format!("{API}remotes/rpm/rpm/1/"), format!("{API}acs/rpm/rpm/1/"));
+        get(&server, &remote, json!({ "pulp_href": remote, "name": "cdn" })).await;
+        let item = json!({ "pulp_href": acs, "name": "cdn-acs", "remote": remote, "paths": ["rpm/", "rpm2/"] });
+        get(&server, &format!("{API}acs/rpm/rpm/"), page(json!([item, { "name": "other", "paths": ["rpm/"] }]))).await;
+        get(&server, &format!("{API}acs/file/file/"), page(json!([{ "name": "files", "paths": ["iso/"] }]))).await;
+        get(&server, &format!("{API}acs/deb/deb/"), page(json!([]))).await;
+        answer(&server, "PATCH", &acs, 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        answer(&server, "DELETE", &acs, 202, json!({ "task": format!("{API}tasks/2/") })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.conn.as_mut().unwrap().caps = Arc::new(plugins());
+        app.list.kind = Kind::Acs(RepoType::Rpm);
+        let patches = async |server: &wiremock::MockServer| -> Vec<Value> {
+            let sent = server.received_requests().await.unwrap();
+            sent.iter().filter(|r| r.method.as_str() == "PATCH").map(|r| r.body_json().unwrap()).collect()
+        };
+        let edit = async |app: &mut App, rx: &mut tokio::sync::mpsc::UnboundedReceiver<super::super::app::Msg>, k: &str, v: &str| {
+            run(app, Act::Edit, item.clone());
+            settle(app, rx).await; // the name of the remote is read first
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            assert_eq!((form.get("remote"), form.get("paths")), ("cdn", "rpm/,rpm2/"), "as stored");
+            set(&mut form, k, v);
+            submit(app, &form).unwrap();
+            settle(app, rx).await;
+        };
+
+        edit(&mut app, &mut rx, "name", "cdn-new").await;
+        assert!(app.modal.is_none(), "no path removed: sent at once");
+        assert_eq!(patches(&server).await, [json!({ "name": "cdn-new" })], "only what changed");
+
+        edit(&mut app, &mut rx, "paths", "rpm2/").await;
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no warning") };
+        assert!(lines.iter().any(|l| l.contains("other (RPM): rpm/")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("files") || l.contains("cdn-acs (")), "{lines:?}");
+        assert_eq!(patches(&server).await.len(), 1, "nothing is sent before the confirm");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(patches(&server).await[1], json!({ "paths": ["rpm2/"] }));
+
+        run(&mut app, Act::Delete, item.clone());
+        let Some(Modal::Confirm { typed, lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed.as_deref(), Some("cdn-acs"));
+        assert!(lines.iter().any(|l| l.contains("2 path(s)")), "{lines:?}");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.iter().filter(|r| r.method.as_str() == "DELETE" && r.url.path() == acs).count(), 1);
     }
 }

@@ -15,6 +15,8 @@ pub enum Kind {
     /// `true` also shows the snapshot repositories of Content Views (label `pulp_tui_cv`).
     Repos(RepoType, bool),
     Remotes(RepoType),
+    /// Alternate content sources.
+    Acs(RepoType),
     /// Versions of one repository (href, name) or of all repositories.
     Versions(Option<(String, String)>),
     /// Content of a repository version; `ctype` indexes `RepoType::content_types`.
@@ -73,6 +75,7 @@ pub const NAV: &[(&str, Kind)] = &[
     ("File Repositories", Kind::Repos(RepoType::File, false)),
     ("Deb Repositories", Kind::Repos(RepoType::Deb, false)),
     ("Remotes", Kind::Remotes(RepoType::Rpm)),
+    ("Alternate Sources", Kind::Acs(RepoType::Rpm)),
     ("Repository Versions", Kind::Versions(None)),
     ("Publications", Kind::Publications(RepoType::Rpm)),
     ("Distributions", Kind::Distributions(RepoType::Rpm)),
@@ -140,15 +143,22 @@ pub enum Act {
     Versions,
     Content,
     Upload,
+    /// RPM: a comps.xml (`rpm/comps/`) or one advisory as JSON (POST `content/rpm/advisories/`) into the repository.
+    UploadComps,
+    UploadAdvisory,
     Publish,
     Distribute,
     CopyContent,
+    /// Delete the stored files of a repository's synced content (`repositories/reclaim_space/`).
+    Reclaim,
     RemoveContent,
     AddToRepo,
     Compare,
     Rollback,
     /// A new latest version with the content of the selected version (`modify/` with `base_version`).
     Restore,
+    /// Download missing or corrupt files of a repository version again (`{version}repair/`).
+    Repair,
     CopyUrl,
     Verify,
     CancelTask,
@@ -188,6 +198,8 @@ pub enum Act {
     /// Import check, then the import.
     Import,
     Imports,
+    /// Alternate content source: index what the source has (`refresh/`, a task group).
+    Refresh,
     /// In no `actions()` list: offered on Connect and save; here so that `mutates` classifies them.
     MigrateDb,
     CopyDb,
@@ -222,14 +234,14 @@ impl Act {
             StoreSecret => 'K',
             ExportCv | Export => 'E',
             ImportCv | Import => 'I',
-            CvFilters | FallbackReplicate => 'F',
+            CvFilters | FallbackReplicate | Repair => 'F',
             CvPreview | Password => 'w',
             Promote | MigrateDb => 'M',
             CopyDb => 'Y',
-            Resume | Replicate | Roles | Restore => 'R',
+            Resume | Replicate | Roles | Restore | Refresh | Reclaim => 'R',
             ToggleProtected => 'L',
-            ToggleActive => 'A',
-            BreakLock => 'U',
+            ToggleActive | UploadAdvisory => 'A',
+            BreakLock | UploadComps => 'U',
             PruneOrphans => 'O',
         }
     }
@@ -246,14 +258,18 @@ impl Act {
             Versions => "Versions",
             Content => "Browse content",
             Upload => "Upload local file",
+            UploadComps => "Upload comps.xml (package groups)",
+            UploadAdvisory => "Upload advisory (JSON)",
             Publish => "Publish",
             Distribute => "Distribute (create/re-point distribution)",
             CopyContent => "Copy content from another repository",
+            Reclaim => "Reclaim disk space (files of synced content)",
             RemoveContent => "Remove from repository (new version)",
             AddToRepo => "Add to another repository",
             Compare => "Compare with marked version",
             Rollback => "Roll back a distribution to this",
             Restore => "Restore as latest version (new version)",
+            Repair => "Repair (download missing or corrupt files again)",
             CopyUrl => "Copy content URL",
             Verify => "Verify served content",
             CancelTask => "Cancel task on server",
@@ -292,6 +308,7 @@ impl Act {
             Exports => "Exports",
             Import => "Import (check first)",
             Imports => "Imports",
+            Refresh => "Refresh (index the source)",
             MigrateDb => "Migrate database",
             CopyDb => "Copy Content View data",
         }
@@ -349,6 +366,7 @@ impl Kind {
                 if *snapshots { " — snapshots shown" } else { "" }
             ),
             Kind::Remotes(t) => format!("{} Remotes  [t: toggle type]", t.label()),
+            Kind::Acs(t) => format!("{} Alternate Content Sources  [t: toggle type]", t.label()),
             Kind::Versions(Some((_, n))) => format!("Versions of {n}"),
             Kind::Versions(None) => "Repository Versions (all repositories)".into(),
             Kind::Content { version, ctype } => {
@@ -390,7 +408,10 @@ impl Kind {
     /// Precise message when the server lacks what this screen needs.
     pub fn unsupported(&self, caps: &Capabilities) -> Option<String> {
         let f = match self {
-            Kind::Repos(t, _) | Kind::Remotes(t) | Kind::Publications(t) | Kind::Distributions(t) => t.feature(),
+            Kind::Acs(t) if caps.supports(t.feature()) && !caps.has_endpoint(t.acs()) => {
+                return Some(format!("not supported by this server: {} alternate content sources ({})", t.label(), t.acs()));
+            }
+            Kind::Repos(t, _) | Kind::Remotes(t) | Kind::Acs(t) | Kind::Publications(t) | Kind::Distributions(t) => t.feature(),
             Kind::UpstreamPulps => Feature::NativeReplication,
             Kind::PulpExporters => Feature::PulpExport,
             Kind::FsExporters => Feature::FilesystemExport,
@@ -412,6 +433,7 @@ impl Kind {
         Some(match self {
             Kind::Repos(t, snapshots) => Kind::Repos(*t, !snapshots),
             Kind::Remotes(t) => Kind::Remotes(t.next()),
+            Kind::Acs(t) => Kind::Acs(t.next()),
             Kind::Publications(t) => Kind::Publications(t.next()),
             Kind::Distributions(t) => Kind::Distributions(t.next()),
             Kind::Content { version, ctype } => {
@@ -444,6 +466,7 @@ impl Kind {
                 (t.repositories().into(), q, name)
             }
             Kind::Remotes(t) => (t.remotes().into(), vec![("ordering", "name".into())], name),
+            Kind::Acs(t) => (t.acs().into(), vec![("ordering", "name".into())], name),
             Kind::Versions(Some((repo, _))) => (format!("{repo}versions/"), vec![("ordering", "-number".into())], None),
             Kind::Versions(None) => ("repository_versions/".into(), vec![("ordering", "-pulp_created".into())], None),
             Kind::Content { version, ctype } => {
@@ -513,6 +536,12 @@ impl Kind {
             Kind::Remotes(_) => {
                 vec![col("name", 28, |v| s(v, "name")), col("policy", 10, |v| s(v, "policy")), col("url", 50, |v| s(v, "url"))]
             }
+            Kind::Acs(_) => vec![
+                col("name", 28, |v| s(v, "name")),
+                col("paths", 30, |v| v["paths"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
+                col("last refreshed", 19, |v| ts(v, "last_refreshed")),
+                col("remote", 13, |v| short(&s(v, "remote"))),
+            ],
             Kind::Versions(_) => vec![
                 col("repo", 10, |v| short(&s(v, "repository"))),
                 col("number", 7, |v| s(v, "number")),
@@ -698,13 +727,31 @@ impl Kind {
         match self {
             Kind::Profiles => vec![Connect, TestProfile, Create, Edit, Delete, StoreSecret, ExportCv, ImportCv],
             Kind::Repos(t, _) => {
-                let mut actions =
-                    vec![Versions, Content, Sync, SyncHistory, Upload, Publish, Distribute, CopyContent, Create, Edit, Delete, Inspect];
+                let mut actions = vec![
+                    Versions,
+                    Content,
+                    Sync,
+                    SyncHistory,
+                    Upload,
+                    Publish,
+                    Distribute,
+                    CopyContent,
+                    Reclaim,
+                    Create,
+                    Edit,
+                    Delete,
+                    Inspect,
+                ];
                 actions.retain(|a| *a != Upload || t.uploads());
+                match t {
+                    RepoType::Rpm => drop(actions.splice(5..5, [UploadComps, UploadAdvisory])),
+                    RepoType::File | RepoType::Deb => {}
+                }
                 actions
             }
             Kind::Remotes(_) | Kind::Roles => vec![Create, Edit, Delete, Inspect],
-            Kind::Versions(_) => vec![Content, Publish, Distribute, Rollback, Restore, Compare, Delete, PruneOrphans, Inspect],
+            Kind::Acs(_) => vec![Refresh, Create, Edit, Delete, Inspect],
+            Kind::Versions(_) => vec![Content, Publish, Distribute, Rollback, Restore, Compare, Repair, Delete, PruneOrphans, Inspect],
             // A structured Deb copy brings the release records of binary packages only; other units would arrive alone.
             Kind::Content { version, ctype } if RepoType::from_href(version) == Some(RepoType::Deb) && *ctype != 0 => {
                 vec![Inspect, RemoveContent]
@@ -1307,6 +1354,37 @@ mod tests {
         assert_eq!(e.as_deref(), Some("not supported by this server: Pulp import (importers/core/pulp/, import-check/)"));
         caps.paths.insert("importers/core/pulp/import-check/".into());
         assert_eq!(k.unsupported(&caps), None);
+    }
+
+    #[test]
+    fn acs_screens_list_each_type_and_need_its_endpoint() {
+        let k = Kind::Acs(RepoType::Rpm);
+        assert!(NAV.iter().any(|(l, n)| *l == "Alternate Sources" && *n == k));
+        assert_eq!(k.title(), "RPM Alternate Content Sources  [t: toggle type]");
+        assert_eq!(k.toggle(), Some(Kind::Acs(RepoType::File)));
+        let paths: Vec<String> = RepoType::ALL.iter().map(|t| Kind::Acs(*t).source().unwrap().0).collect();
+        assert_eq!(paths, ["acs/rpm/rpm/", "acs/file/file/", "acs/deb/deb/"]);
+        assert_eq!(k.actions(), [Act::Refresh, Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
+        assert!(Act::Refresh.mutates(&k, false), "a refresh runs sync tasks");
+        let mut caps = Capabilities::default();
+        caps.versions.insert("rpm".into(), "3.39.5".into());
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/remotes/rpm/rpm/": {} } }));
+        assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: RPM alternate content sources (acs/rpm/rpm/)"));
+        caps.paths.insert("acs/rpm/rpm/".into());
+        assert_eq!(k.unsupported(&caps), None);
+        assert_eq!(Kind::Acs(RepoType::Deb).unsupported(&caps).as_deref(), Some("not supported by this server: pulp_deb plugin"));
+        let row = json!({ "name": "cdn", "paths": ["rpm/", "rpm2/"], "last_refreshed": "2026-11-02T10:00:00.123Z",
+            "remote": "/pulp/api/v3/remotes/rpm/rpm/0190abcd-1234-5678/" });
+        let cells: Vec<(&str, String)> = k.columns().iter().map(|c| (c.title, (c.get)(&row))).collect();
+        assert_eq!(
+            cells,
+            [
+                ("name", "cdn".into()),
+                ("paths", "rpm/, rpm2/".into()),
+                ("last refreshed", "2026-11-02 10:00:00".into()),
+                ("remote", "0190abcd-1234".into())
+            ]
+        );
     }
 
     #[test]

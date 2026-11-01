@@ -575,6 +575,7 @@ pub fn help_lines() -> Vec<String> {
         "                -> M promote through Lifecycle Envs -> b roll back -> u unpromote -> D verify/drift",
         "  Composite:  Content Views -> c create with Composite -> a add components (x remove) -> P publish",
         "  Replication: Replication -> c add Upstream Pulp -> R replicate; F = fallback sync from a profile",
+        "  ACS:        Remotes -> c remote with policy on_demand (Pulp takes no other) -> Alternate Sources -> c -> R refresh",
         "",
         "Safety",
         "  Read-only profiles block all server changes. Production profiles show a red banner",

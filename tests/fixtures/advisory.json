@@ -1,0 +1,29 @@
+{
+  "id": "PULP-TUI-2026:0002",
+  "title": "fixture-alpha enhancement",
+  "type": "enhancement",
+  "severity": "Low",
+  "status": "final",
+  "version": "1",
+  "issued": "2026-01-02 00:00:00",
+  "updated": "2026-01-02 00:00:00",
+  "description": "Fixture advisory for the advisory upload (RPM repository action A); live_content makes the id unique.",
+  "pkglist": [
+    {
+      "name": "fixture",
+      "short": "fixture",
+      "packages": [
+        {
+          "name": "fixture-alpha",
+          "epoch": "0",
+          "version": "1.0",
+          "release": "1",
+          "arch": "noarch",
+          "filename": "fixture-alpha-1.0-1.noarch.rpm",
+          "sum": "",
+          "sum_type": "sha256"
+        }
+      ]
+    }
+  ]
+}

@@ -113,6 +113,22 @@ impl RepoType {
             RepoType::Deb => "distributions/deb/apt/",
         }
     }
+    /// Alternate content sources of the plugin.
+    pub fn acs(self) -> &'static str {
+        match self {
+            RepoType::Rpm => "acs/rpm/rpm/",
+            RepoType::File => "acs/file/file/",
+            RepoType::Deb => "acs/deb/deb/",
+        }
+    }
+    /// OpenAPI path of the repair of a repository version.
+    pub fn version_repair(self) -> &'static str {
+        match self {
+            RepoType::Rpm => "{rpm_rpm_repository_version_href}repair/",
+            RepoType::File => "{file_file_repository_version_href}repair/",
+            RepoType::Deb => "{deb_apt_repository_version_href}repair/",
+        }
+    }
     /// Primary content type (packages / files).
     pub fn content(self) -> &'static str {
         match self {
@@ -419,11 +435,13 @@ impl TaskGroup {
     }
     /// `all_tasks_dispatched` is not reliable (pulpcore 3.123 leaves it false after a
     /// replication or an import), so a failure, the replication finalizer or the completed
-    /// `pulp_import` (it dispatches every repository task of the import) also ends the group.
+    /// `pulp_import` (it dispatches every repository task of the import) also ends the group. An
+    /// ACS refresh dispatches all its tasks before it answers and never sets the flag.
     pub fn is_final(&self) -> bool {
         let last = |n: &str| n.ends_with("finalize_replication") || n.ends_with("importer.pulp_import");
         let finalized = self.tasks.iter().any(|t| t["name"].as_str().is_some_and(last) && t["state"] == "completed");
-        self.active() == 0 && self.done() > 0 && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized)
+        let refresh = self.description.starts_with("Refreshing ") && self.description.to_lowercase().contains("alternate content source");
+        self.active() == 0 && self.done() > 0 && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh)
     }
     /// How a final group ended: a failed task fails it; a canceled or skipped task is not a success either.
     pub fn outcome(&self) -> &'static str {
@@ -799,5 +817,28 @@ mod tests {
         assert_eq!(state(group("completed", Some("completed"), json!({ "completed": 2 }))), (true, "completed".into()));
         assert_eq!(state(group("completed", None, json!({ "completed": 1 }))), (true, "completed".into()), "no destination found");
         assert_eq!(state(group("failed", None, json!({ "failed": 1 }))), (true, "failed".into()));
+    }
+
+    /// The refresh of an alternate content source dispatches all its tasks before it answers and never sets
+    /// `all_tasks_dispatched`: the group ends with its tasks (the descriptions of pulp_rpm, pulp_file, pulp_deb).
+    #[test]
+    fn an_acs_refresh_group_ends_with_its_tasks() {
+        use serde_json::json;
+        for d in [
+            "Refreshing 2 alternate content source path(s).",
+            "Refreshing 1 alternate content source paths.",
+            "Refreshing Alternate Content Source 'apt'.",
+        ] {
+            let g = |counts: Value| -> TaskGroup {
+                let mut g = json!({ "pulp_href": "/g/1/", "description": d, "all_tasks_dispatched": false, "tasks": [{}, {}] });
+                g.as_object_mut().unwrap().extend(counts.as_object().unwrap().clone());
+                serde_json::from_value(g).unwrap()
+            };
+            assert_eq!(g(json!({ "completed": 2 })).as_task().state, "completed", "{d}");
+            assert_eq!(g(json!({ "completed": 1, "running": 1 })).as_task().state, "running", "{d}");
+        }
+        let other = json!({ "pulp_href": "/g/2/", "description": "Replication of up", "completed": 2, "tasks": [{}, {}] });
+        let other: TaskGroup = serde_json::from_value(other).unwrap();
+        assert!(!other.is_final(), "another group may still dispatch tasks");
     }
 }

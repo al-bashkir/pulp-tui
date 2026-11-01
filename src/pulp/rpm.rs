@@ -1,10 +1,32 @@
-//! RPM plugin operations: package listing, serving checks and the copy API.
+//! RPM plugin operations: package listing, serving checks, the copy API, comps and advisory uploads.
 
 use super::client::{Mutation, Page, PulpClient, PulpError, Result};
 use super::models::*;
 use super::ops::CONTENT_PAGE;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::path::Path;
+
+/// Upload endpoints (POST) of comps.xml and of one advisory.
+pub const COMPS: &str = "rpm/comps/";
+pub const ADVISORIES: &str = "content/rpm/advisories/";
+
+/// POST the file at `path` to `endpoint` with `fields` (multipart, field `file`); a task that makes a new version.
+async fn upload_file(c: &PulpClient, endpoint: &str, path: &Path, fields: &[(&str, String)]) -> Result<Mutation> {
+    let bytes = tokio::fs::read(path).await.map_err(|e| PulpError::Config(format!("{}: {e}", path.display())))?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
+    c.post_form(&c.api(endpoint), fields, Some((name, bytes))).await
+}
+
+/// Add the groups, categories, environments and langpacks of a comps.xml to `repo`; `replace` first removes the ones it has.
+pub async fn upload_comps(c: &PulpClient, path: &Path, repo: &str, replace: bool) -> Result<Mutation> {
+    upload_file(c, COMPS, path, &[("repository", repo.into()), ("replace", replace.to_string())]).await
+}
+
+/// Add one advisory to `repo`: a JSON file with the fields of an updateinfo record (`id`, `issued`, `updated` required).
+pub async fn upload_advisory(c: &PulpClient, path: &Path, repo: &str) -> Result<Mutation> {
+    upload_file(c, ADVISORIES, path, &[("repository", repo.into())]).await
+}
 
 pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<Package>> {
     let fields = "pulp_href,name,epoch,version,release,arch,location_href,sha256";

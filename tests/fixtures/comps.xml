@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE comps PUBLIC "-//Red Hat, Inc.//DTD Comps info//EN" "comps.dtd">
+<!-- One package group for the comps upload (RPM repository action U); live_content makes the id unique. -->
+<comps>
+  <group>
+    <id>pulp-tui-fixture</id>
+    <name>pulp-tui fixture</name>
+    <description>Fixture group for pulp-tui tests.</description>
+    <default>false</default>
+    <uservisible>true</uservisible>
+    <packagelist>
+      <packagereq type="mandatory">fixture-alpha</packagereq>
+    </packagelist>
+  </group>
+</comps>

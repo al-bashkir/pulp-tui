@@ -453,6 +453,24 @@ pub async fn restore_version(c: &PulpClient, repo: &str, version: &str) -> Resul
     c.post(&format!("{repo}modify/"), &json!({ "base_version": version })).await
 }
 
+/// Check the files of the content of `version` and download missing ones (with `verify_checksums`, also
+/// corrupt ones) again from a remote. pulpcore 3.123 repairs the whole domain when the version has no content.
+pub async fn repair_version(c: &PulpClient, version: &str, verify_checksums: bool) -> Result<Mutation> {
+    c.post(&format!("{version}repair/"), &json!({ "verify_checksums": verify_checksums })).await
+}
+
+pub const RECLAIM_SPACE: &str = "repositories/reclaim_space/";
+
+/// Delete the stored files of the content that only `repo` has and that a remote can give again; the content
+/// stays (on demand). The versions in `keep` keep their files.
+pub async fn reclaim_space(c: &PulpClient, repo: &str, keep: &[String]) -> Result<Mutation> {
+    let mut body = json!({ "repo_hrefs": [repo] });
+    if !keep.is_empty() {
+        body["repo_versions_keeplist"] = keep.into();
+    }
+    c.post(&c.api(RECLAIM_SPACE), &body).await
+}
+
 /// Bytes of hrefs in one copy or modify body. Pulp refuses a body above Django's
 /// `DATA_UPLOAD_MAX_MEMORY_SIZE` (default 2,621,440) with HTTP 400; this leaves room for the rest.
 const BATCH_BYTES: usize = 2_000_000;

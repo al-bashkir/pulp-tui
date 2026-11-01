@@ -146,14 +146,32 @@ are visible.
 | f         | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File and Deb: additive, mirror). Mirror policies show a warning first. RPM and Deb: sync options (below).                                  |
 | H         | sync history (tasks that touched this repository)                                                                                                                                                                                                                                     |
 | u         | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed chunked uploads are deleted, also on a Connect. Not offered for Deb repositories (upload of `.deb` files is not supported). |
+| U         | RPM: upload a comps.xml (Pulp `rpm/comps/`): its package groups, categories, environments and langpacks go into a new version. **Replace** on first removes the comps units that the repository has                                                                                   |
+| A         | RPM: upload one advisory, a JSON file with the fields of an updateinfo record (POST `content/rpm/advisories/`); `id`, `issued` and `updated` are required, and each package needs `sum_type` (for example `sha256`). Example: `tests/fixtures/advisory.json`                          |
 | P         | publish the latest version: always creates a new publication, with the repository settings at that moment. Deb asks for an optional signing service (empty = the repository's own keys). The field is not asked when the server's Deb publications have no `signing_service`.         |
 | D         | distribute: pin the latest version (publication) or follow the repository latest. Deb asks for the same optional signing service as **P**, for the pinned publication; a publication of the version is reused only when its signing service is the same.                              |
 | C         | copy content from another repository (filter rules; RPM can copy dependencies; a Deb copy is structured: it also copies the Release, component and architecture records of the packages, and never solves dependencies)                                                               |
+| R         | reclaim disk space (below)                                                                                                                                                                                                                                                            |
 | c / e / d | create / edit / delete (delete names every distribution that serves the repository, a version or a publication of it; refused while it holds Content View snapshots)                                                                                                                  |
 | i         | full JSON                                                                                                                                                                                                                                                                             |
 
+**U** and **A** wait for the task; the notice gives the new version, for example
+`upload comps.xml to os: new version 4`. A server without the upload endpoint says
+"not supported by this server: comps.xml upload (rpm/comps/)" before the form.
+
+**R** reclaims disk space (Pulp `repositories/reclaim_space/`): Pulp deletes the stored
+files of the synced content that no other repository has. The content stays in every
+version; when a client asks for a file, Pulp downloads it again from its remote (on
+demand) and stores it, so the upstream must still serve it. Uploaded content (it has no
+remote) keeps its files. A form asks which versions keep their files (`3,4`; empty =
+none). Then the confirm shows the number of versions, the default remote and its download
+policy, and the versions that keep their files; type the repository name to start. When
+the task ends, a notice gives the number of deleted files, for example `reclaim space of
+os: deleted 5 file(s)`. Refused for Content View snapshots. A server without the endpoint
+says "not supported by this server: reclaim space (repositories/reclaim_space/)".
+
 Edit sends only changed fields. Remote shows the default remote by name; clear it to remove
-the default remote. Edit, sync, upload, copy and content add/remove are refused
+the default remote. Edit, sync, uploads, copy, reclaim and content add/remove are refused
 on Content View snapshot repositories (a change of retention would prune their snapshots).
 **Retain checkpoints** (RPM, File and Deb, when the server has the field): how many
 checkpoint publications Pulp keeps; empty = all.
@@ -241,6 +259,27 @@ Deb remote fields (each is shown only when the server has it):
 | GPG public key                                 | path of a local file; its content is uploaded and Pulp uses it to check the `Release` signature. On edit, empty keeps the server value and `-` clears it                               |
 | Excluded package metadata fields               | `field,...`, for example `Phased-Update-Percentage`: custom package fields that the sync drops (core fields such as `Package` and `Version` stay). Clear it on edit to keep all fields |
 
+### Alternate Sources
+
+`t` switches RPM/File/Deb. An alternate content source (ACS) is another place where Pulp
+can download content files, for example a mirror near the server. A sync of any repository
+then downloads the files that the ACS has from the ACS, not from the repository's remote.
+Pulp takes only a remote with the download policy `on_demand` ("Remote used with alternate
+content source must have the 'on_demand' policy"): create one in Remotes first. Columns:
+name, paths, last refreshed, remote. The screen needs the plugin's `acs/` endpoint; else it
+shows "not supported by this server: RPM alternate content sources (acs/rpm/rpm/)".
+
+| Key       | Action                                                                                                                                                                                                                                                                      |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R         | refresh: Pulp syncs each path into a hidden repository, one task per path in a task group. The Task Center shows the group as one row (label `refresh ACS <name>`) and reports how it ended. Refresh again when the source changes                                          |
+| c / e / d | create / edit / delete. Name, remote (picked by name), paths (RPM and File: `path,...` that Pulp adds to the remote URL; empty = the remote URL itself; pulp_deb ignores paths, so the Deb form has none). Edit sends only changed fields. Delete asks you to type the name |
+| i         | full JSON                                                                                                                                                                                                                                                                   |
+
+pulpcore 3.123 deletes a path that you remove on edit from **every** ACS that has the same
+path. So an edit that removes a path first lists the other sources that lose it and asks.
+Delete removes the hidden repositories of the refreshes too, except on Deb: pulp_deb 3.11
+keeps `<name>--repository`, and a new ACS with the same name uses it again.
+
 ### Repository Versions
 
 From a repository (**v**) or for all repositories. Columns: number, created, present /
@@ -254,7 +293,7 @@ content type that the Content browser lists, each line starts with its type, suc
 fewer units in a version than the compare lists; a `not compared (not on this server):` line names the content types
 that the server has no endpoint for, also in the restore preview), **d** delete (names the distributions that serve the version or its
 publications, Deb verbatim publications too, and you type the version id; refused for Content View snapshots; never needed
-for rollback), **R** restore as latest (below).
+for rollback), **R** restore as latest (below), **F** repair (below).
 
 **R** makes a new latest version of the repository with the content of the selected version
 (Pulp `modify/` with `base_version`). No version is deleted by the restore, but a
@@ -269,6 +308,16 @@ one distribution and makes no version, so the distributions that follow the repo
 the next sync still use the newest version. The latest version itself is refused (nothing to
 restore). When the latest version already has the same content, Pulp makes no version and the
 notice says so. Refused for Content View snapshots.
+
+**F** repairs the version (Pulp `{version}repair/`): Pulp checks the stored files of its
+content and downloads a missing or corrupt file again from a remote that has it. It deletes
+a corrupt file that no remote can give again. **Verify checksums** on (Pulp's default) reads
+every file and compares its digest, which is slow for a large repository; off only checks
+that each file exists. The confirm shows how many content units the version has. A version
+without content is refused, because Pulp then repairs every file of the server. When the
+task ends, a notice gives Pulp's counts, for example `repair version 3: 0 missing, 0
+corrupt, 0 repaired`; it is a warning when Pulp repaired fewer files than it found. A
+server without the endpoint says "not supported by this server: repository version repair".
 
 **O** prunes orphans on the whole server (Pulp `orphans/cleanup/`): content that no
 repository version has, and artifacts (files) that no content uses. Deleting versions
@@ -697,8 +746,8 @@ refreshes until the task ends; **i** details with all progress reports, **X** ca
 the server (confirmation), **z** dismiss finished tasks from the list (above 500 tracked
 tasks, the oldest finished one goes by itself). `t` switches to all
 server tasks (**a** tracks one; **W** tracks it and opens the live view). A native
-replication is one row for its task group: the progress counts the finished tasks of the
-group, and a restart re-attaches it like a task. A task or group that ends canceled or
+replication and an ACS refresh are one row for their task group: the progress counts the
+finished tasks of the group, and a restart re-attaches it like a task. A task or group that ends canceled or
 skipped gives a warning; a failed one gives an error.
 
 ### Logs
