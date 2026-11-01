@@ -155,6 +155,11 @@ server gives the final answer; the dashboard shows a warning.
   repository's `manifest` with every File publication it creates, and Verify fetches the
   manifest that the served publication names (with none, it reports that it compared no
   files).
+* **File, RPM and Deb distributions serve only publications** (`SERVE_FROM_PUBLICATION =
+  True` in pulp_file, pulp_rpm and pulp_deb; pulpcore 3.123.1
+  `Distribution.get_repository_publication`): a distribution bound to a repository version
+  serves the newest complete publication of that version, and with none every path is 404.
+  Verify and the rollback preview then say that the distribution serves nothing.
 * **RPM content types.** pulp_rpm 3.39.5 has 11 content types (OpenAPI
   `content/rpm/...`). A `rpm/comps/` upload adds package groups, categories, environments and
   langpacks; langpacks have no id (`unique_together` is the digest), so the compare keys
@@ -186,6 +191,10 @@ server gives the final answer; the dashboard shows a warning.
 * **Task cancellation** is asynchronous. A task blocked in a network read can end as
   `failed` before the worker processes the cancel request; pulp-tui shows Pulp's final
   state. Cancelling a completed task returns 409 and is shown as such.
+* **Skipped tasks.** `skipped` is a final task state in pulpcore (`TASK_FINAL_STATES`),
+  but no code of pulpcore 3.123.1 or of the RPM, File and Deb plugins sets it (read in the
+  source on pulp1). pulp-tui treats a skipped task as not run: the workflow step fails
+  (Content View copy or publication, fallback replication sync) and nothing is published.
 * `all_tasks_dispatched` of replication task groups stays false in 3.123; see
   `docs/ARCHITECTURE.md` for how completion is detected.
 * **Canceled replication tasks.** On 3.63 `replicate_distributions` sets
@@ -378,7 +387,9 @@ The live tests connect to `127.0.0.1` without TLS, so they do not exercise this 
 
 * Plugins other than pulp_rpm, pulp_file and pulp_deb (container, python, …) are not managed.
 * pulp_deb: no upload of `.deb` files, no replication (native or fallback), no verbatim
-  publications, no dependency solving on copy.
+  publications, no dependency solving on copy. A verbatim publication made elsewhere still
+  protects its version (pulpcore `protected_versions` reads every publication type), so the
+  version delete impact lists `publications/deb/verbatim/` too.
 * RPM publication layout `nested_by_digest`: the package probe of served-content checks is
   skipped (metadata is still checked).
 * Signing: repository fields for signing services are editable, but pulp-tui does not

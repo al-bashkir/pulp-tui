@@ -833,8 +833,8 @@ impl CvService {
     }
 
     /// The task of one checkpointed step of `vr` (the copy, or a Deb publication): re-attach to `vr.pending_task`,
-    /// else run `submit` and record the task before waiting. A failed or canceled task is not re-attached: it is
-    /// cleared, so the next Resume sends that step again.
+    /// else run `submit` and record the task before waiting. A failed, canceled or skipped task is not re-attached:
+    /// it is cleared, so the next Resume sends that step again.
     async fn tracked_task(
         &self,
         vr: &mut CvVersionRepo,
@@ -1594,6 +1594,37 @@ mod tests {
         let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
         assert_eq!(saved.pending_task, None, "Resume copies again instead of waiting on the dead task");
         assert_none(&server, "POST").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skipped_copy_task_fails_the_version_and_records_no_snapshot() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, vr) = rpm_version(&svc).await;
+        svc.store.save_version_repo(&vr).await.unwrap();
+        let ok = |body: Value| ResponseTemplate::new(200).set_body_json(body);
+        // The derived repository still has the content of the previous publish.
+        let old = format!("{DERIVED}versions/1/");
+        let derived =
+            json!({ "pulp_href": DERIVED, "name": "web-os", "pulp_labels": { LABEL_DB: svc.store.db_id() }, "latest_version_href": old });
+        Mock::given(method("GET")).and(path(DERIVED)).respond_with(ok(derived)).mount(&server).await;
+        Mock::given(method("GET")).and(path(old.as_str())).respond_with(ok(json!({ "pulp_href": old, "number": 1 }))).mount(&server).await;
+        let task = json!({ "task": "/pulp/api/v3/tasks/1/" });
+        Mock::given(method("POST"))
+            .and(path("/pulp/api/v3/rpm/copy/"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(task))
+            .mount(&server)
+            .await;
+        let skipped = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "skipped", "name": "copy" });
+        Mock::given(method("GET")).and(path("/pulp/api/v3/tasks/1/")).respond_with(ok(skipped)).mount(&server).await;
+        let e = svc.resume(vr.version_id, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert_eq!(format!("{e:#}"), "repository os: task skipped: ");
+        let v = svc.store.version(vr.version_id).await.unwrap();
+        assert_eq!((v.state.as_str(), v.error.as_deref()), ("failed", Some("repository os: task skipped: ")));
+        let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
+        assert_eq!((saved.derived_version, saved.pending_task), (None, None), "the old version is not the snapshot");
     }
 
     const FILE_DERIVED: &str = "/pulp/api/v3/repositories/file/file/2/";
@@ -2690,7 +2721,7 @@ mod tests {
         let files = json!({ "count": 1, "next": null, "results": [{ "pulp_href": "/f/a/", "relative_path": "a.txt", "sha256": "ab" }] });
         get("/pulp/api/v3/content/file/files/".into(), files).await;
         let issues = svc.verify(cv, lib).await.unwrap();
-        assert_eq!(issues, ["files: not supported by this server: CUSTOM returned HTTP 404"], "the manifest of the publication is fetched");
+        assert_eq!(issues, ["files: served content differs: CUSTOM returned HTTP 404"], "the manifest of the publication is fetched");
         let served = wiremock::ResponseTemplate::new(200).set_body_string("a.txt,ab,3\n");
         let manifest = wiremock::Mock::given(wiremock::matchers::path("/pulp/content/library/docs/files/CUSTOM"));
         manifest.respond_with(served).mount(&server).await;

@@ -233,6 +233,15 @@ async fn task_polling_until_completion_or_failure() {
         PulpError::TaskFailed { state, message, .. } => assert_eq!((state.as_str(), message.as_str()), ("failed", "404 upstream")),
         e => panic!("{e:?}"),
     }
+    // A skipped task did not run: no caller may take its (empty) result as done.
+    let skipped = json!({ "pulp_href": format!("{API}tasks/5/"), "state": "skipped" });
+    Mock::given(method("GET"))
+        .and(path(format!("{API}tasks/5/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(skipped))
+        .mount(&server)
+        .await;
+    let e = ops::wait_task(&c, &format!("{API}tasks/5/"), &no_progress).await.unwrap_err();
+    assert!(matches!(&e, PulpError::TaskFailed { state, .. } if state == "skipped"), "{e:?}");
 }
 
 #[tokio::test]
@@ -593,7 +602,10 @@ async fn deb_verify_checks_release_index_and_package_digest() {
     let (server, base) = deb_server(pkg("00")).await;
     let c = client(&server, |_, _| {});
     let err = deb::verify(&c, &base, "/v/").await.unwrap_err();
-    assert!(matches!(&err, PulpError::Unsupported(m) if m.contains("not served with the expected digest")), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "served content differs: package pool/main/f/fixture-beta_1.0-1_amd64.deb not served with the expected digest"
+    );
 
     let (server, base) = deb_server(json!([])).await;
     let c = client(&server, |_, _| {});
@@ -772,6 +784,11 @@ async fn file_verify_reads_the_manifest_of_the_publication() {
         .respond_with(ResponseTemplate::new(200).set_body_string(format!("a.txt,{good},10\n")))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/pulp/content/d/OLD"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("a.txt,00,10\n"))
+        .mount(&server)
+        .await;
     let c = client(&server, |_, _| {});
     let base = format!("{}/pulp/content/d/", server.uri());
     let verify = |p: Value| {
@@ -779,7 +796,10 @@ async fn file_verify_reads_the_manifest_of_the_publication() {
         async move { ops::verify_served(c, RepoType::File, base, "/v/", &p).await }
     };
     assert_eq!(verify(json!({ "manifest": "CUSTOM" })).await.unwrap(), "CUSTOM matches 1 files");
-    assert!(verify(json!({ "manifest": "PULP_MANIFEST" })).await.unwrap_err().to_string().contains("PULP_MANIFEST returned HTTP 404"));
+    let e = |m: &str| verify(json!({ "manifest": m }));
+    assert_eq!(e("PULP_MANIFEST").await.unwrap_err().to_string(), "served content differs: PULP_MANIFEST returned HTTP 404");
+    let old = e("OLD").await.unwrap_err().to_string();
+    assert_eq!(old, "served content differs: OLD does not match the version (1 served, 1 expected)");
     assert_eq!(verify(json!({ "manifest": null })).await.unwrap(), "the publication has no manifest: served files not compared");
 }
 
@@ -810,7 +830,8 @@ async fn rpm_verify_reads_the_layout_of_the_publication() {
     assert_eq!(verify(json!({ "layout": "flat" })).await.unwrap(), ok);
     // Without a layout the package is looked for at the nested path (Pulp's default), where this one is not.
     let e = verify(json!({})).await.unwrap_err().to_string();
-    assert!(e.contains("tried Packages/b/bash-5.2-1.x86_64.rpm, bash-5.2-1.x86_64.rpm"), "{e}");
+    let tried = "tried Packages/b/bash-5.2-1.x86_64.rpm, bash-5.2-1.x86_64.rpm";
+    assert_eq!(e, format!("served content differs: package bash-5.2-1.x86_64.rpm not served with the expected digest ({tried})"));
 }
 
 #[tokio::test]
@@ -831,4 +852,34 @@ async fn version_content_is_listed_in_large_pages() {
     for t in RepoType::ALL {
         assert!(ops::all_content_keys(&c, t, "/v/").await.unwrap().is_empty(), "{t:?}");
     }
+}
+
+#[tokio::test]
+async fn a_deb_verbatim_publication_protects_its_version() {
+    let server = MockServer::start().await;
+    let (repo, version) = (format!("{API}repositories/deb/apt/1/"), format!("{API}repositories/deb/apt/1/versions/2/"));
+    let verbatim = format!("{API}publications/deb/verbatim/7/");
+    let page =
+        |r: Value| ResponseTemplate::new(200).set_body_json(json!({ "count": r.as_array().unwrap().len(), "next": null, "results": r }));
+    Mock::given(method("GET")).and(path(format!("{API}publications/deb/apt/"))).respond_with(page(json!([]))).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path(format!("{API}publications/deb/verbatim/")))
+        .and(query_param("repository", repo.as_str()))
+        .respond_with(page(json!([{ "pulp_href": verbatim, "repository_version": version }])))
+        .mount(&server)
+        .await;
+    let d = json!({ "pulp_href": format!("{API}distributions/deb/apt/1/"), "name": "apt", "base_path": "apt", "publication": verbatim });
+    Mock::given(method("GET")).and(path(format!("{API}distributions/deb/apt/"))).respond_with(page(json!([d]))).mount(&server).await;
+    let c = client(&server, |_, _| {});
+    let (pubs, by) = ops::version_protection(&c, &Capabilities::default(), RepoType::Deb, &version).await.unwrap();
+    let by: Vec<_> = by.iter().map(|(d, why)| (d.name.as_str(), *why)).collect();
+    assert_eq!((pubs.len(), by), (1, vec![("apt", "pinned to a publication of this version")]));
+
+    // A server without verbatim publications is not asked for them.
+    let mut caps = Capabilities::default();
+    caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/publications/deb/apt/": {} } }));
+    let (pubs, by) = ops::version_protection(&c, &caps, RepoType::Deb, &version).await.unwrap();
+    assert_eq!((pubs.len(), by.len()), (0, 0));
+    let asked = server.received_requests().await.unwrap().iter().filter(|r| r.url.path().contains("/verbatim/")).count();
+    assert_eq!(asked, 1, "only the first call lists verbatim publications");
 }

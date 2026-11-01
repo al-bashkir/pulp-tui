@@ -187,7 +187,7 @@ enum RepoSync {
     /// The task finished and created this repository version (href).
     NewVersion(String),
     NoChange,
-    /// The error text: a rejected request, a failed or canceled task, or a task that could not be read.
+    /// The error text: a rejected request, a failed, canceled or skipped task, or a task that could not be read.
     Failed(String),
     /// No default remote.
     Skipped,
@@ -214,8 +214,6 @@ async fn start_syncs(c: &PulpClient, repos: &[CvRepo], policy: &str) -> Vec<(Str
 async fn finish_sync(c: &PulpClient, state: RepoSync, on: OnTask<'_>) -> RepoSync {
     let RepoSync::Submitted(h) = state else { return state };
     match ops::wait_task(c, &h, on).await {
-        // `wait_task` accepts a skipped task as done, but a skipped sync did not sync.
-        Ok(t) if t.state == "skipped" => RepoSync::Failed("task skipped".into()),
         Ok(t) => t.created_matching("/versions/").map_or(RepoSync::NoChange, RepoSync::NewVersion),
         // `TaskUnknown` says when reading the task failed, not the task: it may still run, or may be done.
         Err(e) => RepoSync::Failed(e.to_string()),
@@ -1237,7 +1235,7 @@ mod tests {
         let server = MockServer::start().await;
         serve(&server, "GET", format!("{TASKS}1/"), 200, json!({ "pulp_href": format!("{TASKS}1/"), "state": "skipped" })).await;
         let out = finish_syncs(&client(&server), vec![("os".into(), RepoSync::Submitted(format!("{TASKS}1/")))], &ops::no_progress).await;
-        assert_eq!(out[0].1, RepoSync::Failed("task skipped".into()));
+        assert_eq!(out[0].1, RepoSync::Failed("task skipped: ".into()));
     }
 
     #[tokio::test]

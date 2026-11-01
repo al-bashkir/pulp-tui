@@ -119,15 +119,13 @@ fn served_by(ds: &[Distribution], serves: impl Fn(&Distribution) -> bool) -> Vec
     ds.iter().filter(|d| serves(d)).map(|d| format!("  {} ({})", d.name, d.base_url.as_deref().unwrap_or(&d.base_path))).collect()
 }
 
-/// What a distribution serves: (repository version, its publication or `Null`, how). `None`: nothing.
+/// What a distribution serves: (repository version, its publication, how). `None`: nothing, also for a
+/// version binding without a publication (File, RPM and Deb serve only publications).
 /// A repository binding serves the newest publication of the repository (pulpcore orders by repository
 /// version, then creation), which is not the latest version when that one has no publication.
 async fn served_now(c: &PulpClient, t: RepoType, d: &Value) -> anyhow::Result<Option<(String, Value, String)>> {
-    let version = d["repository_version"].as_str();
-    let Some(p) = ops::served_publication(c, t, d).await? else {
-        return Ok(version.map(|v| (v.to_string(), Value::Null, "pinned to repository version".into())));
-    };
-    let how = match (d["publication"].as_str(), version) {
+    let Some(p) = ops::served_publication(c, t, d).await? else { return Ok(None) };
+    let how = match (d["publication"].as_str(), d["repository_version"].as_str()) {
         (Some(x), _) => format!("pinned to publication {}", short(x)),
         (None, Some(_)) => "pinned to repository version".into(),
         (None, None) => format!("follows repository {}: newest publication {}", short(&s(d, "repository")), short(&s(&p, "pulp_href"))),
@@ -1438,7 +1436,7 @@ fn version_action(app: &mut App, act: Act, item: Value) {
             if ctx.cv()?.store.protected_versions(&ctx.scope).await?.contains(&href) {
                 bail!("refused: this version is a snapshot of a Content View version (delete the CV version instead)");
             }
-            let (pubs, by) = ops::version_protection(c, t, &href).await?;
+            let (pubs, by) = ops::version_protection(c, &ctx.caps, t, &href).await?;
             let id = short(&href);
             if !by.is_empty() {
                 // Pulp refuses the delete (HTTP 400): no typed confirm.
@@ -1762,7 +1760,7 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             let c = &ctx.client;
             let d: Value = c.get(&href, &[]).await?;
             let Some((version, publication, how)) = served_now(c, t, &d).await? else {
-                bail!("distribution serves nothing (no binding, or its repository has no publication)");
+                bail!("distribution serves nothing (no binding, or no publication of its repository or version)");
             };
             let res = ops::verify_served(c, t, &s(&d, "base_url"), &version, &publication).await;
             let lines = vec![
@@ -3527,6 +3525,22 @@ mod tests {
         assert_eq!(title, "Verify docs");
         assert_eq!(lines.first().map(String::as_str), Some("docs: follows repository r: newest publication 1"), "{lines:?}");
         assert_eq!(lines.last().map(String::as_str), Some("OK: CUSTOM matches 1 files"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn verify_of_a_version_without_a_publication_says_nothing_is_served() {
+        let server = wiremock::MockServer::start().await;
+        let dist = format!("{API}distributions/file/file/d/");
+        let (v, base) = (format!("{API}repositories/file/file/r/versions/3/"), format!("{}/pulp/content/docs/", server.uri()));
+        get(&server, &dist, json!({ "pulp_href": dist, "name": "docs", "base_url": base, "repository_version": v })).await;
+        // pulp_file, pulp_rpm and pulp_deb serve only publications: every path of this distribution is 404.
+        get(&server, &format!("{API}publications/file/file/"), page(json!([]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        distribution_action(&mut app, RepoType::File, Act::Verify, json!({ "pulp_href": dist, "name": "docs" }));
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no OK result");
+        let e = app.notices.iter().find(|n| n.level == Level::Error).expect("no error").text.clone();
+        assert!(e.contains("distribution serves nothing"), "{e}");
     }
 
     #[tokio::test]

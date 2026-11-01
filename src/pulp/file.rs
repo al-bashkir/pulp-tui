@@ -17,7 +17,7 @@ pub fn key(f: &FileContent) -> String {
 /// The served manifest (the publication's `manifest`; `None`: it has none) must list exactly the
 /// version's files. `base` ends with `/`.
 pub async fn verify(c: &PulpClient, base: &str, version: &str, manifest: Option<&str>) -> Result<String> {
-    let fail = |m: String| Err(PulpError::Unsupported(m));
+    let fail = |m: String| Err(PulpError::Mismatch(m));
     let Some(probe) = manifest else { return Ok("the publication has no manifest: served files not compared".into()) };
     let (status, body) = c.fetch_content(&format!("{base}{probe}"), 64 << 20).await?;
     if status != 200 {
@@ -36,7 +36,7 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str, manifest: Option<
     // `sha256` comes from the stored file: `null` for an on_demand file until a client downloads it.
     let differs = want.iter().any(|f| served.get(&f.relative_path).is_none_or(|d| f.sha256.as_ref().is_some_and(|s| s != d)));
     if differs || served.len() != want.len() {
-        return fail(format!("served manifest differs from snapshot ({} served, {} expected)", served.len(), want.len()));
+        return fail(format!("{probe} does not match the version ({} served, {} expected)", served.len(), want.len()));
     }
     Ok(format!("{probe} matches {} files", want.len()))
 }

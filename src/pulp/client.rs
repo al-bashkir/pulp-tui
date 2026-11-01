@@ -30,6 +30,9 @@ pub enum PulpError {
     BadHref(String),
     #[error("not supported by this server: {0}")]
     Unsupported(String),
+    /// A served-content check (`ops::verify_served`) found what clients get is not the version.
+    #[error("served content differs: {0}")]
+    Mismatch(String),
     #[error("task {state}: {message}")]
     TaskFailed { href: String, state: String, message: String },
     #[error("could not read task {href}, it may still be running (see Tasks): {message}")]

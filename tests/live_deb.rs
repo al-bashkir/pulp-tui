@@ -10,7 +10,7 @@ use pulp_tui::filters::{Selector, parse_rules};
 use pulp_tui::pulp::client::Page;
 use pulp_tui::pulp::models::{DebPackage, RepoVersion};
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{PulpClient, RepoType, deb};
+use pulp_tui::pulp::{Capabilities, PulpClient, RepoType, deb};
 use pulp_tui::store::{CvRepo, Store};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -145,6 +145,33 @@ async fn a_removed_deb_package_is_no_longer_served() {
     ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let index = served(&c, &format!("{base}dists/fixture/main/binary-amd64/Packages")).await.1;
     assert!(String::from_utf8_lossy(&index).contains("Package: fixture-beta-dbg\n"), "restored");
+    cleanup(&c, &[&dist, &repo, &remote]).await;
+}
+
+/// A distribution that serves a verbatim publication protects its version, as Pulp says on delete.
+#[tokio::test]
+async fn a_served_verbatim_publication_protects_its_version() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Deb;
+    let name = unique("it-deb-verbatim");
+    let body = json!({ "name": name, "url": format!("{}/deb/", upstream()), "policy": "immediate", "distributions": "fixture" });
+    let remote = create(&c, t.remotes(), body, "/remotes/").await;
+    let repo = create(&c, t.repositories(), json!({ "name": name, "remote": remote }), "/repositories/").await;
+    let m = ops::sync(&c, t, &repo, None, "mirror").await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let v1 = latest(&c, &repo).await;
+    let verbatim = create(&c, deb::VERBATIM_PUBLICATIONS, json!({ "repository_version": v1 }), "/publications/").await;
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&verbatim), &json!({}), None, &no_progress).await.unwrap();
+
+    let caps = Capabilities::detect(&c).await.unwrap();
+    let (pubs, by) = ops::version_protection(&c, &caps, t, &v1).await.unwrap();
+    let by: Vec<_> = by.into_iter().map(|(d, why)| (d.name, why)).collect();
+    assert_eq!((pubs.len(), by), (1, vec![(name.clone(), "pinned to a publication of this version")]));
+    let err = c.delete(&v1).await.unwrap_err();
+    assert!(err.status() == Some(400) && err.to_string().contains("currently being used to distribute content"), "{err}");
     cleanup(&c, &[&dist, &repo, &remote]).await;
 }
 

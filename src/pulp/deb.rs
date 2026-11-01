@@ -9,6 +9,9 @@ use std::collections::HashSet;
 
 const FIELDS: &str = "pulp_href,package,version,architecture,relative_path,sha256";
 
+/// Publications that serve the synced upstream metadata as is; pulp-tui does not create them.
+pub const VERBATIM_PUBLICATIONS: &str = "publications/deb/verbatim/";
+
 pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<DebPackage>> {
     let q = [("repository_version", version.into()), ("fields", FIELDS.into()), ("limit", CONTENT_PAGE.into())];
     c.list_all(&c.api("content/deb/packages/"), &q, 2_000_000).await
@@ -29,7 +32,7 @@ fn served_entry(index: &str, p: &DebPackage) -> Option<(String, Option<String>)>
 /// The Release file must be served and the smallest package must be listed in a `Packages` index
 /// and downloadable with the expected digest. `base` ends with `/`.
 pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String> {
-    let fail = |m: String| Err(PulpError::Unsupported(m));
+    let fail = |m: String| Err(PulpError::Mismatch(m));
     let q = [("repository_version", version.to_string()), ("fields", "distribution".into()), ("limit", "1".into())];
     let releases: Page<Value> = c.list(&c.api("content/deb/releases/"), &q).await?;
     let Some(dist) = releases.results.first().and_then(|r| r["distribution"].as_str()) else {

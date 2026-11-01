@@ -1,6 +1,7 @@
 //! Typed Pulp operations shared by the TUI and the workflow services. Every mutation
 //! that Pulp runs as a task is awaited here with adaptive polling.
 
+use super::caps::Capabilities;
 use super::client::{Mutation, Page, PulpClient, PulpError, Result, jitter, retryable};
 use super::models::*;
 use super::{deb, file, rpm};
@@ -20,7 +21,8 @@ pub fn no_progress(_: &Task) {}
 const POLL_OUTAGE: Duration = Duration::from_secs(120);
 
 /// Poll a task until it reaches a final state. The interval grows while nothing changes
-/// and resets on progress, so long tasks cost few requests. A task that cannot be read
+/// and resets on progress, so long tasks cost few requests. Only `completed` is done: a failed,
+/// canceled or skipped task (it did not run) gives `TaskFailed`. A task that cannot be read
 /// gives `TaskUnknown`, never `TaskFailed`: it may still run.
 pub async fn wait_task(c: &PulpClient, href: &str, on: OnTask<'_>) -> Result<Task> {
     let (min, max) = c.poll();
@@ -43,7 +45,7 @@ pub async fn wait_task(c: &PulpClient, href: &str, on: OnTask<'_>) -> Result<Tas
         }
         if t.is_final() {
             return match t.state.as_str() {
-                "completed" | "skipped" => Ok(t),
+                "completed" => Ok(t),
                 _ => {
                     Err(PulpError::TaskFailed { href: href.into(), message: t.error_message().unwrap_or_default(), state: t.state.clone() })
                 }
@@ -162,14 +164,18 @@ pub fn protecting<'a>(version: &str, pubs: &[Publication], ds: &'a [Distribution
 }
 
 /// The publications of `version` (Pulp deletes them with it) and the distributions that protect it.
-/// shortcut: lists only `t.publications()`, so Deb verbatim publications are missed; list the generic
-/// `publications/` once pulp-tui creates verbatim publications.
+/// Deb also has verbatim publications, which Pulp counts the same.
 pub async fn version_protection(
     c: &PulpClient,
+    caps: &Capabilities,
     t: RepoType,
     version: &str,
 ) -> Result<(Vec<Publication>, Vec<(Distribution, &'static str)>)> {
-    let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", repo_of_version(version))], 100_000).await?;
+    let q = [("repository", repo_of_version(version))];
+    let mut pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &q, 100_000).await?;
+    if t == RepoType::Deb && caps.has_endpoint(deb::VERBATIM_PUBLICATIONS) {
+        pubs.extend(c.list_all::<Publication>(&c.api(deb::VERBATIM_PUBLICATIONS), &q, 100_000).await?);
+    }
     let ds = distributions(c, t).await?;
     let by = protecting(version, &pubs, &ds).into_iter().map(|(d, why)| (d.clone(), why)).collect();
     Ok((pubs.into_iter().filter(|p| p.repository_version.as_deref() == Some(version)).collect(), by))

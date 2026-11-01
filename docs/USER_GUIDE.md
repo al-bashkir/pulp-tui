@@ -212,7 +212,7 @@ with the marked version (`Space` on one, `m` on the other; shows added/removed u
 content type that the Content browser lists, each line starts with its type, such as
 `+ advisory RHSA-2024:0001`; older → newer; a `warning:` line says when Pulp counts more or
 fewer units in a version than the compare lists), **d** delete (names the distributions that serve the version or its
-publications, and you type the version id; refused for Content View snapshots; never needed
+publications, Deb verbatim publications too, and you type the version id; refused for Content View snapshots; never needed
 for rollback), **R** restore as latest (below).
 
 **R** makes a new latest version of the repository with the content of the selected version
@@ -272,7 +272,8 @@ repository version) or **FOLLOWS LATEST** (repository). **y** copies the content
 (OSC 52 terminal clipboard; in tmux it needs `set -g allow-passthrough on` or
 `set -s set-clipboard on`), **V** verifies what is served (for a distribution that follows
 a repository: its newest publication, which is not the latest version when that version has
-no publication; File: the manifest file name of that publication), **b** re-points to a version (preview first; Deb: with the signing service
+no publication; File: the manifest file name of that publication; a difference reads
+`MISMATCH: served content differs: …`), **b** re-points to a version (preview first; Deb: with the signing service
 of the publication it serves now), **c**/**e** create/edit
 (name, base path, binding, content guard, labels; Deb: the optional signing service of a
 pinned publication), **d** delete. A distribution of a

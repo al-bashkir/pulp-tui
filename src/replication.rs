@@ -316,6 +316,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_skipped_sync_is_not_published_or_reported_as_done() {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let p = crate::config::Profile { url: server.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
+        let c = PulpClient::new("dst", &p, &crate::config::Settings::default()).unwrap();
+        let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+        let (remote, repo) = ("/pulp/api/v3/remotes/file/file/1/", "/pulp/api/v3/repositories/file/file/1/");
+        let one = |o: Value| json!({ "count": 1, "next": null, "results": [o] });
+        let labels = json!({ LABEL_REPLICA: "up" });
+        let r = json!({ "pulp_href": remote, "name": "files", "url": "https://up/files/PULP_MANIFEST", "pulp_labels": labels.clone() });
+        wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/remotes/file/file/")).respond_with(ok(one(r))).mount(&server).await;
+        // The repository has the version of an earlier run.
+        let r = json!({ "pulp_href": repo, "name": "files", "latest_version_href": format!("{repo}versions/1/"), "pulp_labels": labels });
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/repositories/file/file/"))
+            .respond_with(ok(one(r.clone())))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("GET")).and(path(repo)).respond_with(ok(r)).mount(&server).await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(format!("{repo}sync/")))
+            .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": "/pulp/api/v3/tasks/1/" })))
+            .mount(&server)
+            .await;
+        let skipped = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "skipped", "name": "sync" });
+        wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/tasks/1/")).respond_with(ok(skipped)).mount(&server).await;
+        let it = PlanItem {
+            t: RepoType::File,
+            name: "files".into(),
+            base_path: "files".into(),
+            remote_url: "https://up/files/PULP_MANIFEST".into(),
+            action: PlanAction::Update,
+            note: String::new(),
+        };
+        let e = replicate_one(&c, "up", &it, false, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), "task skipped: ");
+        let sent = server.received_requests().await.unwrap();
+        let changes: Vec<_> = sent.iter().filter(|r| r.method.as_str() != "GET").map(|r| r.url.path().to_string()).collect();
+        assert_eq!(changes, [format!("{repo}sync/")], "no publication, no distribution");
+    }
+
+    #[tokio::test]
     async fn a_file_replica_syncs_from_the_manifest_the_upstream_serves() {
         use wiremock::matchers::{method, path, query_param};
         let (up, down) = (wiremock::MockServer::start().await, wiremock::MockServer::start().await);

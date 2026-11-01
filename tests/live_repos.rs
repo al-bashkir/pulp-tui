@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use pulp_tui::pulp::models::{Package, RepoVersion};
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{Mutation, PulpClient, RepoType, file, rpm};
+use pulp_tui::pulp::{Capabilities, Mutation, PulpClient, RepoType, file, rpm};
 use serde_json::{Value, json};
 
 async fn dist_url(c: &PulpClient, dist: &str) -> String {
@@ -211,7 +211,8 @@ async fn file_lifecycle() {
     // Rollback: the served manifest is exactly v1 again (see grace-period note in rpm_lifecycle).
     ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     ops::verify_served(&c, t, &base, &v1, &c.get(&pub1, &[]).await.unwrap()).await.unwrap();
-    assert!(ops::verify_served(&c, t, &base, &v2, &c.get(&pub1, &[]).await.unwrap()).await.is_err(), "detects mismatch");
+    let e = ops::verify_served(&c, t, &base, &v2, &c.get(&pub1, &[]).await.unwrap()).await.unwrap_err().to_string();
+    assert_eq!(e, "served content differs: PULP_MANIFEST does not match the version (3 served, 4 expected)");
 
     // A custom manifest name: Publish keeps it, and Verify reads the one of the autopublished publication.
     let custom = json!({ "name": format!("{name}-custom"), "manifest": "CUSTOM_MANIFEST", "autopublish": true });
@@ -260,12 +261,13 @@ async fn served_versions_are_protected_from_delete() {
     let follow = json!({ "name": format!("{name}-follow"), "base_path": format!("{name}-follow"), "repository": repo });
     let follow = create(&c, t.distributions(), follow, "/distributions/").await;
 
+    let caps = Capabilities::default(); // no capability changes File protection
     let why = |by: Vec<(pulp_tui::pulp::models::Distribution, &'static str)>| -> Vec<(String, &str)> {
         by.into_iter().map(|(d, why)| (d.name, why)).collect()
     };
-    let (pubs, by) = ops::version_protection(&c, t, &v[1]).await.unwrap();
+    let (pubs, by) = ops::version_protection(&c, &caps, t, &v[1]).await.unwrap();
     assert_eq!((pubs.len(), why(by)), (1, vec![(format!("{name}-pin"), "pinned to a publication of this version")]));
-    let (_, by) = ops::version_protection(&c, t, &v[2]).await.unwrap();
+    let (_, by) = ops::version_protection(&c, &caps, t, &v[2]).await.unwrap();
     assert_eq!(why(by), [(format!("{name}-follow"), "follows the repository; this is its newest published version")]);
     // Pulp agrees: both deletes are refused before any task starts.
     for version in &v[1..] {
@@ -274,7 +276,7 @@ async fn served_versions_are_protected_from_delete() {
     }
 
     // v1 is published, but nothing serves it: not protected, and the delete completes.
-    let (pubs, by) = ops::version_protection(&c, t, &v[0]).await.unwrap();
+    let (pubs, by) = ops::version_protection(&c, &caps, t, &v[0]).await.unwrap();
     assert_eq!((pubs.len(), by.len()), (1, 0));
     let m = c.delete(&v[0]).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();

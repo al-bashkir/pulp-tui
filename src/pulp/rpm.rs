@@ -26,7 +26,7 @@ pub fn package_path(layout: &str, location_href: &str) -> Option<String> {
 /// RPM metadata must be served and the smallest package must be downloadable with the
 /// expected digest. `base` ends with `/`.
 pub async fn verify(c: &PulpClient, base: &str, version: &str, layout: &str) -> Result<String> {
-    let fail = |m: String| Err(PulpError::Unsupported(m));
+    let fail = |m: String| Err(PulpError::Mismatch(m));
     let probe = "repodata/repomd.xml";
     let (status, _) = c.fetch_content(&format!("{base}{probe}"), 64 << 20).await?;
     if status != 200 {

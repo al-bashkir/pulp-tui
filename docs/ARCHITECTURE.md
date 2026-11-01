@@ -52,7 +52,9 @@ Pulp tasks are the source of truth. The Task Center stores task references in th
 polls each unfinished task on its own schedule: the interval starts at `poll_min_ms`,
 grows by 1.5x while nothing changes, resets on progress, and has ±20 % jitter. At most
 three polls run at the same time. A task that a workflow already waits on is not polled
-twice. After a restart, unfinished references are polled again ("re-attached"). A task that
+twice. A workflow takes only a `completed` task as done (`ops::wait_task`): a `failed`,
+`canceled` or `skipped` task stops that step with the task state as the error. After a
+restart, unfinished references are polled again ("re-attached"). A task that
 the server answers with 404 (purged) gets the final state `gone`. A poll answer for a task
 that is not tracked (sent to the previous server before a Connect) is dropped.
 
