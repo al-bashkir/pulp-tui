@@ -435,8 +435,13 @@ pub async fn content_keys(c: &PulpClient, t: RepoType, version: Option<&str>) ->
 /// Keys of every unit of a version, of each content type of `t`, prefixed with the type
 /// (`advisory FIXTURE-2026:0001`): for the Versions compare. Fetches only the fields of the keys.
 pub async fn all_content_keys(c: &PulpClient, t: RepoType, version: &str) -> Result<BTreeSet<String>> {
+    content_keys_except(c, t, version, &[]).await
+}
+
+/// `all_content_keys` without the content types at the API paths `skip`.
+pub async fn content_keys_except(c: &PulpClient, t: RepoType, version: &str, skip: &[&str]) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
-    for ct in t.content_types() {
+    for ct in t.content_types().iter().filter(|ct| !skip.contains(&ct.path)) {
         let q = [("repository_version", version.to_string()), ("fields", ct.fields.into()), ("limit", CONTENT_PAGE.into())];
         let units: Vec<Value> = c.list_all(&c.api(ct.path), &q, 2_000_000).await?;
         out.extend(units.iter().map(ct.key));

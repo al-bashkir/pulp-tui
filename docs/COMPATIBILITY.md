@@ -104,7 +104,8 @@ server gives the final answer; the dashboard shows a warning.
   base version, also the Deb release records. Exception: pulp_deb 3.11.1 removes the upstream
   metadata units (`ReleaseFile`, `PackageIndex`, `InstallerFileIndex`) from every new version
   (`AptRepository.initialize_new_version`); only a sync adds them again. A restored Deb version
-  therefore lacks them; an APT publication does not use them. A version without a change is deleted at once
+  therefore lacks them; an APT publication does not use them. The restore preview leaves them
+  out of the new version and says so. A version without a change is deleted at once
   (`RepositoryVersion.__exit__`): the task completes with no created version. A new version
   runs the retention cleanup (`retain_repo_versions`) and autopublish (`on_new_version`), as
   a sync does. Verified in `live_repos` (File, RPM) and `live_deb` (3.123.1).

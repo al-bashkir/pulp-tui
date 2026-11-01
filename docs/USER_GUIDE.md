@@ -224,7 +224,9 @@ for rollback), **R** restore as latest (below).
 repository with `retain_repo_versions` then deletes its oldest versions, as after any new
 version. The preview shows what changes from the latest version (the same lines as
 compare) and what serves the new version: with autopublish on, Pulp publishes it at once;
-else publish it with **P**. Then the distributions that follow the repository serve it, and
+else publish it with **P**. For Deb, the new version has no Release files and no package or
+installer file indices: pulp_deb removes them from every new version, and the next publish
+writes new ones; the preview leaves them out. Then the distributions that follow the repository serve it, and
 the next sync, copy or publish starts from it. **b** (rollback) is different: it re-points
 one distribution and makes no version, so the distributions that follow the repository and
 the next sync still use the newest version. The latest version itself is refused (nothing to

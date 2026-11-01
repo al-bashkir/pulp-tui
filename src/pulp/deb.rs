@@ -12,6 +12,11 @@ const FIELDS: &str = "pulp_href,package,version,architecture,relative_path,sha25
 /// Publications that serve the synced upstream metadata as is; pulp-tui does not create them.
 pub const VERBATIM_PUBLICATIONS: &str = "publications/deb/verbatim/";
 
+/// Content types that pulp_deb removes from every new version (`AptRepository.initialize_new_version`);
+/// only a sync adds them again.
+pub const NEW_VERSION_DROPS: [&str; 3] =
+    ["content/deb/release_files/", "content/deb/package_indices/", "content/deb/installer_file_indices/"];
+
 pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<DebPackage>> {
     let q = [("repository_version", version.into()), ("fields", FIELDS.into()), ("limit", CONTENT_PAGE.into())];
     c.list_all(&c.api("content/deb/packages/"), &q, 2_000_000).await

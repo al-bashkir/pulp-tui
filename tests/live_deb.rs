@@ -136,10 +136,9 @@ async fn a_removed_deb_package_is_no_longer_served() {
     ops::settle(&c, m, &no_progress).await.unwrap();
     let v3 = latest(&c, &repo).await;
     // pulp_deb removes the upstream metadata units from every new version; only a sync adds them.
-    let synced_only = ["release file ", "package index ", "installer file index "];
-    let mut want = ops::all_content_keys(&c, t, &v1).await.unwrap();
-    assert!(want.iter().any(|k| k.starts_with("package index ")), "the sync stored the index: {want:?}");
-    want.retain(|k| !synced_only.iter().any(|p| k.starts_with(p)));
+    let synced = ops::all_content_keys(&c, t, &v1).await.unwrap();
+    assert!(synced.iter().any(|k| k.starts_with("package index ")), "the sync stored the index: {synced:?}");
+    let want = ops::content_keys_except(&c, t, &v1, &deb::NEW_VERSION_DROPS).await.unwrap();
     assert_eq!(ops::all_content_keys(&c, t, &v3).await.unwrap(), want);
     let publication = ops::create_publication(&c, t, &v3, None, &no_progress).await.unwrap();
     ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();

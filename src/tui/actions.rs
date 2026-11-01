@@ -1595,8 +1595,10 @@ fn restore_preview(app: &mut App, t: RepoType, version: String, number: String) 
         if latest == version {
             bail!("version {number} is already the latest version of {name}");
         }
-        let d = ops::diff(&ops::all_content_keys(c, t, &latest).await?, &ops::all_content_keys(c, t, &version).await?);
-        let lines = restore_lines(&r, &number, d.lines(&format!("latest {}", short(&latest)), &format!("new (= v{number})")));
+        let drops: &[&str] = if t == RepoType::Deb { &deb::NEW_VERSION_DROPS } else { &[] };
+        let new = ops::content_keys_except(c, t, &version, drops).await?;
+        let d = ops::diff(&ops::all_content_keys(c, t, &latest).await?, &new);
+        let lines = restore_lines(t, &r, &number, d.lines(&format!("latest {}", short(&latest)), &format!("new (= v{number})")));
         let typed = name.clone();
         ap(move |app| {
             app.confirm_prod(format!("Restore version {number} as latest"), lines, &typed, move |app| {
@@ -1611,7 +1613,7 @@ fn restore_preview(app: &mut App, t: RepoType, version: String, number: String) 
 }
 
 /// The restore confirm: what it does, how it differs from Rollback, what serves it, and the content `diff`.
-fn restore_lines(r: &Value, number: &str, diff: Vec<String>) -> Vec<String> {
+fn restore_lines(t: RepoType, r: &Value, number: &str, diff: Vec<String>) -> Vec<String> {
     let mut lines = vec![
         format!("Make a new latest version of {} with the content of version {number}; newer versions are kept.", s(r, "name")),
         "Rollback (b) instead re-points one distribution and makes no version. After a restore, the".into(),
@@ -1624,6 +1626,12 @@ fn restore_lines(r: &Value, number: &str, diff: Vec<String>) -> Vec<String> {
     ];
     if let Some(n) = r["retain_repo_versions"].as_i64() {
         lines.push(format!("retain_repo_versions = {n}: Pulp then deletes the versions older than the newest {n}."));
+    }
+    if t == RepoType::Deb {
+        lines.push(
+            "pulp_deb removes Release files and package and installer file indices from every new version; the next publish writes new ones."
+                .into(),
+        );
     }
     lines.push(String::new());
     lines.extend(diff);
@@ -3368,9 +3376,51 @@ mod tests {
         assert_eq!(last(&app), "restore docs v2 as latest: no new version (the latest version already has this content)");
     }
 
+    /// pulp_deb removes its Release files and indices from every new version: the preview does not promise them.
+    #[tokio::test]
+    async fn a_deb_restore_preview_leaves_out_the_units_pulp_deb_drops() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/deb/apt/r/");
+        let (v1, v2) = (format!("{repo}versions/1/"), format!("{repo}versions/2/"));
+        get(&server, &repo, json!({ "pulp_href": repo, "name": "deb", "latest_version_href": v2, "autopublish": false })).await;
+        let unit =
+            |p: &str, id: &str| json!({ "pulp_href": format!("{API}content/deb/{p}/{id}/"), "relative_path": format!("dists/b/{id}") });
+        for (p, id) in [("release_files", "Release"), ("package_indices", "Packages"), ("installer_file_indices", "SHA256SUMS")] {
+            wiremock::Mock::given(method("GET"))
+                .and(path(format!("{API}content/deb/{p}/")))
+                .and(query_param("repository_version", v1.as_str()))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([unit(p, id)]))))
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}content/deb/generic_contents/")))
+            .and(query_param("repository_version", v1.as_str()))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([unit("generic_contents", "g")]))))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("GET"))
+            .and(path_regex("/content/deb/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([]))))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        version_action(&mut app, Act::Restore, json!({ "pulp_href": v1, "number": 1 }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm") };
+        assert!(lines.contains(&"+ generic content dists/b/g  (g)".to_string()), "{lines:?}");
+        for word in ["release file", "package index", "installer file index"] {
+            assert!(!lines.iter().any(|l| l.starts_with('+') && l.contains(word)), "the new version lacks the {word}: {lines:?}");
+        }
+        let note = "pulp_deb removes Release files and package and installer file indices from every new version; the next publish writes new ones.";
+        assert!(lines.contains(&note.to_string()), "{lines:?}");
+    }
+
     #[test]
     fn the_restore_confirm_says_what_serves_the_new_version() {
-        let lines = |r: Value| restore_lines(&r, "2", vec!["+ file a.txt".into()]);
+        let lines = |r: Value| restore_lines(RepoType::File, &r, "2", vec!["+ file a.txt".into()]);
         let off = lines(json!({ "name": "docs", "autopublish": false, "retain_repo_versions": 3 }));
         assert_eq!(
             off,
