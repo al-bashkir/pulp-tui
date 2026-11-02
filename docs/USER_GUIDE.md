@@ -13,443 +13,392 @@
  [ok] last notification  (or the running operation and its progress)
 ```
 
-* The header always shows the active server. A **read-only** profile shows a yellow tag.
-  A **production** profile turns the header red.
-* Narrow terminals hide the screen list (use the palette) and the details pane. Below
-  60x15 the UI asks for a larger terminal.
-* Selection is shown with `▶` and reverse video, so it does not depend on color.
+* The header shows the active server. A read-only profile shows a yellow tag. A production
+  profile makes the header red.
+* A narrow terminal hides the screen list (use the palette) and the details pane. Below 60x15 the
+  UI asks for a larger terminal.
+* `▶` and reverse video show the selection, so it does not depend on color.
+
+## Common rules
+
+These rules apply to all screens. The screen sections do not repeat them.
+
+* **Read-only profile.** The action menu marks with `*` each action that changes Pulp or a
+  shared database. A read-only profile does not show these actions. See "What is shared" for
+  the Content View rules.
+* **Production profile.** Rollbacks, promotions, *Restore as latest* and Importer imports ask
+  you to type the object name.
+* **Destructive actions.** pulp-tui loads the impact first (what serves the object, what it
+  deletes). Then you type the shown name to confirm.
+* **Capabilities.** A form field shows only when the server has it, and is sent only when you set
+  or change it. An action that needs a missing endpoint shows
+  `not supported by this server: <feature>` and sends nothing.
+* **Edit** sends only the changed fields. Clear a field to remove the setting, or to return to the
+  server default.
+* **Secret fields** (passwords, keys, tokens, headers) never show their value. On edit, empty keeps
+  the server value and `-` clears it.
+* **Tasks.** An action that starts a Pulp task waits for the task. The notice then gives the
+  result, for example the new version number.
+* **Signing service pickers** list the signing services of all plugins. Pulp refuses a service of
+  the wrong type.
+* **Content View objects** belong to pulp-tui: snapshot repositories (`pulp-tui-cv-<view>-<repo>`,
+  label `pulp_tui_cv`) and Content View distributions. The Pulp screens do not edit, sync, upload
+  to, copy into, reclaim or restore a snapshot repository, change its content, or delete it, its
+  versions or its publications. Use the Content View actions.
+* **Dialogs of background jobs** wait until the open dialog closes (the footer shows
+  `N dialog(s) waiting`). A new dialog ignores keys for 0.3 s.
+
+### Three kinds of cancel
+
+1. **Esc on a loading list** cancels the HTTP request. Esc does not stop an operation (sync,
+   publish, replication, upload).
+2. **Quit** or **Connect** stops waiting for client operations, so both ask first. Pulp tasks
+   continue, and the Task Center attaches them again at the next start. When a task cannot be read
+   for about two minutes, the operation ends with `could not read task …, it may still be running`.
+   This is not a failure.
+3. **X on Tasks** asks Pulp to cancel a task or a task group. The Task Center then shows the state
+   that Pulp reports.
 
 ## Keys
 
-| Key                                   | Action                                                                                                                                                                                                                                               |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Tab`                                 | switch focus between the screen list and the main area                                                                                                                                                                                               |
-| `:` or `Ctrl-P`                       | command palette: go to a screen, connect to a server, dismiss finished tasks. It opens in filter mode (`-- FILTER --`): type to filter, `Ctrl-J/K` or `Ctrl-N/P` move. `Esc` goes to move mode (`j k g G`), `/` filters again, a second `Esc` closes |
-| `?`                                   | help (a text view: `j k g G Ctrl-D Ctrl-U` scroll, `Esc` closes)                                                                                                                                                                                     |
-| `N`                                   | notification log                                                                                                                                                                                                                                     |
-| `q` / `Ctrl-C`                        | quit (q asks first when client operations still run)                                                                                                                                                                                                 |
-| `↑ ↓ j k PgUp PgDn Ctrl-D Ctrl-U g G` | move (in the screen list: `j k g G` choose a screen)                                                                                                                                                                                                 |
-| `h` / `l`                             | from the list to the screen list / from the screen list open the screen                                                                                                                                                                              |
-| `Enter`                               | action menu of the selected item (shows the shortcut letter of each action; `*` marks actions that change the server)                                                                                                                                |
-| `/`                                   | search: server-side, or in the list for Content Views and other pulp-tui screens (empty clears; lists the API cannot filter, such as Versions and Publications, say `this list has no search`)                                                       |
-| `s` / `S`                             | sort by next column / reverse (current page)                                                                                                                                                                                                         |
-| `n` / `p`                             | next / previous page (100 items per page)                                                                                                                                                                                                            |
-| `Space`                               | mark item (compare, bulk remove or add content)                                                                                                                                                                                                      |
-| `t`                                   | toggle RPM/File/Deb, content type, tracked tasks / server tasks / task groups / workers, task polling in Logs, or Content View snapshots in Repositories                                                                                             |
-| `r`                                   | refresh                                                                                                                                                                                                                                              |
-| `Esc`                                 | cancel a loading request, clear marks, or go back                                                                                                                                                                                                    |
+| Key                                   | Action                                                   |
+| ------------------------------------- | -------------------------------------------------------- |
+| `Tab`                                 | move focus between the screen list and the main area     |
+| `:` / `Ctrl-P`                        | command palette (see below)                              |
+| `?`                                   | help (`j k g G Ctrl-D Ctrl-U` scroll, `Esc` closes)      |
+| `N`                                   | notification log                                         |
+| `q` / `Ctrl-C`                        | quit (`q` asks first while client operations run)        |
+| `↑ ↓ j k PgUp PgDn Ctrl-D Ctrl-U g G` | move                                                     |
+| `h` / `l`                             | go to the screen list / open the selected screen         |
+| `Enter`                               | action menu: shortcut of each action, `*` marks a change |
+| `/`                                   | search (empty clears)                                    |
+| `s` / `S`                             | sort the current page by the next column / reverse       |
+| `n` / `p`                             | next / previous page (100 items)                         |
+| `Space`                               | mark the item (compare, bulk remove or add)              |
+| `t`                                   | toggle the type or the sub-list of the screen            |
+| `r`                                   | refresh                                                  |
+| `Esc`                                 | cancel a loading request, clear the marks, or go back    |
 
-In forms (they open in move mode): `j k`/`Tab`/`↑↓` change the field, `i` or `Enter` edits
-a text field (the box shows `-- EDIT --`), `Enter` then goes to the next field (submits on
-the last), and `Esc` stops editing. `h l`/`←→`/`Space` change a choice, `Space` toggles a
-checkbox. `Ctrl-S` submits from either mode (also from an open picker, after it takes the
-selection), and `Esc` in move mode cancels. A form with a single text, secret or number
-field opens in edit mode.
+* **Search** is server-side on Pulp lists, and local on pulp-tui screens such as Content Views. A
+  list that the API cannot filter (Versions, Publications) says `this list has no search`.
+* **Palette:** go to a screen, connect to a server, or dismiss finished tasks. It opens in filter
+  mode (`-- FILTER --`): type to filter, `Ctrl-J/K` or `Ctrl-N/P` move. `Esc` goes to move mode
+  (`j k g G`), `/` filters again, a second `Esc` closes.
+* Lists keep 5 rows of margin above and below the selected row.
 
-While editing a text field (forms and the search input), the cursor moves inside the text:
-`← →`/`Ctrl-B Ctrl-F` one character, `Alt-B Alt-F`/`Ctrl-← Ctrl-→` one word, `Home End`/`Ctrl-A Ctrl-E`
-to the start or end. `Backspace`/`Delete` delete one character, `Ctrl-W` the word before the
-cursor, `Ctrl-U`/`Ctrl-K` everything before/after the cursor.
+**Forms** open in move mode:
 
-Lists scroll with 5 rows of margin above and below the highlighted row (as vim `scrolloff=5`). In confirmations:
-`y`/`Enter` confirms, `n`/`Esc` cancels; destructive operations require typing the shown
-name, and so do rollbacks and promotions on a production profile. A dialog that a finished
-background job opens never replaces the open one: it waits until that one closes (the footer
-shows `N dialog(s) waiting`), and it ignores keys for 0.3 s after it appears, so keys typed
-for another dialog never answer it. `j k g G Ctrl-D Ctrl-U ↑↓ PgUp PgDn Home End` scroll long previews. With a typed name
-letters type, so only `Ctrl-D`/`Ctrl-U`, `PgUp`/`PgDn`, `Home`/`End` and the arrows scroll
-(`Ctrl-J`/`Ctrl-K` do not).
+* `j k`, `Tab` or `↑ ↓` change the field. `h l`, `← →` or `Space` change a choice. `Space`
+  toggles a checkbox.
+* `i` or `Enter` edits a text field (`-- EDIT --`). `Enter` then goes to the next field, or
+  submits on the last one. `Esc` stops editing.
+* `Ctrl-S` submits from both modes, also from an open picker. `Esc` in move mode cancels.
+* A form with one text, secret or number field opens in edit mode.
+* Text editing (also in search): `← →`/`Ctrl-B Ctrl-F` one character, `Alt-B Alt-F`/`Ctrl-← Ctrl-→`
+  one word, `Home End`/`Ctrl-A Ctrl-E` start or end. `Backspace`/`Delete` delete one character,
+  `Ctrl-W` the word before the cursor, `Ctrl-U`/`Ctrl-K` all text before/after the cursor.
 
-**Pickers.** A field shown as `[ value ▾ ]` picks an existing object (repository, remote,
-distribution, role, user, ...) from the server. `Enter` or `Space` opens the list in move
-mode: `j k` or `↑↓` move one row, `g G` go to the first or last row, `Ctrl-D`/`Ctrl-U` or
-`PgDn PgUp` move 10 rows. Typing a letter other than `j` or `k` on the closed field opens
-the list in filter mode with that letter as the filter (`j` and `k` move to another field).
-`/` enters filter mode (the popup shows `-- FILTER --`):
-type to filter, `Ctrl-J/K` or `Ctrl-N/P` (and the arrow keys) move, and `Esc` keeps the
-filter and returns to move mode. A second `Esc` closes the list and keeps the old value;
-in move mode a single `Esc` closes it.
-`Enter` selects and moves to the next field; it does not submit (use `Ctrl-S`). In a
-multi-select list `Space` marks items and `Enter` takes all marked items (or the
-highlighted one if none is marked). `Backspace` on the closed field clears it. If the
-list cannot be loaded, the popup is in filter mode, shows the error, and `Enter` takes
-the typed text as the value (with no text, it closes the list and keeps the old value).
+**Pickers** (a field shown as `[ value ▾ ]`) pick an existing object from the server:
 
-### Three kinds of "cancel"
+* `Enter` or `Space` opens the list in move mode: `j k`/`↑ ↓` one row, `g G` first or last row,
+  `Ctrl-D Ctrl-U`/`PgDn PgUp` 10 rows.
+* A letter other than `j` or `k` on the closed field opens the list in filter mode with that
+  letter. `/` also starts filter mode, where `Ctrl-J/K`, `Ctrl-N/P` and the arrows move. `Esc`
+  returns to move mode, and `Esc` in move mode closes the list and keeps the old value.
+* `Enter` selects and goes to the next field. It does not submit.
+* In a multi-select list, `Space` marks items. `Enter` takes the marked items, or the selected
+  item when none is marked.
+* `Backspace` on the closed field clears it.
+* When the list cannot load, the popup shows the error, and `Enter` takes the typed text.
 
-1. **Esc on a loading list** cancels the HTTP request in the client. Esc does not stop an
-   operation (sync, publish, replication, upload): the client waits until it ends.
-2. **Quitting** stops waiting for client operations. Pulp tasks continue on the server and
-   are re-attached in the Task Center at the next start. **Connect** to a profile also stops
-   waiting for them, so it asks first while operations run. When a task cannot be read
-   (network or server error for more than about two minutes), the operation ends with
-   "could not read task …, it may still be running": it is not reported as failed.
-3. **Tasks → X** asks Pulp to cancel a server task. The Task Center then shows the state
-   that Pulp reports (`canceled`, or `failed`/`completed` if the task ended first). On a
-   task group (a native replication) it cancels the whole group: the confirmation names the
-   group and how many of its tasks are not finished. A server without group cancel says
-   "not supported by this server" and nothing is sent.
+**Confirmations:** `y`/`Enter` confirms, `n`/`Esc` cancels. `j k g G Ctrl-D Ctrl-U ↑ ↓ PgUp PgDn
+Home End` scroll a long preview. When you must type a name, letters type, so only `Ctrl-D`/
+`Ctrl-U`, `PgUp`/`PgDn`, `Home`/`End` and the arrows scroll.
 
 ## Screens
 
 ### Dashboard
 
-Server health (database, Redis, workers, content apps, storage), the current user,
-installed plugins with versions, detected capabilities (RPM, File, Deb, ...), counts of
-repositories, distributions, content and tasks (a Deb line when the server has pulp_deb),
-and the number of Content Views and environments (it says if they are in the local file
-or in the shared database). It shows at once with what the connect found; each count
-shows `...` until its request returns. `r` refreshes health, plugin versions and counts,
-and keeps the old values until the new ones come; the capability marks change only with a
-new connect. When a tracked task ends, the Dashboard refreshes the same way by itself.
+Server health (database, Redis, workers, content apps, storage), the current user, plugins with
+versions, capabilities, and counts of repositories, distributions, content, tasks, Content Views
+and environments. It says if the Content Views are in the local file or in a shared database, and
+shows the shared database scope (see "What is shared").
+
+A count shows `...` until its request returns. `r` refreshes health, versions and counts. The
+capability marks change only with a new Connect. The Dashboard also refreshes when a tracked task
+ends.
 
 ### Servers
 
-Named profiles from the config file. Actions: **o** connect, **T** test connection (shows
-user, content origin, plugin versions), **c**/**e** create/edit, **d** remove from the
-config (after typing the name; Pulp is not changed, and the Content View definitions of the
-server stay where they are: the dialog names the database of the profile, or says the local
-file), **K** store a password/token in the system keyring (when the profile has its own
-database, it first asks if the secret is for the "Pulp server" or the "database"),
-**E**/**I** export/import Content View definitions (with an external database, import
-writes to it, so a read-only profile cannot import), **X**/**J** export/import repository
-and remote definitions. **X** exports the server of the selected profile to a file (the
-same file as `export-repos`, no secrets; a text view lists the `note:` lines). **J**
-imports a file into the connected server: it first shows the plan (`create N, keep M
-existing`, a `create` line per new object and the notes), and creates the objects after
-you confirm (as `import-repos`; existing objects are never changed, and a file with
-nothing to create only shows the plan). See "Server profiles", "Shared database" and
-"Command line" below.
+The profiles of the config file. See "Server profiles" and "Content View database".
 
-The create/edit form has three database fields: **Database**, **Database secret** and
-**Database CA**. **Database** shows the database that the profile uses now: the path of the
-local file, or the `[database]` that it follows. Type `local` (or the local file path) for
-the local file, a file path such as `/srv/cv.db` for SQLite (it is saved as
-`sqlite:///srv/cv.db`), or a `postgres://` or `sqlite://` URL. Never type a password in the
-URL. If you do not change the field, the form adds no database block to the profile (a
-block that the profile already has is kept).
+* **o** connect. **T** test the connection (user, content origin, plugin versions).
+* **c** / **e** create / edit. **d** removes the profile from the config. It does not change Pulp
+  or the Content View database, and the dialog names the database that keeps the definitions.
+* **K** stores a secret in the system keyring. When the profile has its own database, it asks if
+  the secret is for the "Pulp server" or the "database".
+* **E** / **I** export / import Content View definitions, as `export-cv` and `import-cv`. **I**
+  writes to the database of the profile, so with a shared database a read-only profile cannot
+  import.
+* **X** exports the repository and remote definitions of the selected profile's server, as
+  `export-repos`. A text view shows the `note:` lines.
+* **J** imports such a file into the connected server, as `import-repos`. It first shows the plan
+  (`create N, keep M existing`), then creates the objects after you confirm.
 
-**Connect** opens the Content View database of the profile in the background. If the
-schema is not there yet, pulp-tui asks `Migrate database of <profile>?`. Saving a profile
-with a new database asks the same. When you change the database location of a profile
-that has Content View data, pulp-tui asks `Database of <profile> changes`: copy and
-switch, switch without copy, or Esc. See "Shared database" for both.
+The form has three database fields: **Database**, **Database secret** and **Database CA**.
+**Database** shows what the profile uses now. Type `local` (or the local file path) for the local
+file, a path such as `/srv/cv.db` for SQLite (saved as `sqlite:///srv/cv.db`), or a `postgres://`
+or `sqlite://` URL. Never put a password in the URL. An unchanged field adds no database block.
 
-### RPM Repositories / File Repositories / Deb Repositories
+**Connect** opens the Content View database in the background. A database without a current
+schema asks `Migrate database of <profile>?` (see "Migrate"). A save with a new database asks the
+same. A changed database location asks `Database of <profile> changes` (see "Change the database
+of a profile").
 
-Columns: name, latest version, default remote, retention, description. Details explain
-retention and mark Content View snapshot repositories. The Deb screen needs the pulp_deb
-plugin on the server.
+### Repositories (RPM, File, Deb)
 
-The list does not show Content View snapshot repositories (`pulp-tui-cv-<view>-<repo>`, label
-`pulp_tui_cv`). Press **t** to show or hide them; the title shows `snapshots shown` when they
-are visible.
+Columns: name, latest version, default remote, retention, description. The Deb screen needs
+pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the title then shows
+`snapshots shown`).
 
-| Key       | Action                                                                                                                                                                                                                                                                                |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| v         | versions of the repository                                                                                                                                                                                                                                                            |
-| o         | browse content of the latest version                                                                                                                                                                                                                                                  |
-| f         | sync: choose remote (pre-filled with the default remote; empty = default) and policy (RPM: additive, mirror_complete, mirror_content_only; File and Deb: additive, mirror). Mirror policies show a warning first. RPM and Deb: sync options (below).                                  |
-| H         | sync history (tasks that touched this repository)                                                                                                                                                                                                                                     |
-| u         | upload a local file (RPM package or File content with relative path); large files use chunked upload with progress; the server digest is verified; failed chunked uploads are deleted, also on a Connect. Not offered for Deb repositories (upload of `.deb` files is not supported). |
-| U         | RPM: upload a comps.xml (Pulp `rpm/comps/`): its package groups, categories, environments and langpacks go into a new version. **Replace** on first removes the comps units that the repository has                                                                                   |
-| A         | RPM: upload one advisory, a JSON file with the fields of an updateinfo record (POST `content/rpm/advisories/`); `id`, `issued` and `updated` are required, and each package needs `sum_type` (for example `sha256`). Example: `tests/fixtures/advisory.json`                          |
-| P         | publish the latest version: always creates a new publication, with the repository settings at that moment. Deb asks for an optional signing service (empty = the repository's own keys). The field is not asked when the server's Deb publications have no `signing_service`.         |
-| D         | distribute: pin the latest version (publication) or follow the repository latest. Deb asks for the same optional signing service as **P**, for the pinned publication; a publication of the version is reused only when its signing service is the same.                              |
-| C         | copy content from another repository (filter rules; RPM can copy dependencies; a Deb copy is structured: it also copies the Release, component and architecture records of the packages, and never solves dependencies)                                                               |
-| R         | reclaim disk space (below)                                                                                                                                                                                                                                                            |
-| c / e / d | create / edit / delete (delete names every distribution that serves the repository, a version or a publication of it; refused while it holds Content View snapshots)                                                                                                                  |
-| i         | full JSON                                                                                                                                                                                                                                                                             |
+* **v** versions. **o** content of the latest version. **H** sync history (tasks that touched the
+  repository). **i** full JSON.
+* **f** sync. Choose the remote (empty = the default remote) and the policy: RPM `additive`,
+  `mirror_complete`, `mirror_content_only`; File and Deb `additive`, `mirror`. A mirror policy
+  shows a warning first. Options:
+  * **Optimize** (default on): turn it off for a full re-sync.
+  * **Skip srpm**, **Skip treeinfo** (RPM): do not download source packages or `.treeinfo`.
+  * The form refuses what Pulp refuses: skip types with `mirror_complete`, `mirror_complete` with
+    autopublish on, and a mirror policy with **retain package versions** above 0.
+* **u** uploads a local file: an RPM package, or File content with its relative path. Large files
+  go in chunks with progress. pulp-tui verifies the server digest and deletes a failed chunked
+  upload. Upload of `.deb` files is not supported.
+* **U** (RPM) uploads a comps.xml. Its package groups, categories, environments and langpacks go
+  into a new version. **Replace** first removes the comps units of the repository.
+* **A** (RPM) uploads one advisory: a JSON file with the fields of an updateinfo record. `id`,
+  `issued` and `updated` are required, and each package needs `sum_type` (for example `sha256`).
+  Example: `tests/fixtures/advisory.json`.
+* **P** publishes the latest version. It always makes a new publication, with the repository
+  settings of that moment.
+* **D** distributes: pin the latest version (publication), or follow the repository latest.
+* **P** and **D** on Deb ask for an optional signing service (empty = the keys of the repository).
+  **D** reuses a publication only when its signing service is the same.
+* **C** copies content from another repository, with the filter rules of Content Views (see
+  "Filters"). RPM can copy dependencies. A Deb copy is structured: it also copies the Release,
+  component and architecture records, and does not solve dependencies.
+* **R** reclaims disk space. Pulp deletes the stored files of synced content that no other
+  repository has. The content stays in every version. Pulp downloads a file again from the remote
+  when a client asks, so the upstream must still serve it. Uploaded content keeps its files. A
+  form asks which versions keep their files (`3,4`; empty = none). The confirm shows the default
+  remote and its download policy. Type the repository name to start.
+* **c** / **e** / **d** create / edit / delete. Delete names each distribution that serves the
+  repository, a version or a publication of it.
 
-**U** and **A** wait for the task; the notice gives the new version, for example
-`upload comps.xml to os: new version 4`. A server without the upload endpoint says
-"not supported by this server: comps.xml upload (rpm/comps/)" before the form.
+All types have **Retain checkpoints**: the number of checkpoint publications that Pulp keeps (empty
+= all).
 
-**R** reclaims disk space (Pulp `repositories/reclaim_space/`): Pulp deletes the stored
-files of the synced content that no other repository has. The content stays in every
-version; when a client asks for a file, Pulp downloads it again from its remote (on
-demand) and stores it, so the upstream must still serve it. Uploaded content (it has no
-remote) keeps its files. A form asks which versions keep their files (`3,4`; empty =
-none). Then the confirm shows the number of versions, the default remote and its download
-policy, and the versions that keep their files; type the repository name to start. When
-the task ends, a notice gives the number of deleted files, for example `reclaim space of
-os: deleted 5 file(s)`. Refused for Content View snapshots. A server without the endpoint
-says "not supported by this server: reclaim space (repositories/reclaim_space/)".
+RPM fields:
 
-Edit sends only changed fields. Remote shows the default remote by name; clear it to remove
-the default remote. Edit, sync, uploads, copy, reclaim and content add/remove are refused
-on Content View snapshot repositories (a change of retention would prune their snapshots).
-**Retain checkpoints** (RPM, File and Deb, when the server has the field): how many
-checkpoint publications Pulp keeps; empty = all.
+* **Checksum type** of the published metadata and packages (`sha256` or stronger).
+* **Metadata compression**: `zstd`, `gz` or `none`.
+* **Package layout**: `nested_alphabetically` (`Packages/<letter>/`), `flat` or `nested_by_digest`.
+* **Repo config (JSON)** for the generated `.repo` file, for example `{"gpgcheck": 1}`.
+* **Metadata signing service**: signs `repomd.xml` of each publication.
+* **Package signing service**: signs the packages that an upload or a modify adds (not a sync or a
+  copy). **Package signing fingerprint**: `v4:<hex fingerprint>` or `keyid:<16 hex>`.
 
-RPM repository fields (create and edit; each is shown only when the server has it; the
-choices come from the server's schema; clear a field on edit to remove the setting):
+A Content View snapshot copies these fields from its source, except the package signing fields.
 
-| Field                       | Meaning                                                                                                                                                     |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Checksum type               | checksum of the published metadata and packages (`sha256` and stronger); empty = server default                                                             |
-| Metadata compression        | `zstd`, `gz` or `none` for the published metadata files; empty = server default                                                                             |
-| Package layout              | where a publication puts the packages: `nested_alphabetically` (`Packages/<letter>/`), `flat` (`Packages/`) or `nested_by_digest`; empty = server default   |
-| Repo config (JSON)          | a JSON object for the `.repo` file that Pulp generates, for example `{"gpgcheck": 1, "repo_gpgcheck": 1}`; clear it on edit to remove it (Pulp stores `{}`) |
-| Metadata signing service    | signs `repomd.xml` of each publication                                                                                                                      |
-| Package signing service     | signs the packages that an upload or `modify/` adds (not a sync or a copy)                                                                                  |
-| Package signing fingerprint | the key that the package signing service uses: `v4:<hex fingerprint>` or `keyid:<16 hex>`                                                                   |
+Deb fields:
 
-A Content View snapshot gets the checksum type, compression, layout, repo config and metadata
-signing service of its source, so it publishes the same metadata. It does not get the
-package signing settings: Pulp would sign the packages that the snapshot gets, and the
-snapshot would then hold other packages than its source.
+* **Signing service (Release)**: signs the `Release` file of a publication without its own signing
+  service.
+* **Per-release signing services**: `release=signing service href,...`, for example
+  `bookworm=/pulp/api/v3/signing-services/<id>/`.
+* **Package signing service**: signs the `.deb` packages that an upload or a modify adds (not in
+  pulp_deb 3.8 and older). **Package signing fingerprint**: `v4:<hex>` or `keyid:<16 hex>`.
+* **Per-release package fingerprints**: `release=fingerprint,...`.
+* **Publish upstream Release fields** (default on): a publication uses the version, origin, label
+  and description of the upstream `Release`.
+* **Excluded package metadata fields**: `field,...`, for example `Phased-Update-Percentage`. A
+  publication leaves them out of the `Packages` indices.
 
-Sync options (each is shown only when the server's sync request has it, and is sent only
-when you change it): **Optimize** (RPM, File and Deb) is on, Pulp's default. Turn it off for a
-full re-sync: Pulp then processes the upstream metadata also when it did not change.
-**Skip srpm** and **Skip treeinfo** (RPM) send `skip_types`: the sync does not download
-source packages or the distribution tree (`.treeinfo`). Pulp refuses skip types with
-`mirror_complete`, so the form refuses them before it sends the sync. It also refuses
-`mirror_complete` for a repository with autopublish on, and both mirror policies for a
-repository with **retain package versions** above 0, as Pulp does.
-
-Deb repositories use the same keys. Sync a Deb repository from a Deb remote, publish it
-(**P**) and distribute it (**D**) as for the other types. A Deb distribution is served
-at `<content URL>/dists/<distribution>/...`. Distribution verification (**V** in
-Distributions) fetches the `Release` file, finds the smallest package in a `Packages`
-index and compares the digest of the downloaded `.deb`. Deb repositories can be used in
-Content Views (see "Deb repositories in Content Views"). The fallback replication handles RPM
-and File only.
-
-Deb repository fields (create and edit; each is shown only when the server has it):
-
-| Field                            | Meaning                                                                                                                                                                                                      |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Signing service (Release)        | signs the `Release` file of a publication made without its own signing service (**P** with the field empty)                                                                                                  |
-| Per-release signing services     | `release=signing service href,...`, for example `bookworm=/pulp/api/v3/signing-services/<id>/`; this service signs that release instead. On edit, a release that you remove from the list loses its override |
-| Package signing service          | signs the `.deb` packages that an upload or `modify/` adds (not a sync or a copy); not in pulp_deb 3.8 and older                                                                                             |
-| Package signing fingerprint      | the key that the package signing service uses: `v4:<hex fingerprint>` or `keyid:<16 hex>`                                                                                                                    |
-| Per-release package fingerprints | `release=fingerprint,...`, for example `bookworm=v4:<hex>`; the packages of that release are signed with this key instead. On edit, a release that you remove from the list loses its override               |
-| Publish upstream Release fields  | on (Pulp's default for a new repository): a publication uses the `Release` fields (version, origin, label, description) of the upstream                                                                      |
-| Excluded package metadata fields | `field,...`, for example `Phased-Update-Percentage`: custom package fields that a publication leaves out of the `Packages` indices when it does not set its own list. Clear it on edit to keep all fields    |
-
-A Release file is signed with the signing service of the publication, else the per-release
-service, else the repository's service. The pickers list the signing services of all
-plugins; Pulp refuses one of the wrong type. Clear a field on edit to remove the setting.
+On edit, a release that you remove from a per-release list loses its override. A `Release` file is
+signed by the service of the publication, else the per-release service, else the service of the
+repository. A Deb distribution serves at `<content URL>/dists/<distribution>/...`.
 
 ### Remotes
 
-`t` switches RPM/File/Deb. Create/edit: URL (`http://`, `https://`, or `file://` under the
-server's `ALLOWED_IMPORT_PATHS`; File: URL of `PULP_MANIFEST`; Deb: the Debian archive
-base URL, the directory that holds `dists/`), download policy, TLS validation,
-CA/client certificate and key (file paths; content is uploaded), username and password,
-proxy (`http://` or `https://` with host and port, for example `http://proxy.corp:3128`),
-concurrency, rate limit, labels, SLES token (RPM). The edit form cannot show the
-certificates, key, credentials and token: empty keeps the server value, `-` clears it.
-Delete lists repositories that use the remote.
+`t` toggles RPM/File/Deb. **c** / **e** / **d** create / edit / delete, **i** full JSON. Delete
+lists the repositories that use the remote.
 
-Download fields of all remote types (each is shown only when the server has it; edit sends
-only changed fields, and a cleared field returns to the server default):
+* **URL**: `http://`, `https://`, or `file://` under the server's `ALLOWED_IMPORT_PATHS`. File: the
+  URL of `PULP_MANIFEST`. Deb: the archive base URL (the directory with `dists/`).
+* Download policy, TLS validation, concurrency, rate limit, labels.
+* Secret fields: CA, client certificate and key (local file paths; pulp-tui uploads the content),
+  username, password, SLES token (RPM), **Headers** (`Name: value; Name: value`, for example
+  `Authorization: Bearer <token>`).
+* **Proxy**: `http://` or `https://` with host and port, for example `http://proxy.corp:3128`.
+* **Total / connect / socket connect / socket read timeout** (whole seconds), **Max retries**
+  after a download failure (server default 3).
 
-| Field                                                  | Meaning                                                                                                                                                                                                               |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Total / connect / socket connect / socket read timeout | whole seconds for one download, to make the connection, to open the socket, and between two reads; empty = server default                                                                                             |
-| Max retries                                            | retries after a download failure; empty = server default (3)                                                                                                                                                          |
-| Headers                                                | extra HTTP headers of each download, `Name: value; Name: value`, for example `Authorization: Bearer <token>`. A header can hold a credential, so the form never shows them: on edit, empty keeps them, `-` clears all |
+Deb fields:
 
-Deb remote fields (each is shown only when the server has it):
-
-| Field                                          | Meaning                                                                                                                                                                                |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Distributions                                  | required; space-separated releases to mirror, for example `bookworm bookworm-updates`                                                                                                  |
-| Components                                     | space-separated, for example `main contrib`; empty = all                                                                                                                               |
-| Architectures                                  | space-separated, for example `amd64 arm64`; empty = all                                                                                                                                |
-| Sync source packages / udebs / installer files | on or off (default off)                                                                                                                                                                |
-| Ignore missing package indices                 | on or off; keeps a sync going when a `Packages` index is missing upstream                                                                                                              |
-| GPG public key                                 | path of a local file; its content is uploaded and Pulp uses it to check the `Release` signature. On edit, empty keeps the server value and `-` clears it                               |
-| Excluded package metadata fields               | `field,...`, for example `Phased-Update-Percentage`: custom package fields that the sync drops (core fields such as `Package` and `Version` stay). Clear it on edit to keep all fields |
+* **Distributions** (required): the releases to mirror, for example `bookworm bookworm-updates`.
+* **Components**, **Architectures**: space-separated; empty = all.
+* **Sync source packages / udebs / installer files**: default off.
+* **Ignore missing package indices**: the sync continues when an upstream `Packages` index is
+  missing.
+* **GPG public key**: a local file. Pulp checks the `Release` signature with it.
+* **Excluded package metadata fields**: `field,...`. The sync drops these custom fields.
 
 ### Alternate Sources
 
-`t` switches RPM/File/Deb. An alternate content source (ACS) is another place where Pulp
-can download content files, for example a mirror near the server. A sync of any repository
-then downloads the files that the ACS has from the ACS, not from the repository's remote.
-Pulp takes only a remote with the download policy `on_demand` ("Remote used with alternate
-content source must have the 'on_demand' policy"): create one in Remotes first. Columns:
-name, paths, last refreshed, remote. The screen needs the plugin's `acs/` endpoint; else it
-shows "not supported by this server: RPM alternate content sources (acs/rpm/rpm/)".
+`t` toggles RPM/File/Deb. An alternate content source (ACS) is another place where Pulp gets
+content files, for example a near mirror. A sync of any repository then gets the files that the
+ACS has from the ACS. Columns: name, paths, last refreshed, remote.
 
-| Key       | Action                                                                                                                                                                                                                                                                      |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| R         | refresh: Pulp syncs each path into a hidden repository, one task per path in a task group. The Task Center shows the group as one row (label `refresh ACS <name>`) and reports how it ended. Refresh again when the source changes                                          |
-| c / e / d | create / edit / delete. Name, remote (picked by name), paths (RPM and File: `path,...` that Pulp adds to the remote URL; empty = the remote URL itself; pulp_deb ignores paths, so the Deb form has none). Edit sends only changed fields. Delete asks you to type the name |
-| i         | full JSON                                                                                                                                                                                                                                                                   |
-
-pulpcore 3.123 deletes a path that you remove on edit from **every** ACS that has the same
-path. So an edit that removes a path first lists the other sources that lose it and asks.
-Delete removes the hidden repositories of the refreshes too, except on Deb: pulp_deb 3.11
-keeps `<name>--repository`, and a new ACS with the same name uses it again.
+* **R** refresh: one task per path in a task group (one row in the Task Center). Refresh again
+  when the source changes.
+* **c** / **e** / **d** create / edit / delete, **i** full JSON.
+* The remote must have the download policy `on_demand`. Create it in Remotes first.
+* **Paths** (RPM and File): `path,...` that Pulp adds to the remote URL; empty = the remote URL.
+  The Deb form has no paths, because pulp_deb ignores them.
+* An edit that removes a path first lists the other sources that lose it: Pulp removes that path
+  from every ACS that has it.
+* Delete also removes the hidden repositories of the refreshes, except on Deb (see
+  COMPATIBILITY.md).
 
 ### Repository Versions
 
-From a repository (**v**) or for all repositories. Columns: number, created, present /
-added / removed counts. Actions: **o** content, **P** publish this version (always a new publication), **D**
-distribute it (Deb: both ask for the optional signing service, as in Repositories), **b**
-point a distribution to it (rollback, with preview; Deb: the new publication keeps the
-signing service of the publication that the distribution serves now), **m** compare
-with the marked version (`Space` on one, `m` on the other; shows added/removed units of every
-content type that the Content browser lists, each line starts with its type, such as
-`+ advisory RHSA-2024:0001`; older → newer; a `warning:` line says when Pulp counts more or
-fewer units in a version than the compare lists; a `not compared (not on this server):` line names the content types
-that the server has no endpoint for, also in the restore preview), **d** delete (names the distributions that serve the version or its
-publications, Deb verbatim publications too, and you type the version id; refused for Content View snapshots; never needed
-for rollback), **R** restore as latest (below), **F** repair (below).
+From a repository (**v**), or for all repositories. Columns: number, created, present, added and
+removed counts.
 
-**R** makes a new latest version of the repository with the content of the selected version
-(Pulp `modify/` with `base_version`). No version is deleted by the restore, but a
-repository with `retain_repo_versions` then deletes its oldest versions, as after any new
-version. The preview shows what changes from the latest version (the same lines as
-compare) and what serves the new version: with autopublish on, Pulp publishes it at once;
-else publish it with **P**. For Deb, the new version has no Release files and no package or
-installer file indices: pulp_deb removes them from every new version, and the next publish
-writes new ones; the preview leaves them out. Then the distributions that follow the repository serve it, and
-the next sync, copy or publish starts from it. **b** (rollback) is different: it re-points
-one distribution and makes no version, so the distributions that follow the repository and
-the next sync still use the newest version. The latest version itself is refused (nothing to
-restore). When the latest version already has the same content, Pulp makes no version and the
-notice says so. Refused for Content View snapshots.
-
-**F** repairs the version (Pulp `{version}repair/`): Pulp checks the stored files of its
-content and downloads a missing or corrupt file again from a remote that has it. It deletes
-a corrupt file that no remote can give again. **Verify checksums** on (Pulp's default) reads
-every file and compares its digest, which is slow for a large repository; off only checks
-that each file exists. The confirm shows how many content units the version has. A version
-without content is refused, because Pulp then repairs every file of the server. When the
-task ends, a notice gives Pulp's counts, for example `repair version 3: 0 missing, 0
-corrupt, 0 repaired`; it is a warning when Pulp repaired fewer files than it found. A
-server without the endpoint says "not supported by this server: repository version repair".
-
-**O** prunes orphans on the whole server (Pulp `orphans/cleanup/`): content that no
-repository version has, and artifacts (files) that no content uses. Deleting versions
-makes orphans; this frees their disk space. A form asks how long the content must be an
-orphan (minutes, default 1440, which is Pulp's default). pulp-tui sends this time with the
-request, because it cannot read the server's `ORPHAN_PROTECTION_TIME`, and counts the
-content with the same time. So the count in the confirm dialog is what Pulp deletes. Type
-the profile name to start. When the task ends, a notice shows what Pulp deleted, for
-example `prune orphans on lab: deleted 12 content unit(s) and 30 artifact(s)`. `0` deletes
-all orphans, also the content of an upload that is still running. A sync downloads
-deleted content again. A read-only profile does not allow it. A server without
-`orphans/cleanup/` shows "orphan cleanup is not supported by this server".
+* **o** content. **i** full JSON.
+* **P** publishes this version (always a new publication). **D** distributes it. On Deb, both ask
+  for the optional signing service.
+* **b** points a distribution to this version (rollback, with a preview). It makes no version, so
+  the distributions that follow the repository and the next sync still use the newest version. On
+  Deb, the new publication keeps the signing service of the one the distribution serves now.
+* **m** compares with the marked version: mark one with `Space`, then press `m` on the other. It
+  lists the added and removed units (older → newer) of each content type, for example
+  `+ advisory RHSA-2024:0001`. A `warning:` line shows when Pulp counts other numbers. A
+  `not compared (not on this server):` line names the content types that the server cannot list.
+* **R** restores as latest: a new latest version with the content of this version. The preview
+  shows what changes, and what serves the new version (with autopublish, Pulp publishes it; else
+  use **P**). Retention can then delete the oldest versions. On Deb, pulp_deb removes the Release
+  files and indices from the new version; the next publish writes new ones. Refused for the latest
+  version. When the content is the same, Pulp makes no version.
+* **F** repairs: Pulp downloads missing or corrupt files again from a remote, and deletes a
+  corrupt file that no remote has. **Verify checksums** (default on) reads every file, which is
+  slow; off only checks that each file exists. Refused for a version without content, because
+  Pulp would then repair the whole server. The notice gives the counts
+  (`0 missing, 0 corrupt, 0 repaired`).
+* **d** deletes the version. It names the distributions that serve the version or its
+  publications, and you type the version id. Rollback never needs a delete.
+* **O** prunes orphans on the whole server: content that no version has, and files that no content
+  uses. Give the minimum orphan age in minutes (default 1440). The confirm counts with the same
+  age, so it shows what Pulp deletes. Type the profile name. `0` also deletes the content of an
+  upload that still runs. A sync downloads deleted content again.
 
 ### Content browser
 
-Opened from a repository or version. `t` cycles the content types of the repository type.
-RPM: packages, advisories, modulemds, package groups, distribution trees, repo metadata
-files, modulemd defaults, modulemd obsoletes, package categories, package environments,
-package langpacks. Deb: packages (package, version, architecture, sha256), releases
-(distribution, codename, suite, version), release components, source packages, generic
-contents, installer packages, installer file indices, package indices, source indices,
-release architectures, release files, package release components, source release
-components. `/`
-searches package names (on the RPM and Deb packages lists) or file paths. **i** shows all metadata of a unit (requires,
-provides, files, advisory package lists, …). **x** removes the marked (or selected)
-units from the repository; **a** adds them to another repository (Deb: a structured copy,
-which also copies the Release, component and architecture records, so apt finds the packages;
-only on the Deb packages list, because other Deb units would arrive without their records). Both create a new
-repository version; old versions are unchanged. When the task ends, a notice gives the new version number. After
-**x**, a Content screen that still shows the old version switches to the new one; the marks stay when the task fails.
+Opened from a repository or a version. `t` cycles the content types of the repository type (RPM:
+packages, advisories, modulemds, package groups, distribution trees and more; Deb: packages,
+releases, components, indices and more). `/` searches package names or file paths.
+
+* **i** shows all metadata of the unit (requires, provides, files, ...).
+* **x** removes the marked (or selected) units: a new version. The screen then shows the new
+  version. The marks stay when the task fails.
+* **a** adds them to another repository: a new version. On Deb, it is a structured copy, only on
+  the packages list.
 
 ### Publications
 
-`t` switches RPM/File/Deb. **c** create from repository name and optional version number
-(Deb: and the optional signing service, as in Repositories): always a new publication, with the
-repository settings at that moment. **D** distribute: serves exactly the selected publication.
-**d** delete (names the distributions that serve it, and you type the
-publication id; refused for publications of Content View snapshots).
+`t` toggles RPM/File/Deb. **D** distributes exactly this publication. **i** full JSON.
 
-**c** also has the publication options of the server (each is shown only when the server's
-publication has it). Each starts empty, which means the repository setting or the server
-default, and only the options that you set are sent. **P** in Repositories and Versions
-publishes without options.
-
-| Field                               | Type     | Meaning                                                                                                                                                     |
-| ----------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Checksum type, Metadata compression | RPM      | as the repository fields of the same name, for this publication only                                                                                        |
-| Package layout                      | RPM, Deb | where the publication puts the packages; the choices come from the server                                                                                   |
-| Repo config (JSON)                  | RPM      | a JSON object for the generated `.repo` file, for example `{"gpgcheck": 1}`                                                                                 |
-| Simple / Structured                 | Deb      | `true` or `false`: publish all packages in one component (simple), or with the upstream components (structured, Pulp's default). One of them must be `true` |
-| Legacy Release files                | Deb      | `true` also writes the legacy `Release` file of each component and architecture                                                                             |
-| Publish upstream Release fields     | Deb      | `true` or `false` instead of the repository setting                                                                                                         |
-| Excluded package metadata fields    | Deb      | `field,...` instead of the repository setting                                                                                                               |
-| Checkpoint                          | all      | `true` makes a checkpoint publication, which a checkpoint distribution serves. Pulp then publishes the latest version, so the form refuses a version number |
+* **c** creates a publication (always a new one): a repository, an optional version number, and
+  for Deb an optional signing service. It also has the publication options of the server. Empty
+  means the repository setting or the server default. (**P** in Repositories and Versions uses no
+  options.)
+  * **Checksum type**, **Metadata compression**, **Repo config** (RPM): as the repository fields.
+  * **Package layout** (RPM, Deb).
+  * **Simple** / **Structured** (Deb): one component, or the upstream components (default). One of
+    them must be `true`.
+  * **Legacy Release files** (Deb): also the `Release` file of each component and architecture.
+  * **Publish upstream Release fields**, **Excluded package metadata fields** (Deb).
+  * **Checkpoint**: a checkpoint publication. Pulp then publishes the latest version, so the form
+    refuses a version number.
+* **d** deletes. It names the distributions that serve the publication, and you type its id.
 
 ### Distributions
 
-`t` switches RPM/File/Deb. Details say whether a distribution is **PINNED** (publication or
-repository version) or **FOLLOWS LATEST** (repository). **y** copies the content URL
-(OSC 52 terminal clipboard; in tmux it needs `set -g allow-passthrough on` or
-`set -s set-clipboard on`), **V** verifies what is served (for a distribution that follows
-a repository: its newest publication, Deb APT or verbatim, which is not the latest version when that version has
-no publication; File: the manifest file name of that publication; a difference reads
-`MISMATCH: served content differs: …`), **b** re-points to a version (preview first; Deb: with the signing service
-of the publication it serves now), **c**/**e** create/edit
-(name, base path, binding, content guard, labels; Deb: the optional signing service of a
-pinned publication), **d** delete. A distribution of a
-Content View (label `pulp_tui_cv`) cannot be re-pointed or re-bound here (use promote or
-roll back) or renamed, and its `pulp_tui_*` labels stay (promote finds it by name and
-labels); its base path and other labels can be edited, and delete warns.
+`t` toggles RPM/File/Deb. Details show **PINNED** (a publication or a version) or **FOLLOWS
+LATEST** (a repository). **i** full JSON.
 
-Distribution flags (create and edit; each is shown only when the server has it; create
-sends only the flags that are on, edit only the changed ones):
-
-| Field             | Meaning                                                                                                                                                                            |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Hidden            | the content app does not list the distribution; its URL still serves                                                                                                               |
-| Checkpoint        | serves the checkpoint publications of the repository at `<base path>/<timestamp>/`. Needs Serve = follow repository latest: the form refuses it with a publication before it sends |
-| Serve config.repo | RPM only (`generate_repo_config`): Pulp serves a `.repo` file for clients at the distribution                                                                                      |
+* **y** copies the content URL (OSC 52 terminal clipboard). In tmux, set
+  `set -g allow-passthrough on` or `set -s set-clipboard on`.
+* **V** verifies what the distribution serves. One that follows a repository serves its newest
+  publication, which is not the latest version when that version has no publication. Deb: it
+  fetches `Release`, a `Packages` index and the smallest `.deb`, and compares the digest. A
+  difference reads `MISMATCH: served content differs: …`.
+* **b** re-points to a version, with a preview. On Deb, it keeps the signing service of the
+  publication that it serves now.
+* **c** / **e** / **d** create / edit / delete. Fields: name, base path, what it serves, content
+  guard, labels (Deb: the signing service of a pinned publication). Flags:
+  * **Hidden**: the content app does not list it. Its URL still serves.
+  * **Checkpoint**: serves the checkpoint publications at `<base path>/<timestamp>/`. Needs
+    "follow repository latest".
+  * **Serve config.repo** (RPM): Pulp serves a `.repo` file.
+* A Content View distribution: you can edit its base path and its other labels, and delete warns.
+  You cannot re-point, re-bind or rename it, or change its `pulp_tui_*` labels. Use promote or
+  roll back.
 
 ### Content Views
 
-Managed by pulp-tui (see `docs/ARCHITECTURE.md`). Columns: composite (`yes` for a
-composite view), repositories, latest version, environments with bound versions and
-states. A composite view has components instead of repositories; see "Composite Content
-Views" below.
+Managed by pulp-tui, not by Pulp (see [ARCHITECTURE.md](ARCHITECTURE.md)). Columns: composite,
+repositories, latest version, environments with bound versions and states.
 
-| Key       | Action                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| c / e / d | create / edit description / delete (removes the view's distributions and snapshot repositories, never source repositories; the dialog lists every served path, and a served protected environment must be typed after the view name, for example `web Prod`). On a composite, Edit also sets auto publish and the pin of each component, and Delete removes only its distributions.                                                                                                                                                             |
-| a         | add repositories: a multi-select picker of RPM, File and Deb repositories (those already in the view and Content View snapshot repositories are not listed) and filter rules; the rules apply to each selected repository, so a selection of more than one type needs empty rules. On a composite: add components (see below).                                                                                                                                                                                                                  |
-| F         | edit the filter rules of one repository (not offered on a composite)                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| x         | remove a repository from the definition (published versions are unchanged). On a composite: remove a component.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| f         | sync repositories: a multi-select picker of the view's repositories (all marked) and one sync policy (RPM values when the view has an RPM repository, else the File and Deb values additive and mirror; File and Deb repositories treat any mirror policy as mirror). Each repository syncs from its own default remote; one without is skipped. Mirror policies show a warning first. The tasks show in Tasks; the result lists each repository: new version, no change, failed or skipped. Sync does not publish. Not offered on a composite. |
-| w         | preview: exact content the draft selects compared with the latest published version                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| P         | publish a new version: notes (and the Deb signing, when the view has a Deb repository) → preview → confirm (type `Library` when Library is protected); the version becomes active in Library (when that step fails, the version stays published and the warning says `Library step failed: …; promote v4 to Library`)                                                                                                                                                                                                                           |
-| v         | versions of the view                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| M         | promote a version to an environment (preview of every distribution; protected environments require typing their name)                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| b         | roll back an environment to an earlier version: in an environment after Library only a version older than the active one, or the active one again (a retry); a newer one gives `v5 is newer than the active v4 in Test; use Promote`, an environment without a version gives `no version is active in Test; use Promote`; in Library any published version                                                                                                                                                                                      | |
-| u         | unpromote: take the view out of an environment. It deletes the view's distributions there (the dialog lists the paths; type the view name, and also the environment when it is protected, for example `web Prod`) and removes the binding, so the version can be deleted. Versions and snapshots stay. Refused while a later environment on the path still has the view: go back along the path (Prod, then Test, then Dev).                                                                                                                    |
-| D         | verify all environments (drift check)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| U         | break the lock of the selected view (shows who holds it; you type the view name). See "Shared database".                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+* **a** adds repositories: a multi-select picker of RPM, File and Deb repositories, and filter
+  rules. The rules apply to each selected repository, so a mix of types needs empty rules.
+* **F** edits the filter rules of one repository. **x** removes a repository; published versions
+  do not change.
+* **f** syncs the repositories of the view. Pick the repositories (all marked) and one policy (the
+  RPM choices when the view has an RPM repository; File and Deb take any mirror policy as
+  `mirror`). Each repository syncs from its default remote; one without is skipped. The result
+  lists each repository: new version, no change, failed or skipped. Sync does not publish.
+* **w** preview: the content that the draft selects, compared with the latest version.
+* **P** publishes a new version: notes (and Deb signing) → preview → confirm. The version becomes
+  active in Library. When the Library step fails, the version stays published:
+  `Library step failed: …; promote v4 to Library`.
+* **P** refuses a view that holds a snapshot repository. Remove it (**x**) and add its source. To
+  use the content of another view, make a composite.
+* **v** versions. **i** full JSON.
+* **M** promotes a version to an environment, with a preview of every distribution.
+* **b** rolls an environment back. After Library: only a version older than the active one, or the
+  active one again (a retry). For a newer version, or an environment without a version, use
+  Promote. In Library: any published version.
+* **u** unpromotes: it deletes the distributions of the view in the environment (the dialog lists
+  the paths; type the view name) and removes the binding, so you can delete the version. Versions
+  and snapshots stay. Refused while a later environment on the path has the view: go back along
+  the path (Prod, then Test, then Dev).
+* **D** verifies all environments (drift check).
+* **U** breaks the lock of the view. It shows the holder; type the view name. See "Locks".
+* **c** creates. **e** edits the description (composite: also auto publish and the pins).
+* **d** deletes the distributions and snapshot repositories of the view, never the source
+  repositories. The dialog lists every served path. A composite loses only its distributions.
+* For **d** and **u**, also type a served protected environment after the view name, for example
+  `web Prod`.
 
-Publish, promote, roll back, delete (the view or a version) and *Resume* take a lock on
-the view while they run; a second operator (or a second pulp-tui on this host) gets
-`Content View web is locked by alice@ws12 (promote to Prod) since 14:02 UTC` before
-anything is sent to Pulp. Preview, compare and the drift check do not lock. Sync
-repositories does not lock the view; it writes one audit entry (`cv.sync`) when the syncs are
-submitted, with how many were submitted, failed or skipped (the per-repository result of the
-finished tasks is shown in the result view, not in the entry).
+**Served paths.** A promoted repository serves at
+`https://<pulp>/pulp/content/<label>/<view>/<repo>/` (`<label>`: see "Lifecycle Environments"). A
+promotion keeps the path of an existing distribution, so you can change a base path in
+Distributions. A relabel moves all paths of the environment to `<label>/<view>/<repo>`, also the
+changed ones.
 
-A snapshot repository of a view is never a source of a view. Publish refuses a view that has
-one (for example, added before this check existed):
-`pulp-tui-cv-web-os is a snapshot repository of content view web; remove it from outer and add its source`.
-Remove it (**x**) and add the source repository of the other view. To use the content of
-another view, make a composite view.
+#### Filters
 
-Each promoted repository is served at
-`https://<pulp>/pulp/content/<lc label>/<view>/<repo>/`, where `<lc label>` is
-the label of the lifecycle environment (see "Lifecycle Environments"). A promotion keeps the
-path of a distribution that exists: distributions of an earlier pulp-tui stay at `cv/...`.
-For a custom path, change the `base_path` of the distribution in Pulp (Distributions,
-Edit); later promotions keep it. A relabel moves all paths of the environment to
-`<lc label>/<view>/<repo>`, also the paths that you changed.
-
-Filter syntax (rules separated by `;`):
+Rules separated by `;`:
 
 ```
 include name=kernel* arch=x86_64 evr>=5.14-1
@@ -459,409 +408,251 @@ exclude name=*-dbg version<1.0                  # Deb repositories
 exclude path=isos/*            # File repositories
 ```
 
-A unit is selected when (no include rule exists or one matches) and no exclude rule
-matches. All criteria of one rule must match. `evr` supports `= < <= > >=` with rpm
-version comparison; `epoch:` is optional (a number); without a release only epoch and
-version are compared. The value must start with a letter or digit, so a typo such as
-`evr=>5.14` is refused instead of meaning `= >5.14`.
-
-Each repository type accepts its own criteria, and a rule with a criterion of another type
-is refused with a message that names the types that have it: RPM takes `name=`, `arch=` and
-`evr`; Deb takes `name=`, `arch=` and `version`; File takes `path=`. `version` supports the
-same operators as `evr` with the Debian rules for version comparison (`~` sorts before
-everything, `epoch:` is optional, and a rule without a revision matches every revision of
-that upstream version). The same rules filter the copy action (**C**) of a repository.
+* A unit is selected when (no include rule exists or one matches) and no exclude rule matches.
+  All criteria of one rule must match.
+* RPM: `name=`, `arch=`, `evr`. Deb: `name=`, `arch=`, `version`. File: `path=`. A criterion of
+  another type is refused.
+* `evr` and `version` take `= < <= > >=` with RPM or Debian version comparison. `epoch:` is
+  optional. Without a release (RPM) or revision (Deb), the rule compares only epoch and version.
+* The value must start with a letter or digit, so a typo such as `evr=>5.14` is refused.
 
 #### Deb repositories in Content Views
 
-A Content View can hold Deb repositories, also together with RPM and File repositories (then
-without filter rules). Publish copies the selected packages with a structured copy
-(`deb/copy/`): it also copies the Release, component and architecture records of these
-packages, so apt finds the same distributions and components. A server without this API
-stops Publish before its form and Resume of such a version before it sends anything: `not supported by this server: Deb copy API (deb/copy/)`. Without filter rules, all
-content is copied. A filtered snapshot has only the selected binary packages: source packages
-and the upstream index files are not copied, and the publication makes new indices.
+A view can hold Deb repositories, also with RPM and File repositories (then without filter rules).
+Publish uses a structured copy (the server needs the Deb copy API), so apt finds the same
+distributions and components. A filtered snapshot has only the selected binary packages, and the
+publication makes new indices.
 
-**Deb signing.** The Publish form shows this choice when the view has a Deb repository. One
-choice applies to every Deb repository of the publish:
+The Publish form has one **Deb signing** choice for all Deb repositories of the view:
 
-* `same as source` (the default): the snapshot repository gets the `signing_service` and the
-  per-release keys (`signing_service_release_overrides`) of its source repository.
-* `none`: the snapshot repository has no keys (no signing service and no per-release keys).
-  Clients get an unsigned `Release` (no `Release.gpg` and no `InRelease`).
-* `service`: pick a signing service in **Signing service**. The snapshot repository gets it,
-  and no per-release keys. The picker lists the signing services of all plugins; Pulp
-  refuses one that is not a Deb (APT) signing service, and Publish stops with `signing
-  service <href> was refused by the server; delete this Content View version and publish
-  again with another choice` (*Resume* would send the same choice). Publish stops with `pick a signing
-  service` when you pick none, and with `not supported by this server: signing_service on
-  Deb repositories` when the server's Deb repositories have no signing field.
+* `same as source` (default): the snapshot gets the signing service and the per-release keys of
+  its source.
+* `none`: no keys. Clients get an unsigned `Release`.
+* `service`: the snapshot gets the picked **Signing service** and no per-release keys.
 
-Pulp changes only the per-release keys that a request names, so pulp-tui removes each
-per-release key that the snapshot repository must not keep (also one that the source no
-longer has). pulp-tui changes only the snapshot repository, never the source. The choice is saved with
-the version, so *Resume* signs as you asked. Each Deb repository of a version gets its own
-publication: a publication that repository keys signed does not record the keys, so
-pulp-tui never reuses one for a Deb repository (also when the content is the same as in the
-previous version). A composite uses the publications of its component versions, so its
-Publish does not ask.
+pulp-tui changes only the snapshot repository, never the source. The version stores the choice,
+so *Resume* signs the same way. When Pulp refuses the service, delete the version and publish again
+with another choice. Each Deb repository gets a new publication in each version. A composite
+publish does not ask.
 
-**Large selections.** Pulp refuses a request body above 2.5 MiB (Django
-`DATA_UPLOAD_MAX_MEMORY_SIZE`), which is about 35,000 package hrefs. A filtered snapshot starts
-from the latest version of the snapshot repository: pulp-tui removes what the rules no longer
-select, then copies what is missing, each list in batches, one after the other. The job's
-progress shows each step, for example `main: copying 25316 units (2/3)`. An unchanged selection
-sends nothing and uses the latest version again. Each batch makes one version of the snapshot
-repository, and the last one is the snapshot. After the copy, pulp-tui deletes the versions of
-the snapshot repository that no Content View version uses (Pulp merges each one into the next
-version, so the snapshot does not change); version 0 stays, and a version that fails to delete
-is logged and tried again by the next publish. When a publish stops between batches, Resume
-continues from the latest version of the snapshot repository. Copy
-content (`C` on a repository) also sends batches; Tasks shows the last one. A repository
-without filter rules sends no list of hrefs.
+**Large selections** (above about 35,000 packages) go in batches (see COMPATIBILITY.md). The
+progress shows each step, for example `main: copying 25316 units (2/3)`. When a publish stops
+between batches, *Resume* continues it.
 
 #### Composite Content Views
 
-A composite view joins other Content Views (its **components**), as a Katello composite
-does. Example: the view `rocky9-os` holds BaseOS and AppStream, and you keep it at a
-version that you tested. The view `rocky9-extras` holds docker, postgres and other
-repositories that you want to follow. The composite `rocky9` has both as components:
-`rocky9-os` pinned to a version, `rocky9-extras` on `latest`. When you publish
-`rocky9-extras` and then `rocky9`, clients of `rocky9` keep the OS packages and get the new
-extras.
+A composite view joins other Content Views (its **components**). Example: `rocky9` has
+`rocky9-os` pinned to a tested `v1`, and `rocky9-extras` on `latest`.
 
-* **Create.** `c` has the flag *Composite (fixed after create)*. A view is composite or
-  normal for its whole life. A composite has no repositories and no filters of its own, and
-  a composite cannot be a component of another composite (no nesting).
-* **Components.** `a` opens a multi-select picker of the normal Content Views that are not
-  yet components, then asks for the pin of each: `latest` (the newest published version at
-  the time the composite publishes) or one published version (`v3`). `x` removes a
-  component. `e` sets the description, **auto publish** and the pin of each component.
-  Changes take effect at the next publish. The repository actions `a` (add repository), `F`,
-  `x` (remove repository) and `f` are not offered on a composite.
-* **Repository rule.** Two components must not contain the same repository, and two
-  repositories must not have names with the same path segment (`os/x` and `os x` both
-  become `os-x`). pulp-tui checks this when you add a component and again at every
-  publish, over the versions that the publish would use, and names both views or both
-  repositories. Nothing is written when it refuses.
-* **Publish** (`P`) resolves each `latest` to the newest published version of the
-  component. It is refused, before anything is written, for a composite with no
-  components, a `latest` component that has no published version, a pinned version that
-  is no longer published, and a repository clash (see above). It copies nothing in Pulp:
-  the composite version only records which component versions it uses and points at their
-  snapshot repositories and publications. Like every publish, it becomes active in
-  Library. The preview lists every component version (`rocky9-os: v1 (unchanged)`,
-  `rocky9-extras: v1 -> v2`), then the content that changes in each repository.
-* **Served paths.** A composite has its own distributions
-  `pulp-tui-cv-<composite>-<env>-<repo>` at
-  `<lc label>/<composite>/<repo>`. Promote, roll back and the drift check work as
-  for a normal view. One publication can be served by the distribution of its component and
-  by the distribution of the composite at the same time.
-* **Auto publish.** Off by default, set per composite with `e`. When a component publishes
-  (Publish, or *Resume* that finishes), every composite with auto publish that lists this
-  component on `latest` publishes too, each under its own lock. A component that is pinned
-  does not trigger it. *Resume* of an older version does not trigger it either: composites
-  use the newest published version. The result is part of the notice, for example `rocky9-extras version
-  2 published and active in Library; auto publish: rocky9 v2 published`. If a composite
-  fails (for example, it is locked), the component stays published and the notice is a
-  warning that names the composite and the reason. Auto publish never promotes: the new
-  composite version is active in Library only; promote it yourself. While Library is
-  protected, auto publish publishes nothing, because nobody types the confirmation:
-  `rocky9: not published: Library is protected (publish it yourself)`.
-* **Delete.** The delete actions never remove an object that a component owns.
-  * A component version that a composite version uses (or a composite pins) cannot be
-    deleted: `version 1 is used by rocky9 v1, rocky9 (pinned)`.
-  * A Content View that is a component, or that a composite version uses, cannot be
-    deleted: `content view rocky9-os is used by rocky9 (component), rocky9 v1; remove it
-    from the composite and delete those composite versions first`.
-  * Deleting a composite version, or a composite, removes only the composite's own
-    records and distributions. The component snapshots and publications stay.
-  * Deleting a version keeps every publication (with its repository version) that any
-    environment of the server still serves. Deleting a view stops with `... is still
-    served by <view> in <environment>` when another view serves one of its publications.
-    Pulp deletes the publications of a repository version with it, and a deleted
-    publication silently stops its distributions (COMPATIBILITY.md). These rules also apply
-    to normal views.
+* **Create**: `c` with *Composite (fixed after create)*. A composite has no repositories or
+  filters of its own, and cannot be a component (no nesting). `F`, `f` and the repository forms of
+  `a` and `x` are not available.
+* **Components**: `a` picks normal views and asks for the pin of each: `latest` or one published
+  version (`v3`). `x` removes one. `e` changes the pins and **auto publish**. Changes take effect
+  at the next publish.
+* **Repository rule**: two components must not hold the same repository, and two repositories must
+  not give the same path segment (`os/x` and `os x` both give `os-x`). pulp-tui checks this on add
+  and at each publish.
+* **Publish** uses the newest published version for `latest`, and copies nothing in Pulp: the
+  composite version points at the snapshots and publications of the components. It is refused,
+  before it writes anything, with no components, a `latest` component without a published
+  version, a pinned version that is not published, or a repository clash. The preview lists each
+  component version (`rocky9-extras: v1 -> v2`), then the content changes.
+* **Served paths**: the composite has its own distributions at `<label>/<composite>/<repo>`.
+  Promote, roll back and drift check work as for a normal view.
+* **Auto publish** (default off): when a component on `latest` publishes, the composite publishes
+  too, under its own lock. The notice gives the result. A failed composite gives a warning; the
+  component stays published. Auto publish never promotes, and publishes nothing while Library is
+  protected.
+* **Delete**: you cannot delete a component view, or a component version that a composite version
+  uses or a composite pins. The error names the users. A composite delete removes only its own
+  records and distributions.
 
 ### Content View versions
 
-**M** promote, **b** roll back, **m** compare with the marked version, **R** resume a
-publish that failed or was interrupted (continues from checkpoints and re-attaches to a
-submitted task; with a shared database it can also continue a publish that another
-operator started; the version becomes active in Library only when no newer version is
-published, else the warning says `Library not changed: v5 is newer (use Rollback to serve
-v4)`; when Library is protected, you type `Library` first; on a published version whose
-Library step stopped (Library shows it `interrupted`), it runs the Library step and auto
-publish again, else it says `version is already published`), **W** watch the task of the copy
-step or the publication step of a publishing version (see Tasks; only these two steps store
-their task, so during the other steps (settings, cleanup of unused snapshot versions, the
-Library step) W says that no copy or publication task runs, and the session that runs the
-publish shows their tasks in Tasks),
-**d** delete (refused while bound, and while a composite uses it; the confirmation lists each
-publication and snapshot version it deletes, and each one it keeps with the reason),
-**i** details (source versions, snapshot versions, publications, unit counts; for a
-composite version, the component versions). A `publishing` version shows as `interrupted`
-when nobody holds a live lock on the view: the client that ran it ended (quit, crash,
-Connect), so nothing continues it until you press **R**. The same rule applies to a
-`promoting` binding wherever pulp-tui shows its state: the *environments* column of
-Content Views, the *bound views* column of Lifecycle Environments (`Dev:v3
-(interrupted)`), the promote and rollback preview, and Verify. Promote or roll back that
-version again. Compare of two composite versions shows the
-component versions first (`rocky9-extras: v1 -> v2`), then the added and removed content of
-each repository.
+* **M** promote. **b** roll back. **m** compare with the marked version (composites: component
+  versions first, then the content changes).
+* **R** resumes a failed or interrupted publish. It continues from the checkpoints and attaches to
+  a submitted task, also for a publish that another operator started. The version becomes active
+  in Library only when no newer version is published. For a published version with an
+  `interrupted` Library step, it runs the Library step and auto publish again.
+* **W** watches the task of the copy step or the publication step. Other steps show their tasks
+  only in the session that runs the publish.
+* **d** deletes. Refused while the version is bound or a composite uses it. The confirm lists each
+  publication and snapshot version that it deletes, and each one that it keeps (still served by an
+  environment) with the reason.
+* **i** details: source versions, snapshot versions, publications, unit counts, component
+  versions.
+
+A `publishing` version, or a `promoting` binding, shows as `interrupted` when nobody holds a live
+lock on the view (the client quit, crashed or ran Connect). Press **R** for a version. Promote or
+roll back again for a binding.
 
 ### Lifecycle Environments
 
-Library exists automatically. **c** creates an environment after an existing one
-(paths can branch). **L** toggles protection: to change what a protected environment
-serves, you type its name (promote, roll back; for Library also publish and *Resume*). **d** deletes an unused environment. With a
-shared database, environments belong to the server and every operator sees them. The
-*bound views* column shows the state of a binding that is not active (`web:v2 (partial)`).
+Library exists by default. With a shared database, all operators see the same environments. The
+*bound views* column shows a binding that is not active, for example `web:v2 (partial)`.
 
-Each environment has a **label**, the part of the served path that names it (column
-*label*). A new environment gets its name in lower case as the label (`Dev` gives `dev`).
-**e** edits the label: 1-64 characters of `a-z 0-9 - _ .`, unique for the server. pulp-tui
-loads the served paths that change and shows them as `/old -> /new`, with the line
-`Clients using the old paths stop getting content.` When served paths move, you type the
-environment name to confirm (when none move, there is no confirmation). Then it moves each
-distribution to the new path in place (one Pulp task each), and a result view lists what
-moved, and the drift check of each bound view. The distribution names do not change. The label is stored first. If a row fails, it stays at its old path
-and is named in the result; run Edit again with the same label to move the rest. A relabel
-locks every view that is bound in the environment (see "Locks"), and stops with the
-holder's name if another operator holds one of them. A view bound in the environment during
-the relabel is not moved; the relabel result names it, or, when the promotion saved it
-later, the promotion fails as `partial` with `Dev was relabeled qa during the promotion;
-edit Dev again with label qa`. Run Edit again. A label must not overlap the base path of another distribution (for example a repository distributed at
-`dev`, or at `dev/tools`): Pulp refuses a path that is equal to, a parent of, or a child of
-another path, and the rows that fail stay as described above.
+* **c** creates an environment after an existing one. Paths can branch.
+* **L** toggles protection. To change what a protected environment serves, you type its name
+  (promote, roll back; for Library also publish and *Resume*).
+* **d** deletes an unused environment.
+* **e** edits the **label**, the part of the served path that names the environment. A new
+  environment gets its name in lower case (`Dev` gives `dev`). A label has 1-64 characters of
+  `a-z 0-9 - _ .` and is unique on the server. A label must not be equal to, a parent of, or a
+  child of the base path of another distribution.
+* The relabel shows the paths that move (`/old -> /new`), and you type the environment name. Then
+  it moves each distribution in place (one task each), and shows the result and the drift check of
+  each bound view. It locks every view bound in the environment. A row that fails stays at its old
+  path: run **e** again with the same label.
 
 ### Replication
 
-Native Upstream Pulp objects (tech preview). **c**/**e** create/edit: upstream base URL
-(`http://` or `https://`) as reachable from *this* Pulp server, relative API root (`pulp/`), domain, credentials,
-CA/client certificates, TLS validation, distribution filter (`q_select`, e.g.
-`name__startswith="rhel9"`), deletion policy (`nodelete` default; `all` needs typed
-confirmation). **R** replicates and shows the task group result; canceled or skipped tasks
-give a warning with the counts. **H** shows the five newest
-replication task groups of this upstream (it reads at most the 2000 newest task groups of
-the server). **F** starts the fallback: choose another configured profile as
-source, types, a name filter and additive or mirror mode; a dry run lists
-CREATE / SYNC / SKIP per distribution before anything changes; reruns are safe. Both
-servers must have the plugin of each chosen type: else the dry run stops with, for example,
-`pulp2 (destination): not supported by this server: pulp_file plugin`. A File replica
-serves its files under the manifest name of the upstream publication. A File distribution
-is a SKIP row with the reason when its upstream publication cannot be read (for example
-`permission denied [403]`), when it serves no publication (pulp_file serves only from
-publications), or when the publication has no manifest; the other rows go on. The
-fallback does not follow an upstream label change: a distribution that the source moved to
-another base path is reported as a 409 conflict, and the replica stays at its old path.
-Delete the replica distribution, or move it by hand, to make it follow.
+Native Upstream Pulp objects (tech preview).
 
-Download settings of an Upstream Pulp (create and edit; each is shown only when the
-server's `UpstreamPulp` has it): **Replica download policy** (`remote_policy`: `immediate`,
-`on_demand` or `streamed`; empty = server default, `immediate`), download concurrency, max
-retries, and the total, connect, socket connect and socket read timeouts (whole seconds).
-Pulp copies them to the remotes that replication creates. Create sends only the filled
-fields; a field cleared on edit returns to the server default.
+* **R** replicates now and shows the task group result.
+* **H** shows the 5 newest replication task groups of this upstream.
+* **c** / **e** / **d** create / edit / delete, **i** full JSON. Fields:
+  * upstream base URL (as *this* Pulp server reaches it), API root (`pulp/`), domain,
+    credentials, CA and client certificates, TLS validation;
+  * distribution filter (`q_select`, for example `name__startswith="rhel9"`);
+  * deletion policy: `nodelete` (default) or `all` (needs a typed confirmation);
+  * **Replica download policy** (`immediate`, `on_demand` or `streamed`), concurrency, max
+    retries, timeouts. Pulp copies them to the replica remotes.
+* **F** fallback: sync from another profile. Choose types (RPM, File), a name filter, and additive
+  or mirror mode. A dry run lists `CREATE` / `SYNC` / `SKIP` per distribution before anything
+  changes. You can run it again safely.
+  * Both servers need the plugin of each type.
+  * A File distribution without a readable publication or manifest is a `SKIP` row with the
+    reason.
+  * It does not follow an upstream base path change: the row shows a 409 conflict. Delete or move
+    the replica distribution by hand.
 
 ### Exporters
 
-Disconnected export with the exporters of pulpcore. The Pulp server writes the files to a
-directory on its own disk. That directory must be in the `ALLOWED_EXPORT_PATHS` setting of
-the server (empty by default); else Pulp refuses the exporter with "... is not an allowed
-export path".
+Disconnected export with the exporters of pulpcore. Pulp writes the files to a directory on its
+own disk, which must be in the server's `ALLOWED_EXPORT_PATHS` (empty by default). `t` toggles
+Pulp and filesystem exporters. **i** full JSON.
 
-**c**/**e** create/edit a Pulp exporter: name, directory on the Pulp server, and its RPM,
-File and Deb repositories (a picker with more than one choice). **E** loads the
-repositories and the last export of the exporter, then opens the form. Its note lists each
-repository with its latest version and its version in the last export, and the time of the
-last export. The export is one file or chunks of at most the given size (`1GB`). By default
-it is a full export of the latest version of each repository. **Incremental** exports only
-the content added since the last export (Pulp still writes the full content list of each
-version, so import it on a server that has the content of the earlier exports). **Start
-versions** (`web=3,os=7`, incremental only) starts there instead; a repository that is not
-named starts at its version in the last export. The form refuses an incremental export when
-a repository has no start version: the exporter has no last export, or the repository is
-not in it (it was added to the exporter later). Give its start version or make a full
-export first.
-**Versions** (`web=3,os=7`) exports these version numbers instead of the latest ones; a
-repository that is not named gets its latest version (Pulp needs one version of each
-repository of the exporter). The form refuses a name that is not a repository of the
-exporter and a version that is not a number. pulp-tui waits for the task (the Task Center shows it),
-then shows the TOC file (`<directory>/export-<id>-<time>-toc.json`) and the output files.
-Copy them to the disconnected server and import the TOC there. **o** shows the exports of
-the exporter (time, number of exported repository versions, TOC); **d** on an export
-deletes its record. **d** on an exporter loads the number of its exports and then asks for
-the exporter name. Pulp deletes only the records: the export files stay on the disk of the
-server.
+Pulp exporters:
 
-`t` switches to the filesystem exporters, which write the plain files of one publication
-or repository version (for example to serve them with another web server). **c**/**e**:
-name, directory, and the method (`write`, `hardlink` or `symlink`; the choices come from
-the server). **E**: a repository, a version number (empty = latest) and what to export:
-the publication (the newest publication of that version; pulp-tui stops when there is
-none) or the repository version. Pulp makes the directory itself, so it must not exist: a
-second export into it fails ("Cannot export to directories that contain existing data", or
-"File exists" for a version). Edit the directory before the next export.
+* **c** / **e**: name, directory, and RPM, File and Deb repositories.
+* **E** exports. The form shows each repository with its latest version and its version in the
+  last export. The export is one file, or chunks of a maximum size (`1GB`). Default: a full export
+  of the latest versions.
+  * **Incremental**: only the content added since the last export. Import it on a server that has
+    the earlier exports.
+  * **Start versions** (`web=3,os=7`, incremental only): start from these versions. The form
+    refuses an incremental export of a repository without a start version.
+  * **Versions** (`web=3,os=7`): export these versions; the others get their latest version.
+  * At the end, pulp-tui shows the TOC file (`<directory>/export-<id>-<time>-toc.json`) and the
+    output files. Copy them to the disconnected server and import the TOC there.
+* **o** lists the exports (time, repository versions, TOC). **d** on an export deletes its record.
+* **d** on an exporter shows its number of exports; type its name. The export files stay on the
+  server disk.
+
+Filesystem exporters write the plain files of one publication or version:
+
+* **c** / **e**: name, directory, method (`write`, `hardlink` or `symlink`).
+* **E**: a repository, a version (empty = latest), and the publication (the newest of that
+  version) or the version.
+* The directory must not exist. Change it before the next export.
 
 ### Importers
 
-Disconnected import of a Pulp export with the Pulp importers of pulpcore. Copy the export
-files to a directory of the Pulp server that is in its `ALLOWED_IMPORT_PATHS` setting
-(empty by default). Pulp must be able to write to that directory.
+Disconnected import of a Pulp export. Copy the export files to a directory in the server's
+`ALLOWED_IMPORT_PATHS` (empty by default). Pulp must be able to write there.
 
-**c**/**e** create/edit an importer: name and repository mapping, as
-`source=destination,...` (a repository name in the export, then a repository of this
-server). Every destination must exist: pulp-tui checks each name before it sends the form,
-because pulpcore answers an edit with an unknown destination with HTTP 500 and has then lost
-the old mapping. A repository of the export without a pair goes to the repository of the
-same name; Pulp skips it when there is none.
-
-**I** imports: type the path of the `-toc.json` file on the Pulp server. pulp-tui first
-sends the import check (`import-check/`) and shows its result: when the TOC or the mapping
-is not valid, it shows the messages of Pulp ("file ... does not exist", "directory ... must
-allow pulp write-access") and imports nothing. Else the confirmation shows the check and
-the mapping (on a production profile, type the importer name). The import is a task group:
-the Task Center shows it, and pulp-tui shows each task of the group when it ends. Each
-imported repository gets a new version with exactly the exported content; its older
-versions stay. When Pulp found no destination repository, the import completes without a
-repository task, and pulp-tui gives a warning. **o** shows the imports of the importer
-(time, TOC, task). **d** loads the number of imports and asks for the importer name; the
-imported repository versions stay.
+* **c** / **e**: name and mapping `source=destination,...` (an exported repository name, then a
+  repository of this server). Each destination must exist; pulp-tui checks it first. An unmapped
+  repository goes to the repository of the same name, or Pulp skips it.
+* **I** imports: type the path of the `-toc.json` file on the server. pulp-tui first runs the
+  import check and shows its result. When the check fails, nothing is imported. Each imported
+  repository gets a new version with exactly the exported content. When Pulp finds no destination
+  repository, pulp-tui gives a warning.
+* **o** lists the imports (time, TOC, task). **i** full JSON.
+* **d** shows the number of imports; type the importer name. The imported versions stay.
 
 ### Users, Groups, Roles
 
-Users: **R** roles, **c**/**e** create/edit, **w** set password (Pulp's local users
-only), **A** enable/disable, **d** delete (refused for yourself; staff accounts warn).
-Role assignments: **c** add (role, optional object, and an optional domain when the
-server has domains enabled), **d**
-remove; owner/admin roles ask for confirmation. Groups: **o** members, **R** roles,
-**c** create, **e** rename (a `PATCH` of `name`; members and roles stay), **d** delete. Roles: system roles are locked (read-only); custom roles can be created,
-edited (permissions as a comma list) and deleted.
+* **Users**: **R** roles, **c** / **e** / **d**, **w** set password (local Pulp users only),
+  **A** enable/disable. Delete refuses your own user and warns for staff.
+* **Groups**: **o** members (**c** add a user, **d** remove), **R** roles, **c** create, **e**
+  rename (members and roles stay), **d** delete.
+* **Roles** of a user or group: **c** adds a role, an optional object, and an optional domain (when
+  the server has domains). **d** removes. Owner and admin roles ask to confirm.
+* **Roles** screen: system roles are read-only. **c** / **e** / **d** a custom role (permissions as
+  a comma list).
 
 ### Tasks
 
-Tracked tasks with state, progress (only what Pulp reports; no invented percentages),
-start time and errors. The label is the operation that started the task (for example
-`publish web`, `replicate up`); a task tracked from the server tasks keeps Pulp's task name.
-After a restart, pulp-tui reads the start times of the finished rows from Pulp once, in one
-request; an unfinished row shows Pulp's start time once it is polled. A purged task, or a failed
-read, keeps the time pulp-tui first tracked the task. The top box lists client operations still running. **W** opens a
-live view of the task (state, progress reports, times, error, created resources) that
-refreshes until the task ends; **i** details with all progress reports, **X** cancel on
-the server (confirmation), **z** dismiss finished tasks from the list (above 500 tracked
-tasks, the oldest finished one goes by itself). `t` switches to all
-server tasks (**a** tracks one; **W** tracks it and opens the live view). A native
-replication and an ACS refresh are one row for their task group: the progress counts the
-finished tasks of the group, and a restart re-attaches it like a task. A task or group that ends canceled or
-skipped gives a warning; a failed one gives an error.
+The Task Center shows tracked tasks: label (the operation that started it), state, progress (only
+what Pulp reports), start time and error. The top box lists the running client operations. A
+native replication or an ACS refresh is one row for its task group. `t` cycles: tracked tasks →
+server tasks → task groups → workers.
 
-On the server tasks, **F** filters the list on the server: state, name contains (the same
-filter as `/`), resource href (`reserved_resources`: the tasks that locked this object, for
-example a repository) and started at or after (`started_at__gte`: `2026-11-01` or
-`2026-11-01T08:00:00Z`; Pulp checks the format and the list shows its error). An empty
-field does not filter. The title shows the filters in use, for example `Server tasks
-(state=failed)`.
+* **W** live view of the task. **i** details with all progress reports.
+* **X** cancels on the server. On a task group, it cancels the whole group; the confirm counts its
+  unfinished tasks.
+* **z** dismisses finished tasks. Above 500 tracked tasks, the oldest finished one goes by itself.
+* A canceled or skipped task gives a warning; a failed task gives an error.
 
-**d** deletes the record of a finished task on Pulp (after a confirmation; what the task
-made stays). A waiting, running or canceling task is refused: cancel it first (**X**).
-**P** purges finished tasks of the whole server (`tasks/purge/`): give *Finished before*
-(`2026-10-01`) and the states (comma list of `completed`, `failed`, `canceled`, `skipped`;
-default `completed`). pulp-tui first counts the matching tasks that you can see, then you
-type the profile name. Pulp deletes only the tasks that you may delete. When the purge
-task ends, a notice gives the number of deleted tasks. A server without the endpoint or
-the DELETE says `not supported by this server`.
+Server tasks:
 
-`t` on the server tasks opens **Task groups** (`task-groups/`, newest first; Pulp has no
-filter for them, so there is no search): description and the number of waiting, running,
-completed, failed, canceled and skipped tasks. **i** shows the group with its tasks, **X**
-cancels the whole group on the server (the confirmation names it and counts its
-unfinished tasks; a server without group cancel says `not supported by this server`).
+* **a** tracks the task. **W** tracks it and opens the live view.
+* **F** filters on the server: state, name contains, resource href (the tasks that locked an
+  object), started at or after (`2026-11-01` or `2026-11-01T08:00:00Z`). The title shows the
+  filters.
+* **d** deletes the record of a finished task (what the task made stays). Cancel an unfinished
+  task first.
+* **P** purges finished tasks of the whole server: *Finished before* (`2026-10-01`) and states
+  (`completed`, `failed`, `canceled`, `skipped`; default `completed`). pulp-tui counts the tasks
+  first, then you type the profile name.
 
-`t` on the task groups opens **Workers** (`workers/`, read-only): name, last heartbeat and
-the current task of each worker, also of a worker that stopped (an old heartbeat). `/`
-searches the name, **i** shows a worker. `t` goes back to the tracked tasks.
+**Task groups** (newest first, no search): counts of tasks by state. **i** shows the tasks, **X**
+cancels the group. **Workers** (read-only): name, last heartbeat, current task.
 
 ### Logs
 
-Everything that happened in this session, newest first, with the time in UTC. It works
-without a connection and follows new rows while it is open. Three kinds of rows:
-`request` (every HTTP request to Pulp: method, path, status or error, duration),
-`action` (every action you started, also ones you then cancelled, for example "Delete on os-repo") and `notice` (every
-message that the footer showed, with its `[ok]`/`[warning]`/`[error]` tag). `Enter` opens
-a row: for a request the full request and response bodies, for the others the message.
-`/` filters the rows. The polling of tasks (a GET of one task or task group, repeated
-while a job runs) is hidden by default; `t` shows or hides it.
+All events of this session, newest first, with UTC times. It works without a connection.
 
-Secrets are redacted: the `Authorization` header is never recorded, JSON values of
-`password`, `token`, `secret`, `client_key`, `authorization`, `headers` (of a remote) and
-keys that end in `_password`, `_token` or `_secret` (for example `proxy_password` and
-`sles_auth_token`), in any letter case, show as `•••`, and
-uploads show only their size. A body is cut at 64 KiB.
-The log keeps the last 1000 rows in memory for this session only. When it is full, the
-hidden polling rows are dropped first. It is never written to disk and is gone when you
-quit.
+* `request`: each HTTP request (method, path, status or error, duration).
+* `action`: each action that you started, also a cancelled one.
+* `notice`: each footer message with its tag.
+
+`Enter` opens a row (a request shows the full bodies). `/` filters. `t` shows or hides task polling
+(hidden by default).
+
+The log never records the `Authorization` header. It shows as `•••` the JSON values of
+`password`, `token`, `secret`, `client_key`, `authorization`, `headers`, and of keys that end in
+`_password`, `_token` or `_secret`, in any letter case. An upload shows only its size. A body is
+cut at 64 KiB. The log keeps 1000 rows in memory only and is gone when you quit.
 
 ## Server profiles
 
-The config file (`--config`, `$PULP_TUI_CONFIG`, or
-`$XDG_CONFIG_HOME/pulp-tui/config.toml`) holds named profiles; `pulp-tui config-example`
-prints a full example. Profile selection: `--profile` > `$PULP_TUI_PROFILE` >
-`default_profile` > first profile.
+The config file is `--config`, `$PULP_TUI_CONFIG`, or `$XDG_CONFIG_HOME/pulp-tui/config.toml`.
+`pulp-tui config-example` prints a full example. The profile is the first of: `--profile`,
+`$PULP_TUI_PROFILE`, `default_profile`, the first profile.
 
 Secrets are references:
 
-| Reference                | Use                                                                                                 |
-| ------------------------ | --------------------------------------------------------------------------------------------------- |
-| `env:PULP_PASSWORD`      | environment variable (CI, containers)                                                               |
-| `file:/run/secrets/pulp` | mounted secret file (trailing newline is removed)                                                   |
-| `keyring`                | system keyring, service `pulp-tui`, user = profile name (store it with **K**; see "System keyring") |
+| Reference                | Use                                                     |
+| ------------------------ | ------------------------------------------------------- |
+| `env:PULP_PASSWORD`      | environment variable                                    |
+| `file:/run/secrets/pulp` | secret file (the last newline is removed)               |
+| `keyring`                | system keyring, service `pulp-tui`, user = profile name |
 
-Auth methods: `basic` (username + secret), `bearer` (secret is the token), `none`
-(anonymous or identity from the mTLS client certificate). TLS options: `ca_cert`
-(PEM bundle added to the system roots), `client_cert` + `client_key` (mTLS). `proxy`,
-`timeout_secs`, `read_only`, `production`. Credentials never go into `url`, and `proxy`
-may not hold a password: set an authenticated proxy in `HTTPS_PROXY` instead.
-
-A profile can have its own Content View database. It takes the same fields as the
-top-level `[database]` (see "Shared database"):
-
-```toml
-[profiles.prod.database]
-url = "postgres://pulp_tui@db.example.com:5432/pulp_tui_prod"
-secret = "keyring"            # keyring user [database]:prod
-# ca_cert = "/etc/pki/tls/certs/internal-ca.pem"
-```
-
-The database of a profile is the first of these (the TUI and the command line use the same
-rule):
-
-1. the `[profiles.<name>.database]` of the profile;
-2. else the top-level `[database]`;
-3. else the local file `<data-dir>/pulp-tui.db`.
-
-`url = "local"` in `[profiles.<name>.database]` keeps that profile in the local file even
-when a top-level `[database]` is set. The form accepts `local` or the path of the local
-file for this, and a bare absolute path such as `/srv/cv.db` for an SQLite database. A
-form value that is the same as what the profile would use without a block (the inherited
-`[database]`, or the local file) stores nothing, so an untouched form never adds a
-`database` block. The keyring user of the `keyring` secret of a profile database is
-`[database]:<profile>`; the top-level `[database]` uses the user `[database]`.
+* `auth`: `basic` (username and secret), `bearer` (the secret is the token), `none` (anonymous, or
+  the identity of the mTLS client certificate).
+* `ca_cert` (PEM bundle added to the system roots), `client_cert` and `client_key` (mTLS).
+* `proxy`, `timeout_secs`, `read_only`, `production`.
+* Never put credentials in `url`. `proxy` must not hold a password; set an authenticated proxy in
+  `HTTPS_PROXY`.
 
 ### System keyring
 
-pulp-tui does not keep a keyring file. It gives the secret to the keyring of the operating
-system:
-
-| System     | Store                                                                                                    |
-| ---------- | -------------------------------------------------------------------------------------------------------- |
-| Linux, BSD | Secret Service over D-Bus (`org.freedesktop.secrets`): GNOME Keyring, KDE Wallet (`ksecretd`), KeePassXC |
-| macOS      | Keychain                                                                                                 |
-| Windows    | Credential Manager                                                                                       |
-
-On Linux the secret goes to the `default` collection (unlocked first, which can show a
-password prompt). Each entry has the attributes `service=pulp-tui` and `username=<user>`
-and the label `keyring:<user>@pulp-tui`:
+pulp-tui stores secrets in the keyring of the operating system: Secret Service over D-Bus on Linux
+and BSD (GNOME Keyring, KDE Wallet, KeePassXC), Keychain on macOS, Credential Manager on Windows.
 
 | Secret                        | Keyring user      |
 | ----------------------------- | ----------------- |
@@ -869,16 +660,14 @@ and the label `keyring:<user>@pulp-tui`:
 | `[profiles.prod.database]`    | `[database]:prod` |
 | top-level `[database]`        | `[database]`      |
 
-* **K** on the Servers screen only writes the keyring. Set `secret = "keyring"` in the
-  config too, else pulp-tui does not read the entry. **K** again replaces the secret.
-* **K** cannot store the top-level `[database]` secret. Create it with the system tool.
-* Builds without the `keyring` feature (`--no-default-features`, the container image)
-  give an error for `keyring`; use `env:` or `file:`.
-* KDE Plasma 6: KWalletManager does not show these entries. It shows only entries with
-  the KWallet attributes `server`, `user` and `type`. The entries are in the wallet
-  (folder `Secret Service`) and pulp-tui reads them; use `secret-tool` to see them.
-
-Linux examples with `secret-tool` (libsecret):
+* **K** on Servers only writes the keyring. Also set `secret = "keyring"` in the config. **K**
+  again replaces the secret.
+* **K** cannot store the top-level `[database]` secret. Use the system tool.
+* On Linux the entry goes to the `default` collection (it can ask to unlock).
+* Builds without the `keyring` feature (the container image) give an error for `keyring`. Use
+  `env:` or `file:`.
+* KDE Plasma 6: KWalletManager does not show these entries, but they are there (folder
+  `Secret Service`). Use `secret-tool`.
 
 ```sh
 secret-tool search --all service pulp-tui          # list entries (prints the secrets)
@@ -886,334 +675,235 @@ secret-tool store --label='keyring:[database]@pulp-tui' service pulp-tui usernam
 secret-tool clear service pulp-tui username prod   # remove the secret of profile prod
 ```
 
-## Shared database
+## Content View database
 
-A profile without a database (neither its own `database` nor a top-level `[database]`)
-keeps Content Views, versions, environments, promotions and their history in a SQLite file
-in the data directory. Only one operator uses it. With a database, several operators use one
-database and see the same Content Views, versions, environments, promotions and history.
-There is no pulp-tui server: each pulp-tui connects to the database directly. A change of
-another operator shows after a refresh (`r`); nothing is pushed.
+Content Views, environments and their history are in a database. By default this is the local
+SQLite file `<data-dir>/pulp-tui.db`, for one operator. Several operators can share one database.
+Each pulp-tui connects to it directly; press `r` to see the changes of another operator.
 
 ```toml
-[database]
+[database]                       # default for all profiles
 url = "postgres://pulp_tui@db.example.com:5432/pulp_tui"   # or "sqlite:///srv/pulp-tui/cv.db"
 secret = "env:PULP_TUI_DB_PASSWORD"                         # env:VAR, file:/path or keyring
 ca_cert = "/etc/pki/tls/certs/internal-ca.pem"              # optional, PostgreSQL only
+
+[profiles.prod.database]         # this profile only
+url = "postgres://pulp_tui@db.example.com:5432/pulp_tui_prod"
+secret = "keyring"               # keyring user [database]:prod
 ```
 
-* `[database]` is the default for all profiles. A profile with its own
-  `[profiles.<name>.database]` uses that instead, and `url = "local"` there keeps the
-  profile in the local file (see "Server profiles"). Profiles in one config file can
-  therefore use different databases. Profiles with the same connect URL share one open
-  store in a running pulp-tui.
-* The password is never in the URL. A URL with a password is rejected. `secret` is a
-  reference, as for profiles. For `keyring` the entry has the service `pulp-tui` and the
-  user `[database]`; the **K** key of the Servers screen cannot store it, so use `env:` or
-  `file:` unless you create the entry with the system keyring tool. The database of a
-  profile uses the keyring user `[database]:<profile>`, and **K** can store that one (it asks
-  "Pulp server" or "database"). Error messages show the URL without the password.
-* PostgreSQL traffic is always encrypted and verified (certificate chain and host name),
-  except through a Unix socket or to `localhost`, `127.0.0.1` or `::1`, where it does not
-  leave the machine. For other hosts pulp-tui overrides any `sslmode` in the URL with
-  `verify-full`. The server certificate must list the host name (or IP address) that the
-  URL uses.
-* `ca_cert` is a PEM file with one or more CA certificates. It is **added to the root
-  certificates that are built into pulp-tui. The trust store of the operating system is not
-  used for the database.** An internal CA therefore needs `ca_cert`, also when the host
-  already trusts it. (This differs from the `ca_cert` of a profile, which adds to the
-  system roots.)
-* The database of a profile opens in the background when you connect to the profile. If it
-  cannot be opened, the Pulp screens still work. The Content View screens and actions show
-  `shared database unavailable: <reason>` and do nothing. pulp-tui does not use the local
-  file instead, because the state would split. Fix the cause and Connect again (a failed
-  open is not kept, so the next Connect tries again). This is also true for a schema that
-  `db migrate` did not create or upgrade: the Content View screens show `shared database
-  unavailable: postgres://pulp_tui@db.example.com:5432/pulp_tui: database not migrated
-  (open Servers, Connect again to migrate, or run pulp-tui db migrate --profile prod)`, and
-  Connect offers the migration (see below). The command-line Content View commands
-  (`export-cv`, `import-cv`, `db copy`) stop with, for example, `... database schema 1 is
-  older than this pulp-tui (5); run pulp-tui db migrate --profile prod` or `...: database is
-  not initialized; run pulp-tui db migrate --profile prod`.
-* **Migrate from the TUI.** When Connect finds a database with no schema, or an older one,
-  it asks `Migrate database of <profile>?`. The dialog shows the database, the schema
-  change (for example `empty -> 5`) and a warning that other operators then need this
-  pulp-tui version or newer. Enter migrates (with the role of the connection, which must
-  create tables, as for `db migrate`). Esc does not migrate; the Content View screens then
-  show the message above. When you save a profile with a new database, pulp-tui opens it at
-  once and asks the same question. A SQLite file that does not exist yet counts as not
-  migrated: only the migration creates it, a normal open never does. A read-only profile
-  gets a warning instead of the question: run `pulp-tui db migrate --profile <name>`.
-* **Change the database of a profile.** When you edit a profile and change the location
-  (the URL) of its database, pulp-tui reads the old database (it only reads it) and counts
-  the Content Views, versions and environments of this server. If there are none, it saves
-  the profile. Otherwise it shows `Database of <profile> changes`:
-  **copy and switch** copies the data into the new database like `db copy` (new IDs, never
-  merges), and saves the profile only after the copy worked; **switch without copy** only
-  saves, and the old data stays in the old database; Esc cancels and the profile is not
-  changed. Objects that the old database published in Pulp carry its database ID, so the new
-  database can change them only after a copy, which records the old ID (see "Database ID").
-  Nothing is deleted from the old database. A read-only profile, and an old database that
-  cannot be read, get only **switch without copy**. A change of only the secret or the CA is
-  saved at once. The change takes effect at the next Connect.
+The database of a profile is the first of these (TUI and command line): its
+`[profiles.<name>.database]` (`url = "local"` there means the local file), the top-level
+`[database]`, the local file.
 
-### Set up (administrator)
+* A URL with a password is refused. Error messages show the URL without the password.
+* PostgreSQL traffic is always encrypted and verified (`verify-full` replaces any `sslmode` of the
+  URL), except over a Unix socket or to `localhost`, `127.0.0.1` or `::1`. The server certificate
+  must list the host name or IP address of the URL.
+* `ca_cert` is added to the roots built into pulp-tui. The system trust store is **not** used for
+  the database, so an internal CA always needs `ca_cert`.
+* When the database cannot open, the Pulp screens still work, and the Content View screens show
+  `shared database unavailable: <reason>`. pulp-tui does not use the local file instead. Fix the
+  cause and Connect again.
+* Profiles with the same URL share one open database.
+
+### Migrate
+
+The local file migrates when it opens. An external database changes only with
+`pulp-tui db migrate`, or with the question on Connect. Without a current schema, the Content View
+screens show `database not migrated (...)`, and the Content View commands stop.
+
+* **Connect** asks `Migrate database of <profile>?` with the schema change (for example
+  `empty -> 5`). Enter migrates; Esc does not. A save with a new database asks the same.
+* The role of the connection must be able to create tables.
+* After a migration, all operators need this pulp-tui version or newer. An older one stops with
+  `database schema N is newer than this pulp-tui`.
+* Only the migration creates a SQLite file.
+* A read-only profile gets a warning instead: run `pulp-tui db migrate --profile <name>`.
+
+### Change the database of a profile
+
+When you edit the database URL of a profile, pulp-tui counts the Content View data of this server
+in the old database. With no data, it saves at once. Else it asks `Database of <profile> changes`:
+
+* **copy and switch**: copy the data as `db copy` does, then save the profile;
+* **switch without copy**: save only; the old data stays in the old database;
+* **Esc**: change nothing.
+
+A read-only profile, or an old database that cannot be read, gets only **switch without copy**. A
+change of only the secret or the CA saves at once. The change takes effect at the next Connect.
+
+### Set up a shared database (administrator)
 
 1. Create the PostgreSQL database and a role for the operators.
-2. Run `pulp-tui db migrate --profile <name>` with a role that can create tables. It creates
-   the schema the first time and upgrades it after you upgrade pulp-tui. A normal start
-   never changes the schema. If the schema is older, the Content View screens show
-   `... database not migrated (...)` (see above). If it is newer, upgrade pulp-tui. When two
-   administrators migrate at the same time, the second one waits. After you upgrade to the
-   pulp-tui version with lifecycle environment labels, migrate an external database that is
-   at schema 2 once (the TUI offers it on Connect, or run `pulp-tui db migrate --profile
-   <name>`). Schema 3 gives each environment the label of its lower-case name, so no served
-   path moves. An external
-   database at schema 3 needs the same migration (the TUI offer, or `db migrate`) before
-   composite Content Views work: schema 4 adds their tables and columns.
-   **Upgrade to the version with Deb Content Views:** this version adds schema 5: run
-   `pulp-tui db migrate`; every operator of a shared database must upgrade; older versions
-   stop with `database schema 5 is newer than this pulp-tui`. Schema 5 adds the column
-   `cv_version_repos.signing` (the Deb signing choice of a publish). An older pulp-tui also
-   cannot read a view with a Deb repository.
-3. Give the operators' role only `SELECT`, `INSERT`, `UPDATE` and `DELETE`. After a migration
-   that adds tables, grant again (or use `ALTER DEFAULT PRIVILEGES`).
+2. Run `pulp-tui db migrate --profile <name>` with a role that can create tables. Do this again
+   after each pulp-tui upgrade.
+3. Give the operator role only `SELECT`, `INSERT`, `UPDATE` and `DELETE`. Grant again after a
+   migration that adds tables, or use `ALTER DEFAULT PRIVILEGES`.
 
    ```sql
    GRANT USAGE ON SCHEMA public TO pulp_tui_op;
    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pulp_tui_op;
    ```
 
-4. Each operator puts the same `[database]` in the config (or the same `database` in the
-   profile) and starts pulp-tui.
+4. Each operator puts the same `[database]` (or the same profile `database`) in the config.
 
-### Move the data of one operator
+### Copy the data (`db copy`)
 
-`pulp-tui --profile lab db copy` copies the Content View data of the profile `lab` from the
-local file into the database of `lab`: Content Views with repositories and filters (and
-composites with their components, pins and auto publish flag), versions and their
-checkpoints (and the component versions that a composite version used), environments,
-bindings and the audit log. The rows get new IDs. The
-local profile name becomes the server key (see below). The copy runs in one transaction. It
-**never merges**: if the target database already has a Content View, or an environment
-other than Library, with the same name for this server, it stops and writes nothing. Task
-references, replication history and locks are not copied. The source stays as it is. A
-read-only profile cannot run `db copy`. Run it once for each server.
+`pulp-tui --profile lab db copy` copies the Content View data from the local file into the
+database of `lab`. `--from <profile>` reads the database of another profile instead (default:
+`local`).
 
-`--from <profile|local>` chooses the source. The default is `local`: the local file, also
-when a profile has that name. With a profile name, `db copy` reads the database of that
-profile (an external one with its server key, the local file with the profile name).
-For example, `pulp-tui --profile prod db copy --from lab` copies the data of `lab` into the
-database of `prod`, under the server key of `prod`. The command refuses two cases and
-writes nothing:
-
-* The source and the target are the same database, also when two URLs reach it:
-  `source and target are the same database`.
-* A Content View of the source has a live lock (renewed within the last 2 minutes): `Content
-  View web is locked by alice@ws12 (publish); copy after it ends`. The lock of a crashed
-  session expires after 2 minutes and does not block the copy.
-
-After the copy, objects that the source published get the database ID label of the
-target database on the next publish or promotion (see "Database ID" below). After that, the
-old source cannot change them any more. The TUI does the same copy when you change the
-database of a profile and choose "copy and switch" (see above).
+* It copies views (with repositories, filters, components, pins, auto publish), versions and
+  checkpoints, environments, bindings and the audit log. It does not copy task references,
+  replication history or locks.
+* The rows get new IDs. The copy is one transaction. The source does not change.
+* It never merges: when the target has a view, or an environment other than Library, with the same
+  name for this server, it stops and writes nothing.
+* It refuses when the source and the target are the same database, and when a source view has a
+  live lock (renewed in the last 2 minutes).
+* A read-only profile cannot run it. Run it once for each server.
+* After the copy, the objects in Pulp get the database ID of the target at their next publish or
+  promotion. The old source then cannot change them.
 
 ### What is shared
 
-| Shared (in the external database)                                                                                               | Always local (`<data-dir>/pulp-tui.db`)     |
-| ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
-| Content Views, repositories and filters, versions and checkpoints, environments, bindings, audit log (with the operator), locks | Task Center references, replication history |
+| In the shared database                                        | Always local           |
+| ------------------------------------------------------------- | ---------------------- |
+| views, filters, versions, checkpoints, environments, bindings | Task Center references |
+| audit log (with the operator), locks                          | replication history    |
 
-* **Server key.** In the shared database, rows belong to the server, not to a profile name:
-  the key is the URL, the API root and the domain (for example
-  `https://pulp.example.com/pulp/#default`). Two operators can name their profiles
-  differently and still see the same Content Views. The local file keeps the profile name.
-  Deleting a profile (Servers, **d**) changes nothing in the database.
-  The key comes from the URL that you type: **every operator must use the same scheme,
-  host name, port, `api_root` and domain for a server.** `https://pulp.example.com` and
-  `https://pulp.example.com:443` give the same key, but `https://pulp` (a short name),
-  an IP address or `http://` give a different key, and that operator sees other (or no)
-  Content Views. `db copy` uses the URL of the profile that runs it. The Dashboard shows
-  the key as `shared database scope: <key>`; compare it between operators.
-* **Operator.** Locks and audit rows name the operator as `username@host`, for example
-  `alice@ws12`. The audit lines in the Content View details show it: `<time>
-  cv.publish.done web version 3 by alice@ws12`. A row without a name (written before the
-  upgrade) shows no `by`; `db copy` marks such rows `by copied`. In a container the host
-  name is a random container ID: start the container with `--hostname` (for example
-  `--hostname ws12`), so that the lock owner and the audit actor stay the same.
-* **Read-only profiles.** When the database of the profile is external (its own, or
-  `[database]`), creating or editing a Content View, adding or removing repositories,
-  filters and components, and creating, deleting or protecting an environment change state
-  that other operators publish from. A read-only profile does not show these actions. `import-cv` and
-  `db copy` refuse a read-only profile, and the TUI neither migrates its database nor
-  offers "copy and switch" for it. When the profile uses the local file, these actions stay
-  available, because they change only the local file. The exception is the label edit on
-  Lifecycle Environments: it moves distributions in Pulp, so a read-only profile does not
-  show it, also with the local file.
+* **Server key.** Shared rows belong to a server, not to a profile name. The key is the URL, API
+  root and domain, for example `https://pulp.example.com/pulp/#default`. **All operators must use
+  the same scheme, host name, port, `api_root` and domain.** A short host name, an IP address or
+  `http://` gives another key (a default port does not). The Dashboard shows
+  `shared database scope: <key>`; compare it between operators.
+* **Operator.** Locks and audit rows name `username@host`, for example `alice@ws12`. In a
+  container, use `--hostname` so that the name stays the same.
+* **Read-only profiles.** With a shared database, a read-only profile also cannot change Content
+  View definitions (create, edit, add or remove repositories, filters and components) or
+  environments, cannot run `import-cv` or `db copy`, and gets no migration or "copy and switch".
+  With the local file these actions stay. The label edit on Lifecycle Environments moves
+  distributions, so it is always blocked.
 
 ### Locks
 
-* Publish, *Resume*, promote, roll back, reconcile (promote again), delete a Content View
-  and delete a version take a lock on **one Content View**. A second operator gets
-  `Content View web is locked by alice@ws12 (promote to Prod) since 14:02 UTC` before
-  anything is sent to Pulp. The lock is also taken when two pulp-tui processes use one
-  local file.
-* Publishing a composite locks the composite only; it reads the component versions and
-  never changes them. Auto publish takes the lock of each composite after the lock of the
-  component is released.
-* Changing the label of an environment (Edit on Lifecycle Environments) takes the locks of
-  **all** views that are bound in it, in the order of their IDs. If another operator holds
-  one of them, the relabel stops before it changes anything, with that operator's name.
-* Preview, compare and the drift check do not lock. Edits (create, add or remove
-  repositories, filters or components, create, protect or delete an environment) do not
-  lock either: the last write wins.
-* The holder renews the lock every 30 seconds. A lock that is not renewed for 2 minutes is
-  expired, and the next operator takes it over. Times come from the client clocks.
-* The lock is released when the workflow ends (also with an error), and when Connect stops
-  its job. If pulp-tui crashes, the lock stays until it expires.
-* If a holder loses the lock (someone broke it, another operator took it over after it
-  expired, or the database is not reachable or does not answer a renewal within 30 s), the
-  workflow stops before its next change in Pulp and before its next checkpoint: `lock on
-  web lost: <reason>`. A workflow also stops when its lock was not renewed for 90 seconds,
-  for example after the computer slept: `lock on web lost: not renewed for 412 s`. A
-  stopped publish keeps its checkpoints, so *Resume* continues it. A stopped promotion is
-  stored as `partial` (or `failed` if no repository was done); promote again. If another
-  operator has changed that version or that promotion since then, the stopped workflow
-  does not overwrite their result.
-* **Break lock** (**U** on Content Views) removes a lock whoever holds it. It shows the
-  holder and asks you to type the view name. Use it only when the session of the holder is
-  dead; its workflow stops within 30 s. Only the lock that the dialog showed is removed: if
-  another operator took the lock meanwhile, nothing is removed and the message shows the
-  new holder. The audit log records it.
+* Publish, *Resume*, promote, roll back, unpromote and delete (a view or a version) lock **one
+  Content View**. A second operator, or a second pulp-tui on the same file, gets
+  `Content View web is locked by alice@ws12 (promote to Prod) since 14:02 UTC` before anything goes
+  to Pulp.
+* A composite publish locks only the composite. Auto publish locks each composite after the
+  component lock is released.
+* A relabel locks **all** views bound in the environment. When another operator holds one, it stops
+  before any change.
+* Preview, compare, drift check and sync do not lock. Definition edits do not lock: the last write
+  wins.
+* The holder renews the lock every 30 s. A lock not renewed for 2 minutes expires, and the next
+  operator takes it. After a crash, the lock stays until it expires.
+* A workflow that loses its lock stops before its next change: `lock on web lost: <reason>`. It
+  also stops when its own lock was not renewed for 90 s (for example after sleep). A stopped
+  publish continues with *Resume*. A stopped promotion is `partial` or `failed`: promote again.
+* **Break lock** (**U** on Content Views) removes the lock that the dialog shows. Use it only when
+  the session of the holder is dead. Its workflow stops within 30 s. The audit log records it.
 
 ### Database ID
 
-Each CV database (the local file too) has a random ID. Derived repositories and Content
-View distributions carry it as the label `pulp_tui_db=<id>`. pulp-tui refuses to change an
-object with the ID of another database: `... is owned by another pulp-tui database (<id>)`.
-Objects without the label (made by an older pulp-tui) are adopted and labeled on the next
-change. pulp-tui also refuses an object that does not carry the labels of its view and
-environment (`pulp_tui_cv`, `pulp_tui_env`): `... is not labeled pulp_tui_env=Dev`. Delete,
-*Delete version* and *Unpromote* keep such an object and log it. This stops two databases that manage the same Pulp server from taking over each
-other's objects, for example an old local file after you moved to a shared database.
+Each Content View database has a random ID. Snapshot repositories and Content View distributions
+carry it as the label `pulp_tui_db=<id>`.
+
+* pulp-tui refuses to change an object with the ID of another database:
+  `... is owned by another pulp-tui database (<id>)`.
+* It also refuses an object without the labels of its view and environment:
+  `... is not labeled pulp_tui_env=Dev`. Delete and unpromote keep such an object.
+* An object without the ID label gets it at its next change.
 
 ### SQLite as the shared database
 
-`url = "sqlite:///srv/pulp-tui/cv.db"` is safe only when every operator runs pulp-tui on
-that one host (for example several users of a jump server). **Do not put the file on a
-network share (NFS, SMB):** SQLite locking and WAL do not work there and the file can be
-damaged. For operators on different hosts, use PostgreSQL. `db migrate` creates the SQLite
-file; a normal start does not.
+`sqlite:///srv/pulp-tui/cv.db` is safe only when all operators use one host (for example a jump
+server). **Do not put the file on a network share (NFS, SMB):** SQLite locks do not work there,
+and the file can become damaged. For several hosts, use PostgreSQL.
 
-Every operator's account must be able to write the file and its `-wal` and `-shm` files,
-which SQLite creates next to it. Put the file in a directory of a group that has all
-operators, make the directory group-writable with the setgid bit (`chmod 2770`, so new
-files get that group), and after `db migrate` make the file group-writable (`chmod 660`).
-SQLite gives the `-wal` and `-shm` files the permissions of the database file.
+Each operator must be able to write the file and its `-wal` and `-shm` files. Use a group
+directory with the setgid bit (`chmod 2770`). After `db migrate`, make the file group-writable
+(`chmod 660`).
 
 ## Protect Content View objects (Pulp RBAC)
 
-pulp-tui refuses to change Content View objects by hand (retention, sync, upload, copy,
-content changes, delete). Other Pulp clients (`pulp` CLI, scripts, the API) do not know these
-rules. A user with write access to a snapshot repository can break published versions:
+Other Pulp clients (`pulp` CLI, scripts) do not know the pulp-tui rules. A user with write access
+to a snapshot repository can break published versions:
 
-| Change by another client                    | Result                                                                                                  |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| add or remove content                       | no effect on published versions; the next publish replaces it                                           |
-| set `retain_repo_versions`                  | Pulp deletes old versions and their publications: older Content View versions and rollback stop working |
-| delete the repository or a distribution     | the environments of that view stop serving that repository                                              |
-| point a distribution to another publication | the environment serves wrong content; the drift check (**D**) reports it                                |
+| Change by another client                    | Result                                          |
+| ------------------------------------------- | ----------------------------------------------- |
+| add or remove content                       | no effect; the next publish replaces it         |
+| set `retain_repo_versions`                  | old versions and rollback stop working          |
+| delete the repository or a distribution     | the environments stop serving that repository   |
+| point a distribution to another publication | wrong content; the drift check (**D**) shows it |
 
-Only Pulp RBAC stops this. Set up the roles so that only pulp-tui operators can change these
-objects:
+Only Pulp RBAC stops this:
 
 1. **pulp-tui operators** get global roles (no object): `rpm.admin`, and for File
    `file.filerepository_owner`, `file.fileremote_owner`, `file.filepublication_owner`,
-   `file.filedistribution_owner` (pulp_file has no `file.admin` role). Operators of one shared
-   database change the objects of each other, so object-level roles are not sufficient for
-   them.
-2. **Other users** get only roles that do not give write access to objects of other users:
-   * to see everything: `rpm.viewer`, and `file.filerepository_viewer`,
-     `file.fileremote_viewer`, `file.filepublication_viewer`, `file.filedistribution_viewer`;
-   * the creator roles of what they make, for example `rpm.rpmrepository_creator`,
-     `rpm.rpmremote_creator`, `rpm.rpmpublication_creator`, `rpm.rpmdistribution_creator`, and
-     the `file.file…_creator` roles. Pulp gives the creator the owner role of each new object
-     (for example `rpm.rpmrepository_owner`) on that object only.
-3. **Do not give** `rpm.admin` or a global `*_owner` role to other users. A global owner role
-   gives write access to all objects of that type, also the snapshot repositories and the
-   Content View distributions.
+   `file.filedistribution_owner`. Operators of one shared database change the objects of each
+   other, so object roles are not sufficient.
+2. **Other users** get only viewer roles (`rpm.viewer`, `file.filerepository_viewer`,
+   `file.fileremote_viewer`, `file.filepublication_viewer`, `file.filedistribution_viewer`) and
+   creator roles (for example `rpm.rpmrepository_creator`, `rpm.rpmremote_creator`,
+   `rpm.rpmpublication_creator`, `rpm.rpmdistribution_creator`, `file.file…_creator`). Pulp gives
+   the creator the owner role of each new object only.
+3. **Do not give** `rpm.admin` or a global `*_owner` role to other users.
 
-Assign roles on **Users** (or **Groups**): **R**, then **c** with the role name and an empty
-object. Groups are easier to keep correct, for example a `pulp-tui-operators` group with the
-operator roles.
-
-RBAC does not stop superusers (`is_superuser`): they can always change everything. Keep their
-number small. RBAC protects only the Pulp API; it has no effect on who can download served
-content (use content guards for that).
+Assign roles on **Users** or **Groups**: **R**, then **c** with the role and an empty object. A
+group such as `pulp-tui-operators` is easier to keep correct. RBAC does not stop superusers; keep
+their number small. RBAC does not control downloads of served content (use content guards).
 
 ## Command line
 
 ```
-pulp-tui [--config FILE] [--profile NAME] [--data-dir DIR]     start the TUI
+pulp-tui [--config FILE] [-p|--profile NAME] [--data-dir DIR]   start the TUI
 pulp-tui check                       test a profile non-interactively
 pulp-tui export-cv [-o FILE]         export Content View definitions (JSON, no secrets)
 pulp-tui import-cv FILE              import them (existing names are kept)
-pulp-tui export-repos [-o FILE]      export repository and remote definitions of the server
-                                     (JSON, no secrets)
-pulp-tui import-repos FILE           create the ones the server does not have (existing
-                                     names are kept)
+pulp-tui export-repos [-o FILE]      export repository and remote definitions (JSON, no secrets)
+pulp-tui import-repos FILE           create the ones that the server does not have
 pulp-tui db migrate                  create or upgrade the schema of the profile's database
 pulp-tui --profile NAME db copy [--from PROFILE|local]
-                                     copy Content View data into the database of NAME, from
-                                     the local file (default) or the database of another
-                                     profile (never merges)
+                                     copy Content View data into the database of NAME
 pulp-tui config-example              print an example config
 ```
 
-`export-cv`, `import-cv`, `db migrate` and `db copy` use the database of the selected
-profile (`--profile`, `$PULP_TUI_PROFILE`, `default_profile`): its own `database`, else
-`[database]`, else the local file. `db migrate` on a profile that uses the local file stops
-with `profile <name> uses the local file; db migrate is only for an external database`.
+The global options also come from `$PULP_TUI_CONFIG`, `$PULP_TUI_PROFILE` and `$PULP_TUI_DATA_DIR`.
+Logs go to `<data-dir>/pulp-tui.log`. Set the level with `PULP_TUI_LOG` (for example
+`PULP_TUI_LOG=pulp_tui=debug`). Secrets are never logged.
 
-The export file has `"format": 2`. It carries composite views, their components (by view
-name), the auto publish flag, and the label and protection of Library (`prior` empty; an
-import uses them only when it creates Library). A pin is written as a version number, but versions are not
-exported, so `import-cv` (and **I** on Servers) imports every pin as `latest` and prints a
-line for each: `warning: rocky9: component os was pinned to v1; imported as latest` (the TUI
-shows one warning notice). Pin the component again with **e**. A component that the import
-does not find, or that is itself a composite, is skipped with a `warning:` line that names
-it. A format 1 file still imports. A pulp-tui from before composites refuses a format 2
-file. The database needs schema 4 (`pulp-tui db migrate`) for composites.
+**`export-cv`, `import-cv`, `db migrate`, `db copy`** use the Content View database of the
+selected profile. `db migrate` refuses a profile that uses the local file.
 
-`export-repos` and `import-repos` use the Pulp server of the selected profile, not a
-database (in the TUI: **X** and **J** on Servers). Use them to copy the repository setup of
-one server to another:
+The `export-cv` file has `"format": 2`. It holds composites, components (by name), auto publish,
+and the label and protection of Library (used only when an import creates Library). A format 1
+file still imports.
+
+* Versions are not exported, so `import-cv` (and **I** on Servers) imports each pin as `latest`
+  with a warning, for example
+  `warning: rocky9: component os was pinned to v1; imported as latest`. Pin it again with **e**.
+* A component that the import does not find, or that is a composite, is skipped with a warning.
+
+**`export-repos`, `import-repos`** use the Pulp server of the profile (in the TUI: **X** and **J**
+on Servers). Use them to copy the repository setup to another server:
 
 ```
 pulp-tui --profile old export-repos -o repos.json
 pulp-tui --profile new import-repos repos.json
 ```
 
-The export file has `"format": 1`. It holds the RPM, File and Deb remotes and repositories
-with the fields that the server accepts on create. A repository holds the name of its
-remote, and the import gives it the remote of that name on the target server. The export
-does not include:
-
-* secrets: passwords, usernames, client keys and proxy credentials (Pulp never shows them),
-  `sles_auth_token` and `headers`. The file lists the credentials a remote had in
-  `secrets`; after the import, `import-repos` prints `warning: RPM remote os: set
-  username, password again by hand (not in the export)`. Set them with **e** on Remotes.
-* signing services: they are objects of the source server. Set them again with **e** on
-  Repositories.
-* objects that Content Views or replication manage (labels `pulp_tui_cv`, `pulp_tui_env`,
-  `pulp_tui_db`, `pulp_tui_replica`, `UpstreamPulp`). Their owner creates them.
-* distributions, publications and content.
-
-`export-repos` prints a `note:` line on stderr for each item it leaves out. `import-repos`
-never changes an existing object. It keeps an object whose name exists and prints the
-fields that are different, for example `warning: RPM repository os exists; kept (differs:
-description)`. A field that the target server does not have is left out with a warning.
-Because of this, you can run the import again after an error, and the result is the same.
-
-Logs: `<data-dir>/pulp-tui.log`; level with `PULP_TUI_LOG` (for example
-`PULP_TUI_LOG=pulp_tui=debug`). Secrets are never logged.
+* The file holds the RPM, File and Deb remotes and repositories. A repository gets the remote of
+  the same name on the target.
+* The export leaves out (with a `note:` line on stderr):
+  * secrets (credentials, client keys, `sles_auth_token`, `headers`). The import names them:
+    `warning: RPM remote os: set username, password again by hand (not in the export)`. Set them
+    with **e** on Remotes.
+  * signing services. Set them again with **e** on Repositories.
+  * objects of Content Views and replication (`pulp_tui_*` labels, `UpstreamPulp`).
+  * distributions, publications and content.
+* `import-repos` never changes an existing object. It keeps it and prints the differences, for
+  example `warning: RPM repository os exists; kept (differs: description)`. A field that the
+  target does not have is left out with a warning. You can run the import again after an error.

@@ -81,8 +81,8 @@ podman run --rm -it --read-only \
 ## Documentation
 
 * [User guide](docs/USER_GUIDE.md): every screen, keys, profiles, workflows.
-* [Architecture](docs/ARCHITECTURE.md): layers, native vs application-managed concepts,
-  storage, failure recovery, security model.
+* [Architecture](docs/ARCHITECTURE.md): layers, runtime (requests, tasks), Pulp vs pulp-tui
+  objects, Content View workflows and recovery, replication, export/import, storage, security.
 * [Compatibility](docs/COMPATIBILITY.md): tested versions, detected capabilities, known
   server behaviors, unsupported operations.
 * [Status](docs/STATUS.md): verified workflows, test results, limitations and risks.

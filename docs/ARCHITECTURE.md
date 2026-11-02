@@ -1,555 +1,428 @@
 # Architecture
 
-pulp-tui is one Rust binary. It talks to Pulp 3 only through the documented REST API.
-It never reads or writes the Pulp database and it never runs `pulp`, `curl` or other
-tools for normal operation.
+pulp-tui is one Rust binary. It talks to Pulp 3 only through the documented REST API. It
+never reads or writes the Pulp database, and it never runs `pulp`, `curl` or other tools
+for normal operation.
 
 ## Layers
 
-| Layer          | Module                                                                                            | Responsibility                                                                                                                                                                                                                                                                                                |
-| -------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Transport      | `src/pulp/client.rs`                                                                              | Auth (basic, bearer, mTLS), TLS (always verified, custom CA bundles), proxies, timeouts, bounded concurrency (semaphore), retries for reads only, pagination, response size limit, error mapping, href confinement to the configured API root, recording of each request attempt in the in-memory session log |
-| Capabilities   | `src/pulp/caps.rs`                                                                                | `status/` (component versions, health, content origin), `login/` or `users/?username=` (current user), live OpenAPI schema (endpoints and their methods, fields, enums)                                                                                                                                       |
-| Typed adapters | `src/pulp/models.rs`, `src/pulp/ops.rs`, `src/pulp/rpm.rs`, `src/pulp/file.rs`, `src/pulp/deb.rs` | RPM/File/Deb endpoints, task and task-group waiting, find-or-create helpers, publications, distributions, uploads, content listing, diffs, served-content verification                                                                                                                                        |
-| Services       | `src/cv.rs`, `src/replication.rs`, `src/filters.rs`, `src/repo_export.rs`                         | Content Views (publish, promote, rollback, verify, cleanup), replication (native and fallback), filter rules, `rpmvercmp` and the dpkg version comparison, export and import of repository and remote definitions                                                                                             |
-| Storage        | `src/store.rs`                                                                                    | sqlx (SQLite, optionally PostgreSQL): task references, Content View definitions, versions, checkpoints, environments, bindings, audit log with operator, locks, replication runs                                                                                                                              |
-| TUI            | `src/tui/*`                                                                                       | Event loop, state, screens, forms, confirmations, Task Center                                                                                                                                                                                                                                                 |
+| Layer          | Modules                                                       |
+| -------------- | ------------------------------------------------------------- |
+| Transport      | `src/pulp/client.rs`                                          |
+| Capabilities   | `src/pulp/caps.rs`                                            |
+| Typed adapters | `src/pulp/models.rs`, `ops.rs`, `rpm.rs`, `file.rs`, `deb.rs` |
+| Services       | `src/cv.rs`, `replication.rs`, `filters.rs`, `repo_export.rs` |
+| Storage        | `src/store.rs`                                                |
+| TUI            | `src/tui/` (`view.rs` renders only)                           |
 
-### Plugins
+* **Transport**: auth (basic, bearer, mTLS), TLS (always verified, custom CA bundles),
+  proxies, timeouts, a concurrency semaphore, retries for reads only, pagination, a
+  response size limit, error mapping. It keeps every href below the API root and records
+  each attempt in the session log.
+* **Capabilities**: `status/` (versions, health, content origin), the current user, and
+  the live OpenAPI schema (endpoints, methods, fields, enums).
+* **Typed adapters**: plugin endpoints, task and task-group waits, find-or-create,
+  publications, distributions, uploads, content lists, diffs, served-content checks.
+* **Services** use only the layers above: Content Views, replication, filter rules
+  (`rpmvercmp` port, dpkg version comparison), repository and remote definitions.
 
-REST operations of one Pulp plugin go in `src/pulp/<plugin>.rs` (`rpm.rs`, `file.rs`, `deb.rs`).
-`RepoType` in `models.rs` holds the per-type facts: component name, label, endpoints,
-schema names and required `Feature`. Every dispatch on `RepoType` is an exhaustive
-`match`, so a new type is a compile error in each place that must handle it. There is no
-`== RepoType::X`, no `_ =>` arm and no `unwrap_or(RepoType::X)` on a type.
+Plugins: the REST operations of one plugin go in `src/pulp/<plugin>.rs`. `RepoType`
+(`models.rs`) holds the per-type facts (component, label, endpoints, schema names, required
+`Feature`). Dispatch on it with an exhaustive `match`, with no `_ =>` arm and no
+`unwrap_or(RepoType::X)`, so a new type is a compile error at each place that must handle
+it.
+
+## Runtime
 
 ### Event model
 
-The TUI loop (`src/tui/mod.rs`) waits on three sources: key events, messages from
-background jobs, and a 250 ms tick. A job is a Tokio task. It returns a closure that
-changes `App` state on the UI thread. Rendering only reads state, so drawing never waits
-on network or disk. Each list load carries a generation number; a stale response is
-dropped. The visible list or the Dashboard reloads once when a tracked task ends, and the list
-reloads when an operation job (not a read) fails, so it shows the state the failure left (a Content View version `failed`). Esc aborts only list loads (`App::abort_loads`, the HTTP request of the list). An operation job (sync, publish, replication, upload) keeps waiting until it ends; Connect to a profile (`App::abort_all`) or quit stops the wait. Pulp tasks always continue: only *Cancel task* asks Pulp to cancel one.
+* The loop (`src/tui/mod.rs`) waits on keys, job messages and a 250 ms tick.
+* A job is a Tokio task. It returns a closure that changes `App` on the UI thread.
+  Rendering only reads state.
+* Each list load has a generation number; a stale response is dropped. A list reloads when
+  a tracked task ends, and when an operation job fails (to show the state it left).
+* Esc aborts only list loads (`App::abort_loads`). An operation job waits until it ends;
+  Connect (`App::abort_all`) or quit stops the wait. Pulp tasks always continue: only
+  *Cancel task* asks Pulp to cancel one.
 
 ### Requests and retries
 
-* At most `max_concurrent_requests` HTTP requests run per server.
-* GET requests are retried (network error, timeout, 429, 502, 503, 504) with exponential
-  backoff and jitter. `Retry-After` is honored.
-* POST, PATCH, PUT and DELETE are never retried automatically. Workflows make retries
-  safe on their own level: find-or-create by name, publication reuse, and checkpoints that
-  store submitted task hrefs.
-* Responses larger than `max_response_mb` are rejected.
-* The client records each attempt (method, URL, status, duration, redacted bodies) in the
-  in-memory session log, so a retried read shows as several rows.
-* Every href (from the server, an import file or the database, including `next` links) must
-  stay on the same origin and below the configured API root.
+* At most `max_concurrent_requests` requests run per server.
+* GET is retried on network errors, timeouts, 429, 502, 503 and 504, with exponential
+  backoff, jitter and `Retry-After`.
+* POST, PATCH, PUT and DELETE are never retried. Workflows make a rerun safe instead:
+  find-or-create by name, publication reuse, checkpoints with submitted task hrefs.
+* Responses above `max_response_mb` are rejected.
+* Every href (server, import file, database, `next` links) must stay on the same origin
+  and below the configured API root.
 
-### Task tracking
+### Tasks
 
-Pulp tasks are the source of truth. The Task Center stores task references in the local file and
-polls each unfinished task on its own schedule: the interval starts at `poll_min_ms`,
-grows by 1.5x while nothing changes, resets on progress, and has ±20 % jitter. At most
-three polls run at the same time. A task that a workflow already waits on is not polled
-twice. A workflow takes only a `completed` task as done (`ops::wait_task`): a `failed`,
-`canceled` or `skipped` task stops that step with the task state as the error. After a
-restart, unfinished references are polled again ("re-attached"). Final ones are not polled:
-one background list read (`tasks/?pulp_href__in=...&fields=pulp_href,started_at`) gives their
-`started_at`. A task that is not listed (purged), or a failed read (a quiet Logs entry, no
-dialog), keeps the `created_at` of the stored reference. A task that the server answers with 404 (purged) gets the final state `gone`. A poll answer for a task
-that is not tracked (sent to the previous server before a Connect) is dropped.
+Pulp tasks are the source of truth.
 
-Task groups (native replication, import, ACS refresh) are final when no task is waiting or
-running and the group says all tasks were dispatched, a task failed, the replication
-finalizer completed, or the `pulp_import` task completed (it dispatches every task of an
-import). pulpcore 3.123 leaves `all_tasks_dispatched` false after a replication and an
-import, so an idle group whose counts stay the same for three polls is also treated as
-final. An ACS refresh never sets the flag either, but it dispatches all its tasks before it
-answers: a group whose description is the one of a refresh (`Refreshing ... alternate
-content source ...`, pulp_rpm, pulp_file and pulp_deb) is final when its tasks are.
-*Refresh* goes through `submit`, which gives a returned task group to the Task Center as it
-gives a task.
+* The Task Center stores task references in the local file. It polls each unfinished task:
+  the interval starts at `poll_min_ms`, grows 1.5x while nothing changes, resets on a
+  change, has ±20 % jitter. At most three polls run at a time. A task that a workflow waits
+  on is not polled twice.
+* A workflow takes only `completed` as done (`ops::wait_task`). `failed`, `canceled` and
+  `skipped` stop the step with the state as the error.
+* After a restart, unfinished references are polled again (re-attached). A task that
+  answers 404 (purged) gets the final state `gone`. An answer for a task that is not
+  tracked (previous server) is dropped.
 
-A task group is one Task Center row. Its href goes into the same task references (the href
-tells a group from a task, so the store has no extra column), and `ops::get_task` reads it
-as one task (`TaskGroup::as_task`): the description is the task name, the finished tasks of the
-group are the progress, and the final state is `failed`, `canceled` or `skipped` when a task
-of the group ended so, else `completed`, with the counts as the error. The replication job
-reports each snapshot to the Task Center, so the row exists while it runs, the final notice
-and the list reload come from the Task Center, and a restart re-attaches the group. A task
-or group that a job reports for the first time (`Ctx::on_task`) gets the label of that job
-(`publish web`, `replicate up`), not Pulp's task name. A task
-that a workflow reports for the first time already final also gives its final notice. A
-task or group that ends `canceled` or `skipped` gives a warning, a `failed` one an error.
-Only the three-poll rule above is not in `as_task`: such a group would stay `running` in the
-Task Center (no supported pulpcore needs the rule, see COMPATIBILITY.md).
+Task groups (native replication, import, ACS refresh) are one Task Center row each. The
+href goes into the task references; `ops::get_task` reads a group as one task
+(`TaskGroup::as_task`). A group is final (`TaskGroup::is_final`) when no task is waiting or
+running, at least one is done, and one of these is true:
 
-## Native Pulp concepts versus application-managed concepts
+1. all tasks are dispatched;
+2. a task failed or was canceled;
+3. the replication finalizer completed;
+4. the `pulp_import` task completed;
+5. the description is an ACS refresh (it dispatches all tasks before it answers).
 
-| Concept                                                                                                                                                   | Owner        | Notes                                                                                                                                                                                                      |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Repository, Remote, Repository Version, Publication, Distribution, Task, Task Group, User, Group, Role, Upstream Pulp, Exporter, Export, Importer, Import | **Pulp**     | Used as documented. The Repository and the Remote are separate objects.                                                                                                                                    |
-| Content View, Content View Version, Lifecycle Environment, Promotion, Binding                                                                             | **pulp-tui** | Not a Pulp API and not Katello. Stored in the local SQLite file, or in the external database of the profile (its own `database`, else `[database]`; see "Storage"), and built from the Pulp objects above. |
+Its state is `failed`, `canceled` or `skipped` when a task ended so, else `completed`.
+pulpcore 3.123 leaves `all_tasks_dispatched` false after a replication or an import (rules
+3 and 4 cover it). As a last fallback, `ops::wait_task_group` also ends an idle group whose
+counts stay the same for three polls; `as_task` does not have this rule. Replication and
+import jobs report each group snapshot to the Task Center, so a restart re-attaches it.
 
-### Content View implementation
+## Pulp objects and pulp-tui objects
 
-* A **Content View** is a named list of RPM, File and Deb repositories. Each repository has
-  optional filter rules (`src/filters.rs`). A composite view lists other Content Views
-  instead (see "Composite Content Views" below).
-* **Publish** first records the latest version of every source repository, so the
-  snapshot is consistent in time, together with the Deb signing choice of the publish
-  (`cv_version_repos.signing`: `''` = same as source, `none`, or a signing service href).
-  Then for each repository:
-  1. find or create the derived repository `pulp-tui-cv-<view>-<repo>`, labeled
-     `pulp_tui_cv=<view>`, with no retention limit;
-  2. fill it with the selected content. Without filters, RPM uses `rpm/copy/` and Deb
-     `deb/copy/` with `dest_base_version: 0` (all content, one request). With filters (File:
-     always), the latest derived version changes only where it differs from the selection:
-     `modify/` removes the units that are no longer selected, then RPM and File add the
-     missing ones with `modify/` (exactly those units) and Deb with `deb/copy/`
-     (`structured: true`: the release, component and architecture records of the copied
-     packages come with them; `dependency_solving: false`);
-  3. record the new repository version (or the latest one if the content did not change);
-  4. give the derived repository the publish settings of the source (RPM; File: `manifest`)
-     or the signing choice (Deb: `signing_service` and `signing_service_release_overrides`),
-     only the fields that differ, and only fields the server has;
-  5. RPM and File: reuse or create the publication of that version; after a PATCH of step 4,
-     always create one, because a publication keeps the settings that the repository had
-     when it was made (an unchanged selection records the version of the previous publish).
-     So does *Resume* when an earlier run recorded the version of step 3: that run can have
-     sent the PATCH and stopped before the publication.
-     Deb: always create one, because a publication signed with repository keys stores
-     `signing_service: null` and cannot be told apart from an unsigned one.
+| Owner    | Objects                                                                       |
+| -------- | ----------------------------------------------------------------------------- |
+| Pulp     | Repository, Remote, Repository Version, Publication, Distribution             |
+|          | Task, Task Group, User, Group, Role, Upstream Pulp                            |
+|          | Exporter, Export, Importer, Import                                            |
+| pulp-tui | Content View, Content View Version, Lifecycle Environment, Promotion, Binding |
 
-  Every step writes a checkpoint. The href of a submitted copy task is stored before
-  waiting, so an interrupted publish **re-attaches to the same task** and does not submit
-  it again. A copy task that failed or was canceled is cleared from the checkpoint, so the
-  next *Resume* submits the copy again (it starts from an empty base). So does a completed
-  copy without filters that made no version, or whose new version is gone (404): a newer
-  publish can change the latest version in the meantime, and it deletes the versions that no
-  Content View version records. A recorded copy or publication task that answers 404 (an
-  administrator purged it with `tasks/purge/`, or it belongs to another Pulp user) is
-  cleared, and *Resume* sends that step again in the same run (`CvService::reattach`): Pulp
-  purges only finished tasks, but what the task made is unknown. Under the view's lock the
-  copy is idempotent, and an extra publication is harmless. A filtered snapshot sends only the batches that the latest
-  version lacks; with none left, it records the latest version. A publication task
-  (every publication that is not reused) uses the same checkpoint column (`pending_task`): with no derived version recorded it
-  is the copy task, with one it is the publication task (the copy step clears it in the same
-  write that records the version). *Watch task* (**W**) on a version opens this task.
-* RPM filters select packages by name glob, architecture glob and EVR comparison
-  (`rpmvercmp` port, tested with rpm's own cases). An advisory is kept only when every
-  package it references that exists in the source is selected. Other metadata (comps,
-  modules, distribution trees, repo metadata files) is copied unchanged. A filtered snapshot
-  holds exactly the selection: a package that a filter excludes stays out, also when a module
-  or a comps group lists it (`rpm/copy/` would add it, see COMPATIBILITY.md).
-* Deb filters select binary packages by name glob, architecture glob and dpkg version
-  comparison. A filtered snapshot has only the selected packages and the release records
-  that the structured copy adds; source packages and upstream index files are dropped (the
-  publication makes new indices). A filtered snapshot changes the latest derived version only
-  where it differs from the selection (remove, then copy); Pulp refuses a body above 2.5 MiB,
-  so each list goes in batches, each a version of the derived repository. Afterwards the
-  versions that no Content View version uses are deleted (see COMPATIBILITY.md).
-* A **Content View Version** is immutable. It refers to exact derived repository versions
-  and publications. Version numbers are never reused.
-* **Lifecycle environments** form paths from `Library`, for example
-  `Library -> Dev -> Test -> Prod`. Publishing makes the new version active in Library.
-  *Resume* does so only when the version is the newest published one of the view: a resumed
-  older version is published, and Library keeps the newer version (`bind_library`). When the
-  Library step fails, the version stays published and the error is a warning, so auto
-  publish still runs. The version is stored `published` before the Library step, so a
-  client that stops in that step leaves the Library binding `(version, promoting)`
-  (`CvService::library_interrupted`; under the view's lock such a row is an interrupted one).
-  *Resume* of that published version runs the Library step again, then auto publish; of
-  any other published version it says "version is already published". Not covered: a stop
-  between `published` and the `promoting` row. Library then still serves the older version,
-  which cannot be told apart from a deliberate rollback.
+pulp-tui uses Pulp objects as documented. Its own objects are not a Pulp API and not
+Katello: they live in the store of the profile and are built from Pulp objects.
+
+## Content Views
+
+### Model and names
+
+* A **Content View** lists RPM, File and Deb repositories, each with optional filter
+  rules. A **composite** lists other views instead.
+* A **version** is immutable. It refers to exact derived repository versions and
+  publications. Numbers are never reused.
+* **Lifecycle environments** form paths from `Library` (`Library -> Dev -> Test -> Prod`).
+
+| Object             | Name                              | Labels                       |
+| ------------------ | --------------------------------- | ---------------------------- |
+| Derived repository | `pulp-tui-cv-<view>-<repo>`       | `pulp_tui_cv`, `pulp_tui_db` |
+| CV distribution    | `pulp-tui-cv-<view>-<env>-<repo>` | also `pulp_tui_env`          |
+
+* A new distribution serves at `<env label>/<view>/<repo>` (`cv::base_path`). An existing
+  one keeps its path (`CvService::served_path`; older servers use `cv/...`).
+* Names and `pulp_tui_env` use the environment **name**; only the path uses its **label**.
+
+### Ownership
+
+* Never modify a derived repository or CV distribution without its labels
+  (`pulp_tui_cv=<view>`, and `pulp_tui_env=<env>` on a distribution).
+* `pulp_tui_db=<database id>` (`Store::db_id`) of another database is refused: publish and
+  promote stop, delete keeps the object and logs it.
+* The checks also run on hrefs recorded earlier (`CvService::not_ours`): Resume, version
+  delete and unbind skip or refuse such objects.
+* An object without `pulp_tui_db`, or with an id in the aliases (`meta` key `alias:<id>`),
+  is adopted: the workflow sets this database's id when it touches the object.
+
+### Publish
+
+`CvService::publish` records the latest version of every source repository (one point in
+time) and the Deb signing choice (`cv_version_repos.signing`: `''` = as source, `none`, or
+a signing service href). Then for each repository (`publish_repo`):
+
+1. Find or create the derived repository (labeled, no retention limit). A repository of
+   that name without the view's label is refused.
+2. Fill it (`snapshot`):
+   * No filters (RPM, Deb): one `rpm/copy/` or `deb/copy/` onto `dest_base_version: 0`.
+   * Filters (File: always): change the latest derived version only where it differs.
+     `modify/` removes; RPM and File add with `modify/`, Deb with `deb/copy/`
+     (`structured: true`, `dependency_solving: false`). Lists go in batches below Pulp's
+     2.5 MiB body limit.
+3. Record the new version (or the latest one when nothing changed). Delete derived versions
+   that no Content View version uses (`drop_unused_versions`, best effort).
+4. Copy the publish settings of the source (RPM; File `manifest`) or the signing choice
+   (Deb). PATCH only fields that differ and that the server has.
+5. Publication: RPM and File reuse one of that version, except after a PATCH in step 4 or
+   on Resume of a recorded version (a publication keeps the old settings). Deb always
+   creates one (a signed and an unsigned one cannot be told apart).
+
+Then the version is stored `published` and the Library step runs.
+
+### Checkpoints and Resume
+
+Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from them.
+
+* A submitted task href goes into `pending_task` **before** the wait (`tracked_task`), so
+  Resume re-attaches and never submits it twice. It is the copy task until the version is
+  recorded, then the publication task: the write that records the version also clears it.
+  *Watch task* (**W**) opens it.
+* A failed, canceled or skipped task is cleared, so Resume sends that step again.
+* An unfiltered copy that made no version, or whose version is gone, is sent again (a newer
+  publish can change or delete versions).
+* A recorded task that answers 404 (purged, or of another user) is cleared and the step is
+  sent again (`CvService::reattach`). Under the view's lock this is safe.
+* A filtered snapshot sends only the batches that the latest version lacks.
+
+### Filters
+
+* **RPM**: name glob, architecture glob, EVR comparison (`rpmvercmp`). An advisory stays
+  only when all its packages that exist in the source are selected. Other metadata is
+  copied unchanged. An excluded package stays out, also when a module or comps group
+  lists it (see COMPATIBILITY.md).
+* **Deb**: binary packages by name glob, architecture glob, dpkg version. Source packages
+  and upstream indices are dropped; the publication makes new indices.
+* **File**: relative path glob.
+
+### Library step
+
+* Publish makes the version active in Library (`bind_library`). Resume does so only for
+  the newest published version; Library keeps a newer one.
+* A failed Library step is a warning; the version stays published and auto publish runs.
+* A stop in this step leaves the binding `(version, promoting)`; under the view's lock such
+  a row is an interrupted one (`CvService::library_interrupted`). Resume of that version
+  runs the step again; Resume of another published version refuses.
+* Not covered: a stop between `published` and the `promoting` row. Library then serves
+  the older version, like after a rollback.
+
+### Promote, rollback, unpromote
+
 * **Promote** binds a version to an environment. The version must be active in the prior
-  environment. Each (view, environment, repository) has a stable distribution
-  `pulp-tui-cv-<view>-<env>-<repo>` at `<env label>/<view>/<repo>` (`cv::base_path`). An
-  existing distribution keeps its path (`CvService::served_path`): older servers serve at
-  `cv/...`, and an operator may move a distribution by hand. The distribution name and the
-  ownership label `pulp_tui_env` keep the environment **name**; only the served path uses
-  the environment **label**. Promotion re-points the distribution to the version's
-  publication. Repositories that are bound but not part of the version stop serving
-  (`publication: null`); the distribution stays for a later rollback.
-* **Relabel** (`CvService::relabel_env`, Edit on Lifecycle Environments) changes the label
-  of an environment and moves its distributions with a `PATCH` of `base_path`
-  (`ops::move_distribution`: Pulp moves the distribution in place, the task is awaited and
-  the old path stops serving). Steps: load the impact (`relabel_impact`: served rows whose
-  path changes); `confirm_danger` typed with the environment name; take the locks of every
-  view with a binding or served rows in the environment, in `cv_id` order; store the new
-  label (the checkpoint); then for each row check the ownership
-  labels and the database ID, `PATCH`, wait, and save the row. A row that fails keeps its old
-  path and is reported; a rerun with the same label continues with the rows that are left
-  (a row whose `PATCH` finished before the crash is saved without a second `PATCH`). A row
-  of a view bound after the locks were taken is reported as failed and not touched. The
-  relabel lists the rows once, so a promotion that read the old label and saves a row after
-  that list checks the label again at its end and stores `partial` with `<env> was relabeled
-  <label> during the promotion` (a rerun of the relabel moves the row). The audit entry is
-  `env.relabel`.
-* **Rollback** is a promotion of an earlier published version, without the prior-environment
-  check. In an environment after Library, `CvService::promote` (so every caller) accepts only
-  a version with a lower number than the bound one, or the bound one again (a retry of a
-  partial rollback, or a drift repair); a newer version or an environment without a binding
-  is refused before any request (`cv::rollback_refusal`: `v5 is newer than the active v4 in
-  Test; use Promote`), because it would skip the promotion path. The TUI shows the refusal
-  instead of the preview. In Library (also the Library step of a publish) any published
-  version is accepted. Newer versions are never deleted.
-* **Unpromote** deletes the view's distributions in one environment (one of another
-  database, or one without the labels of the view and environment, is kept), then the
-  served rows and the binding (`Store::delete_binding`, last,
-  so a rerun deletes what is left). It is refused while a later environment on the path
-  still has the view. The audit entry is `cv.unpromote`.
-* **Verify / drift**: for every binding, check that the distribution serves the expected
-  publication, that the publication belongs to the expected snapshot version, that the
-  snapshot still exists, and that served content matches (the manifest that the publication
-  names, `PULP_MANIFEST` by default, equal to the snapshot for File; `repomd.xml` plus the smallest package with digest check for RPM;
-  `dists/<distribution>/Release` plus the smallest package, found in a `Packages` index,
-  with digest check for Deb).
-  Retention set on a derived repository is reported. Drift is reconciled by promoting the
-  bound version again (idempotent).
-* **Ownership**: pulp-tui never modifies a derived repository or CV distribution that does
-  not carry its ownership labels. Deleting a CV version keeps Pulp objects that another
-  live version of the view uses, and every publication (and with it its repository
-  version) that any binding row of the server scope still serves, also the binding of a
-  composite (`Store::served_publications`). Pulp deletes the publications of a repository
-  version with it, and deleting a publication silently stops the distributions that serve
-  it (COMPATIBILITY.md), so a served object is never removed. Deleting a view
-  (`CvService::delete_view`) is refused while a composite lists it as a component or a
-  non-deleted composite version used one of its versions, and when another view still
-  serves a publication of one of its derived repositories, because deleting the
-  repository would delete that publication. Deleting a version is refused while a
-  composite version uses it or a composite pins it. Before that check the version is set to
-  `deleting` (`Store::set_version_state`, conditional on its old state), because a composite
-  publish takes the composite's lock only: a composite publish that starts later refuses a
-  version that is not `published`, and one that started earlier is found by the check (on
-  PostgreSQL `Store::begin` holds the row `FOR SHARE`, so the mark waits for its commit). A
-  refused delete restores the old state; a delete that fails later stays `deleting`, and
-  *Delete* again finishes it (*Resume* refuses it).
-* **Composite Content Views**: a composite (`content_views.composite`) has components
-  (`cv_components`: the component view and a pinned version, or none for `latest`) instead
-  of repositories and filters. No nesting: `set_component` refuses a composite as a
-  component. Publish (`CvService::publish_composite`) resolves each component to its pin
-  or its newest published version, refuses one without a published version, and checks the
-  repositories of all resolved versions (`check_repo_clash`: one repository in two
-  components, or two names with one `slug` segment) before any write. Nothing is copied or
-  published in Pulp. `Store::begin_composite_version` takes the component versions
-  (`cv_version_components`) and copies their `cv_version_repos` rows as **borrowed** rows
-  (`borrowed = 1`, same derived repository, version and publication, without the task
-  reference) into the new version. It refuses a component version that is no longer
-  published. Then `resume` runs the normal path: `publish_repo` returns at once for a row
-  that has a publication, and `promote` binds Library with the composite's own
-  distributions `pulp-tui-cv-<composite>-<env>-<repo>`, labeled `pulp_tui_cv=<composite>`,
-  at `<label>/<composite>/<repo>`. One publication can be served by the
-  distribution of the component and the one of the composite (verified, COMPATIBILITY.md).
-  Delete never removes a borrowed object: `delete_version` skips borrowed rows, and
-  `delete_view` of a composite removes its distributions only. The composite takes its own
-  lock only; it reads the component versions and never changes them. `auto_publish`
-  (`CvService::auto_publish`) runs after a component publish or resume, outside the lock of
-  the component. After *Resume* it runs only when the resumed version is the newest
-  published version of the component: composites follow that one, so an older version gives
-  them nothing new. For every composite with the flag that lists the component as `latest`
-  (`Store::auto_composites`) it takes the composite's lock and publishes, and returns one
-  result per composite, so a locked or failing composite does not undo the component's
-  publish. It never promotes beyond Library, and publishes nothing while Library is
-  protected (nobody types the confirmation). The compare and preview of composites list
-  the component versions first (`cv::component_lines`).
-* **Database ID label**: derived repositories and CV distributions also carry
-  `pulp_tui_db=<database id>` (`Store::db_id`). An object that carries the id of another
-  database is refused: publish and promote stop with "... is owned by another pulp-tui
-  database (<id>)", and deleting a Content View keeps such objects (it logs them). The check
-  also runs on hrefs recorded earlier: Resume stops before copying into a derived repository
-  that another database adopted, deleting a version keeps the publication and snapshot of
-  such a repository, and a promotion does not unbind such a distribution. On these recorded
-  hrefs the same rule applies to the ownership labels (`CvService::not_ours`): a derived
-  repository must carry `pulp_tui_cv=<view>`, a distribution also `pulp_tui_env=<env>`;
-  otherwise the reason is "... is not labeled <key>=<value>". An object
-  without the label, or with an id in this database's aliases (`meta` keys `alias:<id>`),
-  is adopted: the label is set to this database's id when the workflow touches it.
+  environment. Each distribution is re-pointed to the version's publication. Bound
+  repositories that the version lacks get `publication: null`; the distribution stays.
+* **Rollback** promotes an earlier version without the prior-environment check. After
+  Library, `promote` accepts only a lower number than the bound one, or the bound one (a
+  retry or drift repair); `cv::rollback_refusal` refuses the rest before any request. In
+  Library any published version is accepted. Newer versions are never deleted.
+* **Result**: Pulp has no multi-object transaction. A promotion stores `partial` (some
+  repositories failed) or `failed` (all), with per-repository rows. Retry is idempotent.
+* **Unpromote** deletes the view's own distributions in one environment, then the served
+  rows, then the binding (last, so a rerun finishes). It is refused while a later
+  environment on the path has the view.
 
-### No cross-resource transactions
+### Relabel an environment
 
-Pulp has no multi-object transaction, so pulp-tui does not promise one. A promotion that
-fails for some repositories is stored as `partial` (all failed: `failed`) together with
-per-repository binding records. The operator can retry (idempotent) or roll back. A
-failed publish keeps its checkpoints; *Resume* continues from them.
+`CvService::relabel_env` moves the distributions with a PATCH of `base_path`
+(`ops::move_distribution`):
+
+1. Load the impact (`relabel_impact`), then `confirm_danger` with the environment name.
+2. Lock every view with rows in the environment, in `cv_id` order.
+3. Store the new label (the checkpoint).
+4. Per row: check the labels and database id, PATCH, wait, save the row.
+
+A failed row keeps its old path; a rerun with the same label moves the rest (a row whose
+PATCH finished before a crash is saved without a second PATCH). A row of a view bound after
+the locks is reported, not touched. A promotion that read the old label stores `partial`; a
+rerun of the relabel moves its row.
+
+### Verify and drift
+
+Verify checks for every binding that the distribution serves the expected publication, the
+publication belongs to the snapshot, the snapshot exists, and served content matches:
+
+| Type | Served check                                                       |
+| ---- | ------------------------------------------------------------------ |
+| File | the manifest that the publication names (default `PULP_MANIFEST`)  |
+| RPM  | `repomd.xml`, the smallest package with digest                     |
+| Deb  | `dists/<dist>/Release`, the smallest package of `Packages`, digest |
+
+It also reports retention on a derived repository. A new promotion of the bound version
+fixes drift.
+
+### Delete
+
+Never remove a served object: deleting a repository version deletes its publications, and
+deleting a publication silently stops its distributions (COMPATIBILITY.md).
+
+* **Version**: keeps objects that another live version uses and every publication that a
+  binding row of the scope serves (`Store::served_publications`). Refused while a composite
+  version uses it or a composite pins it.
+* Before that check the version becomes `deleting` (`Store::set_version_state`,
+  conditional). A later composite publish refuses it; an earlier one is found by the check
+  (PostgreSQL: `FOR SHARE` in `Store::begin`). A refused delete restores the state; a
+  failed one stays `deleting` until *Delete* again.
+* **View** (`CvService::delete_view`): refused while a composite uses it, or another view
+  serves a publication of one of its derived repositories.
+
+### Composites
+
+* Components (`cv_components`): a view and a pinned version, or `latest`. No nesting.
+* Publish (`CvService::publish_composite`):
+  1. Resolve each component to its pin or newest published version; refuse one without.
+  2. Refuse a repository clash (`check_repo_clash`) before any write.
+  3. `Store::begin_composite_version` records the component versions and copies their rows
+     as **borrowed** rows (same Pulp objects, no task reference). It refuses a component
+     version that is no longer published.
+  4. `resume` runs the normal path. It skips rows with a publication and binds Library
+     with the composite's own distributions.
+* Nothing is copied or published in Pulp. Delete never removes a borrowed object.
+* The composite takes only its own lock and never changes its components.
+* **Auto publish** (`CvService::auto_publish`) runs after a component publish (or Resume
+  of its newest version), outside the component's lock. It locks and publishes each
+  composite that follows the component as `latest`, one result per composite. It never
+  promotes beyond Library and does nothing while Library is protected.
 
 ## Replication
 
 * **Native** (`upstream-pulps/`, pulpcore ≥ 3.23, tech preview): pulp-tui manages the
-  Upstream Pulp object, starts `replicate/`, follows the task group and lists task results.
-  A failed task fails the replication; a canceled or skipped task is not a success either
-  and gives a warning with the counts. The deletion policy belongs to Pulp. The form puts `nodelete` first and requires typed
-  confirmation for `all`.
-* **Fallback** (`src/replication.rs`): content synchronization only. For each selected
-  upstream RPM/File distribution it creates or updates a remote (pointing at the published
-  upstream URL), a repository and a pinned distribution with the same name and base path,
-  labeled `pulp_tui_replica=<source profile>`. A dry run shows CREATE / SYNC / SKIP per
-  item. Objects without this label are conflicts and are skipped. A File item is skipped
-  with the reason when the served upstream publication cannot be read, does not exist, or
-  has no manifest: the remote URL is the manifest that the upstream serves, never a guess.
-  The run checks the label
-  of an existing remote and repository again, so an object created after the dry run is
-  refused, not changed. The fallback never deletes anything and does not copy content
-  guards, labels or other Pulp metadata.
-* Guards: source and destination must be different servers; upstream distributions whose
-  content URL is on the destination's content origin are skipped as loops.
+  Upstream Pulp, starts `replicate/` and follows the task group. A failed task fails it; a
+  canceled or skipped one gives a warning. Pulp owns the deletion policy; the form puts
+  `nodelete` first and needs typed confirmation for `all`.
+* **Fallback** (`src/replication.rs`): content sync only, RPM and File. Per upstream
+  distribution it creates or updates a remote (the served URL), a repository and a
+  pinned distribution with the same name and path, labeled
+  `pulp_tui_replica=<source profile>`.
+  * A dry run shows CREATE / SYNC / SKIP. The run checks the label again.
+  * Objects without the label are conflicts and are skipped.
+  * A File item without a readable served manifest is skipped (no URL guess).
+  * It never deletes and does not copy content guards, labels or metadata.
+* Guards: source and destination differ; a distribution served from the destination's
+  content origin is a loop and is skipped.
 
-## Disconnected export and import
+## Export and import
 
-pulp-tui manages the exporters of pulpcore and starts their exports; Pulp writes the files
-on its own disk (`ALLOWED_EXPORT_PATHS`). The Exporters screen (`Kind::PulpExporters`,
-`actions_admin::exporter_action`) creates, edits and deletes Pulp exporters. *Export* posts
-`{exporter}exports/` (a full export of the latest version of each repository, an optional
-`chunk_size`) and waits for the task in a job (`ops::create`, the task goes to the Task
-Center); then it reads the export and shows its TOC file. `Kind::Exports` lists the exports
-of an exporter. Deletes load the impact first (the number of exports of an exporter) and
-need the typed name. `t` switches to the filesystem exporters (`Kind::FsExporters`): their
-*Export* resolves the repository and version number of the form to a version href and, for
-a publication, to the newest publication of that version, then posts exactly one of them.
-
-The Importers screen (`Kind::Importers`, `actions_admin::importer_action`) manages Pulp
-importers. Before a create or edit with a mapping, the job finds every destination by name
-and sends nothing when one is missing (pulpcore loses the mapping on such a PATCH, see
-COMPATIBILITY.md). *Import* is two jobs: `ops::import_check` (the preview: a check that is
-not valid ends there), then, after `confirm_prod`, `ops::pulp_import`, which posts
-`{importer}imports/` with the TOC and waits for the task group (`ops::group_report`, which
-native replication uses too). Like replication, the job reports each snapshot of the group
-to the Task Center (`TaskGroup::as_task`), so a restart re-attaches it. An import that
-completes without an `import_repository_version` task gives a warning.
-`Kind::Imports` lists the imports of an importer.
+* **Pulp export and import**: Pulp writes and reads the files on its own disk. Export
+  waits for the task and shows the TOC. Before an importer create or edit, the job finds
+  every mapped destination and sends nothing when one is missing. *Import* runs
+  `ops::import_check` first, then `ops::pulp_import` after `confirm_prod`, and follows the
+  task group like replication. Deletes of exporters and importers load the impact and need
+  the typed name.
+* **Content View definitions** (`export-cv`, `import-cv`; format 2, reads format 1; an
+  older pulp-tui refuses format 2): views, environments and labels, composites, pins as
+  numbers. No secrets, no Pulp state. Versions are not exported, so import turns pins into
+  `latest` with a warning. Import checks every entry before its first write.
+* **Repository and remote definitions** (`src/repo_export.rs`): the export keeps the
+  fields of the live request schema. It leaves out readable secrets (`sles_auth_token`,
+  `headers`, credentials in URLs), hrefs and objects with ownership labels. The import
+  creates what is missing and never changes an existing object, so a rerun is a no-op.
+  `repo_export::plan` is the dry run.
 
 ## Storage
 
-`Store` (`src/store.rs`) uses sqlx with its `Any` driver, so one implementation of each
-method serves SQLite and PostgreSQL. All store calls are `async`; the UI thread never
-calls them (they run in jobs). pulp-tui holds the local file and one store for each
-external database in use:
+`Store` (`src/store.rs`) uses the sqlx `Any` driver: one implementation for SQLite and
+PostgreSQL, so SQL must be portable. Store calls are `async` and run in jobs.
 
-| Store                                                                                               | Opened                                        | Holds                                                                                                                                              | Rows scoped by |
-| --------------------------------------------------------------------------------------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
-| Local file `<data_dir>/pulp-tui.db` (SQLite, WAL)                                                   | always, migrated on open                      | task references, replication runs; also the Content View data of every profile without an external database                                        | profile name   |
-| External database (PostgreSQL, or SQLite at a path): the `database` of a profile, else `[database]` | on Connect (a job), never migrated by an open | Content Views (also composites and their components), repositories and filters, versions and checkpoints, environments, bindings, audit log, locks | server key     |
+| Store                                 | Opened               | Scope        |
+| ------------------------------------- | -------------------- | ------------ |
+| Local `<data_dir>/pulp-tui.db`        | always; migrates     | profile name |
+| External (PostgreSQL, or SQLite path) | on Connect, in a job | server key   |
 
-`Config::database_for(profile)` decides which database a profile uses: its own `database`,
-else `[database]`, else the local file (`None`). A profile with `url = "local"` also gets
-`None`, even when `[database]` is set. It returns the keyring user of the secret too:
-`[database]`, or `[database]:<profile>` for a profile's own database (`validate_name`
-rejects such a profile name). The store of a database is cached in `App.stores`, keyed by
-the connect URL (which holds the password: the key is never shown or logged), so profiles
-that use one database share one `Arc<Store>`. `App::open_store(db)` returns the cached
-store, or opens and caches it; `None` gives the local store, and a failed open is not cached.
+* The local file holds task references and replication runs, and the Content View data
+  of profiles without an external database.
+* The external database holds Content View data: views, filters, versions, checkpoints,
+  environments, bindings, audit log, locks.
+* `Config::database_for(profile)`: the profile's `database`, else `[database]`, else the
+  local file. A database with `url = "local"` (the marker) is the local file, also when
+  `[database]` is set. The keyring user is
+  `[database]` or `[database]:<profile>`.
+* `App.stores` caches one store per connect URL (the key holds the password: never show
+  it). `App.cv_store` is the CV store of the connected profile, opened by `App::with_store`.
+  While it opens, `cv_store` holds an `opening` error, never the previous profile's store;
+  a result for a profile that is no longer active is dropped.
+* A failed external open puts the error in `cv_store`. Content View screens then report
+  it; nothing falls back to the local file (the state would split).
+* The server key is `<origin><api_root>#<domain>` (`Profile::server_key`), from the URL as
+  typed. All operators must type the same scheme, host, port, API root and domain. The
+  Dashboard shows the key.
 
-`App.store` is the local file. `App.cv_store` is the store of Content View data of the
-connected profile. `App::connect` opens it in a job (`App::with_store`) and sets it when the
-job ends; a result for a profile that is no longer the active one is dropped, and while the
-job runs `cv_store` holds an `opening` error, never the store of the previous profile. For
-a profile without an external database it is the local store. If the external database
-cannot be opened, `cv_store` holds the error, Content View screens and actions report
-`shared database unavailable: ...`, and nothing falls back to the local file (the state
-would split). The next Connect opens it again.
+### Schema and migrations
 
-`Store::open_external` fails with `store::NotMigrated` (`from` 0 for an empty database or a
-SQLite file that does not exist, else the older version) instead of changing anything.
-`with_store` turns it into the message `<display>: database not migrated (open Servers,
-Connect again to migrate, or run pulp-tui db migrate --profile <name>)` for `cv_store`. It
-also shows the confirm `Migrate database of <name>?`; after Enter it runs
-`Store::migrate_external` in a job and opens the store. A read-only profile gets a warning
-instead of the confirm, because migrate is a mutating action (`Act::MigrateDb`). The
-profile form does the same check after a save that changed the database.
+* `MIGRATIONS` (SQLite, `PRAGMA user_version`) and `PG_MIGRATIONS` (PostgreSQL,
+  `schema_version`) have the same length (a unit test checks it). Append to both; never
+  edit a batch. A batch and its number apply in one transaction.
+* PostgreSQL uses `BIGINT` for every integer, because sqlx `Any` reads `i64`.
+* The local file migrates on open. The external database changes only with `pulp-tui db
+  migrate` or the TUI confirm (`Store::migrate_external`, with `pg_advisory_lock` on
+  PostgreSQL). `Store::open_external` changes nothing: it refuses an older schema
+  (`store::NotMigrated`) or a newer one.
+* Operators need only `SELECT/INSERT/UPDATE/DELETE`.
 
-**Server key scope.** In the external database the scope value is the server key
-`<origin><api_root>#<domain>` (`Profile::server_key`, applied by `Store::scope`), so two
-operators with different profile names for one server share rows. In the local file the
-scope stays the profile name, so existing data stays valid. The key comes from the URL as
-the operator typed it (`url::Url` only makes the host lower case and removes a default
-port). So every operator must use the same scheme, host, port, `api_root` and domain for a
-server; a short host name or an IP address gives another key and other rows. `db copy`
-writes under the key of the profile that runs it. The Dashboard shows the key
-(`shared database scope: <key>`), so operators can compare it.
+| Schema | Adds                                                                  |
+| ------ | --------------------------------------------------------------------- |
+| 2      | `meta` (`db_id`, aliases), `locks`, `audit.actor`, `scope_settings`   |
+| 3      | `environments.label` (set to `lower(name)`, so no served path moves)  |
+| 4      | composites, `cv_components`, `cv_version_components`, `borrowed` rows |
+| 5      | `cv_version_repos.signing` (also stops an older pulp-tui on Deb rows) |
 
-**Schema and upgrades.** `MIGRATIONS` (SQLite, `PRAGMA user_version`) and `PG_MIGRATIONS`
-(PostgreSQL, a `schema_version` table) are lists of numbered SQL batches of the same length
-(a unit test checks this). PostgreSQL uses `BIGINT` for every integer and identity
-columns, because sqlx `Any` reads integers as `i64`. A batch and its version number are
-applied in one transaction. The local file migrates on open. The external database changes
-only with `pulp-tui db migrate` or the confirm in the TUI. Both call
-`Store::migrate_external`, which also creates the schema and, on PostgreSQL, holds a
-`pg_advisory_lock` so two administrators cannot migrate at the same time. A normal open
-(`Store::open_external`) compares versions and refuses an uninitialized, older or newer
-schema with a message. Operators need only
-`SELECT/INSERT/UPDATE/DELETE`; the database ID is created with an `INSERT`.
-Schema 2 added the `meta` table (database ID `db_id` and aliases `alias:<id>`),
-`scope_settings` (the base path prefix per server; no longer read), `locks` and
-`audit.actor`.
-Schema 3 added `environments.label`, the path segment of an environment (unique per
-scope; `validate_label`). The migration sets it to `lower(name)`, which is exactly the
-segment that served paths used before (so `Dev` and `dev` share `dev` and nothing moves),
-and seeds `scope_settings` with the first segment of `binding_repos.base_path` (usually
-`cv`; no longer read). Export (format 2) and `db copy` carry the labels, also the label and
-the protection of Library (an import that finds a Library keeps it; `db copy` protects it);
-`db copy` refuses a label that another environment uses in the target scope. An external
-database at schema 2 needs `db migrate` after the upgrade.
-Schema 4 added composite Content Views: `content_views.composite` and `auto_publish`
-(flags, `BIGINT` on PostgreSQL), `cv_version_repos.borrowed`, `cv_components` (composite,
-component, optional pinned version; `component_id` and the pinned `version_id` have no
-cascade, so the database itself refuses to delete a view or version that a composite still
-uses) and `cv_version_components` (the component versions that a composite version used).
-Export format 2 carries composites, components by view name, the auto publish flag and a
-pin as a version number. Versions are not exported, so import turns every pin into `latest`
-and returns a warning that names it (the CLI prints it as `warning: ...`, the TUI shows one
-warning notice); a missing component, or a composite used as component, is skipped with a
-warning. Import checks every name, label and filter rule before its first write, and also
-names and labels that are in the file twice, labels that the target already uses and
-priors that do not exist, so a bad entry leaves nothing behind (a create by another operator
-at the same time can still stop it halfway). Import still reads format 1; an older pulp-tui refuses format 2 (its check is
-`format != 1`). `db copy` copies composites, components with pins, the recorded component
-versions and the borrowed rows, with every id remapped. The links between composites,
-components and versions are written after all views and versions, so a composite that
-sorts before its components (`rocky9` < `rocky9-os`) is copied correctly. An external
-database at schema 3 needs `db migrate` after the upgrade.
-Schema 5 added `cv_version_repos.signing`, the Deb signing choice of a publish (`''` = same
-as source, `none`, or a signing service href; rows of earlier versions read `''`). It is a
-checkpoint like the source version, so a resumed publish signs as asked; composite rows and
-`db copy` carry it. The schema number also stops an older pulp-tui on a shared database,
-which would otherwise fail on a `deb` repository row and drop its `version` filter rules.
-An external database at schema 4 needs `db migrate` after the upgrade.
+`cv_components` has no cascade, so the database refuses to delete a view or version that a
+composite uses.
 
-**Connection.** `Database::connect_url` (`src/config.rs`) builds the URL: it adds the
-password from the secret reference and forces `sslmode=verify-full` for every PostgreSQL
-host except a Unix socket or a loopback address. sqlx uses rustls with the root
-certificates built into the binary; `ca_cert` (`sslrootcert`) is added to them and the
-operating system store is not read (see COMPATIBILITY.md). A first plain connection attempt
-has a 10 s limit, so an unreachable host fails with a clear error. Error text uses the URL
-without the password (`Database::display_url`).
+### Connection
 
-**Operator and audit.** The operator is `username@host` (`store::actor`). It goes into
-the `audit.actor` column and into locks.
+* `Database::connect_url` (`src/config.rs`) adds the password from the secret reference
+  and forces `sslmode=verify-full`, except for a Unix socket or loopback host.
+* rustls with built-in roots; `ca_cert` adds to them. The OS store is not read.
+* The first connection has a 10 s limit. Errors use `Database::display_url` (no password).
 
-**Locks.** One row per Content View in `locks` (`owner`, a random `token`, `operation`,
-`renewed_at` in client Unix seconds). `Store::try_lock` is one statement: `INSERT ... ON
-CONFLICT(cv_id) DO UPDATE ... WHERE locks.renewed_at < now - 120`. It wins when there is
-no row or the row has expired (TTL `LOCK_TTL_SECS` = 120 s), so the takeover is atomic on
-both backends. `CvLock` (`src/cv.rs`) holds the lock for one workflow and renews it every
-`LOCK_RENEW_SECS` = 30 s in a background task. `Store::renew_lock` updates only the row
-with its own token: if it matches nothing (another operator took over after expiry, or
-*Break lock* removed it), the database is unreachable, or the round takes longer than
-30 s (`database unreachable: renewal timed out`), the task sets a flag and stops.
-`CvService::alive()` calls `CvLock::check` before every Pulp mutation and before every
-checkpoint or binding write (no database round trip per step) and stops the workflow with
-`lock on <view> lost: <reason>`. `check` reads that flag, and it also fails with `not
-renewed for <n> s` when the last successful renewal (or the acquire) is more than
-`LOCK_TTL_SECS - LOCK_RENEW_SECS` = 90 s old in wall-clock time (`CvLock::ok_at`). Tokio
-timers do not count the time a computer sleeps, so after a resume the renewal task may not
-have run yet while the row has already expired and another operator holds it; the 90 s
-check stops the workflow before its next step.
-Three writes still happen after a lost lock, because they record work already sent to Pulp
-or why the workflow stopped: the href of a copy task that was just submitted; the `failed`
-state of a stopped publish; and the final state of a promotion (`partial`, or `failed` when
-no repository was done). The last two are conditional when the lock is lost:
-`Store::fail_publishing_version` changes the version only while it is `publishing`, and
-`Store::finish_promoting_binding` changes the binding only while it is still this
-version's `promoting` row. So they do not overwrite the result of an operator who took the
-lock over and finished the work (the audit row is still written). A stopped publish keeps
-its checkpoints, so *Resume* continues it; a promotion is retried. *Break lock*
-(`Store::break_lock`) deletes the row only when its owner and `acquired_at` still match the
-holder shown in the dialog, so it cannot remove a lock that another operator took meanwhile.
-Dropping the `CvLock` (workflow end, or Connect, which aborts the job) releases the row
-by token. A crash leaves the row until it expires. The same code runs for the local file, so
-two pulp-tui processes on one host also exclude each other. Publish, resume, promote
-(rollback, reconcile), unpromote, delete view and delete version lock; preview, compare, verify and
-edits do not. The exception is an environment relabel: it takes the locks of every view
-bound in the environment, in `cv_id` order, and fails with the holder's name if one is taken,
-before it changes anything. `CvLock::acquire` never waits, so two relabels cannot block each
-other; the order only fixes which holder is named in the refusal. A composite publish takes
-the lock of the composite only: it reads the component versions and does not lock the
-components, which are protected by the delete rules instead (a version that a composite uses
-cannot be deleted). Auto publish locks each composite separately, after the lock of the
-component is released.
+### Locks
 
-**Read-only mode.** When the store in use by the active profile is external (`App::shared()`;
-like `scope`, it follows `cv_store`, not the edited config, so an Edit applies at Connect),
-edits of Content Views and environments and `import-cv` change shared state, so
-`Act::mutates(kind, shared)` counts them as mutating. Otherwise they are not (they touch
-only the local file). `MigrateDb` and `CopyDb` always mutate, so a read-only profile cannot
-migrate or copy.
+The operator is `username@host` (`store::actor`), stored in `audit.actor` and in locks.
+`locks` has one row per Content View (`owner`, `token`, `operation`, `renewed_at` from the
+client clock).
 
-**Moving data.** `pulp-tui db copy [--from <profile|local>]` and the "copy and switch"
-choice of the TUI use `Store::copy_from(src, src_scope, dst_scope)`. The source can be any
-store: the local file (`--from local`, the default) or the database of another profile. The
-copy runs in one target transaction, with new ids and remapped references. It refuses name
-clashes and never merges. It refuses `source and target are the same database` (equal
-`db_id`, so two URLs of one database are caught) and a Content View whose lock was renewed
-within `LOCK_TTL_SECS` (`Content View <name> is locked by <owner> (<operation>); copy after
-it ends`); the lock of a crashed session has expired and does not block. The database ID of
-the source becomes an alias in the target `meta`. The source is only read. When Edit
-changes the database of a profile that has data, the TUI counts the data in the old
-database and offers copy, switch or cancel; the profile is saved only after the copy worked.
+* `Store::try_lock` is one atomic statement: insert, or take over a row older than
+  `LOCK_TTL_SECS` (120 s). `CvLock::acquire` never waits.
+* `CvLock` renews every `LOCK_RENEW_SECS` (30 s), by token. A renewal that matches no row,
+  fails, or takes over 30 s marks the lock lost.
+* `CvService::alive()` runs `CvLock::check` before every Pulp mutation and store write,
+  with no database round trip. It fails when the lock is lost, or when the last renewal is
+  older than 90 s (TTL minus renew; Tokio timers stop while a computer sleeps).
+* After a lost lock, only three writes still happen: the href of a just-submitted task, the
+  `failed` state of the publish (`Store::fail_publishing_version`, only while
+  `publishing`), and the promotion result (`Store::finish_promoting_binding`, only on its
+  own `promoting` row). So they never overwrite an operator who took over.
+* *Break lock* (`Store::break_lock`) deletes the row only if the holder is still the one
+  shown. Drop releases by token; a crash leaves the row until it expires.
+* Locked: publish, resume, promote, rollback, unpromote, delete. Not locked: preview,
+  compare, verify, edits. A relabel locks all views of the environment. A composite publish
+  locks only the composite.
 
-**Limits.**
+### Read-only mode and `db copy`
 
-* The database coordinates operators through locks only. There is no daemon: workflows run
-  only while a TUI runs. Pulp tasks continue without the client; the client-side
-  orchestration (next steps of a publish or promotion) waits for the next *Resume* or
-  promotion, which any operator can start.
-* Lock times come from the clients' clocks. The 2-minute TTL covers normal clock skew, not
-  hours of it.
-* Other operators' changes show after a refresh. There is no push.
-* A shared SQLite file works only when all operators use one host, and every operator's
-  account must be able to write the file and its `-wal` and `-shm` files (a group-writable
-  directory). SQLite WAL does not work on NFS or SMB.
-* The operator name contains the host name. In a container it is a random ID unless the
-  container is started with `--hostname`.
-* Two *different* databases that manage the same Pulp server do not coordinate. The
-  ownership labels (including `pulp_tui_db`) stop silent takeover but do not lock.
-* A server that later needs unattended multi-stage workflows can run the existing
-  `CvService` / `replication` code as a worker against the same PostgreSQL tables and resume
-  checkpointed versions. That daemon does not exist.
+* With an external store (`App::shared()`, which follows `cv_store`), Content View and
+  environment edits and `import-cv` count as mutating (`Act::mutates(kind, shared)`).
+  `MigrateDb` and `CopyDb` always mutate.
+* `pulp-tui db copy` and "copy and switch" use `Store::copy_from`: one target transaction,
+  new ids, remapped references, all CV data, under the key of the running profile. It
+  refuses name and label clashes, the same database (equal `db_id`), and a view with a live
+  lock. The source id becomes an alias in the target. The source is only read.
+* When Edit changes the database of a profile with data, the TUI offers copy, switch or
+  cancel, and saves the profile only after the copy worked.
 
-Export/import (`pulp-tui export-cv`, `import-cv`, or the Servers screen) moves Content
-View and environment definitions between databases (format 2, see "Schema and upgrades").
-It contains no secrets and no Pulp state.
+### Limits
 
-`pulp-tui export-repos` and `import-repos` (`src/repo_export.rs`) move repository and
-remote definitions between Pulp servers. The export keeps the fields of the plugin's
-request schema from the live OpenAPI (so it needs that schema) and leaves out readable
-secrets (`sles_auth_token`, `headers`, credentials in `url`/`proxy_url`), hrefs (signing
-services) and objects with an ownership label (`pulp_tui_*`, `UpstreamPulp`). A repository
-holds the name of its remote. The import creates the remotes, then the repositories, finds
-the remote of the same name on the target, and keeps objects whose name exists, so a rerun
-ends in the same state. It never changes an existing object. The Servers screen (**X**,
-**J**) calls the same `export` and `import`; before the import it runs `repo_export::plan`,
-the same walk with no request that changes anything (a remote that the import would create
-gets a placeholder href, so a repository of the file finds it by name), and shows its result
-for confirmation.
+* No daemon: workflows run only while a TUI runs. Pulp tasks continue; the next client
+  steps wait for a *Resume* or promotion by any operator.
+* Lock times use client clocks; the TTL covers normal skew only.
+* Other operators' changes show after a refresh (no push).
+* A shared SQLite file needs one host and a group-writable directory; WAL does not work on
+  NFS or SMB.
+* In a container the host part of the operator is random unless `--hostname` is set.
+* Two different databases on one Pulp server do not coordinate; labels stop a silent
+  takeover but do not lock.
 
 ## Security model
 
-* TLS is always verified. A custom CA bundle is added to the system roots. There is no
-  option to disable verification or to fall back from HTTPS to HTTP.
-* The database connection to a remote PostgreSQL always uses TLS with `verify-full`
-  (chain and host name); only a Unix socket or a loopback host is exempt. The URL may not
-  contain a password, and errors show the URL without it.
-* Secrets are references in the config (`env:VAR`, `file:/path`, `keyring`). The config
-  parser rejects unknown keys such as `password`, a profile `url` with user info, and a
-  `proxy` with a password (use `HTTPS_PROXY` for an authenticated proxy). Secret files that are readable by group
-  or others cause a warning in the log. The `[database]` secret and the secret of a
-  profile's own `database` use the same references.
-* The `Authorization` header is marked sensitive. The log file (never the terminal)
-  records method, path and status only. Write-only fields (remote passwords, keys) are
-  never pre-filled in forms and are displayed masked. Inspect and the Details pane mask the same keys as the
-  Logs screen (a remote's `headers` and tokens are readable on GET).
-* The Logs screen (`src/session_log.rs`) keeps the last 1000 requests, actions and notices
-  of the session in memory, with request and response bodies cut at 64 KiB. Secret JSON
-  keys (any letter case, also a remote's `headers`) are redacted before a body is stored, the `Authorization` header is never recorded
-  and upload bodies are replaced by their size. The log is never written to disk.
-* Read-only profiles block every mutating request in the client before it is sent, and
-  the UI hides mutating actions.
-* RBAC is enforced by Pulp. pulp-tui adds warnings (granting owner/admin roles, setting
-  `is_staff`, changing or removing one's own access) and refuses deleting the logged-in
-  account. It never works around a 403.
-* Destructive operations show the impact first. Deleting repositories, distributions,
-  users, roles, Content Views, alternate content sources and protected promotions, and
-  reclaiming the disk space of a repository require typing the name.
-  Production profiles show a red banner and add a warning line to these dialogs.
+* TLS is always verified; a custom CA adds to the roots. No option disables it or falls
+  back to HTTP. Remote PostgreSQL always uses `verify-full`; its URL must not contain a
+  password.
+* Secrets are references (`env:VAR`, `file:/path`, `keyring`). The parser rejects
+  unknown keys such as `password`, a `url` with user info, and a `proxy` with a password.
+  A secret file that group or others can read gives a warning.
+* `Authorization` is marked sensitive and never recorded. The log file holds method, path
+  and status only.
+* Forms never pre-fill write-only fields and mask them. Inspect, Details and Logs mask the
+  same keys (a remote's `headers` and tokens are readable on GET).
+* The Logs screen (`src/session_log.rs`) keeps the last 1000 entries in memory, bodies cut
+  at 64 KiB, secret keys redacted (any case), upload bodies replaced by their size. It is
+  never written to disk.
+* Read-only profiles block mutating requests in the client; the UI hides the actions.
+* Pulp enforces RBAC. pulp-tui warns on owner/admin grants, `is_staff` and changes to
+  one's own access, refuses to delete the logged-in account, and never works around a 403.
+* Destructive operations show the impact first. Deletes of repositories, distributions,
+  users, roles, Content Views, ACSs and protected promotions, and reclaim space, need the
+  typed name. Production profiles show a red banner and a warning line.
