@@ -138,8 +138,8 @@ The profiles of the config file. See "Server profiles" and "Content View databas
 * **o** connect. **T** test the connection (user, content origin, plugin versions).
 * **c** / **e** create / edit. **d** removes the profile from the config. It does not change Pulp
   or the Content View database, and the dialog names the database that keeps the definitions.
-* **K** stores a secret in the system keyring. When the profile has its own database, it asks if
-  the secret is for the "Pulp server" or the "database".
+* **K** stores a secret in the system keyring. When the profile uses a database (its own or the
+  top-level `[database]`), it asks if the secret is for the "Pulp server" or the "database".
 * **E** / **I** export / import Content View definitions, as `export-cv` and `import-cv`. **I**
   writes to the database of the profile, so with a shared database a read-only profile cannot
   import.
@@ -665,7 +665,7 @@ and BSD (GNOME Keyring, KDE Wallet, KeePassXC), Keychain on macOS, Credential Ma
 
 * **K** on Servers only writes the keyring. Also set `secret = "keyring"` in the config. **K**
   again replaces the secret.
-* **K** cannot store the top-level `[database]` secret. Use the system tool.
+* **K** on a profile that uses the top-level `[database]` stores its secret (user `[database]`).
 * On Linux the entry goes to the `default` collection (it can ask to unlock).
 * Builds without the `keyring` feature (the container image) give an error for `keyring`. Use
   `env:` or `file:`.

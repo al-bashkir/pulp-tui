@@ -4,7 +4,7 @@
 use super::app::{App, Apply, Ctx, Level, Screen, item_key};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, s, short};
-use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile, database_keyring_user};
+use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile};
 use crate::filters::{Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
 use crate::pulp::models::{Distribution, Publication, RepoVersion, TASK_FINAL_STATES, Task, TaskGroup};
@@ -588,14 +588,19 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
         }
         Act::StoreSecret => {
             let mut fields = vec![Field::new("secret", "Password / token", FieldKind::Secret).required()];
-            if app.cfg.profiles.get(&name).and_then(|p| p.database.as_ref()).is_some_and(|d| !d.is_local()) {
-                let target = ["Pulp server", "database"].map(String::from).to_vec();
+            // The profile's own database, else the shared `[database]`, with its keyring user.
+            let db_user = app.cfg.database_for(&name).map(|(_, user)| user);
+            if let Some(user) = &db_user {
+                let target = ["Pulp server".to_string(), format!("database ({user})")].to_vec();
                 fields.insert(0, Field::new("target", "Secret of", FieldKind::Choice(target)));
             }
             let form = Form::new(format!("Store secret for {name} in the system keyring"), fields)
                 .note("The matching secret reference (profile secret or database secret) must be keyring.");
             app.form(form, move |app, f| {
-                let user = if f.get("target") == "database" { database_keyring_user(&name) } else { name.clone() };
+                let user = match db_user.as_ref() {
+                    Some(u) if f.get("target").starts_with("database") => u.clone(),
+                    _ => name.clone(),
+                };
                 let (n, secret) = (user, f.get("secret").to_string());
                 let fut = async move {
                     tokio::task::spawn_blocking(move || crate::config::keyring_set(&n, &secret)).await??;
@@ -3249,6 +3254,26 @@ mod tests {
         set(&mut f, "database", "postgres://u:pw@db/x");
         let e = profile_from_form(&f, Some(&top), local).unwrap_err();
         assert!(e.contains("put the database password in secret") && !e.contains("u:pw"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn store_secret_offers_the_database_the_profile_uses() {
+        use crate::tui::app::Modal;
+        let st = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(crate::config::Config::default(), "/dev/null".into(), st.clone(), Ok(st));
+        app.list.kind = Kind::Profiles;
+        let pg = |url: &str| Database { url: url.into(), secret: Some("keyring".into()), ca_cert: None };
+        app.cfg.database = Some(pg("postgres://u@db/x"));
+        let target = |app: &mut App, db: Option<Database>| {
+            app.cfg.profiles.insert("lab".into(), Profile { url: "https://h".into(), database: db, ..Default::default() });
+            run(app, Act::StoreSecret, json!({ "name": "lab" }));
+            let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+            form.fields.iter().find(|f| f.key == "target").map(|f| f.kind.clone())
+        };
+        let choice = |user: &str| Some(FieldKind::Choice(vec!["Pulp server".into(), format!("database ({user})")]));
+        assert_eq!(target(&mut app, None), choice("[database]"), "the shared [database]");
+        assert_eq!(target(&mut app, Some(pg("postgres://o@own/y"))), choice("[database]:lab"));
+        assert_eq!(target(&mut app, Some(pg(LOCAL_DATABASE))), None, "the local file has no secret");
     }
 
     #[test]
