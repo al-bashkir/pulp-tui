@@ -324,11 +324,16 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
         }
         Modal::Form { form, .. } => draw_form(f, form, area),
         Modal::Confirm { title, lines, typed, input, danger, scroll, .. } => {
-            let w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(40).clamp(50, 120) as u16 + 4;
-            // Wrapped height, so the prompt row below always stays visible.
-            let inner_w = w.saturating_sub(2).max(1) as usize;
-            let wrapped: usize = lines.iter().map(|l| l.chars().count().max(1).div_ceil(inner_w)).sum();
-            let r = centered(area, w, wrapped as u16 + 5);
+            let prompt: Vec<String> = match typed {
+                Some(t) => vec![format!("Type \"{t}\" and press Enter to confirm (Esc cancels):"), format!("> {input}▏")],
+                None => vec!["y / Enter: confirm    n / Esc: cancel".into()],
+            };
+            let w = lines.iter().chain(&prompt).map(|l| l.chars().count()).max().unwrap_or(40).clamp(50, 120) as u16 + 4;
+            // Wrapped heights, so the prompt rows below always stay visible.
+            let inner_w = (w.min(area.width.saturating_sub(2)).saturating_sub(2)).max(1) as usize;
+            let rows = |ls: &[String]| ls.iter().map(|l| l.chars().count().max(1).div_ceil(inner_w)).sum::<usize>() as u16;
+            let ph = rows(&prompt);
+            let r = centered(area, w, rows(lines) + ph + 4);
             let text: Vec<Line> = lines
                 .iter()
                 .skip(*scroll)
@@ -344,10 +349,6 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
                     }
                 })
                 .collect();
-            let prompt = match typed {
-                Some(t) => format!("Type \"{t}\" and press Enter to confirm (Esc cancels): {input}▏"),
-                None => "y / Enter: confirm    n / Esc: cancel".into(),
-            };
             let border = if *danger { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Yellow) };
             let block = Block::bordered().border_style(border).title(format!(" {title} ")).title_bottom(format!(
                 " {}/{} ↑↓ Ctrl-D/U scroll ",
@@ -355,12 +356,13 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
                 lines.len().max(1)
             ));
             let inner = block.inner(r);
-            let [content, gap, p] = Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+            let [content, gap, p] = Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(ph)]).areas(inner);
             let _ = gap;
             f.render_widget(Clear, r);
             f.render_widget(block, r);
             f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), content);
-            f.render_widget(Paragraph::new(prompt).style(Style::default().add_modifier(Modifier::BOLD)), p);
+            let prompt: Vec<Line> = prompt.into_iter().map(Line::raw).collect();
+            f.render_widget(Paragraph::new(prompt).wrap(Wrap { trim: false }).style(Style::default().add_modifier(Modifier::BOLD)), p);
         }
         Modal::Text { title, lines, scroll, .. } => {
             let r = centered(area, area.width.saturating_sub(6), area.height.saturating_sub(4));
@@ -737,6 +739,26 @@ mod tests {
         t.draw(|f| draw(f, &app)).unwrap();
         let s = t.backend().to_string();
         assert!(s.contains("Details") && s.contains("•••") && !s.contains("Bearer abc") && !s.contains("\"tok\""), "{s}");
+    }
+
+    #[tokio::test]
+    async fn confirm_prompt_with_a_long_name_shows_the_typed_input() {
+        let st = std::sync::Arc::new(crate::store::Store::open_in_memory().await.unwrap());
+        let app = App::new(crate::config::Config::default(), "/dev/null".into(), st.clone(), Ok(st));
+        let name = "centos-8-stream-resilient-storage";
+        let m = Modal::Confirm {
+            title: format!("Delete repository {name}"),
+            lines: vec![format!("Deletes repository {name} with all 1 versions and 0 publications.")],
+            typed: Some(name.into()),
+            input: format!("{name}-typed"),
+            on_yes: None,
+            danger: true,
+            scroll: 0,
+        };
+        let mut t = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        t.draw(|f| draw_modal(f, &m, &app, f.area())).unwrap();
+        let s = t.backend().to_string();
+        assert!(s.contains(&format!("> {name}-typed▏")) && s.contains("cancels):"), "{s}");
     }
 
     #[test]
