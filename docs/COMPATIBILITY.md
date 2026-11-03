@@ -479,6 +479,9 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
   keys stores `signing_service: null`, as an unsigned one, and an unchanged copy makes no
   new version. So a `none` publish reused a signed publication (seen live). pulp-tui
   creates a publication for each Deb Content View version (task href checkpointed first).
+* **Empty `package_signing_fingerprint`.** Older pulp_rpm returns `""` for an RPM repository
+  without one; pulp_rpm 3.39.5 refuses `""` (nullable, `minLength` 1) with 400. `import-repos`
+  leaves out every `""` field (the server default applies) and does not report it as "differs".
 
 ## Shared database (PostgreSQL)
 

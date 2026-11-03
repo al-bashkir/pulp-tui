@@ -101,6 +101,8 @@ fn create_body(e: &Entry, writable: &dyn Fn(&str) -> bool, remotes: &BTreeMap<St
                 notes.push(format!("{k} left out (this server does not have it)"));
                 continue;
             }
+            // "" is "not set" (older servers export it); newer ones refuse it (`package_signing_fingerprint`, minLength 1).
+            (_, Value::String(s)) if s.is_empty() => continue,
             ("remote", Value::String(name)) => match remotes.iter().find(|(_, n)| *n == name) {
                 Some((h, _)) => h.clone().into(),
                 None => {
@@ -120,7 +122,7 @@ fn create_body(e: &Entry, writable: &dyn Fn(&str) -> bool, remotes: &BTreeMap<St
 
 /// The note for an object the server already has: the fields of the file whose value on the server is different.
 fn kept_note(file: &Map<String, Value>, server: &Map<String, Value>) -> Option<String> {
-    let differs: Vec<&str> = file.iter().filter(|(k, v)| server.get(*k) != Some(v)).map(|(k, _)| k.as_str()).collect();
+    let differs: Vec<&str> = file.iter().filter(|(k, v)| **v != "" && server.get(*k) != Some(v)).map(|(k, _)| k.as_str()).collect();
     (!differs.is_empty()).then(|| format!("exists; kept (differs: {})", differs.join(", ")))
 }
 
@@ -444,10 +446,12 @@ mod tests {
 
     #[test]
     fn create_body_leaves_out_fields_the_server_lacks_and_a_remote_it_does_not_have() {
-        let e = rpm("app", json!({ "description": "d", "layout": "flat", "remote": "gone" }));
+        let e = rpm("app", json!({ "description": "d", "layout": "flat", "remote": "gone", "package_signing_fingerprint": "" }));
         let writable = |f: &str| f != "layout";
         let (body, notes) = create_body(&e, &writable, &BTreeMap::new());
-        assert_eq!(body, json!({ "name": "app", "description": "d" }));
+        assert_eq!(body, json!({ "name": "app", "description": "d" }), "\"\" is not set: pulp_rpm 3.39 refuses it");
+        let server = json!({ "description": "d", "package_signing_fingerprint": null });
+        assert_eq!(kept_note(&e.fields, server.as_object().unwrap()), Some("exists; kept (differs: layout, remote)".into()));
         assert_eq!(notes, ["layout left out (this server does not have it)", "remote gone left out (this server does not have it)"]);
         let remotes = BTreeMap::from([(remote_href(3), "gone".to_string())]);
         assert_eq!(create_body(&e, &writable, &remotes).0["remote"], json!(remote_href(3)));
