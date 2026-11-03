@@ -202,6 +202,9 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         crate::session_log::record("action", app.profile.as_deref().unwrap_or_default(), format!("{}{on}", act.label()), vec![]);
     }
     match (&kind, act) {
+        (Kind::Repos(..) | Kind::Remotes(_) | Kind::Distributions(_), Act::Delete) if !app.list.marked.is_empty() => {
+            delete_marked(app, kind)
+        }
         (Kind::Logs { .. }, Act::Inspect) => app.text(s(&item, "summary"), log_lines(&item)),
         (_, Act::Inspect) => inspect(app, &kind, item),
         (Kind::Profiles, _) => profile_action(app, act, item),
@@ -1002,6 +1005,116 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
     }
 }
 
+/// Confirmation lines for deleting repository `href`. Refuses one with Content View snapshots.
+async fn repo_delete_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str) -> anyhow::Result<Vec<String>> {
+    let c = &ctx.client;
+    // Fails closed: without the Content View store the snapshot check cannot run.
+    let st = ctx.cv()?.store;
+    let protected = st.protected_versions(&ctx.scope).await?.iter().filter(|v| v.starts_with(href)).count();
+    if protected > 0 {
+        bail!("refused: {protected} version(s) of {name} are Content View snapshots; delete those Content View versions first");
+    }
+    let mut sources = vec![];
+    for cv in st.content_views(&ctx.scope).await? {
+        if st.cv_repos(cv.id).await?.iter().any(|r| r.repo_href == href) {
+            sources.push(cv.name);
+        }
+    }
+    let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", href.to_string())], 100_000).await?;
+    let versions: Page<Value> = c.list(&format!("{href}versions/"), &[("limit", "1".into())]).await?;
+    let users = served_by(&ops::distributions(c, t).await?, |d| {
+        d.repository.as_deref() == Some(href)
+            || d.repository_version.as_ref().is_some_and(|v| v.starts_with(href))
+            || pubs.iter().any(|p| d.publication.as_ref() == Some(&p.pulp_href))
+    });
+    let mut lines = vec![format!("Deletes repository {name} with all {} versions and {} publications.", versions.count, pubs.len())];
+    if users.is_empty() {
+        lines.push("No distribution serves it.".into());
+    } else {
+        lines.push(format!("WARNING: {} distribution(s) serve it and stop serving:", users.len()));
+        lines.extend(users);
+    }
+    if !sources.is_empty() {
+        lines.push(format!("WARNING: Content View(s) {} use it as a source; their next publish fails.", sources.join(", ")));
+    }
+    Ok(lines)
+}
+
+async fn remote_delete_impact(c: &PulpClient, t: RepoType, href: &str, name: &str) -> anyhow::Result<Vec<String>> {
+    let users: Page<Value> = c.list(&c.api(t.repositories()), &[("remote", href.to_string()), ("limit", "100".into())]).await?;
+    Ok(vec![
+        format!("Delete remote {name}. Repository content and versions are not affected."),
+        format!(
+            "{} repository(ies) use it as default remote: {}",
+            users.count,
+            users.results.iter().map(|r| s(r, "name")).collect::<Vec<_>>().join(", ")
+        ),
+    ])
+}
+
+fn distribution_delete_lines(item: &Value) -> Vec<String> {
+    let mut lines =
+        vec![format!("Delete distribution {}.", s(item, "name")), format!("{} will stop serving content.", s(item, "base_url"))];
+    if let Some(cv) = cv_owner(item) {
+        let env = item["pulp_labels"].get(crate::cv::LABEL_ENV).and_then(Value::as_str).unwrap_or("?");
+        lines.push(format!("WARNING: Content View {cv} serves environment {env} here; the view still records this binding."));
+    }
+    lines
+}
+
+/// Delete the marked repositories, remotes or distributions: one impact report, one typed confirmation.
+fn delete_marked(app: &mut App, kind: Kind) {
+    let (t, what) = match kind {
+        Kind::Repos(t, _) => (t, "repositories"),
+        Kind::Remotes(t) => (t, "remotes"),
+        Kind::Distributions(t) => (t, "distributions"),
+        _ => return,
+    };
+    let hrefs: Vec<String> = app.list.marked.iter().cloned().collect();
+    let n = hrefs.len();
+    app.job(format!("impact of deleting {n} {what}"), move |ctx| async move {
+        let c = &ctx.client;
+        let mut lines = vec![format!("Deletes {n} {what}:"), String::new()];
+        let mut targets = vec![];
+        for href in hrefs {
+            // Marks can be on other pages: fetch each object.
+            let item: Value = c.get(&href, &[]).await?;
+            let name = s(&item, "name");
+            lines.extend(match kind {
+                Kind::Repos(..) => repo_delete_impact(&ctx, t, &href, &name).await?,
+                Kind::Remotes(_) => remote_delete_impact(c, t, &href, &name).await?,
+                _ => distribution_delete_lines(&item),
+            });
+            lines.push(String::new());
+            targets.push((href, name));
+        }
+        ap(move |app| {
+            let typed = format!("delete {n} {what}");
+            app.confirm_danger(format!("Delete {n} {what}"), lines, &typed.clone(), move |app| {
+                app.job(typed, move |ctx| async move {
+                    let (mut done, mut failed) = (vec![], vec![]);
+                    for (href, name) in targets {
+                        // One failure does not stop the others; each is reported.
+                        match ctx.client.delete(&href).await {
+                            Ok(m) => done.push((href, m, format!("delete {name}"))),
+                            Err(e) => failed.push(format!("{name}: {e}")),
+                        }
+                    }
+                    ap(move |app| {
+                        for (href, m, label) in done {
+                            app.list.marked.remove(&href);
+                            submitted(app, m, &label);
+                        }
+                        if !failed.is_empty() {
+                            app.error(format!("delete failed (still marked): {}", failed.join("; ")));
+                        }
+                    })
+                })
+            });
+        })
+    });
+}
+
 fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
@@ -1023,37 +1136,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         Act::Create | Act::Edit => repo_edit(app, t, act == Act::Edit, item),
         Act::Delete => {
             app.job(format!("impact of deleting {name}"), move |ctx| async move {
-                let c = &ctx.client;
-                // Fails closed: without the Content View store the snapshot check cannot run.
-                let st = ctx.cv()?.store;
-                let protected = st.protected_versions(&ctx.scope).await?.iter().filter(|v| v.starts_with(&href)).count();
-                if protected > 0 {
-                    bail!("refused: {protected} version(s) of {name} are Content View snapshots; delete those Content View versions first");
-                }
-                let mut sources = vec![];
-                for cv in st.content_views(&ctx.scope).await? {
-                    if st.cv_repos(cv.id).await?.iter().any(|r| r.repo_href == href) {
-                        sources.push(cv.name);
-                    }
-                }
-                let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", href.clone())], 100_000).await?;
-                let versions: Page<Value> = c.list(&format!("{href}versions/"), &[("limit", "1".into())]).await?;
-                let users = served_by(&ops::distributions(c, t).await?, |d| {
-                    d.repository.as_deref() == Some(href.as_str())
-                        || d.repository_version.as_ref().is_some_and(|v| v.starts_with(href.as_str()))
-                        || pubs.iter().any(|p| d.publication.as_ref() == Some(&p.pulp_href))
-                });
-                let mut lines =
-                    vec![format!("Deletes repository {name} with all {} versions and {} publications.", versions.count, pubs.len())];
-                if users.is_empty() {
-                    lines.push("No distribution serves it.".into());
-                } else {
-                    lines.push(format!("WARNING: {} distribution(s) serve it and stop serving:", users.len()));
-                    lines.extend(users);
-                }
-                if !sources.is_empty() {
-                    lines.push(format!("WARNING: Content View(s) {} use it as a source; their next publish fails.", sources.join(", ")));
-                }
+                let lines = repo_delete_impact(&ctx, t, &href, &name).await?;
                 ap(move |app| {
                     app.confirm_danger(format!("Delete repository {name}"), lines, &name.clone(), move |app| {
                         submit(app, format!("delete repository {name}"), move |c| async move { Ok(c.delete(&href).await?) })
@@ -1670,16 +1753,7 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             });
         }
         Act::Delete => app.job(format!("impact of deleting remote {name}"), move |ctx| async move {
-            let c = &ctx.client;
-            let users: Page<Value> = c.list(&c.api(t.repositories()), &[("remote", href.clone()), ("limit", "100".into())]).await?;
-            let lines = vec![
-                format!("Delete remote {name}. Repository content and versions are not affected."),
-                format!(
-                    "{} repository(ies) use it as default remote: {}",
-                    users.count,
-                    users.results.iter().map(|r| s(r, "name")).collect::<Vec<_>>().join(", ")
-                ),
-            ];
+            let lines = remote_delete_impact(&ctx.client, t, &href, &name).await?;
             ap(move |app| {
                 app.confirm_danger(format!("Delete remote {name}"), lines, &name.clone(), move |app| {
                     submit(app, format!("delete remote {name}"), move |c| async move { Ok(c.delete(&href).await?) })
@@ -2440,11 +2514,7 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             });
         }
         Act::Delete => {
-            let mut lines = vec![format!("Delete distribution {name}."), format!("{} will stop serving content.", s(&item, "base_url"))];
-            if let Some(cv) = cv_owner(&item) {
-                let env = item["pulp_labels"].get(crate::cv::LABEL_ENV).and_then(Value::as_str).unwrap_or("?");
-                lines.push(format!("WARNING: Content View {cv} serves environment {env} here; the view still records this binding."));
-            }
+            let lines = distribution_delete_lines(&item);
             app.confirm_danger(format!("Delete distribution {name}"), lines, &name.clone(), move |app| {
                 submit(app, format!("delete distribution {name}"), move |c| async move { Ok(c.delete(&href).await?) })
             });
@@ -4495,6 +4565,33 @@ mod tests {
         run(&mut app, purge, Value::Null);
         assert!(app.modal.is_none());
         assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("not supported by this server: task purge (tasks/purge/)"));
+    }
+
+    #[tokio::test]
+    async fn delete_marked_distributions_confirms_once_and_keeps_the_failed_mark() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let (d1, d2) = (format!("{API}distributions/file/file/1/"), format!("{API}distributions/file/file/2/"));
+        get(&server, &d1, json!({ "pulp_href": d1, "name": "one", "base_url": "http://x/one/" })).await;
+        get(&server, &d2, json!({ "pulp_href": d2, "name": "two", "base_url": "http://x/two/" })).await;
+        let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") }));
+        wiremock::Mock::given(method("DELETE")).and(path(d1.as_str())).respond_with(accepted).expect(1).mount(&server).await;
+        let refused = wiremock::ResponseTemplate::new(500).set_body_json(json!({ "detail": "boom" }));
+        wiremock::Mock::given(method("DELETE")).and(path(d2.as_str())).respond_with(refused).expect(1).mount(&server).await;
+        get(&server, &format!("{API}tasks/1/"), json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed" })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Distributions(RepoType::File);
+        app.list.marked = [d1.clone(), d2.clone()].into();
+        run(&mut app, Act::Delete, json!({ "pulp_href": d1, "name": "one" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!((title.as_str(), typed.as_deref()), ("Delete 2 distributions", Some("delete 2 distributions")));
+        assert!(lines.contains(&"Delete distribution one.".into()) && lines.contains(&"Delete distribution two.".into()), "{lines:?}");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.list.marked, [d2].into(), "only the failed one stays marked");
+        assert!(app.notices.iter().any(|n| n.level == Level::Error && n.text.starts_with("delete failed (still marked): two:")));
     }
 
     #[tokio::test]

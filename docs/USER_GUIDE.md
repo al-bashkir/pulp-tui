@@ -74,7 +74,7 @@ These rules apply to all screens. The screen sections do not repeat them.
 | `/`                                   | search (empty clears)                                    |
 | `s` / `S`                             | sort the current page by the next column / reverse       |
 | `n` / `p`                             | next / previous page (100 items)                         |
-| `Space`                               | mark the item (compare, bulk remove or add)              |
+| `Space`                               | mark the item (compare, bulk remove, add or delete)      |
 | `t`                                   | toggle the type or the sub-list of the screen            |
 | `r`                                   | refresh                                                  |
 | `Esc`                                 | cancel a loading request, clear the marks, or go back    |
@@ -84,6 +84,9 @@ These rules apply to all screens. The screen sections do not repeat them.
 * **Palette:** go to a screen, connect to a server, or dismiss finished tasks. It opens in filter
   mode (`-- FILTER --`): type to filter, `Ctrl-J/K` or `Ctrl-N/P` move. `Esc` goes to move mode
   (`j k g G`), `/` filters again, a second `Esc` closes.
+* **Bulk delete:** on Repositories, Remotes and Distributions, **d** with marked items deletes all
+  the marked items. One confirm lists the impact of each item. Type `delete N <what>`, for example
+  `delete 3 repositories`. An item that fails to delete stays marked.
 * Lists keep 5 rows of margin above and below the selected row.
 
 **Forms** open in move mode:
