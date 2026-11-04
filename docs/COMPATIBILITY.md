@@ -2,7 +2,7 @@
 
 ## Tested versions
 
-All live tests (`tests/run-live.sh`, `real` included) passed on 2026-11-02 on fresh
+All live tests (`tests/run-live.sh`, `real` included) passed on 2026-11-04 on fresh
 containers of `quay.io/pulp/pulp:latest`:
 
 | Component                             | Version                                             |
@@ -13,14 +13,19 @@ containers of `quay.io/pulp/pulp:latest`:
 | PostgreSQL (optional shared database) | 16.15 (`docker.io/library/postgres:16`), sqlx 0.8.6 |
 | Client OS                             | Fedora 44 (Linux 7.2), Rust 1.99.1                  |
 
-On 2026-10-30, all live scenarios, `real` included (Debian `main`, Rocky 9 BaseOS and
+On 2026-11-04, all live scenarios, `real` included (Debian `main`, Rocky 9 BaseOS and
 AppStream), passed on fresh containers of these images:
 
 | Image                       | pulpcore / pulp_file | pulp_rpm | pulp_deb | `real` |
 | --------------------------- | -------------------- | -------- | -------- | ------ |
-| `quay.io/pulp/pulp:3.63.36` | 3.63.36              | 3.27.12  | 3.5.4    | 807 s  |
-| `quay.io/pulp/pulp:3.95.3`  | 3.95.3               | 3.34.0   | 3.8.1    | 804 s  |
-| `quay.io/pulp/pulp:latest`  | 3.123.1              | 3.39.5   | 3.11.1   | 680 s  |
+| `quay.io/pulp/pulp:3.63.36` | 3.63.36              | 3.27.12  | 3.5.4    | 826 s  |
+| `quay.io/pulp/pulp:3.95.3`  | 3.95.3               | 3.34.0   | 3.8.1    | 807 s  |
+| `quay.io/pulp/pulp:latest`  | 3.123.1              | 3.39.5   | 3.11.1   | 644 s  |
+
+* On 3.63.36, `content` first failed in `acs_lifecycle`, a test newer than the 2026-10-30
+  run on this image: pulp_deb 3.5.4 has no `acs/deb/deb/`, and the RPM refresh sets
+  `all_tasks_dispatched`. The test now skips an ACS type without the endpoint and checks the
+  flag only from 3.95; `content` then passed on all three images.
 
 * On 3.95.3, one `native_replication` run failed once with "connection closed before
   message completed" on `POST upstream-pulps/`. The next two runs passed.
@@ -232,14 +237,16 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   run as after a sync. pulp_deb 3.11.1 removes `ReleaseFile`, `PackageIndex` and
   `InstallerFileIndex` from every new version (only a sync adds them; APT publications do
   not use them), and the restore preview says so. Verified in `live_repos` and `live_deb`.
-* **Protected versions** (3.123.0). A version delete gets HTTP 400 ("currently being used to
-  distribute content") when a distribution pins the version or one of its publications, or
-  follows the repository and the version has a checkpoint publication (`checkpoint: true`)
-  or is the newest version with a complete publication (`checkpoint: false`). Every
-  publication type counts. The delete preview applies the same rules (`ops::protecting`).
-  `checkpoint` is new (migration 0131); pulp-tui reads it as `false` on older servers.
-  Older servers (3.63.36, 3.95.3) delete a served version, so the Content View cleanup of
-  unused snapshot versions applies `ops::protecting` itself and keeps those versions.
+* **Protected versions** (`Repository.protected_versions`, read in the source of 3.63.36,
+  3.95.3 and 3.123.1). A version delete gets HTTP 400 ("currently being used to distribute
+  content") when a distribution pins the version or one of its publications, or follows the
+  repository and the version is the newest version with a complete publication
+  (`checkpoint: false`) or, from 3.95.3, has a checkpoint publication (`checkpoint: true`).
+  Every publication type counts. The delete preview applies the same rules
+  (`ops::protecting`). `checkpoint` is new (migration 0131); pulp-tui reads it as `false` on
+  older servers. The Content View cleanup of unused snapshot versions applies
+  `ops::protecting` before it deletes, so it sends no delete that Pulp refuses and its log
+  names the distribution (`live_cv`, on 3.63.36, 3.95.3 and 3.123.1).
 * **Version repair** (`{version}repair/`, `verify_checksums` default true; progress reports
   `repair.missing`, `repair.corrupted`, `repair.repaired`). Pulp downloads each missing or
   corrupt file from the remote artifacts, else deletes the stored file. A version without
@@ -396,9 +403,10 @@ pulp_file 3.123.1 and pulp_deb 3.11.1.
 
 * **The remote must be `on_demand`**, else HTTP 400.
 * **Create** answers with the object; edit and delete are tasks. **Refresh** answers with a
-  task group, one `synchronize` per path (Deb: one for the URL; it ignores paths). The group
-  never gets `all_tasks_dispatched`, but all its tasks exist at once, so
-  `TaskGroup::is_final` ends it with its tasks. Descriptions:
+  task group, one `synchronize` per path (Deb: one for the URL; it ignores paths). On 3.95.3
+  and 3.123.1 the group never gets `all_tasks_dispatched` (on 3.63.36 the RPM refresh sets
+  it, live), but all its tasks exist at once, so `TaskGroup::is_final` ends it with its
+  tasks either way. pulp_deb 3.5.4 (3.63.36) has no Deb ACS. Descriptions:
   `Refreshing <n> alternate content source path(s).` (RPM), `Refreshing <n> alternate
   content source paths.` (File), `Refreshing Alternate Content Source '<name>'.` (Deb).
   pulp_file does not set `last_refreshed`.

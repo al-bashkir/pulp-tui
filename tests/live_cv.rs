@@ -510,3 +510,46 @@ async fn composite_content_view_rocky9() {
     svc.delete_view(extras, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &[&file_repo, &rpm_repo, &file_remote, &rpm_remote]).await;
 }
+
+/// The snapshot cleanup of a publish keeps a version that no view version records but a distribution serves.
+/// Pulp refuses that delete too (`protected_versions`, 3.63.36 and later); the cleanup does not send it.
+#[tokio::test]
+async fn publish_cleanup_keeps_a_served_version_that_no_view_version_records() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvkeep");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
+    let cv = store.create_cv(&profile, &id, "").await.unwrap();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    store.set_cv_repo(cv, &docs).await.unwrap();
+    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let row = store.version_repos(v1.id).await.unwrap().remove(0);
+    let derived = row.derived_repo.clone().unwrap();
+
+    // Outside the view: a new snapshot version without one file, published and served by a plain distribution.
+    let one = ops::content_in(&c, row.derived_version.as_deref().unwrap()).await.unwrap().remove(0);
+    ops::settle(&c, ops::remove_content(&c, &derived, vec![one]).await.unwrap(), &no_progress).await.unwrap();
+    let unrecorded = latest(&c, &derived).await;
+    let p = ops::create_publication(&c, RepoType::File, &unrecorded, &json!({}), &no_progress).await.unwrap();
+    let name = format!("{id}-partial");
+    let dist = ops::ensure_distribution(&c, RepoType::File, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
+
+    // The next publish copies onto that version, so it is no longer the latest one and no view version records it.
+    let lines = Mutex::new(vec![]);
+    svc.publish(cv, "", "", &|s| lines.lock().unwrap().push(s), &no_progress).await.unwrap();
+    assert_ne!(latest(&c, &derived).await, unrecorded, "the publish made a newer version");
+    assert!(c.get::<RepoVersion>(&unrecorded, &[]).await.is_ok(), "the served version was deleted");
+    let d: serde_json::Value = c.get(&dist, &[]).await.unwrap();
+    assert_eq!(d["publication"], json!(p), "the distribution lost its publication");
+    let keeping = format!("keeping {unrecorded}: served by {name} (pinned to a publication of this version)");
+    assert!(lines.lock().unwrap().contains(&keeping), "{:?}", lines.lock().unwrap());
+
+    cleanup(&c, &[&dist]).await;
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote]).await;
+}

@@ -64,11 +64,19 @@ async fn acs_lifecycle() {
     }
     let c = client();
     let name = unique("it-acs");
+    // pulpcore 3.63.36 (pulp_rpm 3.27.12) sets `all_tasks_dispatched` on a refresh; 3.95.3 and 3.123.1 do not.
+    let status: Value = c.get(&c.api("status/"), &[]).await.unwrap();
+    let core = status["versions"].as_array().unwrap().iter().find(|v| v["component"] == "core").unwrap()["version"].clone();
+    let minor: u32 = core.as_str().unwrap().split('.').nth(1).unwrap().parse().unwrap();
     for (t, path, paths, tasks) in [
         (RepoType::Rpm, "", json!(["rpm/", "rpm2/"]), 2),
         (RepoType::File, "file/PULP_MANIFEST", json!([]), 1),
         (RepoType::Deb, "deb/", json!([]), 1),
     ] {
+        // pulp_deb 3.5.4 (pulpcore 3.63.36) has no ACS: the screen says "not supported by this server".
+        if c.get::<Value>(&c.api(t.acs()), &[("limit", "1".into())]).await.is_err_and(|e| e.status() == Some(404)) {
+            continue;
+        }
         let n = format!("{name}-{}", t.component());
         let mut body = json!({ "name": format!("{n}-immediate"), "url": format!("{}/{path}", upstream()), "policy": "immediate" });
         if t == RepoType::Deb {
@@ -87,7 +95,9 @@ async fn acs_lifecycle() {
             panic!("{}: refresh did not return a task group", t.label())
         };
         let group = ops::wait_task_group(&c, &g, &|_| {}).await.unwrap();
-        assert!(!group.all_tasks_dispatched, "{}: Pulp sets the flag now; the description rule can go", t.label());
+        if minor >= 95 {
+            assert!(!group.all_tasks_dispatched, "{}: Pulp sets the flag now; the description rule can go", t.label());
+        }
         assert!(group.is_final(), "{}: {group:?}", t.label());
         assert_eq!((group.tasks.len(), group.completed), (tasks, tasks as u64), "{}: one sync per path", t.label());
         let row = ops::get_task(&c, &g).await.unwrap();

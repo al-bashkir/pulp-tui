@@ -923,8 +923,8 @@ impl CvService {
         let used: HashSet<String> = self.store.used_versions(derived).await?.into_iter().collect();
         let versions: Vec<RepoVersion> =
             c.list_all(&format!("{derived}versions/"), &[("fields", "pulp_href,number".into())], 100_000).await?;
-        // pulpcore before 3.123 deletes a served version: check as newer servers do (a binding row can serve one
-        // that no live view version records, for example after a partial promote).
+        // Pulp refuses to delete a served version (`protected_versions`, 3.63.36 and later): check first, so no refused
+        // request is sent and the log names the distribution (a binding row can serve a version no view version records).
         let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", derived.into())], 100_000).await?;
         let ds = ops::distributions(c, t).await?;
         for v in versions.iter().filter(|v| v.number > 0 && v.pulp_href != latest && !used.contains(&v.pulp_href)) {
@@ -2296,7 +2296,7 @@ mod tests {
         let page = json!({ "count": 5, "next": null, "results": versions });
         let list = format!("{FILE_DERIVED}versions/");
         Mock::given(method("GET")).and(path(list)).respond_with(ResponseTemplate::new(200).set_body_json(page)).mount(&server).await;
-        // Version 4 is in no view version, but a distribution serves its publication: older pulpcore deletes it.
+        // Version 4 is in no view version, but a distribution serves its publication: no delete is sent.
         let p4 = json!({ "pulp_href": "/pulp/api/v3/publications/file/file/4/", "repository_version": v(4) });
         let d =
             json!({ "pulp_href": "/d/1/", "name": "partial", "base_path": "p", "publication": "/pulp/api/v3/publications/file/file/4/" });
