@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the full test suite against real Pulp containers, one scenario at a time.
-# Reuses running containers and built fixtures; starts pulp2 only for replication and
+# Reuses running containers and built fixtures; starts pulp2 only for cv (import-cv) and replication, and
 # PostgreSQL only for shared_db; deb registers the test Deb signing service on pulp1.
 #
 #   tests/run-live.sh            all scenarios
@@ -23,7 +23,7 @@ cargo test --lib --test mock_http
 
 scenarios=${*:-repos cv rbac failures replication shared_db deb export content admin}
 for s in $scenarios; do
-  [ "$s" = replication ] && $ENV up pulp2
+  case $s in cv | replication) $ENV up pulp2 ;; esac
   [ "$s" = shared_db ] && $ENV pg-up
   [ "$s" = deb ] && $ENV deb-signing-up pulp1
   real=; [ "$s" = real ] && real=1

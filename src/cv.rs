@@ -16,9 +16,9 @@
 use crate::filters::Selector;
 use crate::pulp::models::{DebPackage, Distribution, Package, Publication, RepoVersion, Repository, Task};
 use crate::pulp::ops::{self, OnTask};
-use crate::pulp::{Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
+use crate::pulp::{Capabilities, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::{
-    BindingRepo, Component, ContentView, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, LOCK_RENEW_SECS, LOCK_TTL_SECS,
+    BindingRepo, Component, ContentView, CvRepo, CvVersion, CvVersionRepo, Environment, Export, LIBRARY, LOCK_RENEW_SECS, LOCK_TTL_SECS,
     LockHolder, Store, UsedVersion, validate_label,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -277,6 +277,60 @@ pub fn rollback_refusal(env: &str, number: i64, active: Option<i64>) -> Option<S
         Some(a) if number > a => Some(format!("v{number} is newer than the active v{a} in {env}; use Promote")),
         Some(_) => None,
     }
+}
+
+/// `export-cv` of the store `scope` of server `c`. A view records a repository's name when it is added, so each
+/// repository gets its current name on `c` (`import` finds it by name; the store is not changed: derived object
+/// names come from the recorded one). When a repository is gone, the error names each gone one.
+pub async fn export(c: &PulpClient, store: &Store, scope: &str) -> Result<Export> {
+    let mut ex = store.export(scope).await?;
+    let (mut names, mut gone) = (HashMap::new(), vec![]);
+    for v in &mut ex.content_views {
+        for r in &mut v.repos {
+            if !names.contains_key(&r.repo_href) {
+                let name = match c.get::<Value>(&r.repo_href, &[("fields", "name".into())]).await {
+                    Ok(x) => x["name"].as_str().map(str::to_string),
+                    Err(e) if e.is_not_found() => None,
+                    Err(e) => Err(e).with_context(|| format!("repository {}", r.repo_name))?,
+                };
+                names.insert(r.repo_href.clone(), name);
+            }
+            match &names[&r.repo_href] {
+                Some(n) => r.repo_name = n.clone(),
+                None => gone.push(format!("{} ({}, view {})", r.repo_name, r.repo_type.label(), v.name)),
+            }
+        }
+    }
+    if !gone.is_empty() {
+        bail!("repositories not found on this server: {}; nothing was exported", gone.join(", "));
+    }
+    Ok(ex)
+}
+
+/// `import-cv` into the store `scope` of server `c`. An export holds the repository hrefs of its own server, so each
+/// repository of a view that the import creates gets the href of the repository with its name and type on `c`.
+/// When one is missing, nothing is written and the error names each missing one. Returns what `Store::import` returns.
+pub async fn import(c: &PulpClient, caps: &Capabilities, store: &Store, scope: &str, ex: &Export) -> Result<(usize, usize, Vec<String>)> {
+    let kept: HashSet<String> = store.content_views(scope).await?.into_iter().map(|v| v.name).collect();
+    let (mut ex, mut missing) = (ex.clone(), vec![]);
+    for v in ex.content_views.iter_mut().filter(|v| !kept.contains(&v.name)) {
+        for r in &mut v.repos {
+            let t = r.repo_type;
+            let found = if caps.supports(t.feature()) {
+                ops::find_by_name::<Repository>(c, &c.api(t.repositories()), &r.repo_name).await?
+            } else {
+                None
+            };
+            match found {
+                Some(x) => r.repo_href = x.pulp_href,
+                None => missing.push(format!("{} ({}, view {})", r.repo_name, t.label(), v.name)),
+            }
+        }
+    }
+    if !missing.is_empty() {
+        bail!("repositories not found on this server (by name and type): {}; nothing was imported", missing.join(", "));
+    }
+    store.import(scope, &ex).await
 }
 
 /// Content of one repository selected by the filters.
@@ -3746,6 +3800,126 @@ mod tests {
                 "a: retain_repo_versions is set on derived repository docs-a".into(),
             ]
         );
+    }
+
+    /// Server B of the import tests: RPM repository os at `href`, no other RPM or File repository, no pulp_deb.
+    async fn import_target(server: &wiremock::MockServer, href: &str) -> Capabilities {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        let page = |r: Value| json!({ "count": r.as_array().unwrap().len(), "next": null, "results": r });
+        let os = json!([{ "pulp_href": href, "name": "os", "latest_version_href": null }]);
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
+            .and(query_param("name", "os"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(os)))
+            .with_priority(1)
+            .mount(server)
+            .await;
+        for t in ["rpm/rpm", "file/file"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pulp/api/v3/repositories/{t}/")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page(json!([]))))
+                .mount(server)
+                .await;
+        }
+        let mut caps = Capabilities::default();
+        caps.versions.extend([("rpm".into(), "3.29.0".into()), ("file".into(), "3.29.0".into())]);
+        caps
+    }
+
+    #[tokio::test]
+    async fn import_stores_the_href_of_the_repository_with_that_name_on_this_server() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let b = "/pulp/api/v3/repositories/rpm/rpm/b1/";
+        let caps = import_target(&server, b).await;
+        let st = &svc.store;
+        let os = CvRepo {
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/a1/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            filters: vec![],
+        };
+        let web = st.create_cv("a", "web", "").await.unwrap();
+        st.set_cv_repo(web, &os).await.unwrap();
+        // A view that the target has is kept, so its repositories (gone: not on B) are not looked up.
+        let old = st.create_cv("a", "old", "").await.unwrap();
+        st.set_cv_repo(old, &CvRepo { repo_name: "gone".into(), ..os.clone() }).await.unwrap();
+        st.create_cv("b", "old", "").await.unwrap();
+        let (cvs, _, warnings) = import(&svc.client, &caps, st, "b", &st.export("a").await.unwrap()).await.unwrap();
+        assert_eq!((cvs, warnings), (1, vec![]));
+        let id = st.content_views("b").await.unwrap().into_iter().find(|v| v.name == "web").unwrap().id;
+        assert_eq!(st.cv_repos(id).await.unwrap(), [CvRepo { repo_href: b.into(), ..os }]);
+    }
+
+    #[tokio::test]
+    async fn import_names_every_missing_repository_and_writes_nothing() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let caps = import_target(&server, "/pulp/api/v3/repositories/rpm/rpm/b1/").await;
+        let st = &svc.store;
+        let r = |n: &str, t: RepoType| CvRepo {
+            repo_href: format!("/a/{}/{n}/", t.label()),
+            repo_name: n.into(),
+            repo_type: t,
+            filters: vec![],
+        };
+        let web = st.create_cv("a", "web", "").await.unwrap();
+        // os as File: B has os only as RPM. apt: B has no pulp_deb, so nothing is asked.
+        for repo in [r("os", RepoType::Rpm), r("os", RepoType::File), r("apt", RepoType::Deb)] {
+            st.set_cv_repo(web, &repo).await.unwrap();
+        }
+        let db = st.create_cv("a", "db", "").await.unwrap();
+        st.set_cv_repo(db, &r("pkgs", RepoType::Rpm)).await.unwrap();
+        let e = import(&svc.client, &caps, st, "b", &st.export("a").await.unwrap()).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "repositories not found on this server (by name and type): pkgs (RPM, view db), apt (Deb, view web), \
+             os (File, view web); nothing was imported"
+        );
+        assert!(st.content_views("b").await.unwrap().is_empty() && st.environments("b").await.unwrap().is_empty());
+        assert_none(&server, "POST").await;
+    }
+
+    #[tokio::test]
+    async fn export_carries_the_current_pulp_name_and_keeps_the_store() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let href = "/pulp/api/v3/repositories/rpm/rpm/1/";
+        Mock::given(method("GET"))
+            .and(path(href))
+            .and(query_param("fields", "name"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "name": "new" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let st = &svc.store;
+        let old = CvRepo { repo_href: href.into(), repo_name: "old".into(), repo_type: RepoType::Rpm, filters: vec![] };
+        for name in ["web", "db"] {
+            let id = st.create_cv("a", name, "").await.unwrap();
+            st.set_cv_repo(id, &old).await.unwrap();
+        }
+        let ex = export(&svc.client, st, "a").await.unwrap();
+        let names: Vec<&str> = ex.content_views.iter().flat_map(|v| &v.repos).map(|r| r.repo_name.as_str()).collect();
+        assert_eq!(names, ["new", "new"], "renamed in Pulp; one GET for both views");
+        assert_eq!(st.export("a").await.unwrap().content_views[0].repos, [old], "the store keeps the recorded name");
+    }
+
+    #[tokio::test]
+    async fn export_names_every_repository_that_is_gone() {
+        let server = wiremock::MockServer::start().await; // every GET is 404
+        let svc = mock_service(&server).await;
+        let st = &svc.store;
+        let r =
+            |n: &str, t: RepoType| CvRepo { repo_href: format!("/pulp/api/v3/{n}/"), repo_name: n.into(), repo_type: t, filters: vec![] };
+        let web = st.create_cv("a", "web", "").await.unwrap();
+        st.set_cv_repo(web, &r("os", RepoType::Rpm)).await.unwrap();
+        let docs = st.create_cv("a", "docs", "").await.unwrap();
+        st.set_cv_repo(docs, &r("iso", RepoType::File)).await.unwrap();
+        let e = export(&svc.client, st, "a").await.unwrap_err();
+        assert_eq!(e.to_string(), "repositories not found on this server: iso (File, view docs), os (RPM, view web); nothing was exported");
     }
 
     #[test]

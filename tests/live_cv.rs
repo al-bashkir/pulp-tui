@@ -7,12 +7,12 @@
 mod common;
 
 use common::*;
-use pulp_tui::cv::{CvService, Mode, base_path};
+use pulp_tui::cv::{CvService, Mode, base_path, export, import};
 use pulp_tui::filters::parse_rules;
 use pulp_tui::pulp::models::{RepoVersion, Task};
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{Mutation, RepoType};
-use pulp_tui::store::{CvRepo, Store};
+use pulp_tui::pulp::{Capabilities, Mutation, RepoType};
+use pulp_tui::store::{CvRepo, Export, Store};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -605,4 +605,57 @@ async fn deletes_keep_what_a_plain_distribution_serves() {
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     assert!(c.get::<serde_json::Value>(&derived, &[]).await.unwrap_err().is_not_found());
     cleanup(&c, &[&repo, &remote]).await;
+}
+
+/// `export-cv` on pulp2, `import-cv` on pulp1: each repository gets the href of the repository with its name and type
+/// on pulp1, so the view publishes there. One missing repository refuses the whole import before a write. The export
+/// carries the current name of a repository that was renamed on pulp2 after the view recorded it.
+#[tokio::test]
+async fn import_cv_maps_repositories_by_name_to_the_target_server() {
+    if !live_enabled() {
+        return;
+    }
+    let c1 = client();
+    let c2 = client_for(&std::env::var("PULP_TUI_TEST_UPSTREAM_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into()), "pulp2");
+    let id = unique("cvimp");
+    let (docs, old, only2) = (format!("{id}-docs"), format!("{id}-old"), format!("{id}-only2"));
+    let (repo1, remote1) = synced_repo(&c1, RepoType::File, &docs, "file/PULP_MANIFEST", "mirror").await;
+    let repo2 = create(&c2, RepoType::File.repositories(), json!({ "name": old }), "/repositories/").await;
+    let gone = create(&c2, RepoType::File.repositories(), json!({ "name": only2 }), "/repositories/").await;
+    assert_ne!(repo1, repo2);
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let (p1, p2) = (c1.profile().to_string(), c2.profile().to_string());
+    let file =
+        |href: &str, name: &str| CvRepo { repo_href: href.into(), repo_name: name.into(), repo_type: RepoType::File, filters: vec![] };
+    let cv2 = store.create_cv(&p2, &id, "").await.unwrap();
+    store.set_cv_repo(cv2, &file(&repo2, &old)).await.unwrap();
+    let b = store.create_cv(&p2, &format!("{id}-b"), "").await.unwrap();
+    store.set_cv_repo(b, &file(&gone, &only2)).await.unwrap();
+    let m = c2.patch(&repo2, &json!({ "name": docs })).await.unwrap();
+    ops::settle(&c2, m, &no_progress).await.unwrap();
+    let mut ex: Export = serde_json::from_slice(&serde_json::to_vec(&export(&c2, &store, &p2).await.unwrap()).unwrap()).unwrap();
+    assert_eq!(ex.content_views.iter().find(|v| v.name == id).unwrap().repos, [file(&repo2, &docs)], "the name of pulp2 now");
+    assert_eq!(store.cv_repos(cv2).await.unwrap(), [file(&repo2, &old)], "the store keeps the recorded name");
+    let caps = Capabilities::detect(&c1).await.unwrap();
+
+    let e = import(&c1, &caps, &store, &p1, &ex).await.unwrap_err();
+    let want = format!("repositories not found on this server (by name and type): {only2} (File, view {id}-b); nothing was imported");
+    assert_eq!(e.to_string(), want);
+    assert!(store.content_views(&p1).await.unwrap().is_empty() && store.environments(&p1).await.unwrap().is_empty());
+
+    ex.content_views.retain(|v| v.name == id);
+    let (cvs, _, warnings) = import(&c1, &caps, &store, &p1, &ex).await.unwrap();
+    assert_eq!((cvs, warnings), (1, vec![]));
+    let cv1 = store.content_views(&p1).await.unwrap()[0].id;
+    assert_eq!(store.cv_repos(cv1).await.unwrap(), [file(&repo1, &docs)]);
+    let svc = CvService { client: c1.clone(), store: store.clone(), scope: p1.clone(), actor: "test@live".into(), lock: None };
+    svc.publish(cv1, "", "", &quiet, &no_progress).await.unwrap();
+    let url = |f: &str| format!("http://127.0.0.1:8080/pulp/content/{}/{f}", base_path(&id, "library", &docs));
+    let (status, body) = served(&c1, &url("docs/readme.txt")).await;
+    assert_eq!((status, body.len()), (200, 10), "served from pulp1's {docs}");
+    let lib = store.ensure_library(&p1).await.unwrap();
+    assert_eq!(svc.verify(cv1, lib).await.unwrap(), Vec::<String>::new());
+    svc.delete_view(cv1, &quiet, &no_progress).await.unwrap();
+    cleanup(&c1, &[&repo1, &remote1]).await;
+    cleanup(&c2, &[&repo2, &gone]).await;
 }

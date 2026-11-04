@@ -142,7 +142,8 @@ The profiles of the config file. See "Server profiles" and "Content View databas
   top-level `[database]`), it asks if the secret is for the "Pulp server" or the "database".
 * **E** / **I** export / import Content View definitions, as `export-cv` and `import-cv`. **I**
   writes to the database of the profile, so with a shared database a read-only profile cannot
-  import.
+  import. **E** reads the current repository names from the server of the selected profile. **I**
+  imports into the connected server: it finds the repositories there by name.
 * **X** exports the repository and remote definitions of the selected profile's server, as
   `export-repos`. A text view shows the `note:` lines.
 * **J** imports such a file into the connected server, as `import-repos`. It first shows the plan
@@ -880,7 +881,8 @@ Logs go to `<data-dir>/pulp-tui.log`. Set the level with `PULP_TUI_LOG` (for exa
 `PULP_TUI_LOG=pulp_tui=debug`). Secrets are never logged.
 
 **`export-cv`, `import-cv`, `db migrate`, `db copy`** use the Content View database of the
-selected profile. `db migrate` refuses a profile that uses the local file.
+selected profile. `export-cv` and `import-cv` also use the Pulp server of the profile. `db migrate`
+refuses a profile that uses the local file.
 
 The `export-cv` file has `"format": 2`. It holds composites, components (by name), auto publish,
 and the label and protection of Library (used only when an import creates Library). A format 1
@@ -890,6 +892,16 @@ file still imports.
   with a warning, for example
   `warning: rocky9: component os was pinned to v1; imported as latest`. Pin it again with **e**.
 * A component that the import does not find, or that is a composite, is skipped with a warning.
+* The file holds the repository hrefs of the server that exported it. For each view that it
+  creates, `import-cv` finds each repository on the server of the profile by name and type, and
+  stores the href of that server. So you can import into another server when it has repositories
+  with the same names (copy them first with `export-repos` and `import-repos`). When one or more
+  are missing, nothing is imported and the error names each one, for example
+  `error: repositories not found on this server (by name and type): os (RPM, view web); nothing was imported`.
+* `export-cv` writes the current Pulp name of each repository, also when you renamed it after you
+  added it to the view. When a repository is gone from the server, nothing is exported and the
+  error names each one, for example
+  `error: repositories not found on this server: os (RPM, view web); nothing was exported`.
 
 **`export-repos`, `import-repos`** use the Pulp server of the profile (in the TUI: **X** and **J**
 on Servers). Use them to copy the repository setup to another server:

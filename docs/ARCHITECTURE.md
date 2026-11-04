@@ -295,7 +295,13 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
 * **Content View definitions** (`export-cv`, `import-cv`; format 2, reads format 1; an
   older pulp-tui refuses format 2): views, environments and labels, composites, pins as
   numbers. No secrets, no Pulp state. Versions are not exported, so import turns pins into
-  `latest` with a warning. Import checks every entry before its first write.
+  `latest` with a warning. Import checks every entry before its first write. An export holds
+  the repository hrefs of its own server, so `cv::import` first finds each repository of a view
+  that it creates on the target server by name and type and stores that href. When one is
+  missing, it writes nothing and names every missing repository in one error. `cv::export`
+  writes the current Pulp name of each repository href (a view records the name when the
+  repository is added; the store keeps it, because derived object names come from it). A
+  repository that is gone (404) fails the export, again with every one named.
 * **Repository and remote definitions** (`src/repo_export.rs`): the export keeps the
   fields of the live request schema. It leaves out readable secrets (`sles_auth_token`,
   `headers`, credentials in URLs), hrefs and objects with ownership labels. The import

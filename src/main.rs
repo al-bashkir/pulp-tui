@@ -147,7 +147,8 @@ async fn run() -> Result<()> {
         Some(Cmd::ExportCv { output }) => {
             let name = profile.context("no profile configured")?;
             let cv = cv_store(&cfg, &name, &store).await.map_err(|e| anyhow!("shared database unavailable: {e}"))?;
-            let json = serde_json::to_string_pretty(&cv.export(&cv.scope(&name, &cfg.profiles[&name])).await?)?;
+            let c = PulpClient::new(&name, &cfg.profiles[&name], &cfg.settings)?;
+            let json = serde_json::to_string_pretty(&pulp_tui::cv::export(&c, &cv, &cv.scope(&name, &cfg.profiles[&name])).await?)?;
             match output {
                 Some(p) => std::fs::write(&p, json).with_context(|| format!("write {}", p.display()))?,
                 None => println!("{json}"),
@@ -159,7 +160,9 @@ async fn run() -> Result<()> {
             cfg.check_shared_write(&name)?;
             let ex = serde_json::from_slice(&std::fs::read(&file).with_context(|| format!("read {}", file.display()))?)?;
             let cv = cv_store(&cfg, &name, &store).await.map_err(|e| anyhow!("shared database unavailable: {e}"))?;
-            let (cvs, envs, warnings) = cv.import(&cv.scope(&name, &cfg.profiles[&name]), &ex).await?;
+            let c = PulpClient::new(&name, &cfg.profiles[&name], &cfg.settings)?;
+            let caps = Capabilities::detect(&c).await?;
+            let (cvs, envs, warnings) = pulp_tui::cv::import(&c, &caps, &cv, &cv.scope(&name, &cfg.profiles[&name]), &ex).await?;
             println!("imported {cvs} content view(s) and {envs} environment(s) into profile {name}");
             for w in warnings {
                 println!("warning: {w}");

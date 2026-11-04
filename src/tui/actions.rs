@@ -632,14 +632,18 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
         }
         Act::ExportCv => {
             let profile = if name.is_empty() { app.profile.clone().unwrap_or_default() } else { name };
+            let Some(p) = app.cfg.profiles.get(&profile).cloned() else { return };
+            let settings = app.cfg.settings.clone();
             app.input(
                 format!("Export Content View definitions of {profile} to file"),
                 &format!("pulp-tui-{profile}-cv.json"),
                 move |app, path| {
                     let target = app.profile_store(&profile);
+                    // The server of the selected profile (maybe not the connected one): current repository names.
                     let fut = async move {
+                        let c = PulpClient::new(&profile, &p, &settings)?;
                         let (store, scope) = target.await?;
-                        let ex = store.export(&scope).await?;
+                        let ex = crate::cv::export(&c, &store, &scope).await?;
                         tokio::fs::write(&path, serde_json::to_vec_pretty(&ex)?).await.with_context(|| format!("write {path}"))?;
                         ap(move |app| {
                             app.ok(format!("exported {} content view(s) to {path} (no secrets, no Pulp state)", ex.content_views.len()))
@@ -653,17 +657,17 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
             let profile = app.profile.clone().unwrap_or_default();
             app.input(format!("Import Content View definitions into {profile} from file"), "", move |app, path| {
                 let target = app.profile_store(&profile);
-                let fut = async move {
+                // The connected server: the import maps repository names to its hrefs.
+                app.job("import", move |ctx| async move {
                     let ex: crate::store::Export =
                         serde_json::from_slice(&tokio::fs::read(&path).await.with_context(|| format!("read {path}"))?)?;
                     let (store, scope) = target.await?;
-                    let (cvs, envs, warnings) = store.import(&scope, &ex).await?;
+                    let (cvs, envs, warnings) = crate::cv::import(&ctx.client, &ctx.caps, &store, &scope, &ex).await?;
                     ap(move |app| {
                         let t = format!("imported {cvs} content view(s), {envs} environment(s); existing names were kept");
                         if warnings.is_empty() { app.ok(t) } else { app.notify(Level::Warn, format!("{t}; {}", warnings.join("; "))) }
                     })
-                };
-                app.spawn("import".into(), false, fut);
+                });
             });
         }
         // The same functions and file as `export-repos` / `import-repos`; the export never holds a secret.
@@ -5009,6 +5013,59 @@ mod tests {
         settle(&mut app, &mut rx).await;
         let texts: Vec<&String> = app.notices.iter().map(|n| &n.text).collect();
         assert!(texts.contains(&&"profile lab: created 1, kept 2 existing (remotes and repositories)".to_string()), "{texts:?}");
+    }
+
+    /// **I** on Servers imports into the connected server: the repository of the file gets that server's href.
+    #[tokio::test]
+    async fn servers_import_of_content_views_uses_the_hrefs_of_the_connected_server() {
+        let server = wiremock::MockServer::start().await;
+        let here = format!("{API}repositories/rpm/rpm/b1/");
+        get(&server, &format!("{API}repositories/rpm/rpm/"), page(json!([{ "pulp_href": here, "name": "os" }]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.conn.as_mut().unwrap().caps = Arc::new(plugins());
+        let os =
+            crate::store::CvRepo { repo_href: "/elsewhere/".into(), repo_name: "os".into(), repo_type: RepoType::Rpm, filters: vec![] };
+        let view = crate::store::ExportView {
+            name: "web".into(),
+            description: String::new(),
+            composite: false,
+            auto_publish: false,
+            components: vec![],
+            repos: vec![os.clone()],
+        };
+        let ex = crate::store::Export { format: 2, content_views: vec![view], environments: vec![] };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cv.json").display().to_string();
+        std::fs::write(&file, serde_json::to_vec(&ex).unwrap()).unwrap();
+        run(&mut app, Act::ImportCv, Value::Null);
+        type_path(&mut app, &file);
+        settle(&mut app, &mut rx).await;
+        let web = app.store.content_views("lab").await.unwrap().remove(0);
+        assert_eq!(app.store.cv_repos(web.id).await.unwrap(), [crate::store::CvRepo { repo_href: here, ..os }]);
+    }
+
+    /// **E** on Servers reads the current repository names on the server of the profile: a gone repository writes no file.
+    #[tokio::test]
+    async fn servers_export_of_content_views_refuses_a_repository_that_is_gone() {
+        let server = wiremock::MockServer::start().await; // the repository GET is 404
+        let (mut app, mut rx) = connected(&server).await;
+        let web = app.store.create_cv("lab", "web", "").await.unwrap();
+        let os = crate::store::CvRepo {
+            repo_href: format!("{API}repositories/rpm/rpm/1/"),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            filters: vec![],
+        };
+        app.store.set_cv_repo(web, &os).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cv.json").display().to_string();
+        run(&mut app, Act::ExportCv, json!({ "name": "lab" }));
+        type_path(&mut app, &file);
+        settle(&mut app, &mut rx).await;
+        let texts: Vec<&String> = app.notices.iter().map(|n| &n.text).collect();
+        let want = "export: repositories not found on this server: os (RPM, view web); nothing was exported".to_string();
+        assert!(texts.contains(&&want), "{texts:?}");
+        assert!(!std::path::Path::new(&file).exists());
     }
 
     #[tokio::test]
