@@ -401,7 +401,10 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
 * **`rpm/copy/` adds related units** (pulp_rpm `tasks/copy.py`, also without dependency
   solving): the packages and modules of an advisory, the groups of categories and
   environments, the newest package of each group member not in the request; not the
-  packages of a module. The result changes with the batch size, so a filtered RPM snapshot uses `modify/`, which adds exactly the given units.
+  packages of a module. With `dependency_solving`, a module in the request also adds all its
+  packages (`depsolving.py`, pulp_rpm 3.39.5). The result changes with the batch size, so a filtered RPM snapshot uses `modify/`, which adds exactly the given units.
+  The copy action (**C**) with filter rules sends only the chosen packages to `rpm/copy/` (with
+  dependency solving when asked), then adds the advisories and metadata of the selection with `modify/`.
 * **Request body limit.** A body above Django's `DATA_UPLOAD_MAX_MEMORY_SIZE` (2,621,440
   bytes, the test image default) gets HTTP 400 with an HTML page `Bad Request (400)`, not
   413 (log: `django.core.exceptions.RequestDataTooBig`); nginx allows 10 MB. Same for

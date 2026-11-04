@@ -546,6 +546,43 @@ async fn rpm_prune_dry_run_then_prune_through_the_tui() {
     cleanup(&c, &[&repo, &remote]).await;
 }
 
+/// Copy with filter rules through the TUI from the rpm fixture (alpha, beta, beta-debuginfo, an advisory of beta):
+/// the advisory comes along only when its package is chosen.
+#[tokio::test]
+async fn rpm_filtered_copy_through_the_tui_takes_the_advisory_of_the_chosen_packages() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("it-fcopy"));
+    let (src, remote) = synced_repo(&c, RepoType::Rpm, &name, "rpm/", "additive").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(RepoType::Rpm, false);
+    let mut made = vec![];
+    for (rule, want, advisory) in [
+        ("exclude name=*-debuginfo", ["fixture-alpha-1.0-1.noarch", "fixture-beta-2.0-1.noarch"], true),
+        ("exclude name=fixture-beta", ["fixture-alpha-1.0-1.noarch", "fixture-beta-debuginfo-2.0-1.noarch"], false),
+    ] {
+        let dst_name = format!("{name}-dst{}", made.len());
+        let dst = create(&c, RepoType::Rpm.repositories(), json!({ "name": dst_name }), "/repositories/").await;
+        run(&mut app, Act::CopyContent, json!({ "pulp_href": dst, "name": dst_name }));
+        fill(&mut app, &[("source", name.as_str()), ("filters", rule), ("deps", "false")]);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(&app)) };
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        settle_submitted(&c, &app).await;
+        let v = latest(&c, &dst).await;
+        let mut got: Vec<String> = rpm::packages_in(&c, &v).await.unwrap().iter().map(Package::nevra).collect();
+        got.sort();
+        assert_eq!(got, want, "{rule}");
+        let q = [("repository_version", v.clone()), ("fields", "id".to_string())];
+        let ids: Vec<Value> = c.list_all(&c.api("content/rpm/advisories/"), &q, 100).await.unwrap();
+        assert_eq!(ids.iter().any(|a| a["id"] == "FIXTURE-2026:0001"), advisory, "{rule}: {ids:?}");
+        made.push(dst);
+    }
+    cleanup(&c, &[&made[0], &made[1], &src, &remote]).await;
+}
+
 /// Scan through the TUI. Pulp refuses a repository without `osv_config`; with Rocky Linux 9 the task queries
 /// osv.dev once per fixture package (the server needs internet access) and finds no vulnerabilities.
 #[tokio::test]

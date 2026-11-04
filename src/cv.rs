@@ -203,6 +203,40 @@ fn deb_signing_patch(choice: &str, source: &Value, derived: &Value) -> serde_jso
         .collect()
 }
 
+/// What an RPM filter takes from `version` (packages `pkgs`) besides the `chosen` packages: each advisory whose
+/// packages in the version are all chosen, and the other content (comps, modules, distribution trees, repo metadata
+/// files) as it is. Add these with `modify/`: the copy API would also add what advisories and comps groups name.
+pub async fn rpm_metadata(c: &PulpClient, version: &str, pkgs: &[Package], chosen: &[&Package]) -> Result<Vec<String>> {
+    let nevra = |p: &Package| (p.name.clone(), norm_epoch(&p.epoch), p.version.clone(), p.release.clone(), p.arch.clone());
+    let chosen_nevra: HashSet<_> = chosen.iter().map(|p| nevra(p)).collect();
+    let all_nevra: HashSet<_> = pkgs.iter().map(nevra).collect();
+    let q = [("repository_version", version.to_string()), ("fields", "pulp_href,pkglist".into())];
+    let advisories: Vec<Value> = c.list_all(&c.api("content/rpm/advisories/"), &q, 1_000_000).await?;
+    let mut hrefs = vec![];
+    for a in &advisories {
+        let refs: Vec<_> = a["pkglist"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|coll| coll["packages"].as_array().cloned().unwrap_or_default())
+            .map(|p| {
+                let s = |k: &str| p[k].as_str().map(str::to_string).unwrap_or_else(|| p[k].to_string());
+                (s("name"), norm_epoch(&s("epoch")), s("version"), s("release"), s("arch"))
+            })
+            .filter(|n| all_nevra.contains(n))
+            .collect();
+        if refs.iter().all(|n| chosen_nevra.contains(n)) {
+            hrefs.push(a["pulp_href"].as_str().unwrap_or_default().into());
+        }
+    }
+    for h in ops::content_in(c, version).await? {
+        if !h.contains("/content/rpm/packages/") && !h.contains("/content/rpm/advisories/") {
+            hrefs.push(h);
+        }
+    }
+    Ok(hrefs)
+}
+
 pub fn derived_repo_name(cv: &str, repo: &str) -> String {
     format!("pulp-tui-cv-{}-{}", slug(cv), slug(repo))
 }
@@ -511,41 +545,8 @@ impl CvService {
         if repo.filters.is_empty() {
             return Ok(Selection { hrefs: None, keys });
         }
-        let chosen_nevra: HashSet<(String, String, String, String, String)> =
-            chosen.iter().map(|p| (p.name.clone(), norm_epoch(&p.epoch), p.version.clone(), p.release.clone(), p.arch.clone())).collect();
-        let all_nevra: HashSet<_> =
-            pkgs.iter().map(|p| (p.name.clone(), norm_epoch(&p.epoch), p.version.clone(), p.release.clone(), p.arch.clone())).collect();
         let mut hrefs: Vec<String> = chosen.iter().map(|p| p.pulp_href.clone()).collect();
-        // Advisories: kept only if every referenced package present in the source is selected.
-        let advisories: Vec<Value> = c
-            .list_all(
-                &c.api("content/rpm/advisories/"),
-                &[("repository_version", source_version.into()), ("fields", "pulp_href,pkglist".into())],
-                1_000_000,
-            )
-            .await?;
-        for a in &advisories {
-            let refs: Vec<_> = a["pkglist"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .flat_map(|coll| coll["packages"].as_array().cloned().unwrap_or_default())
-                .map(|p| {
-                    let s = |k: &str| p[k].as_str().map(str::to_string).unwrap_or_else(|| p[k].to_string());
-                    (s("name"), norm_epoch(&s("epoch")), s("version"), s("release"), s("arch"))
-                })
-                .filter(|n| all_nevra.contains(n))
-                .collect();
-            if refs.iter().all(|n| chosen_nevra.contains(n)) {
-                hrefs.push(a["pulp_href"].as_str().unwrap_or_default().into());
-            }
-        }
-        // Other metadata (comps, modules, distribution trees, repo metadata files) is kept as is.
-        for h in ops::content_in(c, source_version).await? {
-            if !h.contains("/content/rpm/packages/") && !h.contains("/content/rpm/advisories/") {
-                hrefs.push(h);
-            }
-        }
+        hrefs.extend(rpm_metadata(c, source_version, &pkgs, &chosen).await?);
         Ok(Selection { hrefs: Some(hrefs), keys })
     }
 

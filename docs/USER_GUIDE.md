@@ -209,7 +209,10 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   **D** reuses a publication only when its signing service is the same. On RPM, **D** never
   reuses a publication when the repository has a metadata signing service: Pulp signs a new one.
 * **C** copies content from another repository, with the filter rules of Content Views (see
-  "Filters"). RPM can copy dependencies. A Deb copy is structured: it also copies the Release,
+  "Filters"). RPM can copy dependencies. With filter rules, RPM takes what a Content View filter
+  takes: the chosen packages, each advisory whose packages are all chosen, and the comps, modules
+  and other metadata as they are (added after the packages; the confirm counts them). Advisories
+  of the dependencies are not added. A Deb copy is structured: it also copies the Release,
   component and architecture records, and does not solve dependencies.
 * **R** reclaims disk space. Pulp deletes the stored files of synced content that no other
   repository has. The content stays in every version. Pulp downloads a file again from the remote

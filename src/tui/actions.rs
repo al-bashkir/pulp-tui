@@ -1455,10 +1455,14 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                             .ok_or_else(|| anyhow!("no repository {source}"))?;
                         let sv = src["latest_version_href"].as_str().ok_or_else(|| anyhow!("{source} has no versions"))?.to_string();
                         let sel = Selector::new(&rules);
+                        let mut meta = vec![];
                         let units: Option<Vec<String>> = match (t, rules.is_empty()) {
                             (RepoType::Rpm, true) => None,
                             (RepoType::Rpm, false) => {
-                                Some(rpm::packages_in(c, &sv).await?.into_iter().filter(|p| sel.package(p)).map(|p| p.pulp_href).collect())
+                                let pkgs = rpm::packages_in(c, &sv).await?;
+                                let chosen: Vec<_> = pkgs.iter().filter(|p| sel.package(p)).collect();
+                                meta = crate::cv::rpm_metadata(c, &sv, &pkgs, &chosen).await?;
+                                Some(chosen.into_iter().map(|p| p.pulp_href.clone()).collect())
                             }
                             (RepoType::File, _) => {
                                 Some(file::files_in(c, &sv).await?.into_iter().filter(|x| sel.file(x)).map(|x| x.pulp_href).collect())
@@ -1469,26 +1473,37 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                             ),
                         };
                         let what = units.as_ref().map(|u| format!("{} unit(s)", u.len())).unwrap_or("all content".into());
-                        let lines = vec![
-                            format!("Copy {what} from {} into {name}.", short(&sv)),
-                            if deps { "RPM dependencies are copied too.".into() } else { String::new() },
-                        ];
+                        let mut lines = vec![format!("Copy {what} from {} into {name}.", short(&sv))];
+                        if !meta.is_empty() {
+                            lines.push(format!(
+                                "Then add {} unit(s) as a Content View filter takes them: each advisory whose packages are all chosen, \
+                                 and comps, modules and other metadata as they are (no dependency solving for these).",
+                                meta.len()
+                            ));
+                        }
+                        lines.push(if deps { "RPM dependencies are copied too.".into() } else { String::new() });
                         ap(move |app| {
                             app.confirm("Confirm copy", lines, move |app| {
                                 submit(app, format!("copy {source} -> {name}"), move |c| async move {
-                                    let batches: Vec<Option<Vec<String>>> = match units {
-                                        None => vec![None],
-                                        Some(u) => ops::batches(&u).into_iter().map(|b| Some(b.to_vec())).collect(),
+                                    // (units, through modify/): the RPM metadata goes after the packages, through modify/.
+                                    let mut batches: Vec<(Option<Vec<String>>, bool)> = match units {
+                                        None => vec![(None, false)],
+                                        Some(u) => ops::batches(&u).into_iter().map(|b| (Some(b.to_vec()), false)).collect(),
                                     };
+                                    if !meta.is_empty() {
+                                        batches.extend(ops::batches(&meta).into_iter().map(|b| (Some(b.to_vec()), true)));
+                                    }
                                     // Each batch adds to the latest version: wait for one before the next; the last goes to Tasks.
                                     let mut sent = None;
-                                    for units in batches {
+                                    for (units, modify) in batches {
                                         if let Some(m) = sent.take() {
                                             ops::settle(&c, m, &ops::no_progress).await?;
                                         }
                                         sent = Some(match t {
-                                            RepoType::Rpm => rpm::copy(&c, &sv, &href, None, units, deps).await?,
-                                            RepoType::File => ops::add_content(&c, &href, units.unwrap_or_default()).await?,
+                                            RepoType::Rpm if !modify => rpm::copy(&c, &sv, &href, None, units, deps).await?,
+                                            RepoType::Rpm | RepoType::File => {
+                                                ops::add_content(&c, &href, units.unwrap_or_default()).await?
+                                            }
                                             RepoType::Deb => deb::copy(&c, &sv, &href, None, units).await?,
                                         });
                                     }
@@ -4066,6 +4081,72 @@ mod tests {
             }
             assert_eq!(sent, json!({ "config": [cfg], "structured": true, "dependency_solving": false }));
         }
+    }
+
+    /// A filtered RPM copy takes what a Content View filter takes: the chosen packages through rpm/copy/, then through
+    /// modify/ (Pulp adds no units that advisories or comps groups name) each advisory whose packages are all chosen
+    /// and the other content as it is.
+    #[tokio::test]
+    async fn rpm_copy_with_filter_rules_adds_the_advisories_and_metadata_of_the_chosen_packages() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (src, dst) = (format!("{API}repositories/rpm/rpm/src/"), format!("{API}repositories/rpm/rpm/dst/"));
+        let sv = format!("{src}versions/3/");
+        get(&server, &format!("{API}repositories/rpm/rpm/"), page(json!([{ "pulp_href": src, "name": "src", "latest_version_href": sv }])))
+            .await;
+        let h = |kind: &str, n: &str| format!("{API}content/rpm/{kind}/{n}/");
+        let nevra = |n: &str| json!({ "name": n, "epoch": "0", "version": "1.0", "release": "1", "arch": "x86_64" });
+        let pkg = |n: &str| {
+            let mut p = nevra(n);
+            p["pulp_href"] = h("packages", n).into();
+            p
+        };
+        get(&server, &format!("{API}content/rpm/packages/"), page(json!([pkg("bash"), pkg("bash-debuginfo")]))).await;
+        let adv = |id: &str, n: &str| json!({ "pulp_href": h("advisories", id), "pkglist": [{ "packages": [nevra(n)] }] });
+        get(&server, &format!("{API}content/rpm/advisories/"), page(json!([adv("a1", "bash"), adv("a2", "bash-debuginfo")]))).await;
+        let all = [("packages", "bash"), ("packages", "bash-debuginfo"), ("advisories", "a1"), ("advisories", "a2")];
+        let all: Vec<Value> =
+            all.iter().chain(&[("packagegroups", "g"), ("modulemds", "m")]).map(|(k, n)| json!({ "pulp_href": h(k, n) })).collect();
+        get(&server, &format!("{API}content/"), page(json!(all))).await;
+        let task = json!({ "task": format!("{API}tasks/1/") });
+        answer(&server, "POST", &format!("{API}rpm/copy/"), 202, task.clone()).await;
+        answer(&server, "POST", &format!("{dst}modify/"), 202, task).await;
+        get(&server, &format!("{API}tasks/1/"), json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "name": "copy" }))
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.conn.as_mut().unwrap().caps = Arc::new(plugins());
+        repo_action(&mut app, RepoType::Rpm, Act::CopyContent, json!({ "pulp_href": dst, "name": "dst" }));
+        fill_and_submit(&mut app, &[("source", "src"), ("filters", "exclude name=*-debuginfo")]);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, on_yes, .. }) = app.modal.take() else {
+            panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text))
+        };
+        assert_eq!(
+            lines[..2],
+            [
+                "Copy 1 unit(s) from src@v3 into dst.",
+                "Then add 3 unit(s) as a Content View filter takes them: each advisory whose packages are all chosen, \
+                 and comps, modules and other metadata as they are (no dependency solving for these)."
+            ]
+        );
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        let cfg = json!({ "source_repo_version": sv, "dest_repo": dst, "content": [h("packages", "bash")] });
+        assert_eq!(posts_to(&server, &format!("{API}rpm/copy/")).await, [json!({ "config": [cfg], "dependency_solving": true })]);
+        let added = json!({ "add_content_units": [h("advisories", "a1"), h("packagegroups", "g"), h("modulemds", "m")] });
+        assert_eq!(posts_to(&server, &format!("{dst}modify/")).await, [added], "after the copy: the modify, once");
+
+        // Without rules: one copy of everything, nothing else.
+        repo_action(&mut app, RepoType::Rpm, Act::CopyContent, json!({ "pulp_href": dst, "name": "dst" }));
+        fill_and_submit(&mut app, &[("source", "src"), ("deps", "false")]);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(lines, ["Copy all content from src@v3 into dst.", ""]);
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        let all = json!({ "config": [{ "source_repo_version": sv, "dest_repo": dst }], "dependency_solving": false });
+        assert_eq!(posts_to(&server, &format!("{API}rpm/copy/")).await[1], all);
+        assert_eq!(posts_to(&server, &format!("{dst}modify/")).await.len(), 1);
     }
 
     #[tokio::test]
