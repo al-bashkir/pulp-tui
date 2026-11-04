@@ -308,6 +308,20 @@ fn role_action(app: &mut App, act: Act, item: Value) {
 
 // ---- replication ------------------------------------------------------------------------
 
+/// The warning for replication with deletion `policy`, None for `nodelete`. pulpcore's `remove_missing`
+/// deletes for every other policy; empty (or no field, older servers) is its default, `all`.
+fn deletion_warning(policy: &str) -> Option<String> {
+    let what = match policy {
+        "nodelete" => return None,
+        "labeled" => {
+            "the local repositories, remotes and distributions that earlier replications from this upstream created and that are gone upstream"
+        }
+        _ => "every local repository, remote and distribution of this domain that does not exist upstream",
+    };
+    let name = if policy.is_empty() { "empty (server default: `all`)".to_string() } else { format!("`{policy}`") };
+    Some(format!("!!! policy {name} may DELETE {what} !!!"))
+}
+
 fn upstream_action(app: &mut App, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
@@ -428,18 +442,16 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                         },
                     )
                 };
-                if f.get("policy") == "all" {
-                    app.confirm_danger(
+                let policy = f.get("policy");
+                match deletion_warning(policy) {
+                    // An empty policy is no word to type: the Upstream name instead.
+                    Some(w) => app.confirm_danger(
                         "Destructive replication policy",
-                        vec![
-                            "Policy `all` lets replication DELETE local repositories, remotes and".into(),
-                            "distributions of this domain that do not exist upstream.".into(),
-                        ],
-                        "all",
+                        vec![w],
+                        if policy.is_empty() { f.get("name") } else { policy },
                         go,
-                    );
-                } else {
-                    go(app);
+                    ),
+                    None => go(app),
                 }
                 Ok(())
             });
@@ -479,8 +491,8 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                     })
                 });
             };
-            if policy == "all" {
-                lines.insert(0, "!!! policy `all` may DELETE local objects not present upstream !!!".into());
+            if let Some(w) = deletion_warning(&policy) {
+                lines.insert(0, w);
                 app.confirm_danger(format!("Replicate {}", s(&item, "name")), lines, &s(&item, "name"), go);
             } else {
                 app.confirm(format!("Replicate {}", s(&item, "name")), lines, go);
@@ -1191,6 +1203,51 @@ mod tests {
         assert_eq!(policy.kind, super::FieldKind::Choice(["nodelete", "all", "labeled", "keep"].map(String::from).to_vec()));
     }
 
+    /// pulpcore's `remove_missing` deletes for every policy but `nodelete`; empty is its default, `all`.
+    /// (policy, word to type on the form save, what the warning says it deletes)
+    const POLICIES: [(&str, Option<&str>, &str); 4] = [
+        ("nodelete", None, ""),
+        ("labeled", Some("labeled"), "that earlier replications from this upstream created and that are gone upstream"),
+        ("all", Some("all"), "every local repository, remote and distribution of this domain that does not exist upstream"),
+        ("", Some("up"), "(server default: `all`) may DELETE every local repository, remote and distribution of this domain"),
+    ];
+
+    #[tokio::test]
+    async fn replicate_needs_a_typed_confirmation_for_every_policy_but_nodelete() {
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        for (policy, typed, deletes) in POLICIES {
+            let item = json!({ "pulp_href": UP, "name": "up", "base_url": "https://upstream.example.com/", "policy": policy });
+            super::upstream_action(&mut app, crate::tui::kinds::Act::Replicate, item);
+            let Some(Modal::Confirm { lines, typed: word, .. }) = app.modal.take() else { panic!("{policy:?}: no confirmation") };
+            assert_eq!(word.as_deref(), typed.map(|_| "up"), "{policy:?}: Replicate types the upstream name");
+            let warned = lines[0].starts_with("!!!") && lines[0].contains(deletes);
+            assert_eq!(warned, typed.is_some(), "{policy:?}: {lines:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_save_needs_a_typed_confirmation_for_every_policy_but_nodelete() {
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        for (policy, typed, deletes) in POLICIES {
+            super::upstream_action(&mut app, crate::tui::kinds::Act::Create, Value::Null);
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            for (k, v) in [("name", "up"), ("base_url", "https://upstream.example.com"), ("policy", policy)] {
+                form.fields.iter_mut().find(|f| f.key == k).unwrap().value = v.into();
+            }
+            submit(&mut app, &form).unwrap();
+            match (app.modal.take(), typed) {
+                (None, None) => assert_eq!(app.jobs.len(), 1, "nodelete: saved at once"),
+                (Some(Modal::Confirm { lines, typed: Some(word), .. }), Some(typed)) => {
+                    assert_eq!(word, typed, "{policy:?}: form save");
+                    assert!(lines.iter().any(|l| l.starts_with("!!!") && l.contains(deletes)), "{policy:?}: {lines:?}");
+                }
+                (m, _) => panic!("{policy:?}: form save shows {:?}", m.is_some()),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn upstream_download_settings_follow_the_schema_and_send_only_what_is_set() {
         let server = MockServer::start().await;
@@ -1200,6 +1257,7 @@ mod tests {
         let new = ["download_concurrency", "max_retries", "total_timeout", "connect_timeout", "sock_connect_timeout", "sock_read_timeout"];
         let mut props: serde_json::Map<String, Value> = new.iter().map(|k| (k.to_string(), json!({}))).collect();
         props.insert("name".into(), json!({}));
+        props.insert("policy".into(), json!({})); // nodelete: saved without a typed confirmation
         // The generated name (`RemotePolicyEnum` today) can change: the choices come through the property's `$ref`.
         props.insert("remote_policy".into(), json!({ "allOf": [{ "$ref": "#/components/schemas/RemotePolicy7Enum" }] }));
         let mut caps = crate::pulp::Capabilities::default();
@@ -1230,7 +1288,7 @@ mod tests {
         settle(&mut app, &mut rx).await;
 
         let item = json!({ "pulp_href": UP, "name": "up", "base_url": "https://upstream.example.com", "api_root": "pulp/",
-            "remote_policy": "streamed", "total_timeout": 3600.0, "max_retries": 5 });
+            "remote_policy": "streamed", "total_timeout": 3600.0, "max_retries": 5, "policy": "nodelete" });
         let (mut f, mut submit) = form(&mut app, crate::tui::kinds::Act::Edit, item);
         assert_eq!(["remote_policy", "total_timeout", "max_retries"].map(|k| f.get(k)), ["streamed", "3600", "5"], "as stored");
         submit(&mut app, &f).unwrap();

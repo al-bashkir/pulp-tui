@@ -519,7 +519,8 @@ Native Upstream Pulp objects (tech preview).
   * upstream base URL (as *this* Pulp server reaches it), API root (`pulp/`), domain,
     credentials, CA and client certificates, TLS validation;
   * distribution filter (`q_select`, for example `name__startswith="rhel9"`);
-  * deletion policy: `nodelete` (default) or `all` (needs a typed confirmation);
+  * deletion policy: `nodelete` (default), `labeled` or `all`; every policy but `nodelete`
+    may delete local objects and needs a typed confirmation, also on Replicate;
   * **Replica download policy** (`immediate`, `on_demand` or `streamed`), concurrency, max
     retries, timeouts. Pulp copies them to the replica remotes.
 * **F** fallback: sync from another profile. Choose types (RPM, File), a name filter, and additive

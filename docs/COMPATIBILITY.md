@@ -409,6 +409,10 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
 * **History** pages through `task-groups/` for `Replication of <upstream>` and stops at
   five matches or 2000 groups.
 * **`api_root`** of an Upstream Pulp is relative and needs a trailing slash (`pulp/`).
+* **Deletion policy.** In 3.123.1, `remove_missing` deletes for every policy but `nodelete`:
+  `labeled` deletes the objects labeled with this Upstream Pulp that are gone upstream, `all`
+  every one that is missing upstream. The default is `all`. pulp-tui asks for typed
+  confirmation for every policy but `nodelete`, also for an empty or missing one.
 
 ### Alternate content sources
 
