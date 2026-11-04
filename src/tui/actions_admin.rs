@@ -20,6 +20,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         Kind::GroupUsers { group, name } => member_action(app, act, item, group, name),
         Kind::Roles => role_action(app, act, item),
         Kind::ContentGuards => guard_action(app, act, item),
+        Kind::Uploads if act == Act::Delete => delete_uploads(app, item),
         Kind::UpstreamPulps => upstream_action(app, act, item),
         Kind::PulpExporters | Kind::FsExporters => exporter_action(app, act, item),
         Kind::Exports { .. } => export_action(app, act, item),
@@ -550,6 +551,31 @@ fn guard_access(app: &mut App, href: String, name: String) {
                 Ok(())
             });
         })
+    });
+}
+
+/// Delete the marked uploads, else the selected one. A plain confirmation, no typed name: an upload holds only
+/// the chunks that a client sent (a commit deletes it), so nothing else on the server changes.
+fn delete_uploads(app: &mut App, item: Value) {
+    let marked: Vec<String> = app.list.marked.iter().cloned().collect();
+    let mut lines = match marked.len() {
+        0 => vec![format!(
+            "Delete upload {} ({} bytes, created {}).",
+            short(&s(&item, "pulp_href")),
+            s(&item, "size"),
+            s(&item, "pulp_created")
+        )],
+        n => std::iter::once(format!("Delete {n} marked upload(s):")).chain(marked.iter().map(|h| format!("  {}", short(h)))).collect(),
+    };
+    lines.push("Pulp deletes the chunks that a client sent; no content, artifact or repository changes.".into());
+    lines.push("A client that still sends such an upload fails and must start again.".into());
+    let hrefs = if marked.is_empty() { vec![s(&item, "pulp_href")] } else { marked };
+    app.confirm("Delete uploads", lines, move |app| {
+        for href in hrefs {
+            // shortcut: a failed delete loses its mark (its error names the upload); keep it as delete_marked does if needed.
+            app.list.marked.remove(&href);
+            submit(app, format!("delete upload {}", short(&href)), move |c| async move { Ok(c.delete(&href).await?) });
+        }
     });
 }
 
@@ -2592,7 +2618,11 @@ mod tests {
         let mut app = App::new(cfg, "/dev/null".into(), local, Err(String::new()));
         app.profile = Some("lab".into());
         let rbac = json!({ "pulp_href": RBAC, "name": "staff" });
-        for (k, item, offered, refused) in [(Kind::ContentGuards, rbac, vec![Inspect], vec![GuardAccess, Create, Edit, Delete])] {
+        app.list.marked.insert(U2.into());
+        for (k, item, offered, refused) in [
+            (Kind::ContentGuards, rbac, vec![Inspect], vec![GuardAccess, Create, Edit, Delete]),
+            (Kind::Uploads, json!({ "pulp_href": U1 }), vec![Inspect], vec![Delete]),
+        ] {
             app.list.kind = k.clone();
             assert_eq!(app.available_actions(&item), offered, "{k:?}");
             for a in refused {
@@ -2601,5 +2631,44 @@ mod tests {
                 assert_eq!(notices(&app).last().unwrap().1, "read-only mode: this action changes the server", "{k:?} {a:?}");
             }
         }
+    }
+
+    const U1: &str = "/pulp/api/v3/uploads/0190aaaa-0001/";
+    const U2: &str = "/pulp/api/v3/uploads/0190aaaa-0002/";
+    const U3: &str = "/pulp/api/v3/uploads/0190aaaa-0003/";
+
+    #[tokio::test]
+    async fn uploads_delete_the_selected_or_the_marked_ones_after_a_plain_confirmation() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        for u in [U1, U2, U3] {
+            serve(&server, "DELETE", u, 204, Value::Null).await;
+        }
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Uploads;
+        let item = json!({ "pulp_href": U1, "size": 2048, "pulp_created": "2026-11-02T10:00:00Z" });
+        let tail = [
+            "Pulp deletes the chunks that a client sent; no content, artifact or repository changes.",
+            "A client that still sends such an upload fails and must start again.",
+        ];
+        super::run(&mut app, Act::Delete, item.clone());
+        let Some(Modal::Confirm { lines, typed: None, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no plain confirm") };
+        assert_eq!(lines, [&["Delete upload 0190aaaa-0001 (2048 bytes, created 2026-11-02T10:00:00Z)."][..], &tail].concat());
+        assert!(sent(&server).await.is_empty(), "nothing deleted before the confirmation");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+
+        // Marks can be on other pages: one confirmation for all of them, the selected row is not one of them.
+        app.list.marked.extend([U2.to_string(), U3.to_string()]);
+        super::run(&mut app, Act::Delete, item);
+        let Some(Modal::Confirm { lines, typed: None, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no plain confirm") };
+        assert_eq!(lines, [&["Delete 2 marked upload(s):", "  0190aaaa-0002", "  0190aaaa-0003"][..], &tail].concat());
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let mut deleted: Vec<String> = sent(&server).await.into_iter().map(|(m, p, _)| format!("{m} {p}")).collect();
+        deleted.sort();
+        assert_eq!(deleted, [U1, U2, U3].map(|u| format!("DELETE {u}")));
+        assert!(app.list.marked.is_empty());
+        assert!(notices(&app).iter().any(|(l, t)| *l == Level::Ok && t == "delete upload 0190aaaa-0003: done"), "{:?}", notices(&app));
     }
 }

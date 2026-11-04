@@ -761,6 +761,18 @@ Server tasks:
 **Task groups** (newest first, no search): counts of tasks by state. **i** shows the tasks, **X**
 cancels the group. **Workers** (read-only): name, last heartbeat, current task.
 
+### Uploads
+
+Chunked uploads that are not committed, oldest first: id, created, size (in bytes, as the
+client declared it) and completed. Pulp deletes an upload when it is committed. pulp-tui
+deletes its own failed upload; the uploads of other clients, or of a pulp-tui that stopped,
+stay until you delete them. **i** shows the chunks.
+
+* **d** deletes the selected upload, or the marked ones (`Space` marks). It asks for a plain
+  confirmation, not a typed name: an upload holds only the chunks that a client sent, and no
+  content, artifact or repository changes. A client that still sends that upload fails and
+  must start again.
+
 ### Logs
 
 All events of this session, newest first, with UTC times. It works without a connection.

@@ -69,6 +69,8 @@ pub enum Kind {
     ServerTasks(Vec<(&'static str, String)>),
     TaskGroups,
     Workers,
+    /// Chunked uploads that are not committed (a commit deletes the upload), oldest first.
+    Uploads,
     /// This session's requests, actions and notices; `polls` also shows task polling.
     Logs {
         polls: bool,
@@ -95,6 +97,7 @@ pub const NAV: &[(&str, Kind)] = &[
     ("Groups", Kind::Groups),
     ("Roles", Kind::Roles),
     ("Tasks", Kind::Tasks),
+    ("Uploads", Kind::Uploads),
     ("Logs", Kind::Logs { polls: false }),
 ];
 
@@ -451,6 +454,7 @@ impl Kind {
             }
             Kind::TaskGroups => "Task groups (newest first)  [t: workers]".into(),
             Kind::Workers => "Workers  [t: tracked tasks]".into(),
+            Kind::Uploads => "Uploads (chunked uploads not committed, oldest first)".into(),
             Kind::Logs { polls } => {
                 format!("Logs (this session, UTC)  [t: show/hide task polling]{}", if *polls { " — polling shown" } else { "" })
             }
@@ -484,6 +488,7 @@ impl Kind {
             Kind::Workers => Feature::Workers,
             Kind::TaskGroups => Feature::TaskGroups,
             Kind::ContentGuards => Feature::ContentGuards,
+            Kind::Uploads => Feature::ChunkedUpload,
             _ => return None,
         };
         caps.require(f).err().map(|e| {
@@ -578,6 +583,8 @@ impl Kind {
             Kind::GroupRoles { group, .. } => (format!("{group}roles/"), vec![], None),
             Kind::Roles => ("roles/".into(), vec![("ordering", "name".into())], name),
             Kind::Workers => ("workers/".into(), vec![("ordering", "name".into())], name),
+            // The stale ones first; the API filters only on size.
+            Kind::Uploads => ("uploads/".into(), vec![("ordering", "pulp_created".into())], None),
             // No filters and no ordering in the API; the task list of a group comes with Inspect.
             Kind::TaskGroups => ("task-groups/".into(), vec![("exclude_fields", "tasks".into())], None),
             Kind::ServerTasks(f) => {
@@ -815,6 +822,12 @@ impl Kind {
                 col("last heartbeat", 19, |v| ts(v, "last_heartbeat")),
                 col("current task", 14, |v| short(&s(v, "current_task"))),
             ],
+            Kind::Uploads => vec![
+                col("id", 13, |v| short(&s(v, "pulp_href"))),
+                col("created", 19, |v| ts(v, "pulp_created")),
+                col("size", 12, |v| s(v, "size")),
+                col("completed", 19, |v| ts(v, "completed")),
+            ],
             Kind::Logs { .. } => vec![
                 col("time", 8, |v| s(v, "at")),
                 col("kind", 7, |v| s(v, "kind")),
@@ -899,6 +912,7 @@ impl Kind {
             Kind::Tasks => vec![WatchTask, Inspect, CancelTask, DismissTasks],
             Kind::ServerTasks(_) => vec![WatchTask, Inspect, TrackTask, CancelTask, Filter, Delete, PurgeTasks],
             Kind::TaskGroups => vec![CancelTask, Inspect],
+            Kind::Uploads => vec![Delete, Inspect],
             Kind::Workers | Kind::Logs { .. } => vec![Inspect],
         }
     }
@@ -1619,6 +1633,23 @@ mod tests {
             Some("not supported by this server: content guards API (contentguards/, distributions/)")
         );
         caps.paths.insert("contentguards/".into());
+        assert_eq!(k.unsupported(&caps), None);
+    }
+
+    #[test]
+    fn uploads_screen_lists_unfinished_uploads_oldest_first() {
+        let k = Kind::Uploads;
+        assert!(NAV.iter().any(|(l, n)| *l == "Uploads" && *n == k));
+        let (path, q, search) = k.source().unwrap();
+        assert_eq!((path.as_str(), q, search), ("uploads/", vec![("ordering", "pulp_created".to_string())], None), "no name to search");
+        let row = json!({ "pulp_href": "/pulp/api/v3/uploads/0190abcd-1234-5678/", "pulp_created": "2026-11-02T10:00:00.123Z", "size": 2048, "completed": null });
+        assert_eq!(k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["0190abcd-1234", "2026-11-02 10:00:00", "2048", ""]);
+        assert_eq!(k.actions(), [Act::Delete, Act::Inspect]);
+        assert!(Act::Delete.mutates(&k, false) && !Act::Inspect.mutates(&k, false));
+        let mut caps = Capabilities::default();
+        caps.paths.insert("uploads/".into());
+        assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: chunked uploads API (uploads/)"));
+        caps.paths.insert("{upload_href}".into());
         assert_eq!(k.unsupported(&caps), None);
     }
 

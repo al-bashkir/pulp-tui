@@ -59,6 +59,7 @@ General rules:
 | Deb copy (copy, Add to repository, CVs)   | component `deb` and `deb/copy/`                                      | endpoint message (2)                      |
 | Deb verbatim publications (kind, list)    | `publications/deb/verbatim/`                                         | APT publications only                     |
 | Chunked upload                            | `uploads/` and `{upload_href}`                                       | message for files above `upload_chunk_mb` |
+| Uploads screen                            | `uploads/` and `{upload_href}`                                       | screen not supported                      |
 | Native replication                        | pulpcore ≥ 3.23, `upstream-pulps/`, `{upstream_pulp_href}replicate/` | screen points to the fallback             |
 | Fallback replication of a type            | `status/` component on source and destination                        | dry run stops (3)                         |
 | Alternate content sources                 | the plugin, `acs/rpm/rpm/`, `acs/file/file/`, `acs/deb/deb/`         | endpoint message on the screen            |
@@ -398,6 +399,10 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   `replace` first removes the groups, categories, environments and langpacks. The advisory
   JSON needs `id`, `issued` and `updated`; a package without `sum_type` fails with
   `[RPM0018] "None" is not supported.`
+* **Chunked uploads** (pulpcore 3.123.1): the commit task deletes the upload
+  (`tasks/upload.py`), so `uploads/` lists only uploads that are not committed. The list has
+  no date filter (`size` filters only); `ordering=pulp_created` lists the oldest first.
+  `DELETE {upload_href}` answers 204 at once (no task).
 
 ### Copy and Content View snapshots
 

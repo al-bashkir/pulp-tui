@@ -434,3 +434,28 @@ async fn rbac_guard_access_allows_and_removes_a_user() {
     }
     cleanup(&c, &[&href, &user]).await;
 }
+
+/// The Uploads screen: a chunked upload left unfinished (one chunk of two, no commit) is listed with
+/// its size and no completion; Delete removes it after a plain confirmation (no typed name).
+#[tokio::test]
+async fn an_unfinished_upload_is_listed_and_deleted() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let href = create(&c, "uploads/", json!({ "size": 2048 }), "/uploads/").await;
+    c.put_chunk(&href, (0, 1023, 2048), vec![b'x'; 1024]).await.unwrap();
+    let (mut app, mut rx) = app().await;
+    app.open(Screen::List(Kind::Uploads));
+    settle(&mut app, &mut rx).await;
+    let row = app.list.items.iter().find(|r| r["pulp_href"] == href.as_str()).cloned();
+    let row = row.unwrap_or_else(|| panic!("{href} not on the first page: {:?}", app.list.error));
+    let cells: Vec<String> = Kind::Uploads.columns().iter().map(|col| (col.get)(&row)).collect();
+    assert_eq!((cells[2].as_str(), cells[3].as_str(), cells[1].len()), ("2048", "", 19), "{cells:?}");
+
+    run(&mut app, Act::Delete, row);
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed, None, "an upload is only the chunks a client sent: {lines:?}");
+    settle(&mut app, &mut rx).await;
+    assert_eq!(c.get::<Value>(&href, &[]).await.unwrap_err().status(), Some(404), "{:?}", texts(&app));
+}
