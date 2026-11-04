@@ -514,6 +514,12 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
   `dists/default/Release` and `dists/default/all/binary-<arch>/Packages` (pulp_deb
   `tasks/publishing.py`). Verify probes the paths of each mode that the publication has. A
   Deb Content View snapshot takes the mode of the newest APT publication of its source.
+* **Structured releases come from release components**, not from Release units: one
+  `dists/<distribution>/` per distribution of the version's release components (`/` is
+  `flat-repo`), with a Release file that pulp_deb makes when the version has no Release unit
+  (removed with `modify/`, seen live). With `simple`, a structured `default` is dropped. A
+  version without release components gets `dists/default/` (component `empty`) on 3.11.1,
+  and no structured release on 3.5.4 and 3.8.1 (read in their source). Verify probes each.
 * **`signing-services/` has no type filter**, so Deb and RPM services look the same.
 * **No publication reuse for Deb Content Views.** A publication signed with the repository
   keys stores `signing_service: null`, as an unsigned one, and an unchanged copy makes no

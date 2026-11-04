@@ -71,25 +71,33 @@ async fn served(c: &PulpClient, base: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// What a publication of `version` serves: the `dists/` directories with a Release file, and each
-/// (directory, component) with package indices. Structured (the default): the releases and components of
-/// the version, under `dists/<distribution without slashes>/<last part of the component>/`; simple:
-/// `default` with component `all`.
+/// What a publication of `version` serves, as pulp_deb publishes it (`tasks/publishing.py`): the `dists/`
+/// directories with a Release file, and each (directory, component) with package indices. Structured (the
+/// default): each distribution of the release components of the version, also one without a Release record
+/// (pulp_deb then makes the Release file), under `dists/<distribution without outer slashes, "/" is
+/// flat-repo>/<last part of the component>/`; without release components, `default` with component `empty`
+/// (pulp_deb 3.11.1; 3.5.4 and 3.8.1 publish no structured release then). Simple: `default` with component
+/// `all`, which replaces a structured `default`.
 async fn layout(c: &PulpClient, version: &str, publication: &Value) -> Result<(Vec<String>, Vec<(String, String)>)> {
+    let simple = publication["simple"] == true;
     let (mut releases, mut indices) = (vec![], vec![]);
     if publication["structured"] != false {
-        let q = [("repository_version", version.to_string()), ("fields", "distribution".into()), ("limit", "1".into())];
-        let page: Page<Value> = c.list(&c.api("content/deb/releases/"), &q).await?;
-        let Some(dist) = page.results.first().and_then(|r| r["distribution"].as_str()) else {
-            return Err(PulpError::Mismatch("the version has no Release".into()));
-        };
-        releases.push(dist.trim_matches('/').to_string());
         let q = [("repository_version", version.to_string()), ("fields", "plain_component,distribution".into())];
         let comps: Vec<Value> = c.list_all(&c.api("content/deb/release_components/"), &q, 10_000).await?;
-        let dir = |r: &Value| Some((r["distribution"].as_str()?.trim_matches('/').to_string(), r["plain_component"].as_str()?.to_string()));
-        indices.extend(comps.iter().filter_map(dir));
+        let mut pairs: Vec<(&str, &str)> =
+            comps.iter().filter_map(|r| Some((r["distribution"].as_str()?, r["plain_component"].as_str()?))).collect();
+        if pairs.is_empty() && !simple {
+            pairs.push(("default", "empty"));
+        }
+        for (d, comp) in pairs.into_iter().filter(|(d, _)| !simple || *d != "default") {
+            let dir = if d == "/" { "flat-repo".to_string() } else { d.trim_matches('/').to_string() };
+            if !releases.contains(&dir) {
+                releases.push(dir.clone());
+            }
+            indices.push((dir, comp.to_string()));
+        }
     }
-    if publication["simple"] == true {
+    if simple {
         releases.push("default".into());
         indices.push(("default".into(), "all".into()));
     }

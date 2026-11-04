@@ -556,8 +556,8 @@ async fn deb_copy_is_structured_without_dependency_solving() {
     );
 }
 
-/// A server that lists one Release, two components (one of another release) and `packages`, and
-/// serves the Release file, a `Packages` index for `amd64` and the package bytes.
+/// A server that lists two components (of two distributions) and `packages`, and serves the Release
+/// files, a `Packages` index for `amd64` and the package bytes.
 async fn deb_server(packages: Value) -> (MockServer, String) {
     let server = MockServer::start().await;
     let page = |results: Value| {
@@ -565,7 +565,6 @@ async fn deb_server(packages: Value) -> (MockServer, String) {
     };
     let api = |p: &str| path(format!("{API}content/deb/{p}/"));
     // pulp_deb strips the slashes of the distribution and keeps the last part of the component in the path.
-    Mock::given(method("GET")).and(api("releases")).respond_with(page(json!([{ "distribution": "/stable/" }]))).mount(&server).await;
     let components = json!([
         { "component": "contrib", "plain_component": "contrib", "distribution": "other" },
         { "component": "updates/main", "plain_component": "main", "distribution": "/stable/" },
@@ -583,6 +582,7 @@ async fn deb_server(packages: Value) -> (MockServer, String) {
             .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
     };
     served("dists/stable/Release", "Suite: stable\n").mount(&server).await;
+    served("dists/other/Release", "Suite: other\n").mount(&server).await;
     let index = "Package: fixture-beta\nVersion: 2.0-1\nArchitecture: amd64\nFilename: pool/main/f/fixture-beta_2.0-1_amd64.deb\n\n\
                  Package: fixture-beta\nVersion: 1.0-1\nArchitecture: amd64\nFilename: pool/main/f/fixture-beta_1.0-1_amd64.deb\n";
     served("dists/stable/main/binary-amd64/Packages", index).mount(&server).await;
@@ -646,14 +646,8 @@ async fn deb_verify_probes_the_paths_of_the_publication_mode() {
     let c = client(&server, |_, _| {});
     let err = deb::verify(&c, &base, "/v/", &simple).await.unwrap_err();
     assert_eq!(err.to_string(), "served content differs: dists/default/Release returned HTTP 404");
-    // A simple publication: default/all, also when the version has no Release record.
+    // A simple publication: default/all.
     let (server, base) = deb_server(pkg).await;
-    Mock::given(method("GET"))
-        .and(path(format!("{API}content/deb/releases/")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 0, "next": null, "results": [] })))
-        .with_priority(1)
-        .mount(&server)
-        .await;
     let index = "Package: fixture-beta\nVersion: 1.0-1\nArchitecture: amd64\nFilename: pool/all/f/fixture-beta_1.0-1_amd64.deb\n";
     for (p, body) in [
         ("dists/default/Release", "Suite: default\n"),
@@ -689,7 +683,11 @@ async fn deb_verify_finds_the_package_in_another_distribution() {
         .await;
     let file = "pool/main/f/fixture-gamma_1.0-1_amd64.deb";
     let index = format!("Package: fixture-gamma\nVersion: 1.0-1\nArchitecture: amd64\nFilename: {file}\n");
-    for (p, body) in [("dists/stable-updates/main/binary-amd64/Packages", index.as_str()), (file, "gamma bytes")] {
+    for (p, body) in [
+        ("dists/stable-updates/Release", "Suite: stable-updates\n"),
+        ("dists/stable-updates/main/binary-amd64/Packages", index.as_str()),
+        (file, "gamma bytes"),
+    ] {
         Mock::given(method("GET"))
             .and(path(format!("/pulp/content/d/{p}")))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
@@ -699,6 +697,121 @@ async fn deb_verify_finds_the_package_in_another_distribution() {
     let c = client(&server, |_, _| {});
     let ok = deb::verify(&c, &base, "/v/", &json!({})).await.unwrap();
     assert_eq!(ok, format!("Release and {file} served with matching digest (1 packages)"));
+}
+
+/// fixture-beta 1.0-1 (amd64), which `deb_layout_server` serves.
+fn beta() -> Value {
+    json!([{ "pulp_href": "/p/1/", "package": "fixture-beta", "version": "1.0-1", "architecture": "amd64",
+        "relative_path": "pool/x.deb", "sha256": hex::encode(Sha256::digest(b"deb bytes")) }])
+}
+
+const BETA_OK: &str = "Release and pool/main/f/fixture-beta_1.0-1_amd64.deb served with matching digest (1 packages)";
+
+/// A server with these release components and `packages` in the version, but no Release record. It
+/// serves the file of fixture-beta, and the `served` paths: a `Packages` index that lists fixture-beta,
+/// or else a Release file. Any other path is HTTP 404.
+async fn deb_layout_server(components: Value, packages: Value, served: &[&str]) -> (MockServer, String) {
+    let server = MockServer::start().await;
+    let page = |results: Value| {
+        ResponseTemplate::new(200).set_body_json(json!({ "count": results.as_array().unwrap().len(), "next": null, "results": results }))
+    };
+    let api = |p: &str| path(format!("{API}content/deb/{p}/"));
+    Mock::given(method("GET")).and(api("releases")).respond_with(page(json!([]))).mount(&server).await;
+    Mock::given(method("GET")).and(api("release_components")).respond_with(page(components)).mount(&server).await;
+    Mock::given(method("GET")).and(api("packages")).respond_with(page(packages)).mount(&server).await;
+    let file = "pool/main/f/fixture-beta_1.0-1_amd64.deb";
+    let index = format!("Package: fixture-beta\nVersion: 1.0-1\nArchitecture: amd64\nFilename: {file}\n");
+    for p in served.iter().copied().chain([file]) {
+        let body = if p == file {
+            "deb bytes"
+        } else if p.ends_with("/Packages") {
+            index.as_str()
+        } else {
+            "Suite: x\n"
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("/pulp/content/d/{p}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+    }
+    let base = format!("{}/pulp/content/d/", server.uri());
+    (server, base)
+}
+
+/// How often `server` was asked for the served path `p`.
+async fn hits(server: &MockServer, p: &str) -> usize {
+    let want = format!("/pulp/content/d/{p}");
+    server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == want).count()
+}
+
+fn component(distribution: &str, plain: &str) -> Value {
+    json!({ "component": plain, "plain_component": plain, "distribution": distribution })
+}
+
+/// pulp_deb publishes `dists/<distribution>/` for each distribution of the release components of the
+/// version; without a Release record (uploads, removed releases) it makes the Release file itself.
+#[tokio::test]
+async fn deb_verify_probes_the_release_of_every_distribution_of_the_release_components() {
+    let one = json!([component("stable", "main")]);
+    let (server, base) = deb_layout_server(one, beta(), &["dists/stable/Release", "dists/stable/main/binary-amd64/Packages"]).await;
+    let c = client(&server, |_, _| {});
+    assert_eq!(deb::verify(&c, &base, "/v/", &json!({})).await.unwrap(), BETA_OK);
+
+    // Two distributions (one with two components): each Release file is probed once.
+    let two = json!([component("stable", "main"), component("stable", "contrib"), component("/stable-updates/", "main")]);
+    let all = ["dists/stable/Release", "dists/stable-updates/Release", "dists/stable/main/binary-amd64/Packages"];
+    let (server, base) = deb_layout_server(two.clone(), beta(), &all).await;
+    let c = client(&server, |_, _| {});
+    assert_eq!(deb::verify(&c, &base, "/v/", &json!({})).await.unwrap(), BETA_OK);
+    assert_eq!((hits(&server, all[0]).await, hits(&server, all[1]).await), (1, 1));
+    for missing in &all[..2] {
+        let served: Vec<&str> = all.into_iter().filter(|p| p != missing).collect();
+        let (server, base) = deb_layout_server(two.clone(), beta(), &served).await;
+        let c = client(&server, |_, _| {});
+        let err = deb::verify(&c, &base, "/v/", &json!({})).await.unwrap_err();
+        assert_eq!(err.to_string(), format!("served content differs: {missing} returned HTTP 404"));
+    }
+
+    // pulp_deb strips the outer slashes; a flat repository ("/", pulp_deb 3.5.4) is `flat-repo`.
+    let odd = json!([component("/", "flat-repo-component"), component("bookworm/updates/", "main")]);
+    let (server, base) = deb_layout_server(odd, json!([]), &["dists/flat-repo/Release", "dists/bookworm/updates/Release"]).await;
+    let c = client(&server, |_, _| {});
+    assert_eq!(deb::verify(&c, &base, "/v/", &json!({})).await.unwrap(), "Release served (no packages)");
+}
+
+/// A version without release components: pulp_deb 3.11.1 publishes an empty `dists/default/`
+/// (component `empty`), and none of its packages is in a structured index.
+#[tokio::test]
+async fn deb_verify_of_a_version_without_release_components_probes_the_empty_default() {
+    let (server, base) = deb_layout_server(json!([]), json!([]), &["dists/default/Release"]).await;
+    let c = client(&server, |_, _| {});
+    assert_eq!(deb::verify(&c, &base, "/v/", &json!({})).await.unwrap(), "Release served (no packages)");
+    let (server, base) = deb_layout_server(json!([]), beta(), &["dists/default/Release"]).await;
+    let c = client(&server, |_, _| {});
+    let err = deb::verify(&c, &base, "/v/", &json!({})).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "served content differs: package fixture-beta_1.0-1_amd64 not listed in any Packages index \
+         (tried dists/default/empty/binary-amd64/Packages)"
+    );
+}
+
+/// A publication that is also simple: pulp_deb drops a structured `default` distribution (simple serves
+/// `dists/default/`) and makes no empty structured one.
+#[tokio::test]
+async fn deb_verify_of_a_simple_and_structured_publication_drops_the_structured_default() {
+    let both = json!({ "simple": true, "structured": true });
+    let served = ["dists/stable/Release", "dists/default/Release", "dists/default/all/binary-amd64/Packages"];
+    for comps in [json!([component("default", "main"), component("stable", "main")]), json!([])] {
+        let (server, base) = deb_layout_server(comps.clone(), beta(), &served).await;
+        let c = client(&server, |_, _| {});
+        assert_eq!(deb::verify(&c, &base, "/v/", &both).await.unwrap(), BETA_OK, "{comps}");
+        assert_eq!(hits(&server, "dists/default/Release").await, 1, "{comps}");
+        for structured in ["main", "empty"] {
+            assert_eq!(hits(&server, &format!("dists/default/{structured}/binary-amd64/Packages")).await, 0, "{comps}");
+        }
+    }
 }
 
 /// An RPM repository version; its repository is `{API}repositories/rpm/rpm/r/`.

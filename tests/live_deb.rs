@@ -151,6 +151,45 @@ async fn a_removed_deb_package_is_no_longer_served() {
     cleanup(&c, &[&dist, &repo, &remote]).await;
 }
 
+/// A version without its Release units is served: pulp_deb publishes `dists/<distribution>/` for each
+/// distribution of the release components and makes the Release file itself. Verify accepts it.
+#[tokio::test]
+async fn a_deb_version_without_release_units_is_served_and_verified() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Deb;
+    let name = unique("it-deb-norelease");
+    let body = json!({ "name": name, "url": format!("{}/deb/", upstream()), "policy": "immediate", "distributions": "fixture" });
+    let remote = create(&c, t.remotes(), body, "/remotes/").await;
+    let repo = create(&c, t.repositories(), json!({ "name": name, "remote": remote }), "/repositories/").await;
+    ops::settle(&c, ops::sync(&c, t, &repo, None, "mirror").await.unwrap(), &no_progress).await.unwrap();
+    let units = release_units(&c, &latest(&c, &repo).await).await;
+    assert_eq!(units.len(), 1, "{units:?}");
+    ops::settle(&c, ops::remove_content(&c, &repo, units).await.unwrap(), &no_progress).await.unwrap();
+    let v2 = latest(&c, &repo).await;
+    assert_eq!(release_units(&c, &v2).await, Vec::<String>::new(), "{v2} has no Release");
+
+    let publication = ops::create_publication(&c, t, &v2, &json!({ "structured": true }), &no_progress).await.unwrap();
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
+    let d: Value = c.get(&dist, &[]).await.unwrap();
+    let base = d["base_url"].as_str().unwrap().to_string();
+    let now = ops::served_publication(&c, &Capabilities::default(), t, &d).await.unwrap().unwrap();
+    let msg = ops::verify_served(&c, t, &base, &v2, &now).await.unwrap();
+    assert!(msg.contains("matching digest"), "{msg}");
+    let (status, release) = served(&c, &format!("{base}dists/fixture/Release")).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&release));
+    cleanup(&c, &[&dist, &repo, &remote]).await;
+}
+
+/// Hrefs of the Release units (`content/deb/releases/`) of `version`.
+async fn release_units(c: &PulpClient, version: &str) -> Vec<String> {
+    let q = [("repository_version", version.to_string()), ("fields", "pulp_href".into())];
+    let r: Vec<Value> = c.list_all(&c.api("content/deb/releases/"), &q, 1000).await.unwrap();
+    r.into_iter().map(|r| r["pulp_href"].as_str().unwrap().to_string()).collect()
+}
+
 /// A distribution that serves a verbatim publication protects its version, as Pulp says on delete.
 #[tokio::test]
 async fn a_served_verbatim_publication_protects_its_version() {
