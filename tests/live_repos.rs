@@ -545,3 +545,36 @@ async fn rpm_prune_dry_run_then_prune_through_the_tui() {
     assert_eq!(nevras(&v1).await.len(), left.len() + 1, "version 1 keeps it");
     cleanup(&c, &[&repo, &remote]).await;
 }
+
+/// Scan through the TUI. Pulp refuses a repository without `osv_config`; with Rocky Linux 9 the task queries
+/// osv.dev once per fixture package (the server needs internet access) and finds no vulnerabilities.
+#[tokio::test]
+async fn rpm_version_scan_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("it-scan"));
+    let (repo, remote) = synced_repo(&c, RepoType::Rpm, &name, "rpm/", "additive").await;
+    let v1 = latest(&c, &repo).await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Versions(Some((repo.clone(), name.clone())));
+    let item = json!({ "pulp_href": v1, "number": 1 });
+    run(&mut app, Act::Scan, item.clone());
+    settle(&mut app, &mut rx).await;
+    if !app.conn.as_ref().unwrap().caps.has_operation(rpm::SCAN, "post") {
+        // An older pulp_rpm: the TUI refuses before any request.
+        assert_eq!(texts(&app).last().unwrap(), &format!("not supported by this server: vulnerability scan ({})", rpm::SCAN));
+        return cleanup(&c, &[&repo, &remote]).await;
+    }
+    assert!(texts(&app).last().unwrap().contains("osv.rpm.config"), "{:?}", texts(&app));
+    let m = c.patch(&repo, &json!({ "osv_config": [{ "name": "Rocky Linux", "releases": ["9"] }] })).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    run(&mut app, Act::Scan, item);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no result: {:?}", texts(&app)) };
+    assert_eq!(title, "Vulnerability scan of version 1");
+    // A report belongs to a package, which other tests share: a rerun updates it instead of making one.
+    assert!(lines[0].starts_with("3 package queries sent to osv.dev;"), "{lines:?}");
+    assert_eq!(lines[1..], ["0 of 3 packages have known vulnerabilities."]);
+    cleanup(&c, &[&repo, &remote]).await;
+}

@@ -351,6 +351,12 @@ removed counts.
   slow; off only checks that each file exists. Refused for a version without content, because
   Pulp would then repair the whole server. The notice gives the counts
   (`0 missing, 0 corrupt, 0 repaired`).
+* **V** (RPM, pulp_rpm 3.39) scans the version for known vulnerabilities. Pulp asks osv.dev about
+  each package, for the ecosystems in the repository's `osv_config`, for example
+  `[{"name": "Rocky Linux", "releases": ["9"]}]`. Pulp refuses a repository without it. The
+  repository form does not have this field yet: set it with the API. The Pulp server needs access
+  to `api.osv.dev`. The result shows the counts of the task and each package with vulnerabilities
+  (`bash-5.1.8-6.el9.x86_64: RLSA-2024:1, CVE-2024-1`).
 * **d** deletes the version. It names the distributions that serve the version or its
   publications, and you type the version id. Rollback never needs a delete.
 * **O** prunes orphans on the whole server: content that no version has, and files that no content

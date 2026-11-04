@@ -173,6 +173,8 @@ pub enum Act {
     Restore,
     /// Download missing or corrupt files of a repository version again (`{version}repair/`).
     Repair,
+    /// RPM: scan a repository version for known vulnerabilities (`{version}scan/`, osv.dev).
+    Scan,
     CopyUrl,
     Verify,
     CancelTask,
@@ -247,7 +249,7 @@ impl Act {
             Compare => 'm',
             Rollback => 'b',
             CopyUrl => 'y',
-            Verify => 'V',
+            Verify | Scan => 'V',
             CancelTask => 'X',
             DismissTasks => 'z',
             WatchTask => 'W',
@@ -296,6 +298,7 @@ impl Act {
             Repair => "Repair (download missing or corrupt files again)",
             CopyUrl => "Copy content URL",
             Verify => "Verify served content",
+            Scan => "Scan for vulnerabilities (osv.dev)",
             CancelTask => "Cancel task on server",
             DismissTasks => "Dismiss finished tasks",
             TrackTask => "Track in Task Center",
@@ -833,7 +836,9 @@ impl Kind {
             }
             Kind::Remotes(..) | Kind::Roles => vec![Create, Edit, Delete, Inspect],
             Kind::Acs(_) => vec![Refresh, Create, Edit, Delete, Inspect],
-            Kind::Versions(_) => vec![Content, Publish, Distribute, Rollback, Restore, Compare, Repair, Delete, PruneOrphans, Inspect],
+            Kind::Versions(_) => {
+                vec![Content, Publish, Distribute, Rollback, Restore, Compare, Repair, Scan, Delete, PruneOrphans, Inspect]
+            }
             // A structured Deb copy brings the release records of binary packages only; other units would arrive alone.
             Kind::Content { version, ctype } if RepoType::from_href(version) == Some(RepoType::Deb) && *ctype != 0 => {
                 vec![Inspect, RemoveContent]
@@ -878,7 +883,8 @@ impl Kind {
         }
     }
 
-    /// The actions that fit `item`: a composite view has components instead of repositories, a normal view the opposite.
+    /// The actions that fit `item`: a composite view has components instead of repositories, a normal view the opposite;
+    /// only an RPM version has Scan.
     pub fn item_actions(&self, item: &Value) -> Vec<Act> {
         use Act::*;
         let mut actions = self.actions();
@@ -889,6 +895,9 @@ impl Kind {
                 CvAddComponent | CvRemoveComponent => composite,
                 _ => true,
             });
+        }
+        if RepoType::from_href(&s(item, "pulp_href")) != Some(RepoType::Rpm) {
+            actions.retain(|a| *a != Scan);
         }
         actions
     }
@@ -1124,8 +1133,8 @@ mod tests {
             Kind::Workers,
         ]);
         for k in kinds {
-            // A Content View row is a normal or a composite view: the actions differ, so check both.
-            for item in [json!({}), json!({ "composite": true })] {
+            // A Content View row is a normal or a composite view, a version row can be an RPM one: the actions differ.
+            for item in [json!({}), json!({ "composite": true }), json!({ "pulp_href": "/x/rpm/rpm/1/versions/1/" })] {
                 let keys: Vec<char> = k.item_actions(&item).iter().map(|a| a.key()).collect();
                 let mut dedup = keys.clone();
                 dedup.sort();

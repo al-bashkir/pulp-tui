@@ -2271,6 +2271,7 @@ fn version_action(app: &mut App, act: Act, item: Value) {
         }
         Act::Restore => restore_preview(app, t, href, number),
         Act::Repair => repair(app, t, href, number),
+        Act::Scan if t == RepoType::Rpm => scan(app, href, number),
         Act::Compare => {
             let marked: Vec<String> = app.list.marked.iter().filter(|m| **m != href).cloned().collect();
             let [other] = marked.as_slice() else {
@@ -2400,6 +2401,17 @@ fn repaired(app: &mut App, label: &str, t: &Task) {
     let (missing, corrupt, fixed) = (done("repair.missing"), done("repair.corrupted"), done("repair.repaired"));
     let text = format!("{label}: {missing} missing, {corrupt} corrupt, {fixed} repaired");
     if fixed < missing + corrupt { app.notify(Level::Warn, format!("{text}; see the task for the others")) } else { app.ok(text) }
+}
+
+/// Vulnerability scan of an RPM `version`: what the task counted, then the packages with known vulnerabilities.
+fn scan(app: &mut App, version: String, number: String) {
+    if caps(app).is_some_and(|c| !c.has_operation(rpm::SCAN, "post")) {
+        return app.error(format!("not supported by this server: vulnerability scan ({})", rpm::SCAN));
+    }
+    app.job(format!("vulnerability scan of version {number}"), move |ctx| async move {
+        let lines = rpm::scan(&ctx.client, &version, &ctx.on_task()).await?;
+        ap(move |app| app.text(format!("Vulnerability scan of version {number}"), lines))
+    });
 }
 
 /// Show what a distribution serves now and what it will serve, then re-point on confirmation.
@@ -7429,6 +7441,79 @@ mod tests {
         assert!(app.modal.is_none());
         assert_eq!(last(&app), "read-only mode: this action changes the server");
         assert_eq!(posts().await.len(), 1);
+    }
+
+    /// Scan is offered on RPM versions only. It shows what the task counted, then the packages that `vuln_report/`
+    /// lists with vulnerabilities for the version; old servers and read-only profiles are refused before any request.
+    #[tokio::test]
+    async fn scan_shows_the_task_counts_and_the_packages_with_vulnerabilities() {
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let v = format!("{API}repositories/rpm/rpm/r/versions/2/");
+        answer(&server, "POST", &format!("{v}scan/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        // pulpcore saves the `updated` report only when it counted one.
+        let reports = json!([
+            { "code": "created", "message": "Vulnerability Reports created", "done": 3 },
+            { "code": "total_scanned", "message": "Content scanned", "done": 3 },
+        ]);
+        let task = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "progress_reports": reports });
+        get(&server, &format!("{API}tasks/1/"), task).await;
+        let (bash, zsh, curl) =
+            (format!("{API}content/rpm/packages/1/"), format!("{API}content/rpm/packages/2/"), format!("{API}content/rpm/packages/3/"));
+        let found = page(json!([
+            { "content": zsh, "vulns": [{ "id": "RLSA-2024:2" }] },
+            { "content": bash, "vulns": [{ "id": "RLSA-2024:1", "summary": "x" }, { "id": "CVE-2024-1" }] },
+            { "content": curl, "vulns": [] },
+        ]));
+        // pulpcore 3.123.1 answers 500 to the filter with a version href (it has no pk); the PRN works.
+        let prn = "prn:core.repositoryversion:0190abcd-0002";
+        get(&server, &v, json!({ "pulp_href": v, "prn": prn, "number": 2 })).await;
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}vuln_report/")))
+            .and(query_param("repo_versions", prn))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(found))
+            .mount(&server)
+            .await;
+        let pkg = |h: &str, n: &str| json!({ "pulp_href": h, "name": n, "epoch": "0", "version": "1", "release": "1", "arch": "x86_64" });
+        get(&server, &format!("{API}content/rpm/packages/"), page(json!([pkg(&bash, "bash"), pkg(&zsh, "zsh"), pkg(&curl, "curl")]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let k = Kind::Versions(None);
+        app.list.kind = k.clone();
+        let item = json!({ "pulp_href": v, "number": 2 });
+        assert!(k.item_actions(&item).contains(&Act::Scan) && Act::Scan.mutates(&k, false));
+        assert!(!k.item_actions(&json!({ "pulp_href": format!("{API}repositories/file/file/f/versions/1/") })).contains(&Act::Scan));
+        run(&mut app, Act::Scan, item.clone());
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &format!("{v}scan/")).await, [json!({})]);
+        let Some(crate::tui::app::Modal::Text { title, lines, .. }) = app.modal.take() else {
+            panic!("no result: {:?}", app.notices.iter().map(|n| &n.text).collect::<Vec<_>>())
+        };
+        assert_eq!(title, "Vulnerability scan of version 2");
+        assert_eq!(
+            lines,
+            [
+                "3 package queries sent to osv.dev; 3 report(s) created, 0 updated.",
+                "2 of 3 packages have known vulnerabilities:",
+                "  bash-1-1.x86_64: RLSA-2024:1, CVE-2024-1",
+                "  zsh-1-1.x86_64: RLSA-2024:2",
+            ]
+        );
+        assert_eq!(app.tasks.items.first().map(|t| t.href.clone()), Some(format!("{API}tasks/1/")), "the Task Center has the task");
+
+        let last = |app: &App| app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "{rpm_rpm_repository_version_href}repair/": { "post": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, Act::Scan, item.clone());
+        assert!(app.jobs.is_empty() && app.modal.is_none());
+        assert_eq!(last(&app), "not supported by this server: vulnerability scan ({rpm_rpm_repository_version_href}scan/)");
+
+        let p = Profile { url: server.uri(), auth: AuthMethod::None, read_only: true, ..Default::default() };
+        app.conn.as_mut().unwrap().client = PulpClient::new("lab", &p, &app.cfg.settings).unwrap();
+        assert!(!app.available_actions(&item).contains(&Act::Scan));
+        run(&mut app, Act::Scan, item);
+        assert_eq!(last(&app), "read-only mode: this action changes the server");
+        assert_eq!(posts_to(&server, &format!("{v}scan/")).await.len(), 1);
     }
 
     /// pulpcore 3.123 deletes a path that an edit removes from every ACS that has the same path.

@@ -1,4 +1,4 @@
-//! RPM plugin operations: package listing, serving checks, the copy API, comps and advisory uploads, prune.
+//! RPM plugin operations: package listing, serving checks, the copy API, comps and advisory uploads, prune, scan.
 
 use super::client::{Mutation, Page, PulpClient, PulpError, Result};
 use super::models::*;
@@ -78,6 +78,44 @@ pub async fn prune(
     }
     out.sort_by(|a, b| a.repo.cmp(&b.repo));
     Ok(out)
+}
+
+/// OpenAPI path of the vulnerability scan of a version (POST, pulp_rpm 3.39): osv.dev, for the ecosystems that the
+/// repository's `osv_config` names (Pulp refuses a repository without it).
+pub const SCAN: &str = "{rpm_rpm_repository_version_href}scan/";
+
+/// Scan the packages of `version` for known vulnerabilities (the server asks osv.dev) and wait for the task. The
+/// lines: what the task counted, then each package that `vuln_report/` lists with vulnerabilities for the version.
+pub async fn scan(c: &PulpClient, version: &str, on: super::ops::OnTask<'_>) -> Result<Vec<String>> {
+    let Mutation::Task(h) = c.post(&format!("{version}scan/"), &json!({})).await? else {
+        return Err(PulpError::Decode(format!("{version}scan/ did not answer with a task")));
+    };
+    let t = super::ops::wait_task(c, &h, on).await?;
+    let done = |code: &str| t.progress_reports.iter().find(|r| r.code == code).and_then(|r| r.done).unwrap_or(0);
+    // pulpcore 3.123.1 answers 500 to `repo_versions=<version href>` (the href has no pk); the version's PRN works.
+    let v: Value = c.get(version, &[("fields", "prn".into())]).await?;
+    let prn = v["prn"].as_str().ok_or_else(|| PulpError::Decode(format!("{version} has no prn")))?;
+    let q = [("repo_versions", prn.to_string()), ("fields", "content,vulns".into())];
+    let reports: Vec<Value> = c.list_all(&c.api("vuln_report/"), &q, 2_000_000).await?;
+    let names: std::collections::BTreeMap<String, String> =
+        packages_in(c, version).await?.into_iter().map(|p| (p.pulp_href.clone(), p.nevra())).collect();
+    let mut found: Vec<String> = reports
+        .iter()
+        .filter_map(|r| {
+            let ids: Vec<&str> = r["vulns"].as_array()?.iter().filter_map(|v| v["id"].as_str()).collect();
+            let content = r["content"].as_str().unwrap_or_default();
+            let name = names.get(content).map_or(content, String::as_str);
+            (!ids.is_empty()).then(|| format!("  {name}: {}", ids.join(", ")))
+        })
+        .collect();
+    found.sort();
+    let (scanned, created, updated) = (done("total_scanned"), done("created"), done("updated"));
+    let mut lines = vec![
+        format!("{scanned} package queries sent to osv.dev; {created} report(s) created, {updated} updated."),
+        format!("{} of {} packages have known vulnerabilities{}", found.len(), names.len(), if found.is_empty() { "." } else { ":" }),
+    ];
+    lines.extend(found);
+    Ok(lines)
 }
 
 pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<Package>> {

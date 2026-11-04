@@ -68,6 +68,7 @@ General rules:
 | Version repair (**F**)                    | `{rpm_rpm_repository_version_href}repair/` (4)                       | endpoint message                          |
 | Reclaim space (**R**)                     | `repositories/reclaim_space/`                                        | endpoint message                          |
 | RPM prune old packages (**O**)            | `post` of `rpm/prune/` (8)                                           | endpoint message                          |
+| RPM version scan (**V**)                  | `post` of `{rpm_rpm_repository_version_href}scan/` (9)               | endpoint message                          |
 | Current user                              | `login/`, else `users/?username=<Basic-auth name>`                   | header shows "anonymous" (5)              |
 | Users, groups, roles                      | `users/`, `roles/`                                                   | screen not supported                      |
 | Domain scope of a role assignment         | `status/` `domain_enabled: true`                                     | Assign role has no Domain field           |
@@ -93,6 +94,7 @@ General rules:
 7. pulpcore 3.123.1 has it; 3.63.36 and 3.95.3 do not (read in their images). The picker is
    the same as in (6).
 8. pulp_rpm 3.27.12, 3.34.0 and 3.39.5 have it (read in their images).
+9. pulp_rpm 3.39.5 has it; 3.27.12 and 3.34.0 do not (read in their images).
 
 ### Form fields
 
@@ -345,6 +347,22 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   on a correct server) and, when there are any, says "new version N still has K of the M
   package(s) that Pulp marked removed (pulp_rpm bug, ...)" instead of "removed M package(s)"
   (`rpm_prune_dry_run_then_prune_through_the_tui`).
+* **Vulnerability scan** (`{version}scan/`, empty body; read in pulp_rpm 3.39.5
+  `viewsets/repository.py` and pulpcore 3.123.1 `tasks/vulnerability_report.py`). The
+  ecosystems come from the repository label `osv.rpm.config` (URL-encoded JSON), which the RPM
+  repository field `osv_config` reads and writes; without it the POST gets 400. The task
+  (`check_content`) sends one osv.dev query per package and release, from the server, and keeps
+  one `vuln_report/` record per package (`vulns`: the OSV entries; `repo_versions`: the scanned
+  versions). Progress reports `total_scanned`, `created`, `updated`. The filter
+  `vuln_report/?repo_versions=<version href>` answers HTTP 500 on pulpcore 3.123.1: a version
+  href has no pk, so `HyperlinkRelatedFilter` filters `RepositoryVersion` by `pulp_domain`,
+  which that model lacks (`FieldError`, seen on pulp1). The version's PRN
+  (`prn:core.repositoryversion:<id>`) resolves to a pk and works, so pulp-tui reads the `prn`
+  of the version and lists with it, then names each package with vulnerabilities. On pulp1 the
+  scan of the 3 fixture packages (Rocky Linux 9) reached osv.dev and found none.
+  pulp_rpm refuses `pulp_labels` with the key `osv.rpm.config` ("Use the 'osv_config' field"),
+  and `pulp_labels` without it replaces the label set: so the Labels field of the repository form
+  cannot keep or change the OSV config.
 
 ### Content and digests
 
@@ -703,6 +721,9 @@ or IpAddress(127.0.0.1)`.
 * ULN: a sync from a ULN remote is tested with mock HTTP only (it needs a ULN account).
   `export-repos` leaves out ULN and Git remotes.
 * Signing services can be set on repositories, not created (that needs server scripts).
+* RPM `osv_config` (the ecosystems of a version scan) is not in the repository form; set it with
+  the API. An edit that changes the Labels of a repository that has it gets HTTP 400 from
+  pulp_rpm; with the `osv.rpm.config` label taken out of the field, the edit removes the config.
 * Content guards are only shown and set by href, not created or replicated.
 * Reusable filter sets are not implemented; filters are per view repository, so a later
   table can be added without a change to published versions. A composite has no filters
