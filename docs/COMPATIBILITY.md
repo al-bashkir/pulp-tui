@@ -81,7 +81,9 @@ General rules:
    changes anything.
 4. File: `file_file`, Deb: `deb_apt`.
 5. `users/` is for servers without `login/` (for example 3.63). "anonymous": the user
-   cannot read `users/`, or the profile uses bearer auth.
+   cannot read `users/`, or the profile uses bearer auth. The own-user guards (delete,
+   disable, password, role removal) then use the Basic-auth username; without one, the user
+   delete confirm says that it cannot tell whether this is your own user.
 
 ### Form fields
 

@@ -604,7 +604,9 @@ Disconnected import of a Pulp export. Copy the export files to a directory in th
 ### Users, Groups, Roles
 
 * **Users**: **R** roles, **c** / **e** / **d**, **w** set password (local Pulp users only),
-  **A** enable/disable. Delete refuses your own user and warns for staff. A new password for your
+  **A** enable/disable. Delete refuses your own user and warns for staff. When the server does not
+  name the user of the session (bearer or certificate auth without `login/`), the delete confirm
+  says that it cannot tell whether this is your own user. A new password for your
   own user asks you to type the user name: with Basic auth, the session then gets 401 until you
   update the profile's secret and Connect again.
 * **Groups**: **o** members (**c** add a user, **d** remove), **R** roles, **c** create, **e**

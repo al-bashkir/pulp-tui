@@ -27,8 +27,11 @@ pub fn run(app: &mut App, act: Act, item: Value) {
     }
 }
 
+/// The user of this session: `caps.user`, else the Basic-auth name (when `users/?username=` gave nothing).
+/// None with bearer, certificate or no auth on a server without `login/`.
 fn me(app: &App) -> Option<String> {
-    app.conn.as_ref().and_then(|c| c.caps.user.as_ref().map(|u| u.username.clone()))
+    let c = app.conn.as_ref()?;
+    c.caps.user.as_ref().map(|u| u.username.clone()).or_else(|| c.client.username().map(String::from))
 }
 
 /// Roles that grant broad or administrative access deserve an explicit warning.
@@ -144,7 +147,7 @@ fn user_action(app: &mut App, act: Act, item: Value) {
                 app.error("refused: you cannot delete the account you are logged in with");
                 return;
             }
-            let staff = item["is_staff"] == true;
+            let (staff, unknown) = (item["is_staff"] == true, me(app).is_none());
             app.job(format!("impact of deleting user {username}"), move |ctx| async move {
                 let c = &ctx.client;
                 let user: Value = c.get(&href, &[]).await?;
@@ -157,6 +160,11 @@ fn user_action(app: &mut App, act: Act, item: Value) {
                 lines.push(assignments(&roles, "user"));
                 if staff {
                     lines.push("WARNING: this is a staff (administrator) account.".into());
+                }
+                if unknown {
+                    lines.push(
+                        "WARNING: cannot tell whether this is your own user (the server does not name the user of this session).".into(),
+                    );
                 }
                 lines.push("Prefer disabling (A) if the account may be needed again.".into());
                 ap(move |app| {
@@ -1598,6 +1606,35 @@ mod tests {
             lines,
             ["Delete role custom.viewer. All assignments of this role are removed.", "1 user(s) have it: ann", "1 group(s) have it: ops"]
         );
+    }
+
+    /// `caps.user` comes from `login/` (newer pulpcore) or `users/?username=` (Basic auth); without both the guard cannot work.
+    #[tokio::test]
+    async fn user_delete_says_when_the_current_user_is_unknown_and_basic_auth_names_it() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        let u = "/pulp/api/v3/users/7/";
+        serve(&server, "GET", u, 200, json!({ "username": "ann", "groups": [] })).await;
+        serve(&server, "GET", &format!("{u}roles/"), 200, page(json!([]))).await;
+        // No `login/` and no Basic-auth name (bearer, certificate or no auth): nobody is named.
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let item = json!({ "pulp_href": u, "username": "ann" });
+        super::user_action(&mut app, Act::Delete, item.clone());
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
+        let unknown = "WARNING: cannot tell whether this is your own user (the server does not name the user of this session).";
+        assert!(lines.iter().any(|l| l == unknown), "{lines:?}");
+
+        // Basic auth names the user, also when `users/?username=` gave nothing (403, or no such row).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pw"), "s3cret").unwrap();
+        let secret = Some(format!("file:{}", dir.path().join("pw").display()));
+        let auth = crate::config::AuthMethod::Basic;
+        let p = crate::config::Profile { url: server.uri(), auth, username: Some("ann".into()), secret, ..Default::default() };
+        app.conn.as_mut().unwrap().client = super::PulpClient::new("lab", &p, &app.cfg.settings).unwrap();
+        super::user_action(&mut app, Act::Delete, item);
+        assert!(app.modal.is_none() && app.jobs.is_empty(), "refused before any request");
+        assert_eq!(notices(&app).last().unwrap().1, "refused: you cannot delete the account you are logged in with");
     }
 
     /// Pulp answers 400 to a role assignment with both `content_object` and `domain`.
