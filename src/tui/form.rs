@@ -12,6 +12,8 @@ pub enum Source {
     /// `None` = RPM, File and Deb repositories that can be Content View sources (no CV snapshots).
     Repos(Option<RepoType>),
     Remotes(RepoType),
+    /// The remotes that a repository of the type syncs from: also its second remote type (ULN). The value is the name.
+    SyncRemotes(RepoType),
     Distributions(RepoType),
     ContentGuards,
     SigningServices,

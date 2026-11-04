@@ -8,6 +8,9 @@ use common::*;
 use pulp_tui::pulp::models::{Package, RepoVersion};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{Capabilities, Mutation, PulpClient, RepoType, file, rpm};
+use pulp_tui::tui::actions::run;
+use pulp_tui::tui::app::Modal;
+use pulp_tui::tui::kinds::{Act, Kind};
 use serde_json::{Value, json};
 
 async fn dist_url(c: &PulpClient, dist: &str) -> String {
@@ -397,4 +400,49 @@ async fn restored_version_is_served_after_publish() {
     let task = ops::settle(&c, m, &no_progress).await.unwrap().unwrap();
     assert_eq!((task.created_matching("/versions/"), latest(&c, &repo).await), (None, v3), "same content: no new version");
     cleanup(&c, &[&follow, &repo]).await;
+}
+
+/// A ULN remote through the TUI (Remotes, `t` to RPM ULN): create, edit, delete. Pulp keeps the account
+/// (write-only): an edit that does not type it keeps it. A ULN sync needs a ULN account: not tested.
+#[tokio::test]
+async fn uln_remote_create_edit_and_delete_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("it-uln"));
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Remotes(RepoType::Rpm, true);
+    assert_eq!(app.list.kind.unsupported(&app.conn.as_ref().unwrap().caps), None);
+    run(&mut app, Act::Create, Value::Null);
+    let url = "uln://ol8_x86_64_baseos_latest";
+    fill(&mut app, &[("name", &name), ("url", url), ("policy", "on_demand"), ("username", "uln-user"), ("password", "uln-pass")]);
+    settle(&mut app, &mut rx).await;
+    let found: Option<Value> = ops::find_by_name(&c, &c.api("remotes/rpm/uln/"), &name).await.unwrap();
+    let r = found.unwrap_or_else(|| panic!("not created: {:?}", texts(&app)));
+    let href = r["pulp_href"].as_str().unwrap().to_string();
+    let set = |r: &Value| {
+        let hidden = r["hidden_fields"].as_array().unwrap();
+        ["username", "password"].map(|k| hidden.iter().any(|h| h["name"] == k && h["is_set"] == true))
+    };
+    assert_eq!((r["url"].as_str(), r["policy"].as_str(), set(&r)), (Some(url), Some("on_demand"), [true, true]));
+    assert!(r.get("password").is_none() && r.get("username").is_none(), "write-only: {r}");
+    let repo = create(&c, RepoType::Rpm.repositories(), json!({ "name": name, "remote": href }), "/repositories/").await;
+
+    run(&mut app, Act::Edit, r);
+    fill(&mut app, &[("uln_server_base_url", "https://linux-update.oracle.com/")]);
+    settle(&mut app, &mut rx).await;
+    settle_submitted(&c, &app).await;
+    let r: Value = c.get(&href, &[]).await.unwrap();
+    assert_eq!((r["uln_server_base_url"].as_str(), set(&r)), (Some("https://linux-update.oracle.com/"), [true, true]));
+
+    run(&mut app, Act::Delete, json!({ "pulp_href": href, "name": name }));
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(&app)) };
+    assert_eq!(typed.as_deref(), Some(name.as_str()));
+    assert!(lines.contains(&format!("1 repository(ies) use it as default remote: {name}")), "{lines:?}");
+    yes(&mut app);
+    settle(&mut app, &mut rx).await;
+    settle_submitted(&c, &app).await;
+    assert!(c.get::<Value>(&href, &[]).await.is_err(), "deleted");
+    cleanup(&c, &[&repo]).await;
 }

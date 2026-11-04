@@ -61,6 +61,7 @@ General rules:
 | Native replication                        | pulpcore ≥ 3.23, `upstream-pulps/`, `{upstream_pulp_href}replicate/` | screen points to the fallback             |
 | Fallback replication of a type            | `status/` component on source and destination                        | dry run stops (3)                         |
 | Alternate content sources                 | the plugin, `acs/rpm/rpm/`, `acs/file/file/`, `acs/deb/deb/`         | endpoint message on the screen            |
+| RPM ULN remotes                           | the plugin, `remotes/rpm/uln/`                                       | endpoint message on the screen (6)        |
 | RPM comps, advisory upload (**U**, **A**) | `post` of `rpm/comps/`, `content/rpm/advisories/`                    | endpoint message                          |
 | Version repair (**F**)                    | `{rpm_rpm_repository_version_href}repair/` (4)                       | endpoint message                          |
 | Reclaim space (**R**)                     | `repositories/reclaim_space/`                                        | endpoint message                          |
@@ -84,6 +85,8 @@ General rules:
    cannot read `users/`, or the profile uses bearer auth. The own-user guards (delete,
    disable, password, role removal) then use the Basic-auth username; without one, the user
    delete confirm says that it cannot tell whether this is your own user.
+6. pulp_rpm 3.27.12, 3.34.0 and 3.39.5 have it. The Remote picker of a repository and a sync
+   lists it only when the server has the endpoint.
 
 ### Form fields
 
@@ -98,6 +101,8 @@ General rules:
 | Upstream Pulp (`UpstreamPulp`) | `policy`, replica download policy, concurrency, retries, timeouts                        |
 
 * A hidden sync option uses the server default.
+* **Remote**: the form shows only the fields of the type's schema (`rpm.RpmRemote`,
+  `rpm.UlnRemote`, `file.FileRemote`, `deb.AptRemote`); Labels always.
 * **Replication filter**: the form shows `q_select`, else `pulp_label_select`.
 * **Deb Content View signing** (`signing_service`, `signing_service_release_overrides`):
   detected in the JSON of the derived repository. Without them, pulp-tui does not send them,
@@ -127,6 +132,9 @@ next section.
   stay), sync from a manifest, publish, distribute, served manifest, update, rollback,
   mismatch detection.
 * **Distributions**: base path conflict (409), `base_path` PATCH.
+* **RPM ULN remote** (`live_repos`, 3.123.1, through the TUI): create with `uln://`, an
+  edit of `uln_server_base_url` keeps the account (`hidden_fields`), delete after the impact
+  names the repository that uses it. A ULN sync needs a ULN account: mock tests only.
 * **Content Views**: multi-repository snapshot, RPM, File and advisory filters, numbered
   versions, Library auto-binding, promotion path rules, rollback, served-content check,
   retention protection, partial failure and retry, Resume that re-attaches to a submitted
@@ -427,6 +435,12 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   `file` (under `ALLOWED_IMPORT_PATHS`). `proxy_url` is the same (`proxy.corp:3128` is
   saved). The remote form accepts these three schemes and an `http`/`https` proxy (it does
   not check an unchanged value); the Upstream Pulp form accepts `http` and `https`.
+* **ULN remotes** (pulp_rpm 3.39.5, `rpm.UlnRemote`): `url` must be `uln://<channel>`
+  (`validate_url`); `username` and `password` are required and write-only; an RPM repository
+  syncs from a ULN remote (`REMOTE_TYPES = [RpmRemote, UlnRemote]`), an RPM ACS does not take
+  one (`REMOTE_TYPES = [RpmRemote]`). Remote names are unique across all remote types
+  (`DomainUniqueValidator` on `Remote`), so pulp-tui finds a picked name in the first
+  collection that has it.
 
 ### Replication
 
@@ -616,6 +630,8 @@ or IpAddress(127.0.0.1)`.
   read it) and protects its version, so the delete impact lists `publications/deb/verbatim/`.
 * RPM layout `nested_by_digest`: served-content checks skip the package probe (metadata is
   still checked).
+* ULN: a sync from a ULN remote is tested with mock HTTP only (it needs a ULN account).
+  `export-repos` leaves out ULN remotes.
 * Signing services can be set on repositories, not created (that needs server scripts).
 * Content guards are only shown and set by href, not created or replicated.
 * Reusable filter sets are not implemented; filters are per view repository, so a later

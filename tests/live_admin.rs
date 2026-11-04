@@ -5,53 +5,12 @@
 mod common;
 
 use common::*;
-use pulp_tui::config::{Config, Profile};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{PulpClient, RepoType};
-use pulp_tui::store::Store;
 use pulp_tui::tui::actions::run;
-use pulp_tui::tui::app::{App, Modal, Msg, NO_PROFILE, Screen};
+use pulp_tui::tui::app::{App, Modal, Screen};
 use pulp_tui::tui::kinds::{Act, Kind};
 use serde_json::{Value, json};
-use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedReceiver;
-
-/// An app connected to the test Pulp as profile `pulp1`, with its jobs done.
-async fn app() -> (App, UnboundedReceiver<Msg>) {
-    let url = std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
-    let dir = tempfile::tempdir().unwrap().keep();
-    std::fs::write(dir.join("pw"), std::env::var("PULP_TUI_TEST_PASSWORD").unwrap_or_else(|_| "password".into())).unwrap();
-    let secret = Some(format!("file:{}", dir.join("pw").display()));
-    let mut cfg = Config::default();
-    cfg.profiles.insert("pulp1".into(), Profile { url, username: Some("admin".into()), secret, ..Default::default() });
-    let local = Arc::new(Store::open_in_memory().await.unwrap());
-    let mut app = App::new(cfg, "/dev/null".into(), local, Err(NO_PROFILE.into()));
-    let mut rx = app.rx.take().unwrap();
-    app.connect("pulp1");
-    settle(&mut app, &mut rx).await;
-    assert!(app.conn.is_some(), "not connected: {:?}", texts(&app));
-    (app, rx)
-}
-
-async fn settle(app: &mut App, rx: &mut UnboundedReceiver<Msg>) {
-    while !app.jobs.is_empty() {
-        let m = rx.recv().await.unwrap();
-        app.handle_msg(m);
-    }
-}
-
-fn texts(app: &App) -> Vec<String> {
-    app.notices.iter().map(|n| n.text.clone()).collect()
-}
-
-/// Set `values` in the open form and submit it.
-fn fill(app: &mut App, values: &[(&str, &str)]) {
-    let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form: {:?}", texts(app)) };
-    for (k, v) in values {
-        form.fields.iter_mut().find(|f| f.key == *k).unwrap_or_else(|| panic!("no field {k}")).value = v.to_string();
-    }
-    submit(app, &form).unwrap();
-}
 
 #[tokio::test]
 async fn group_rename() {
@@ -390,7 +349,7 @@ async fn remote_delete_refused_while_an_acs_uses_it() {
     let acs = create(&c, RepoType::File.acs(), json!({ "name": name, "remote": remote }), "/acs/").await;
 
     let (mut app, mut rx) = app().await;
-    app.list.kind = Kind::Remotes(RepoType::File);
+    app.list.kind = Kind::Remotes(RepoType::File, false);
     run(&mut app, Act::Delete, json!({ "pulp_href": remote, "name": name }));
     settle(&mut app, &mut rx).await;
     assert!(app.modal.is_none(), "no confirm: {:?}", texts(&app));

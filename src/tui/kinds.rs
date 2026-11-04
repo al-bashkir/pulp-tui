@@ -14,7 +14,8 @@ pub enum Kind {
     Profiles,
     /// `true` also shows the snapshot repositories of Content Views (label `pulp_tui_cv`).
     Repos(RepoType, bool),
-    Remotes(RepoType),
+    /// `true`: the plugin's second remote type (`RepoType::alt_remote`, pulp_rpm ULN).
+    Remotes(RepoType, bool),
     /// Alternate content sources.
     Acs(RepoType),
     /// Versions of one repository (href, name) or of all repositories.
@@ -77,7 +78,7 @@ pub const NAV: &[(&str, Kind)] = &[
     ("RPM Repositories", Kind::Repos(RepoType::Rpm, false)),
     ("File Repositories", Kind::Repos(RepoType::File, false)),
     ("Deb Repositories", Kind::Repos(RepoType::Deb, false)),
-    ("Remotes", Kind::Remotes(RepoType::Rpm)),
+    ("Remotes", Kind::Remotes(RepoType::Rpm, false)),
     ("Alternate Sources", Kind::Acs(RepoType::Rpm)),
     ("Repository Versions", Kind::Versions(None)),
     ("Publications", Kind::Publications(RepoType::Rpm)),
@@ -128,6 +129,14 @@ pub fn short(href: &str) -> String {
     match t.rsplit_once("/versions/") {
         Some((repo, n)) => format!("{}@v{n}", repo.rsplit('/').next().unwrap_or_default().chars().take(8).collect::<String>()),
         None => t.rsplit('/').next().unwrap_or_default().chars().take(13).collect(),
+    }
+}
+
+/// Label, collection and OpenAPI schema of the remotes on `Kind::Remotes(t, alt)`.
+pub fn remote_type(t: RepoType, alt: bool) -> (String, &'static str, &'static str) {
+    match t.alt_remote().filter(|_| alt) {
+        Some((label, path, schema)) => (format!("{} {label}", t.label()), path, schema),
+        None => (t.label().into(), t.remotes(), t.remote_schema()),
     }
 }
 
@@ -394,7 +403,7 @@ impl Kind {
                 t.label(),
                 if *snapshots { " — snapshots shown" } else { "" }
             ),
-            Kind::Remotes(t) => format!("{} Remotes  [t: toggle type]", t.label()),
+            Kind::Remotes(t, alt) => format!("{} Remotes  [t: toggle type]", remote_type(*t, *alt).0),
             Kind::Acs(t) => format!("{} Alternate Content Sources  [t: toggle type]", t.label()),
             Kind::Versions(Some((_, n))) => format!("Versions of {n}"),
             Kind::Versions(None) => "Repository Versions (all repositories)".into(),
@@ -445,7 +454,11 @@ impl Kind {
             Kind::Acs(t) if caps.supports(t.feature()) && !caps.has_endpoint(t.acs()) => {
                 return Some(format!("not supported by this server: {} alternate content sources ({})", t.label(), t.acs()));
             }
-            Kind::Repos(t, _) | Kind::Remotes(t) | Kind::Acs(t) | Kind::Publications(t) | Kind::Distributions(t) => t.feature(),
+            Kind::Remotes(t, true) if caps.supports(t.feature()) && !caps.has_endpoint(remote_type(*t, true).1) => {
+                let (label, path, _) = remote_type(*t, true);
+                return Some(format!("not supported by this server: {label} remotes ({path})"));
+            }
+            Kind::Repos(t, _) | Kind::Remotes(t, _) | Kind::Acs(t) | Kind::Publications(t) | Kind::Distributions(t) => t.feature(),
             Kind::UpstreamPulps => Feature::NativeReplication,
             Kind::PulpExporters => Feature::PulpExport,
             Kind::FsExporters => Feature::FilesystemExport,
@@ -468,7 +481,9 @@ impl Kind {
     pub fn toggle(&self) -> Option<Kind> {
         Some(match self {
             Kind::Repos(t, snapshots) => Kind::Repos(*t, !snapshots),
-            Kind::Remotes(t) => Kind::Remotes(t.next()),
+            // A plugin's second remote type comes right after its first.
+            Kind::Remotes(t, false) if t.alt_remote().is_some() => Kind::Remotes(*t, true),
+            Kind::Remotes(t, _) => Kind::Remotes(t.next(), false),
             Kind::Acs(t) => Kind::Acs(t.next()),
             Kind::Publications(t) => Kind::Publications(t.next()),
             Kind::Distributions(t) => Kind::Distributions(t.next()),
@@ -503,7 +518,7 @@ impl Kind {
                 }
                 (t.repositories().into(), q, name)
             }
-            Kind::Remotes(t) => (t.remotes().into(), vec![("ordering", "name".into())], name),
+            Kind::Remotes(t, alt) => (remote_type(*t, *alt).1.into(), vec![("ordering", "name".into())], name),
             Kind::Acs(t) => (t.acs().into(), vec![("ordering", "name".into())], name),
             Kind::Versions(Some((repo, _))) => (format!("{repo}versions/"), vec![("ordering", "-number".into())], None),
             Kind::Versions(None) => ("repository_versions/".into(), vec![("ordering", "-pulp_created".into())], None),
@@ -573,7 +588,7 @@ impl Kind {
                 col("retain", 6, |v| s(v, "retain_repo_versions")),
                 col("description", 30, |v| s(v, "description")),
             ],
-            Kind::Remotes(_) => {
+            Kind::Remotes(..) => {
                 vec![col("name", 28, |v| s(v, "name")), col("policy", 10, |v| s(v, "policy")), col("url", 50, |v| s(v, "url"))]
             }
             Kind::Acs(_) => vec![
@@ -804,7 +819,7 @@ impl Kind {
                 }
                 actions
             }
-            Kind::Remotes(_) | Kind::Roles => vec![Create, Edit, Delete, Inspect],
+            Kind::Remotes(..) | Kind::Roles => vec![Create, Edit, Delete, Inspect],
             Kind::Acs(_) => vec![Refresh, Create, Edit, Delete, Inspect],
             Kind::Versions(_) => vec![Content, Publish, Distribute, Rollback, Restore, Compare, Repair, Delete, PruneOrphans, Inspect],
             // A structured Deb copy brings the release records of binary packages only; other units would arrive alone.
@@ -1461,6 +1476,29 @@ mod tests {
                 ("remote", "0190abcd-1234".into())
             ]
         );
+    }
+
+    #[test]
+    fn rpm_uln_remotes_have_their_own_screen_and_need_the_endpoint() {
+        let k = Kind::Remotes(RepoType::Rpm, false);
+        assert!(NAV.iter().any(|(l, n)| *l == "Remotes" && *n == k));
+        let uln = k.toggle().unwrap();
+        assert_eq!(uln, Kind::Remotes(RepoType::Rpm, true));
+        assert_eq!(uln.title(), "RPM ULN Remotes  [t: toggle type]");
+        assert_eq!((k.source().unwrap().0, uln.source().unwrap().0), ("remotes/rpm/rpm/".into(), "remotes/rpm/uln/".into()));
+        assert_eq!(uln.toggle(), Some(Kind::Remotes(RepoType::File, false)));
+        assert_eq!(Kind::Remotes(RepoType::Deb, false).toggle(), Some(k.clone()), "Deb has one remote type");
+        assert_eq!(uln.actions(), [Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
+        assert!(Act::Create.mutates(&uln, false));
+        let mut caps = Capabilities::default();
+        caps.versions.insert("rpm".into(), "3.39.5".into());
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/remotes/rpm/rpm/": {} } }));
+        assert_eq!(uln.unsupported(&caps).as_deref(), Some("not supported by this server: RPM ULN remotes (remotes/rpm/uln/)"));
+        assert_eq!(k.unsupported(&caps), None);
+        caps.paths.insert("remotes/rpm/uln/".into());
+        assert_eq!(uln.unsupported(&caps), None);
+        caps.versions.clear();
+        assert_eq!(uln.unsupported(&caps).as_deref(), Some("not supported by this server: pulp_rpm plugin"));
     }
 
     #[test]

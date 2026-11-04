@@ -3,7 +3,7 @@
 use super::app::{Ctx, unavailable};
 use super::form::{PickItem, Source};
 use super::kinds::short;
-use crate::pulp::RepoType;
+use crate::pulp::{Capabilities, RepoType};
 use anyhow::{anyhow, bail};
 use serde_json::Value;
 
@@ -29,6 +29,9 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
             .map(|t| (t.repositories(), NAME_HREF, "name", "pulp_href", t.component()))
             .collect(),
         Source::Remotes(t) => vec![(t.remotes(), NAME_HREF, "name", "name", "")],
+        Source::SyncRemotes(t) => {
+            sync_remotes(&ctx.caps, *t).into_iter().map(|(path, note)| (path, NAME_HREF, "name", "name", note)).collect()
+        }
         Source::Distributions(t) => vec![(t.distributions(), NAME_HREF, "name", "name", "")],
         Source::ContentGuards => vec![("contentguards/", NAME_HREF, "name", "pulp_href", "")],
         Source::SigningServices => vec![("signing-services/", NAME_HREF, "name", "pulp_href", "")],
@@ -49,6 +52,13 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
         out.extend(rows.iter().map(|r| PickItem { label: text(r, label), value: text(r, value), note: note.into() }));
     }
     Ok(out)
+}
+
+/// Collections (and picker notes) of the remotes that a repository of `t` syncs from: the plugin's own, and its second
+/// type where the server has it. Pulp remote names are unique across all types.
+pub fn sync_remotes(caps: &Capabilities, t: RepoType) -> Vec<(&'static str, &'static str)> {
+    let alt = t.alt_remote().filter(|(_, path, _)| caps.has_endpoint(path)).map(|(label, path, _)| (path, label));
+    [(t.remotes(), "")].into_iter().chain(alt).collect()
 }
 
 /// The views a composite can use as components: not composites themselves.

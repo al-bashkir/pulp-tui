@@ -828,8 +828,8 @@ mod tests {
         use crate::pulp::RepoType;
         let st = std::sync::Arc::new(crate::store::Store::open_in_memory().await.unwrap());
         let mut app = App::new(crate::config::Config::default(), "/dev/null".into(), st.clone(), Ok(st));
-        app.screen = Screen::List(Kind::Remotes(RepoType::Rpm));
-        app.list.kind = Kind::Remotes(RepoType::Rpm);
+        app.screen = Screen::List(Kind::Remotes(RepoType::Rpm, false));
+        app.list.kind = Kind::Remotes(RepoType::Rpm, false);
         app.list.items = vec![serde_json::json!({
             "name": "r1", "headers": [{"Authorization": "Bearer abc"}], "sles_auth_token": "tok"
         })];

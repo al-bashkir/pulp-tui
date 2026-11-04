@@ -243,10 +243,15 @@ repository. A Deb distribution serves at `<content URL>/dists/<distribution>/...
 
 ### Remotes
 
-`t` toggles RPM/File/Deb. **c** / **e** / **d** create / edit / delete, **i** full JSON. Delete
-lists the repositories that use the remote. Pulp does not delete a remote that an alternate
-content source (ACS) uses, so pulp-tui refuses it (also in a bulk delete) and names the ACS:
-delete them or change their remote first.
+`t` toggles RPM, RPM ULN, File, Deb. **c** / **e** / **d** create / edit / delete, **i** full
+JSON. The form shows only the fields of the server's schema for the type. Delete lists the
+repositories that use the remote. Pulp does not delete a remote that an alternate content
+source (ACS) uses, so pulp-tui refuses it (also in a bulk delete) and names the ACS: delete
+them or change their remote first. An ACS takes only RPM, File and Deb remotes, never a ULN
+remote.
+
+The Remote field of a repository and of a sync lists the remotes of both RPM types; the note
+`ULN` marks a ULN remote.
 
 * **URL**: `http://`, `https://`, or `file://` under the server's `ALLOWED_IMPORT_PATHS`. File: the
   URL of `PULP_MANIFEST`. Deb: the archive base URL (the directory with `dists/`).
@@ -257,6 +262,14 @@ delete them or change their remote first.
 * **Proxy**: `http://` or `https://` with host and port, for example `http://proxy.corp:3128`.
 * **Total / connect / socket connect / socket read timeout** (whole seconds), **Max retries**
   after a download failure (server default 3).
+
+RPM ULN fields (Oracle Unbreakable Linux Network; the screen says when the server has no
+`remotes/rpm/uln/`):
+
+* **URL**: `uln://` and the channel label, for example `uln://ol8_x86_64_baseos_latest`.
+* **Username**, **Password** (required on create): the ULN account. Pulp never returns them;
+  on edit, empty keeps them.
+* **ULN server base URL**: empty = the server setting `DEFAULT_ULN_SERVER_BASE_URL`.
 
 Deb fields:
 

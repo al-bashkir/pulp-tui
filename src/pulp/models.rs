@@ -99,6 +99,14 @@ impl RepoType {
             RepoType::Deb => "remotes/deb/apt/",
         }
     }
+    /// The plugin's second remote type: label, collection, OpenAPI schema. Its repositories sync from it too
+    /// (`REMOTE_TYPES`); an ACS does not take it.
+    pub fn alt_remote(self) -> Option<(&'static str, &'static str, &'static str)> {
+        match self {
+            RepoType::Rpm => Some(("ULN", "remotes/rpm/uln/", "rpm.UlnRemote")),
+            RepoType::File | RepoType::Deb => None,
+        }
+    }
     pub fn publications(self) -> &'static str {
         match self {
             RepoType::Rpm => "publications/rpm/rpm/",

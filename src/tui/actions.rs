@@ -88,6 +88,22 @@ pub async fn href_by_name(c: &PulpClient, collection: &str, name: &str) -> anyho
         .ok_or_else(|| anyhow!("no object named {name:?} in {collection}"))
 }
 
+/// Collections of the remotes that a repository of `t` syncs from (`pick::sync_remotes`).
+fn sync_remote_paths(app: &App, t: RepoType) -> Vec<&'static str> {
+    super::pick::sync_remotes(&caps(app).unwrap_or_default(), t).into_iter().map(|(path, _)| path).collect()
+}
+
+/// Href of the remote `name` in the first of `collections` that has it.
+async fn remote_href(c: &PulpClient, collections: &[&str], name: &str) -> anyhow::Result<String> {
+    for coll in collections {
+        if let Some(h) = ops::find_by_name::<Value>(c, &c.api(coll), name).await?.and_then(|v| v["pulp_href"].as_str().map(str::to_string))
+        {
+            return Ok(h);
+        }
+    }
+    bail!("no remote named {name:?} in {}", collections.join(", "))
+}
+
 fn version_of(repo: &str, number: i64) -> String {
     format!("{repo}versions/{number}/")
 }
@@ -269,14 +285,14 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         crate::session_log::record("action", app.profile.as_deref().unwrap_or_default(), format!("{}{on}", act.label()), vec![]);
     }
     match (&kind, act) {
-        (Kind::Repos(..) | Kind::Remotes(_) | Kind::Distributions(_), Act::Delete) if !app.list.marked.is_empty() => {
+        (Kind::Repos(..) | Kind::Remotes(..) | Kind::Distributions(_), Act::Delete) if !app.list.marked.is_empty() => {
             delete_marked(app, kind)
         }
         (Kind::Logs { .. }, Act::Inspect) => app.text(s(&item, "summary"), log_lines(&item)),
         (_, Act::Inspect) => inspect(app, &kind, item),
         (Kind::Profiles, _) => profile_action(app, act, item),
         (Kind::Repos(t, _), _) => repo_action(app, *t, act, item),
-        (Kind::Remotes(t), _) => remote_action(app, *t, act, item),
+        (Kind::Remotes(t, alt), _) => remote_action(app, *t, *alt, act, item),
         (Kind::Acs(t), _) => acs_action(app, *t, act, item),
         (Kind::Versions(_), Act::PruneOrphans) => prune_orphans(app),
         (Kind::Versions(_), _) => version_action(app, act, item),
@@ -914,7 +930,7 @@ fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>, rem
     let mut fields = vec![
         Field::text("name", "Name").required().value(s(&v, "name")),
         Field::text("description", "Description").value(s(&v, "description")),
-        Field::pick("remote", "Remote", Source::Remotes(t)).help("default remote for sync; empty = none").value(remote),
+        Field::pick("remote", "Remote", Source::SyncRemotes(t)).help("default remote for sync; empty = none").value(remote),
         Field::new("retain_repo_versions", "Retain versions", FieldKind::Number)
             .value(s(&v, "retain_repo_versions"))
             .help("empty = keep all versions"),
@@ -975,17 +991,17 @@ fn repo_body(f: &Form, edit: bool) -> Result<Value, String> {
 fn repo_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
     let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
     let current = item["remote"].as_str().filter(|_| edit).map(str::to_string);
-    let caps = caps(app);
+    let (caps, remotes) = (caps(app), sync_remote_paths(app, t));
     let open = move |app: &mut App, remote: String| {
         let form = repo_form(t, caps.as_deref(), edit.then_some(&item), &remote);
         app.form(form, move |app, f| {
             let mut body = repo_body(f, edit)?;
             let remote = body["remote"].as_str().map(str::to_string);
-            let href = href.clone();
+            let (href, remotes) = (href.clone(), remotes.clone());
             let label = format!("{} repository {}", if edit { "update" } else { "create" }, f.get("name"));
             submit(app, label, move |c| async move {
                 if let Some(r) = remote {
-                    body["remote"] = href_by_name(&c, t.remotes(), &r).await?.into();
+                    body["remote"] = remote_href(&c, &remotes, &r).await?.into();
                 }
                 Ok(if edit { c.patch(&href, &body).await? } else { c.post(&c.api(t.repositories()), &body).await? })
             });
@@ -1045,17 +1061,17 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
     let note = if default.is_some() { "repository has a default remote" } else { "repository has NO default remote: pick one" };
     let label = format!("remote of {name}");
     let (autopublish, retain) = (item["autopublish"] == true, item["retain_package_versions"].as_u64().unwrap_or(0));
-    let own = default.clone();
+    let (own, remotes) = (default.clone(), sync_remote_paths(app, t));
     let open = move |app: &mut App, current: String| {
         let mut fields = vec![
-            Field::pick("remote", "Remote", Source::Remotes(t)).help("empty = the repository's default remote").value(current),
+            Field::pick("remote", "Remote", Source::SyncRemotes(t)).help("empty = the repository's default remote").value(current),
             Field::new("policy", "Sync policy", FieldKind::Choice(policies)),
         ];
         fields.extend(sync_fields(t, caps.as_deref()));
         app.form(Form::new(format!("Sync {name}"), fields).note(note), move |app, f| {
             // An untouched (or empty) Remote is the repository's own remote, by href: it can be of a type the picker lacks.
             let remote = f.opt("remote").filter(|_| f.changed("remote")).map(str::to_string);
-            let (policy, own) = (f.get("policy").to_string(), own.clone());
+            let (policy, own, remotes) = (f.get("policy").to_string(), own.clone(), remotes.clone());
             let (href, name, options) = (href.clone(), name.clone(), sync_options(f));
             let repos = vec![href.clone()];
             // pulp_rpm sync() answers HTTP 400 to these pairs; say it before any request.
@@ -1075,7 +1091,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
             let go = move |app: &mut App| {
                 submit(app, format!("sync {name} ({policy})"), move |c| async move {
                     let r = match remote {
-                        Some(r) => Some(href_by_name(&c, t.remotes(), &r).await?),
+                        Some(r) => Some(remote_href(&c, &remotes, &r).await?),
                         None => own,
                     };
                     Ok(ops::sync_with(&c, t, &href, r.as_deref(), &policy, options).await?)
@@ -1133,8 +1149,8 @@ async fn repo_delete_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str) -> a
 }
 
 /// The impact lines, and the ACS that use the remote ("a1 (RPM) uses cdn"). pulpcore `AlternateContentSource.remote`
-/// is PROTECT and an ACS takes only remotes of its own type (`REMOTE_TYPES`).
-async fn remote_delete_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+/// is PROTECT and an ACS takes only remotes of its own type (`REMOTE_TYPES`): never one of the second type (`alt`).
+async fn remote_delete_impact(ctx: &Ctx, t: RepoType, alt: bool, href: &str, name: &str) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let c = &ctx.client;
     let users: Page<Value> = c.list(&c.api(t.repositories()), &[("remote", href.to_string()), ("limit", "100".into())]).await?;
     let mut lines = vec![
@@ -1146,7 +1162,7 @@ async fn remote_delete_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str) ->
         ),
     ];
     let mut acs = vec![];
-    if ctx.caps.has_endpoint(t.acs()) {
+    if !alt && ctx.caps.has_endpoint(t.acs()) {
         // The ACS list has no `remote` filter.
         let all: Vec<Value> = c.list_all(&c.api(t.acs()), &[("fields", "name,remote".into())], 100_000).await?;
         acs = all.iter().filter(|a| a["remote"] == href).map(|a| format!("{} ({}) uses {name}", s(a, "name"), t.label())).collect();
@@ -1176,7 +1192,7 @@ fn distribution_delete_lines(item: &Value) -> Vec<String> {
 fn delete_marked(app: &mut App, kind: Kind) {
     let (t, what) = match kind {
         Kind::Repos(t, _) => (t, "repositories"),
-        Kind::Remotes(t) => (t, "remotes"),
+        Kind::Remotes(t, _) => (t, "remotes"),
         Kind::Distributions(t) => (t, "distributions"),
         _ => return,
     };
@@ -1192,8 +1208,8 @@ fn delete_marked(app: &mut App, kind: Kind) {
             let name = s(&item, "name");
             lines.extend(match kind {
                 Kind::Repos(..) => repo_delete_impact(&ctx, t, &href, &name).await?,
-                Kind::Remotes(_) => {
-                    let (l, users) = remote_delete_impact(&ctx, t, &href, &name).await?;
+                Kind::Remotes(_, alt) => {
+                    let (l, users) = remote_delete_impact(&ctx, t, alt, &href, &name).await?;
                     acs.extend(users);
                     l
                 }
@@ -1735,17 +1751,23 @@ async fn follow_repository(
 /// Help of a remote field whose value the edit form cannot show (write-only, or a file path).
 const WRITE_ONLY: &str = "empty = unchanged, - = clear";
 
-fn remote_url_help(t: RepoType) -> &'static str {
-    match t {
-        RepoType::Rpm => "yum repository base URL",
-        RepoType::File => "URL of the PULP_MANIFEST",
-        RepoType::Deb => "Debian archive base URL (the directory that holds dists/)",
+/// URL schemes of Pulp's downloaders. Pulp checks a file:// path against its ALLOWED_IMPORT_PATHS.
+const WEB: &[&str] = &["http", "https", "file"];
+
+/// Help and accepted schemes of the URL of a remote (`alt`: the plugin's second remote type).
+fn remote_url(t: RepoType, alt: bool) -> (&'static str, &'static [&'static str]) {
+    match (t, alt) {
+        // pulp_rpm UlnRemoteSerializer.validate_url takes only `uln`.
+        (RepoType::Rpm, true) => ("uln://<channel label>, e.g. uln://ol8_x86_64_baseos_latest", &["uln"]),
+        (RepoType::Rpm, false) => ("yum repository base URL", WEB),
+        (RepoType::File, _) => ("URL of the PULP_MANIFEST", WEB),
+        (RepoType::Deb, _) => ("Debian archive base URL (the directory that holds dists/)", WEB),
     }
 }
 
 /// Remote form fields that only some servers or plugins have; `v` is the remote being edited (`Null` on create).
-fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec<Field> {
-    let has = |f: &str| caps.is_none_or(|c| c.has_field(t.remote_schema(), f));
+fn remote_extra_fields(t: RepoType, alt: bool, caps: Option<&Capabilities>, v: &Value) -> Vec<Field> {
+    let has = |f: &str| caps.is_none_or(|c| c.has_field(super::kinds::remote_type(t, alt).2, f));
     let write_only = if v.is_null() { "" } else { WRITE_ONLY };
     // Floats on the server: `s()` would show `3600.0`, which is not a whole number.
     // shortcut: whole seconds only (a Number field); a fractional server value must be retyped on edit. Add a decimal kind when needed.
@@ -1763,16 +1785,20 @@ fn remote_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> V
         // Readable on the server, but it can hold an Authorization token: never shown, as the password.
         Field::new("headers", "Headers", FieldKind::Secret).help(headers),
     ];
-    let mut fields: Vec<Field> = match t {
-        RepoType::Rpm => {
+    let mut fields: Vec<Field> = match (t, alt) {
+        (RepoType::Rpm, true) => {
+            let f = Field::text("uln_server_base_url", "ULN server base URL").value(s(v, "uln_server_base_url"));
+            vec![f.help("empty = the server setting DEFAULT_ULN_SERVER_BASE_URL")].into_iter().filter(|f| has(&f.key)).collect()
+        }
+        (RepoType::Rpm, false) => {
             if has("sles_auth_token") {
                 vec![Field::new("sles_auth_token", "SLES auth token", FieldKind::Secret).help(write_only)]
             } else {
                 vec![]
             }
         }
-        RepoType::File => vec![],
-        RepoType::Deb => {
+        (RepoType::File, _) => vec![],
+        (RepoType::Deb, _) => {
             let text = |k: &str, label: &str| Field::text(k, label).value(s(v, k));
             let flag = |k: &str, label: &str| Field::new(k, label, FieldKind::Bool).value(if v[k] == true { "true" } else { "false" });
             let names: Vec<&str> =
@@ -1814,8 +1840,8 @@ fn parse_headers(v: &str) -> Result<Value, String> {
     Ok(out.into())
 }
 
-/// JSON body from a remote form, and the (field, file path) pairs whose file content goes into it.
-fn remote_body(f: &Form, edit: bool) -> Result<(Value, Vec<(String, String)>), String> {
+/// JSON body from a remote form whose URL takes `schemes`, and the (field, file path) pairs whose file content goes into it.
+fn remote_body(f: &Form, edit: bool, schemes: &[&str]) -> Result<(Value, Vec<(String, String)>), String> {
     let mut b = json!({});
     let mut files = vec![];
     for fld in &f.fields {
@@ -1849,8 +1875,7 @@ fn remote_body(f: &Form, edit: bool) -> Result<(Value, Vec<(String, String)>), S
             _ => b[fld.key.as_str()] = val.into(),
         }
     }
-    // Pulp checks a file:// path against its ALLOWED_IMPORT_PATHS.
-    url_with_scheme(f.get("url"), &["http", "https", "file"])?;
+    url_with_scheme(f.get("url"), schemes)?;
     // Pulp stores any proxy text; a bad one fails only at sync time. An unchanged one on edit is not sent.
     if let Some(p) = b["proxy_url"].as_str() {
         url_with_scheme(p, &["http", "https"]).map_err(|e| format!("Proxy URL: {e}"))?;
@@ -1867,9 +1892,12 @@ pub(super) fn url_with_scheme(u: &str, schemes: &[&str]) -> Result<url::Url, Str
     Ok(url)
 }
 
-fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
+/// Actions of `Kind::Remotes(t, alt)`.
+fn remote_action(app: &mut App, t: RepoType, alt: bool, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
+    let (label, path, schema) = super::kinds::remote_type(t, alt);
+    let (url_help, schemes) = remote_url(t, alt);
     match act {
         Act::Create | Act::Edit => {
             let edit = act == Act::Edit;
@@ -1878,11 +1906,11 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             let write_only = if edit { WRITE_ONLY } else { "" };
             let policies = caps
                 .as_ref()
-                .and_then(|c| c.field_enum(t.remote_schema(), "policy").map(|e| e.to_vec()))
+                .and_then(|c| c.field_enum(schema, "policy").map(|e| e.to_vec()))
                 .unwrap_or_else(|| vec!["immediate".into(), "on_demand".into(), "streamed".into()]);
             let mut fields = vec![
                 Field::text("name", "Name").required().value(s(&v, "name")),
-                Field::text("url", "URL").required().value(s(&v, "url")).help(remote_url_help(t)),
+                Field::text("url", "URL").required().value(s(&v, "url")).help(url_help),
                 Field::new("policy", "Download policy", FieldKind::Choice(policies)).value(if edit {
                     s(&v, "policy")
                 } else {
@@ -1905,22 +1933,28 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 Field::new("rate_limit", "Rate limit (req/s)", FieldKind::Number).value(s(&v, "rate_limit")),
                 Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
             ];
-            fields.extend(remote_extra_fields(t, caps.as_deref(), &v));
-            let form = Form::new(if edit { format!("Edit remote {name}") } else { format!("New {} remote", t.label()) }, fields);
+            fields.extend(remote_extra_fields(t, alt, caps.as_deref(), &v));
+            // Only the fields of the type's schema (pulp_file Git has no policy); `labels` is `pulp_labels`.
+            fields.retain(|f| f.key == "labels" || caps.as_deref().is_none_or(|c| c.has_field(schema, &f.key)));
+            // pulp_rpm requires the ULN account on create; it is write-only, so an edit keeps it when left empty.
+            if (t, alt, edit) == (RepoType::Rpm, true, false) {
+                fields.iter_mut().filter(|f| matches!(f.key.as_str(), "username" | "password")).for_each(|f| f.required = true);
+            }
+            let form = Form::new(if edit { format!("Edit remote {name}") } else { format!("New {label} remote") }, fields);
             app.form(form, move |app, f| {
-                let (mut b, files) = remote_body(f, edit)?;
+                let (mut b, files) = remote_body(f, edit, schemes)?;
                 let href = href.clone();
                 submit(app, format!("{} remote {}", if edit { "update" } else { "create" }, f.get("name")), move |c| async move {
                     for (k, path) in files {
                         b[k.as_str()] = tokio::fs::read_to_string(&path).await.with_context(|| format!("read {path}"))?.into();
                     }
-                    Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api(t.remotes()), &b).await? })
+                    Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api(path), &b).await? })
                 });
                 Ok(())
             });
         }
         Act::Delete => app.job(format!("impact of deleting remote {name}"), move |ctx| async move {
-            let (lines, acs) = remote_delete_impact(&ctx, t, &href, &name).await?;
+            let (lines, acs) = remote_delete_impact(&ctx, t, alt, &href, &name).await?;
             refuse_acs_users(&acs)?;
             ap(move |app| {
                 app.confirm_danger(format!("Delete remote {name}"), lines, &name.clone(), move |app| {
@@ -3350,7 +3384,7 @@ mod tests {
                 Field::text("ca_cert", "CA cert (PEM file path)"),
             ],
         );
-        let (b, files) = remote_body(&f, false).unwrap();
+        let (b, files) = remote_body(&f, false, WEB).unwrap();
         assert_eq!(b, json!({ "name": "r", "url": "https://h/repo/", "tls_validation": false }));
         assert!(files.is_empty());
     }
@@ -3358,7 +3392,7 @@ mod tests {
     /// A remote form of type `t` for `v` (`Null` = create) with the fields that depend on the server.
     fn remote_form(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Form {
         let mut fields = vec![Field::text("name", "Name").value("r"), Field::text("url", "URL").value("https://h/")];
-        fields.extend(remote_extra_fields(t, caps, v));
+        fields.extend(remote_extra_fields(t, false, caps, v));
         Form::new("t", fields)
     }
 
@@ -3390,7 +3424,7 @@ mod tests {
         let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
         let mut new = remote_form(RepoType::Deb, None, &Value::Null);
         set(&mut new, "distributions", "bookworm");
-        let (b, _) = remote_body(&new, false).unwrap();
+        let (b, _) = remote_body(&new, false, WEB).unwrap();
         for k in
             ["connect_timeout", "sock_connect_timeout", "sock_read_timeout", "max_retries", "headers", "excluded_package_metadata_fields"]
         {
@@ -3400,7 +3434,7 @@ mod tests {
         set(&mut new, "max_retries", "2");
         set(&mut new, "headers", "Authorization: Bearer t; X-Org: a:b;");
         set(&mut new, "excluded_package_metadata_fields", "Phased-Update-Percentage, X-Note,");
-        let (b, _) = remote_body(&new, false).unwrap();
+        let (b, _) = remote_body(&new, false, WEB).unwrap();
         assert_eq!(
             [&b["connect_timeout"], &b["max_retries"], &b["headers"], &b["excluded_package_metadata_fields"]],
             [
@@ -3415,19 +3449,19 @@ mod tests {
         let item = json!({ "name": "r", "url": "https://h/", "distributions": "bookworm", "connect_timeout": 10.0, "max_retries": 5,
             "headers": [{ "Authorization": "Bearer t" }], "excluded_package_metadata_fields": ["X-A"] });
         let mut f = remote_form(RepoType::Deb, None, &item);
-        assert_eq!(remote_body(&f, true).unwrap().0, json!({}), "untouched, and empty headers keep the server value");
+        assert_eq!(remote_body(&f, true, WEB).unwrap().0, json!({}), "untouched, and empty headers keep the server value");
         set(&mut f, "connect_timeout", "");
         set(&mut f, "max_retries", "");
         set(&mut f, "excluded_package_metadata_fields", "");
         set(&mut f, "headers", "-");
         // pulpcore: the headers list is not nullable; `[]` removes all.
         assert_eq!(
-            remote_body(&f, true).unwrap().0,
+            remote_body(&f, true, WEB).unwrap().0,
             json!({ "connect_timeout": null, "max_retries": null, "excluded_package_metadata_fields": [], "headers": [] })
         );
         for bad in ["Bearer secret-token", ": x", "Bad Name: x"] {
             set(&mut f, "headers", bad);
-            let e = remote_body(&f, true).unwrap_err();
+            let e = remote_body(&f, true, WEB).unwrap_err();
             assert_eq!(e, "Headers: header 1 must be Name: value (separate headers with ;)");
         }
     }
@@ -3438,13 +3472,13 @@ mod tests {
         // A slip like `ners.internal:8000/...` is a valid URL whose scheme is `ners.internal`; the sync fails later.
         for (slip, scheme) in [("foo:8000/x", "foo"), ("ners.internal:8000/file/PULP_MANIFEST", "ners.internal")] {
             assert_eq!(
-                remote_body(&form(slip), false).unwrap_err(),
+                remote_body(&form(slip), false, WEB).unwrap_err(),
                 format!("invalid URL: use http://, https://, file:// (not {scheme}:)")
             );
         }
         // Pulp downloads file:// from its ALLOWED_IMPORT_PATHS (the server checks the path).
         for ok in ["https://h/repo/", "http://h:8000/x", "file:///srv/import/x"] {
-            assert_eq!(remote_body(&form(ok), false).unwrap().0["url"], ok);
+            assert_eq!(remote_body(&form(ok), false, WEB).unwrap().0["url"], ok);
         }
     }
 
@@ -3463,20 +3497,20 @@ mod tests {
         // `proxy.corp:3128` is a valid URL with the scheme `proxy.corp`: Pulp stores it and the sync fails later.
         for (slip, scheme) in [("proxy.corp:3128", "proxy.corp"), ("socks5://p:1080", "socks5")] {
             assert_eq!(
-                remote_body(&form(slip), false).unwrap_err(),
+                remote_body(&form(slip), false, WEB).unwrap_err(),
                 format!("Proxy URL: invalid URL: use http://, https:// (not {scheme}:)")
             );
         }
-        assert_eq!(remote_body(&form("not a url"), false).unwrap_err(), "Proxy URL: invalid URL: relative URL without a base");
-        assert_eq!(remote_body(&form("http://proxy.corp:3128"), false).unwrap().0["proxy_url"], "http://proxy.corp:3128");
+        assert_eq!(remote_body(&form("not a url"), false, WEB).unwrap_err(), "Proxy URL: invalid URL: relative URL without a base");
+        assert_eq!(remote_body(&form("http://proxy.corp:3128"), false, WEB).unwrap().0["proxy_url"], "http://proxy.corp:3128");
         // On edit an unchanged value is not sent, so it is not checked; a cleared one is null.
         let mut f = Form::new(
             "t",
             vec![Field::text("url", "URL").value("https://h/"), Field::text("proxy_url", "Proxy URL").value("proxy.corp:3128")],
         );
-        assert_eq!(remote_body(&f, true).unwrap().0, json!({}));
+        assert_eq!(remote_body(&f, true, WEB).unwrap().0, json!({}));
         f.fields[1].value.clear();
-        assert_eq!(remote_body(&f, true).unwrap().0, json!({ "proxy_url": null }));
+        assert_eq!(remote_body(&f, true, WEB).unwrap().0, json!({ "proxy_url": null }));
     }
 
     #[tokio::test]
@@ -3491,7 +3525,7 @@ mod tests {
             "PolicyA1bEnum": { "enum": ["immediate", "on_demand", "streamed", "later"] }
         } } }));
         app.conn.as_mut().unwrap().caps = Arc::new(caps);
-        remote_action(&mut app, RepoType::File, Act::Create, Value::Null);
+        remote_action(&mut app, RepoType::File, false, Act::Create, Value::Null);
         let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
         let policy = form.fields.iter().find(|f| f.key == "policy").unwrap();
         assert_eq!(policy.kind, FieldKind::Choice(["immediate", "on_demand", "streamed", "later"].map(String::from).to_vec()));
@@ -3662,18 +3696,18 @@ mod tests {
         let keys = |f: &[Field]| f.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
         let all = ["distributions", "components", "architectures", "sync_sources", "sync_udebs", "sync_installer"];
         let all = [&all[..], &["ignore_missing_package_indices", "gpgkey", "excluded_package_metadata_fields"]].concat();
-        let fields = remote_extra_fields(RepoType::Deb, None, &Value::Null);
+        let fields = remote_extra_fields(RepoType::Deb, false, None, &Value::Null);
         assert_eq!(keys(&fields)[..all.len()], all, "then the fields of all remote types");
         assert!(fields[0].required && !fields[1].required);
-        assert_eq!(remote_url_help(RepoType::Deb), "Debian archive base URL (the directory that holds dists/)");
+        assert_eq!(remote_url(RepoType::Deb, false).0, "Debian archive base URL (the directory that holds dists/)");
 
         // A server without these fields (older pulp_deb) shows only what it has.
         let mut caps = Capabilities::default();
         caps.schemas.insert("deb.AptRemote".into(), ["distributions", "components"].map(String::from).into());
-        assert_eq!(keys(&remote_extra_fields(RepoType::Deb, Some(&caps), &Value::Null)), ["distributions", "components"]);
+        assert_eq!(keys(&remote_extra_fields(RepoType::Deb, false, Some(&caps), &Value::Null)), ["distributions", "components"]);
 
         let v = json!({ "distributions": "bookworm", "components": "main", "sync_sources": true, "gpgkey": "-----BEGIN PGP" });
-        let f = remote_extra_fields(RepoType::Deb, None, &v);
+        let f = remote_extra_fields(RepoType::Deb, false, None, &v);
         let value = |k: &str| f.iter().find(|x| x.key == k).unwrap().value.clone();
         assert_eq!(
             (value("distributions"), value("components"), value("architectures")),
@@ -3698,7 +3732,7 @@ mod tests {
         let (mut app, mut rx) = connected(&server).await;
         let item = json!({ "pulp_href": href, "name": "d", "url": "http://u/", "policy": "immediate", "distributions": "bookworm",
             "tls_validation": true, "pulp_labels": {} });
-        remote_action(&mut app, RepoType::Deb, Act::Edit, item);
+        remote_action(&mut app, RepoType::Deb, false, Act::Edit, item);
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
         for (k, v) in set {
             form.fields.iter_mut().find(|f| f.key == *k).unwrap().value = v.to_string();
@@ -5517,6 +5551,133 @@ mod tests {
         }
     }
 
+    /// The ULN form has the fields of `rpm.UlnRemote`; username and password are required on create, never shown, and
+    /// on edit sent only when typed. The URL must be `uln://`.
+    #[tokio::test]
+    async fn uln_remote_create_and_edit_follow_the_uln_schema() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{body_json, method, path};
+        let server = wiremock::MockServer::start().await;
+        let (coll, href) = (format!("{API}remotes/rpm/uln/"), format!("{API}remotes/rpm/uln/1/"));
+        let url = "uln://ol8_x86_64_baseos_latest";
+        let created = json!({ "name": "ol8", "url": url, "policy": "on_demand", "username": "u", "password": "p4ss" });
+        let base = json!({ "uln_server_base_url": "https://linux-update.oracle.com/" });
+        for (m, p, body, status) in [("POST", &coll, created, 201), ("PATCH", &href, base, 200)] {
+            wiremock::Mock::given(method(m))
+                .and(path(p.as_str()))
+                .and(body_json(body))
+                .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(json!({ "pulp_href": href })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        let mut caps = plugins();
+        let props: serde_json::Map<String, Value> = ["name", "url", "policy", "username", "password", "uln_server_base_url", "pulp_labels"]
+            .map(|k| (k.to_string(), json!({})))
+            .into_iter()
+            .collect();
+        caps.load_openapi(&json!({ "components": { "schemas": { "rpm.UlnRemote": { "properties": props } } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        app.list.kind = Kind::Remotes(RepoType::Rpm, true);
+        let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+
+        run(&mut app, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.title, "New RPM ULN remote");
+        assert_eq!(keys(&form), ["name", "url", "policy", "username", "password", "labels", "uln_server_base_url"]);
+        let required: Vec<&str> = form.fields.iter().filter(|f| f.required).map(|f| f.key.as_str()).collect();
+        assert_eq!(required, ["name", "url", "username", "password"]);
+        assert_eq!(form.fields.iter().find(|f| f.key == "password").unwrap().kind, FieldKind::Secret);
+        for (k, v) in [("name", "ol8"), ("url", "https://linux-update.oracle.com/"), ("policy", "on_demand"), ("username", "u")] {
+            set(&mut form, k, v);
+        }
+        set(&mut form, "password", "p4ss");
+        assert_eq!(submit(&mut app, &form), Err("invalid URL: use uln:// (not https:)".into()));
+        set(&mut form, "url", url);
+        assert_eq!(form.fields.iter().find(|f| f.key == "password").unwrap().display(), "••••", "never shown");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.notices.iter().any(|n| n.text == "create remote ol8: done"), "{:?}", app.notices.back().map(|n| &n.text));
+
+        // GET never returns the credentials: the edit form starts them empty and sends only what changed.
+        run(
+            &mut app,
+            Act::Edit,
+            json!({ "pulp_href": href, "name": "ol8", "url": url, "policy": "on_demand", "uln_server_base_url": null }),
+        );
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.title, "Edit remote ol8");
+        assert!(
+            form.fields.iter().filter(|f| ["username", "password"].contains(&f.key.as_str())).all(|f| !f.required && f.value.is_empty())
+        );
+        set(&mut form, "uln_server_base_url", "https://linux-update.oracle.com/");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.notices.iter().any(|n| n.text == "update remote ol8: done"), "{:?}", app.notices.back().map(|n| &n.text));
+        assert!(!app.notices.iter().any(|n| n.text.contains("p4ss")), "the password is not shown");
+    }
+
+    /// The Remote of the sync and repository forms lists the ULN remotes too (note `ULN`); a picked one is found in its
+    /// collection (Pulp remote names are unique across types) and sent by href. A delete reads the same impact.
+    #[tokio::test]
+    async fn a_uln_remote_is_picked_for_a_sync_and_a_repository_and_deleted_after_its_impact() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        for m in ["POST", "DELETE"] {
+            wiremock::Mock::given(wiremock::matchers::method(m))
+                .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
+                .mount(&server)
+                .await;
+        }
+        let uln = format!("{API}remotes/rpm/uln/1/");
+        get(&server, &format!("{API}remotes/rpm/rpm/"), page(json!([]))).await;
+        get(&server, &format!("{API}remotes/rpm/uln/"), page(json!([{ "pulp_href": uln, "name": "ol8" }]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.conn.as_mut().unwrap().caps = Arc::new(plugins());
+        let items = super::super::pick::load_options(&app.ctx().unwrap(), &Source::SyncRemotes(RepoType::Rpm), "").await.unwrap();
+        assert_eq!(
+            items.iter().map(|i| (i.label.as_str(), i.value.as_str(), i.note.as_str())).collect::<Vec<_>>(),
+            [("ol8", "ol8", "ULN")]
+        );
+
+        let repo = format!("{API}repositories/rpm/rpm/r/");
+        repo_action(&mut app, RepoType::Rpm, Act::Sync, json!({ "pulp_href": repo, "name": "os", "remote": null }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.fields[0].kind, FieldKind::Pick { source: Source::SyncRemotes(RepoType::Rpm), multi: false });
+        form.fields[0].value = "ol8".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let sent = posts_to(&server, &format!("{repo}sync/")).await;
+        assert_eq!(sent.last().map(|b| &b["remote"]), Some(&json!(uln)), "{:?}", app.notices.back().map(|n| &n.text));
+
+        repo_action(&mut app, RepoType::Rpm, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        for (k, v) in [("name", "ol8-os"), ("remote", "ol8")] {
+            form.fields.iter_mut().find(|f| f.key == k).unwrap().value = v.into();
+        }
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let sent = posts_to(&server, &format!("{API}repositories/rpm/rpm/")).await;
+        assert_eq!(sent.last().map(|b| &b["remote"]), Some(&json!(uln)), "{:?}", app.notices.back().map(|n| &n.text));
+
+        // A server without ULN remotes is not asked for them.
+        let mut caps = plugins();
+        caps.paths.insert("remotes/rpm/rpm/".into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let items = super::super::pick::load_options(&app.ctx().unwrap(), &Source::SyncRemotes(RepoType::Rpm), "").await.unwrap();
+        assert!(items.is_empty(), "{items:?}");
+
+        get(&server, &format!("{API}repositories/rpm/rpm/"), page(json!([{ "name": "ol8-os" }]))).await;
+        app.conn.as_mut().unwrap().caps = Arc::new(plugins());
+        app.list.kind = Kind::Remotes(RepoType::Rpm, true);
+        run(&mut app, Act::Delete, json!({ "pulp_href": uln, "name": "ol8" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { typed, lines, .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed.as_deref(), Some("ol8"));
+        assert!(lines.contains(&"1 repository(ies) use it as default remote: ol8-os".to_string()), "{lines:?}");
+    }
+
     #[tokio::test]
     async fn sync_sends_optimize_and_skip_types_only_when_the_operator_sets_them() {
         use crate::tui::app::Modal;
@@ -6044,7 +6205,7 @@ mod tests {
             json!({ "pulp_href": href, "name": "r", "url": "u", "headers": [{ "Authorization": "Bearer abc" }], "sles_auth_token": "tok" });
         get(&server, &href, remote.clone()).await;
         let (mut app, mut rx) = connected(&server).await;
-        inspect(&mut app, &Kind::Remotes(RepoType::Rpm), remote.clone());
+        inspect(&mut app, &Kind::Remotes(RepoType::Rpm, false), remote.clone());
         settle(&mut app, &mut rx).await;
         let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no text") };
         assert!(!lines.iter().any(|l| l.contains("abc") || l.contains("\"tok\"")) && lines.iter().any(|l| l.contains("•••")), "{lines:?}");
@@ -6052,7 +6213,7 @@ mod tests {
         app.modal = None;
         inspect(
             &mut app,
-            &Kind::Remotes(RepoType::Rpm),
+            &Kind::Remotes(RepoType::Rpm, false),
             json!({ "name": "r", "headers": [{ "Authorization": "Bearer abc" }], "sles_auth_token": "tok" }),
         );
         let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no text") };
@@ -6077,6 +6238,7 @@ mod tests {
         remote_action(
             &mut app,
             RepoType::Rpm,
+            false,
             Act::Edit,
             json!({ "pulp_href": href, "name": "r", "url": "https://h/", "policy": "immediate" }),
         );
@@ -6743,7 +6905,7 @@ mod tests {
         let acs = format!("{API}acs/rpm/rpm/");
         get(&server, &acs, page(json!([{ "name": "a1", "remote": cdn }, { "name": "a2", "remote": cdn }]))).await;
         let (mut app, mut rx) = connected(&server).await;
-        app.list.kind = Kind::Remotes(RepoType::Rpm);
+        app.list.kind = Kind::Remotes(RepoType::Rpm, false);
         let refused = "refused: Pulp does not delete a remote that an alternate content source uses: a1 (RPM) uses cdn, \
                        a2 (RPM) uses cdn; delete those ACS or change their remote first";
         let texts = |app: &App| app.notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>();
