@@ -111,8 +111,19 @@ fn user_action(app: &mut App, act: Act, item: Value) {
                 if f.get("p1") != f.get("p2") {
                     return Err("passwords differ".into());
                 }
-                let (href, b) = (href.clone(), json!({ "password": f.get("p1") }));
-                submit(app, format!("set password of {username}"), move |c| async move { Ok(c.patch(&href, &b).await?) });
+                let (href, b, label) = (href.clone(), json!({ "password": f.get("p1") }), format!("set password of {username}"));
+                let go = move |app: &mut App| submit(app, label, move |c| async move { Ok(c.patch(&href, &b).await?) });
+                if !is_me {
+                    go(app);
+                    return Ok(());
+                }
+                let lines = vec![
+                    format!("{username} is the user of this session."),
+                    "If this session signs in with this password (Basic auth), its credentials stop working after the change:".into(),
+                    "every request, also each task poll, gets 401 (authentication failed).".into(),
+                    "Then update the profile's secret (its env, file or keyring entry) and Connect again.".into(),
+                ];
+                app.confirm_danger(format!("Change YOUR OWN password ({username})"), lines, &username.clone(), go);
                 Ok(())
             });
         }
@@ -1584,6 +1595,31 @@ mod tests {
             lines,
             ["Delete role custom.viewer. All assignments of this role are removed.", "1 user(s) have it: ann", "1 group(s) have it: ops"]
         );
+    }
+
+    #[tokio::test]
+    async fn own_password_change_warns_and_needs_the_typed_user_name() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let mut caps = (*app.conn.as_ref().unwrap().caps).clone();
+        caps.user = Some(crate::pulp::caps::CurrentUser { href: "/u/1/".into(), username: "bob".into(), is_staff: None });
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let set_password = |app: &mut App, user: &str| {
+            super::user_action(app, Act::Password, json!({ "pulp_href": format!("/pulp/api/v3/users/{user}/"), "username": user }));
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            set(&mut form, "p1", "n3w");
+            set(&mut form, "p2", "n3w");
+            submit(app, &form).unwrap();
+        };
+        set_password(&mut app, "bob");
+        assert!(app.jobs.is_empty(), "nothing sent before the confirm");
+        let Some(Modal::Confirm { lines, typed, .. }) = app.modal.take() else { panic!("no warning") };
+        assert_eq!(typed.as_deref(), Some("bob"));
+        assert!(lines.iter().any(|l| l.contains("401")) && lines.iter().any(|l| l.contains("profile's secret")), "{lines:?}");
+        set_password(&mut app, "ann");
+        assert!(app.modal.is_none(), "another user's password is sent at once");
+        assert_eq!(app.jobs.len(), 1);
     }
 
     #[test]

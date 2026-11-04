@@ -24,8 +24,12 @@ pub struct Tracked {
 /// State of a task the server does not have (purged, or a reference of another server); final.
 pub const GONE: &str = "gone";
 
+/// State of a task whose poll got 401: final in this session only. The stored reference stays unfinished,
+/// so a Connect with good credentials re-attaches the task.
+pub const UNAUTHORIZED: &str = "unauthorized";
+
 pub fn is_final_state(state: &str) -> bool {
-    crate::pulp::models::TASK_FINAL_STATES.contains(&state) || state == GONE
+    crate::pulp::models::TASK_FINAL_STATES.contains(&state) || state == GONE || state == UNAUTHORIZED
 }
 
 impl Tracked {
@@ -125,12 +129,12 @@ impl TaskCenter {
         }
     }
 
-    /// The server answered 404 for this task: mark it final so it is no longer polled.
-    pub fn gone(&mut self, href: &str) {
+    /// The server cannot answer for this task (`GONE`, `UNAUTHORIZED`): mark it final with `why`, so it is no longer polled.
+    pub fn stop(&mut self, href: &str, state: &str, why: &str) {
         if let Some(t) = self.items.iter_mut().find(|t| t.href == href) {
             t.in_flight = false;
-            t.state = GONE.into();
-            t.error = Some("not found on the server (purged?)".into());
+            t.state = state.into();
+            t.error = Some(why.into());
         }
     }
 
@@ -199,7 +203,7 @@ mod tests {
         assert_eq!(tc.dismiss_finished(), 1);
         tc.poll_failed("/t/2/", "network".into());
         assert_eq!(tc.items.iter().find(|t| t.href == "/t/2/").unwrap().error.as_deref(), Some("network"));
-        tc.gone("/t/2/");
+        tc.stop("/t/2/", GONE, "not found");
         assert_eq!(tc.active(), 3, "a task the server does not have is final");
         assert_eq!(tc.dismiss_finished(), 1);
         assert!(tc.update(task("/t/new/", "canceled"), true), "a workflow reports it final at once: it just ended");

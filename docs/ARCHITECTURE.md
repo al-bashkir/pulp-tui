@@ -74,8 +74,10 @@ Pulp tasks are the source of truth.
   task group: it is done only when every task completed.
 * After a restart or a Connect, every unfinished reference is polled again (re-attached);
   the 50 newest finished ones show, not polled. Dismiss deletes the finished references
-  from the file. A task that answers 404 (purged) gets the final state `gone`. An answer
-  for a task that is not tracked (previous server) is dropped.
+  from the file. A task that answers 404 (purged) gets the final state `gone`. A poll that
+  gets 401 gives the row the state `unauthorized` (final in memory only: the stored
+  reference stays unfinished, so the next Connect re-attaches it) and one error notice. An
+  answer for a task that is not tracked (previous server) is dropped.
 
 Task groups (native replication, import, ACS refresh) are one Task Center row each. The
 href goes into the task references; `ops::get_task` reads a group as one task

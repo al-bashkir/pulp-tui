@@ -559,6 +559,7 @@ impl App {
                 _ if !self.tasks.items.iter().any(|t| t.href == href) => {}
                 Ok(t) => self.task_update(t, false, None),
                 Err(e) if e.is_not_found() => self.task_gone(&href),
+                Err(e) if e.status() == Some(401) => self.task_unauthorized(&href),
                 Err(e) => self.tasks.poll_failed(&href, e.to_string()),
             },
         }
@@ -646,12 +647,26 @@ impl App {
 
     /// The server has no such task: final, and stored as such so the next start does not re-attach it.
     fn task_gone(&mut self, href: &str) {
-        self.tasks.gone(href);
+        self.tasks.stop(href, super::tasks::GONE, "not found on the server (purged?)");
         let label = self.tasks.items.iter().find(|x| x.href == href).map(|x| x.label.clone()).unwrap_or_default();
         self.notify(Level::Warn, format!("task not found on the server (purged?): {label}"));
         if let Some(p) = self.profile.clone() {
             let (st, href) = (self.store.clone(), href.to_string());
             self.persist_task("persist task state", async move { st.finish_task(&p, &href, super::tasks::GONE).await });
+        }
+    }
+
+    /// A poll got 401: the credentials of this session no longer work (an own password change, for example).
+    /// Polling stops with one notice; the stored reference stays unfinished, so a Connect re-attaches the task.
+    fn task_unauthorized(&mut self, href: &str) {
+        use super::tasks::UNAUTHORIZED;
+        let first = !self.tasks.items.iter().any(|t| t.state == UNAUTHORIZED);
+        self.tasks.stop(href, UNAUTHORIZED, "401: the credentials of this session no longer work; Connect again to re-attach");
+        if first {
+            self.error(
+                "task polls get 401: the credentials of this session no longer work. Polling stopped; update the \
+                 profile's secret, then Connect again to re-attach the tasks.",
+            );
         }
     }
 
@@ -2219,6 +2234,35 @@ mod tests {
         let refs = app.store.tasks("lab", 10).await.unwrap();
         assert_eq!(refs.iter().map(|r| (r.href.as_str(), r.state.as_str())).collect::<Vec<_>>(), [("/t/1/", "completed")]);
         assert!(app.notices.is_empty(), "not re-attached as unfinished: {:?}", texts(&app));
+    }
+
+    /// After a change of the own password every poll gets 401: polling stops with one notice, and the stored
+    /// references stay unfinished, so a Connect with good credentials re-attaches them.
+    #[tokio::test]
+    async fn a_401_on_task_polls_stops_them_with_one_notice_and_a_connect_re_attaches_them() {
+        let mut app = app_on(Kind::Tasks).await;
+        let mut rx = app.rx.take().unwrap();
+        app.track_task("/t/1/", "sync", None);
+        app.track_task("/t/2/", "publish", None);
+        settle(&mut app, &mut rx).await;
+        for href in app.tasks.due() {
+            let denied = crate::pulp::PulpError::Api { status: 401, message: "Invalid username/password.".into() };
+            app.handle_msg(Msg::TaskPolled { href, result: Err(denied) });
+            assert_eq!(app.notices.len(), 1, "the first 401 tells it, the next ones do not: {:?}", texts(&app));
+        }
+        let rows: Vec<_> = app.tasks.items.iter().map(|t| (t.href.as_str(), t.state.as_str())).collect();
+        assert_eq!(rows, [("/t/2/", "unauthorized"), ("/t/1/", "unauthorized")], "a final state, visible");
+        assert!(app.tasks.items.iter().all(|t| t.error.as_deref().is_some_and(|e| e.contains("Connect again"))));
+        assert!(app.tasks.items.iter().all(|t| !t.in_flight), "a stopped poll frees its slot");
+        assert_eq!(app.tasks.active(), 0);
+        assert!(app.tasks.due().is_empty(), "no more polls");
+        assert_eq!(app.notices.len(), 1, "one notice: {:?}", texts(&app));
+        assert_eq!(app.notices[0].level, Level::Error);
+        assert!(texts(&app)[0].contains("401") && texts(&app)[0].contains("Connect again"), "{:?}", texts(&app));
+        settle(&mut app, &mut rx).await;
+        restart(&mut app, &mut rx).await;
+        assert_eq!(texts(&app), ["re-attached to 2 unfinished task(s) from a previous session"]);
+        assert_eq!(app.tasks.due().len(), 2, "polled again");
     }
 
     #[tokio::test]

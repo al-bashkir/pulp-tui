@@ -601,7 +601,9 @@ Disconnected import of a Pulp export. Copy the export files to a directory in th
 ### Users, Groups, Roles
 
 * **Users**: **R** roles, **c** / **e** / **d**, **w** set password (local Pulp users only),
-  **A** enable/disable. Delete refuses your own user and warns for staff.
+  **A** enable/disable. Delete refuses your own user and warns for staff. A new password for your
+  own user asks you to type the user name: with Basic auth, the session then gets 401 until you
+  update the profile's secret and Connect again.
 * **Groups**: **o** members (**c** add a user, **d** remove), **R** roles, **c** create, **e**
   rename (members and roles stay), **d** delete.
 * Delete reads the impact first, then you type the name: for a user, its groups and its role
@@ -629,6 +631,10 @@ server tasks → task groups → workers.
 * At start and at Connect, the Task Center attaches every unfinished task again, and shows the 50
   newest finished ones.
 * A canceled or skipped task gives a warning; a failed task gives an error.
+* A task that the server does not have (404) shows `gone`. When polls get 401 (the credentials of
+  the session no longer work, for example after you changed your own password), the tasks show
+  `unauthorized`, polling stops, and one error tells you. Fix the profile's secret and Connect
+  again: the tasks are attached again.
 
 Server tasks:
 
