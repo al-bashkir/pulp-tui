@@ -2458,8 +2458,9 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
             ops::find_by_name(c, &c.api(t.distributions()), &dist).await?.ok_or_else(|| anyhow!("no {} distribution {dist}", t.label()))?;
         cv_distribution_refusal(&d, "promote or roll back the view")?;
         // The new publication keeps the mode of the served one: clients keep their paths and signatures.
-        let (current, mode) = match served_now(c, &ctx.caps, t, &d).await? {
-            Some((v, p, how)) => (format!("{} ({how})", short(&v)), pinned_mode(t, Some(&p), &version, None)),
+        let served = served_now(c, &ctx.caps, t, &d).await?;
+        let (current, mode) = match &served {
+            Some((v, p, how)) => (format!("{} ({how})", short(v)), pinned_mode(t, Some(p), &version, None)),
             None => ("nothing".into(), pinned_mode(t, None, &version, None)),
         };
         ops::refuse_checkpoint(&dist, d["checkpoint"] == true).map_err(|e| anyhow!("{e}; it now serves {current}"))?;
@@ -2469,7 +2470,7 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
             None if signs => "new, signed with the repository's metadata signing service".into(),
             None => "new".into(),
         };
-        let lines = vec![
+        let mut lines = vec![
             format!("Distribution {dist} ({})", s(&d, "base_url")),
             format!("  now serves:  {current}"),
             format!("  will serve:  {} (pinned)", short(&version)),
@@ -2479,6 +2480,12 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
             "Repository metadata switches immediately. Pulp may keep serving files of the previous".into(),
             "publication for DISTRIBUTED_PUBLICATION_RETENTION_PERIOD (default 3 days).".into(),
         ];
+        if let Some((v, ..)) = served.filter(|(v, ..)| !v.is_empty() && repo_of_version(v) != repo_of_version(&version)) {
+            let name = async |h: &str| c.get::<Value>(&repo_of_version(h), &[("fields", "name".into())]).await.map(|r| s(&r, "name"));
+            let (new, now) = (name(&version).await?, name(&v).await?);
+            let n = version_number(&version);
+            lines.insert(3, format!("  WARNING: version {n} of repository {new}, but the distribution serves repository {now} now"));
+        }
         let typed = dist.clone();
         ap(move |app| {
             app.confirm_prod(format!("Roll back {dist}"), lines, &typed, move |app| {
@@ -2880,8 +2887,16 @@ fn repoint_form(app: &mut App, t: RepoType, name: String) {
     app.form(form, move |app, f| {
         let (repo, n, dist) = (f.get("repo").to_string(), f.number("number").unwrap_or(0), name.clone());
         app.job("resolve version", move |ctx| async move {
-            let h = href_by_name(&ctx.client, t.repositories(), &repo).await?;
-            ap(move |app| rollback_preview(app, t, dist, version_of(&h, n)))
+            let c = &ctx.client;
+            let r: Value = ops::find_by_name(c, &c.api(t.repositories()), &repo).await?.ok_or_else(|| anyhow!("no repository {repo}"))?;
+            let v = version_of(&s(&r, "pulp_href"), n);
+            match c.get::<Value>(&v, &[("fields", "number".into())]).await {
+                Err(e) if e.is_not_found() => {
+                    bail!("repository {repo} has no version {n} (latest: {})", version_number(&s(&r, "latest_version_href")))
+                }
+                x => x?,
+            };
+            ap(move |app| rollback_preview(app, t, dist, v))
         });
         Ok(())
     });
@@ -6557,6 +6572,7 @@ mod tests {
         get(&server, &dists, page(json!([cp]))).await;
         get(&server, &format!("{API}distributions/"), page(json!([]))).await;
         get(&server, &r, json!({ "manifest": "PULP_MANIFEST" })).await;
+        get(&server, &format!("{r}versions/1/"), json!({ "number": 1 })).await;
         let p = |n: u32| {
             json!({ "pulp_href": format!("{pubs}{n}/"), "repository_version": format!("{r}versions/{n}/"),
                     "pulp_created": format!("2026-01-0{n}T00:00:00Z"), "manifest": "PULP_MANIFEST", "checkpoint": true })
@@ -6979,6 +6995,45 @@ mod tests {
         );
     }
 
+    /// Re-point (b on Distributions) reads the typed version first: a number that the repository does not have is
+    /// refused with its latest number; the preview warns about a version of another repository than the served one.
+    #[tokio::test]
+    async fn re_point_refuses_a_missing_version_and_warns_about_another_repository() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repos = format!("{API}repositories/rpm/rpm/");
+        let (a, b) = (format!("{repos}a/"), format!("{repos}b/"));
+        let (dists, pubs) = (format!("{API}distributions/rpm/rpm/"), format!("{API}publications/rpm/rpm/"));
+        let served = format!("{pubs}1/");
+        let d = json!({ "pulp_href": format!("{dists}1/"), "name": "docs", "base_path": "docs", "base_url": "http://h/docs/",
+                        "publication": served, "pulp_labels": {} });
+        get(&server, &dists, page(json!([d]))).await;
+        get(&server, &served, json!({ "pulp_href": served, "repository_version": format!("{a}versions/2/") })).await;
+        get(&server, &repos, page(json!([{ "pulp_href": b, "name": "b", "latest_version_href": format!("{b}versions/3/") }]))).await;
+        get(&server, &format!("{b}versions/1/"), json!({ "pulp_href": format!("{b}versions/1/"), "number": 1 })).await;
+        get(&server, &a, json!({ "name": "a" })).await;
+        get(&server, &b, json!({ "name": "b", "metadata_signing_service": null })).await;
+        get(&server, &pubs, page(json!([]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let re_point = |app: &mut App, n: &str| {
+            distribution_action(app, RepoType::Rpm, Act::Rollback, d.clone());
+            fill_and_submit(app, &[("repo", "b"), ("number", n)]);
+        };
+
+        re_point(&mut app, "7");
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no preview");
+        assert_eq!(app.notices.back().unwrap().text, "resolve version: repository b has no version 7 (latest: 3)");
+
+        re_point(&mut app, "1");
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no preview: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert_eq!(
+            lines[2..4],
+            ["  will serve:  b@v1 (pinned)", "  WARNING: version 1 of repository b, but the distribution serves repository a now"]
+        );
+    }
+
     #[tokio::test]
     async fn distribution_copy_re_point_create_edit_and_delete() {
         use crate::tui::app::Modal;
@@ -6999,6 +7054,7 @@ mod tests {
         get(&server, &dists, page(json!([item]))).await;
         get(&server, &pubs, page(json!([]))).await;
         get(&server, &r, json!({ "metadata_signing_service": null })).await;
+        get(&server, &format!("{r}versions/2/"), json!({ "number": 2 })).await;
         answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}2/") })).await;
         answer(&server, "PATCH", &d, 200, json!({ "pulp_href": d })).await;
         answer(&server, "DELETE", &d, 204, json!({})).await;

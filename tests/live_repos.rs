@@ -546,6 +546,35 @@ async fn rpm_prune_dry_run_then_prune_through_the_tui() {
     cleanup(&c, &[&repo, &remote]).await;
 }
 
+/// Re-point (b on Distributions) through the TUI: a version number that the repository does not have is refused
+/// with its latest number; a version of another repository than the served one gets a WARNING line in the preview.
+#[tokio::test]
+async fn re_point_checks_the_version_and_warns_about_another_repository() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::Rpm, unique("it-repoint"));
+    let (a, b) = (format!("{name}-a"), format!("{name}-b"));
+    let ra = create(&c, t.repositories(), json!({ "name": a }), "/repositories/").await;
+    let rb = create(&c, t.repositories(), json!({ "name": b }), "/repositories/").await;
+    let p = ops::ensure_publication(&c, t, &format!("{ra}versions/0/"), &json!({}), &no_progress).await.unwrap();
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
+    let item: Value = c.get(&dist, &[]).await.unwrap();
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Distributions(t);
+    run(&mut app, Act::Rollback, item.clone());
+    fill(&mut app, &[("repo", b.as_str()), ("number", "5")]);
+    settle(&mut app, &mut rx).await;
+    assert!(app.modal.is_none(), "no preview");
+    assert_eq!(texts(&app).last().unwrap(), &format!("resolve version: repository {b} has no version 5 (latest: 0)"));
+    run(&mut app, Act::Rollback, item);
+    fill(&mut app, &[("repo", b.as_str()), ("number", "0")]);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no preview: {:?}", texts(&app)) };
+    assert_eq!(lines[3], format!("  WARNING: version 0 of repository {b}, but the distribution serves repository {a} now"));
+    cleanup(&c, &[&dist, &p, &ra, &rb]).await;
+}
+
 /// Distribute from Repository Versions (all repositories), whose rows have only hrefs: the form offers the
 /// repository name and a base path made safe from it, not a fragment of the repository id.
 #[tokio::test]

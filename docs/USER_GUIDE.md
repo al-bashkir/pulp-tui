@@ -348,6 +348,8 @@ removed counts.
   preview says if it reuses a publication of the version or makes a new one. On RPM, a repository
   with a metadata signing service always gets a new publication, signed with that service: an
   older one can be unsigned. A checkpoint distribution is refused before any change (see
+  Distributions). When the version is of another repository than the one the distribution
+  serves now, the preview has a `WARNING:` line with both repository names (also for **b** on
   Distributions).
 * **m** compares with the marked version: mark one with `Space`, then press `m` on the other. It
   lists the added and removed units (older → newer) of each content type, for example
@@ -434,7 +436,8 @@ LATEST** (a repository) or **CHECKPOINTS** (a checkpoint distribution of a repos
   `<base path>/<timestamp>/` (for example `20260102T030405Z`); Verify reads it there. Deb: it
   fetches `Release`, a `Packages` index and the smallest `.deb`, and compares the digest. A
   difference reads `MISMATCH: served content differs: …`.
-* **b** re-points to a version, with a preview. On Deb, it keeps the signing service of the
+* **b** re-points to a version, with a preview. It first reads that version: a number that the
+  repository does not have is refused, and the message gives the latest number. On Deb, it keeps the signing service of the
   publication that it serves now, or a verbatim publication stays verbatim. On RPM, it makes a new signed publication when the repository
   has a metadata signing service. Pulp cannot pin a checkpoint distribution, so the preview
   refuses it before any change and says what it serves now. To pin it, edit the distribution,
