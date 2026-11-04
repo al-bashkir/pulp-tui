@@ -375,3 +375,30 @@ async fn checkpoint_distribution_verifies_and_refuses_rollback() {
 
     cleanup(&c, &[&dist, &repo]).await;
 }
+
+/// pulpcore `AlternateContentSource.remote` is PROTECT: the Remotes delete refuses a remote that an ACS uses
+/// before any request, and the remote stays.
+#[tokio::test]
+async fn remote_delete_refused_while_an_acs_uses_it() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = unique("admin-acs-remote");
+    let body = json!({ "name": name, "url": format!("{}/{name}/", upstream()), "policy": "on_demand" });
+    let remote = create(&c, RepoType::File.remotes(), body, "/remotes/").await;
+    let acs = create(&c, RepoType::File.acs(), json!({ "name": name, "remote": remote }), "/acs/").await;
+
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Remotes(RepoType::File);
+    run(&mut app, Act::Delete, json!({ "pulp_href": remote, "name": name }));
+    settle(&mut app, &mut rx).await;
+    assert!(app.modal.is_none(), "no confirm: {:?}", texts(&app));
+    let refused = format!(
+        "impact of deleting remote {name}: refused: Pulp does not delete a remote that an alternate content source uses: \
+         {name} (File) uses {name}; delete those ACS or change their remote first"
+    );
+    assert!(texts(&app).contains(&refused), "{:?}", texts(&app));
+    c.get::<Value>(&remote, &[]).await.expect("the remote is still there");
+    cleanup(&c, &[&acs, &remote]).await;
+}

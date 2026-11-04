@@ -1074,16 +1074,40 @@ async fn repo_delete_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str) -> a
     Ok(lines)
 }
 
-async fn remote_delete_impact(c: &PulpClient, t: RepoType, href: &str, name: &str) -> anyhow::Result<Vec<String>> {
+/// The impact lines, and the ACS that use the remote ("a1 (RPM) uses cdn"). pulpcore `AlternateContentSource.remote`
+/// is PROTECT and an ACS takes only remotes of its own type (`REMOTE_TYPES`).
+async fn remote_delete_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let c = &ctx.client;
     let users: Page<Value> = c.list(&c.api(t.repositories()), &[("remote", href.to_string()), ("limit", "100".into())]).await?;
-    Ok(vec![
+    let mut lines = vec![
         format!("Delete remote {name}. Repository content and versions are not affected."),
         format!(
             "{} repository(ies) use it as default remote: {}",
             users.count,
             users.results.iter().map(|r| s(r, "name")).collect::<Vec<_>>().join(", ")
         ),
-    ])
+    ];
+    let mut acs = vec![];
+    if ctx.caps.has_endpoint(t.acs()) {
+        // The ACS list has no `remote` filter.
+        let all: Vec<Value> = c.list_all(&c.api(t.acs()), &[("fields", "name,remote".into())], 100_000).await?;
+        acs = all.iter().filter(|a| a["remote"] == href).map(|a| format!("{} ({}) uses {name}", s(a, "name"), t.label())).collect();
+        if acs.is_empty() {
+            lines.push("No alternate content source uses it.".into());
+        }
+    }
+    Ok((lines, acs))
+}
+
+/// Pulp fails the delete task of a remote that an ACS uses (ProtectedError): refuse before any request.
+fn refuse_acs_users(acs: &[String]) -> anyhow::Result<()> {
+    if acs.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "refused: Pulp does not delete a remote that an alternate content source uses: {}; delete those ACS or change their remote first",
+        acs.join(", ")
+    )
 }
 
 fn distribution_delete_lines(item: &Value) -> Vec<String> {
@@ -1103,14 +1127,18 @@ fn delete_marked(app: &mut App, kind: Kind) {
     app.job(format!("impact of deleting {n} {what}"), move |ctx| async move {
         let c = &ctx.client;
         let mut lines = vec![format!("Deletes {n} {what}:"), String::new()];
-        let (mut targets, mut owned) = (vec![], vec![]);
+        let (mut targets, mut owned, mut acs) = (vec![], vec![], vec![]);
         for href in hrefs {
             // Marks can be on other pages: fetch each object.
             let item: Value = c.get(&href, &[]).await?;
             let name = s(&item, "name");
             lines.extend(match kind {
                 Kind::Repos(..) => repo_delete_impact(&ctx, t, &href, &name).await?,
-                Kind::Remotes(_) => remote_delete_impact(c, t, &href, &name).await?,
+                Kind::Remotes(_) => {
+                    let (l, users) = remote_delete_impact(&ctx, t, &href, &name).await?;
+                    acs.extend(users);
+                    l
+                }
                 _ => {
                     owned.extend(cv_owner(&item).map(|cv| format!("{name} (view {cv})")));
                     distribution_delete_lines(&item)
@@ -1125,6 +1153,7 @@ fn delete_marked(app: &mut App, kind: Kind) {
                 owned.join(", ")
             );
         }
+        refuse_acs_users(&acs)?;
         ap(move |app| {
             let typed = format!("delete {n} {what}");
             app.confirm_danger(format!("Delete {n} {what}"), lines, &typed.clone(), move |app| {
@@ -1833,7 +1862,8 @@ fn remote_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             });
         }
         Act::Delete => app.job(format!("impact of deleting remote {name}"), move |ctx| async move {
-            let lines = remote_delete_impact(&ctx.client, t, &href, &name).await?;
+            let (lines, acs) = remote_delete_impact(&ctx, t, &href, &name).await?;
+            refuse_acs_users(&acs)?;
             ap(move |app| {
                 app.confirm_danger(format!("Delete remote {name}"), lines, &name.clone(), move |app| {
                     submit(app, format!("delete remote {name}"), move |c| async move { Ok(c.delete(&href).await?) })
@@ -6485,5 +6515,54 @@ mod tests {
         settle(&mut app, &mut rx).await;
         let sent = server.received_requests().await.unwrap();
         assert_eq!(sent.iter().filter(|r| r.method.as_str() == "DELETE" && r.url.path() == acs).count(), 1);
+    }
+
+    /// pulpcore `AlternateContentSource.remote` is `on_delete=PROTECT`: Pulp fails the delete of a remote that an ACS uses.
+    #[tokio::test]
+    async fn remote_delete_is_refused_while_an_acs_uses_the_remote() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (cdn, web) = (format!("{API}remotes/rpm/rpm/1/"), format!("{API}remotes/rpm/rpm/2/"));
+        get(&server, &cdn, json!({ "pulp_href": cdn, "name": "cdn" })).await;
+        get(&server, &web, json!({ "pulp_href": web, "name": "web" })).await;
+        get(&server, &format!("{API}repositories/rpm/rpm/"), page(json!([]))).await;
+        let acs = format!("{API}acs/rpm/rpm/");
+        get(&server, &acs, page(json!([{ "name": "a1", "remote": cdn }, { "name": "a2", "remote": cdn }]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Remotes(RepoType::Rpm);
+        let refused = "refused: Pulp does not delete a remote that an alternate content source uses: a1 (RPM) uses cdn, \
+                       a2 (RPM) uses cdn; delete those ACS or change their remote first";
+        let texts = |app: &App| app.notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>();
+
+        run(&mut app, Act::Delete, json!({ "pulp_href": cdn, "name": "cdn" }));
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no confirm");
+        assert!(texts(&app).contains(&format!("impact of deleting remote cdn: {refused}")), "{:?}", texts(&app));
+
+        app.list.marked = [cdn.clone(), web.clone()].into();
+        run(&mut app, Act::Delete, Value::Null);
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no confirm");
+        assert!(texts(&app).contains(&format!("impact of deleting 2 remotes: {refused}")), "{:?}", texts(&app));
+
+        // A remote that no ACS uses asks as before.
+        app.list.marked.clear();
+        run(&mut app, Act::Delete, json!({ "pulp_href": web, "name": "web" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { typed, lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(&app)) };
+        assert_eq!(typed.as_deref(), Some("web"));
+        assert!(lines.iter().any(|l| l == "No alternate content source uses it."), "{lines:?}");
+
+        // A server without the ACS endpoint of the type is not asked.
+        let asked = async || server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == acs).count();
+        let before = asked().await;
+        let mut caps = plugins();
+        caps.paths.insert("remotes/rpm/rpm/".into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, Act::Delete, json!({ "pulp_href": cdn, "name": "cdn" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { typed, .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(&app)) };
+        assert_eq!((typed.as_deref(), asked().await), (Some("cdn"), before));
+        assert!(!server.received_requests().await.unwrap().iter().any(|r| r.method.as_str() == "DELETE"), "nothing deleted");
     }
 }

@@ -455,6 +455,11 @@ pulp_file 3.123.1 and pulp_deb 3.11.1.
 * **A path edit changes other sources.** Removing a path deletes it from every ACS with that
   path. The Edit form lists them and asks first.
 * **Delete** removes the hidden path repositories, but not the pulp_deb `<name>--repository`.
+* **An ACS keeps its remote.** `AlternateContentSource.remote` is `on_delete=PROTECT`
+  (`models/acs.py:33`): the delete task of a remote that an ACS uses fails (ProtectedError).
+  An ACS takes only a remote of its own plugin type (`REMOTE_TYPES`, `serializers/acs.py:70`),
+  and the ACS list has no `remote` filter. So the remote delete reads the ACS list of the
+  remote's type, when the server has that endpoint, and refuses before any request.
 
 ### Export and import
 

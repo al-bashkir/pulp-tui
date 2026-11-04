@@ -237,7 +237,9 @@ repository. A Deb distribution serves at `<content URL>/dists/<distribution>/...
 ### Remotes
 
 `t` toggles RPM/File/Deb. **c** / **e** / **d** create / edit / delete, **i** full JSON. Delete
-lists the repositories that use the remote.
+lists the repositories that use the remote. Pulp does not delete a remote that an alternate
+content source (ACS) uses, so pulp-tui refuses it (also in a bulk delete) and names the ACS:
+delete them or change their remote first.
 
 * **URL**: `http://`, `https://`, or `file://` under the server's `ALLOWED_IMPORT_PATHS`. File: the
   URL of `PULP_MANIFEST`. Deb: the archive base URL (the directory with `dists/`).
