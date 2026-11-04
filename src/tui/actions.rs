@@ -108,6 +108,17 @@ fn version_of(repo: &str, number: i64) -> String {
     format!("{repo}versions/{number}/")
 }
 
+/// Run `then` with the name of repository `repo`: the one the Versions screen came from, else read from Pulp.
+fn with_repo_name(app: &mut App, repo: String, then: impl FnOnce(&mut App, String) + Send + 'static) {
+    if let Some(name) = app.last_repo.as_ref().filter(|r| r.1 == repo).map(|r| r.2.clone()) {
+        return then(app, name);
+    }
+    app.job("read repository name", move |ctx| async move {
+        let r: Value = ctx.client.get(&repo, &[("fields", "name".into())]).await?;
+        ap(move |app| then(app, s(&r, "name")))
+    });
+}
+
 /// The Content View whose label a Pulp object carries: it changes through the Content View actions only.
 fn cv_owner(item: &Value) -> Option<String> {
     item["pulp_labels"].get(crate::cv::LABEL_CV).and_then(Value::as_str).map(str::to_string)
@@ -1779,7 +1790,7 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
     };
     let mut fields = vec![
         Field::text("dist", "Distribution name").required().value(name.clone()),
-        Field::text("base_path", "Base path").required().value(name.clone()),
+        Field::text("base_path", "Base path").required().value(crate::cv::slug(&name)),
         Field::new("mode", "Binding", FieldKind::Choice(modes)),
     ];
     if publication.is_none() {
@@ -2282,10 +2293,7 @@ fn version_action(app: &mut App, act: Act, item: Value) {
             let name = app.last_repo.as_ref().filter(|r| r.1 == repo).map(|r| r.2.clone()).unwrap_or_else(|| short(&repo));
             publish_form(app, t, format!("Publish version {number}"), move |app, mode| publish(app, t, &name, href.clone(), mode));
         }
-        Act::Distribute => {
-            let name = app.last_repo.as_ref().filter(|r| r.1 == repo).map(|r| r.2.clone()).unwrap_or_else(|| short(&repo));
-            distribute_form(app, t, name, Some(href), None, None);
-        }
+        Act::Distribute => with_repo_name(app, repo, move |app, name| distribute_form(app, t, name, Some(href), None, None)),
         Act::Rollback => {
             let form = Form::new(
                 format!("Point a distribution to version {number}"),
@@ -2707,7 +2715,9 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let (href, version) = (s(&item, "pulp_href"), s(&item, "repository_version"));
     match act {
         Act::Create => publication_create(app, t),
-        Act::Distribute => distribute_form(app, t, short(&repo_of_version(&version)), Some(version), None, Some(href)),
+        Act::Distribute => {
+            with_repo_name(app, repo_of_version(&version), move |app, name| distribute_form(app, t, name, Some(version), None, Some(href)))
+        }
         Act::Delete => publication_delete(app, t, href, version),
         _ => {}
     }
@@ -4463,7 +4473,9 @@ mod tests {
         let before = lookups(&server.received_requests().await.unwrap());
         let selected = format!("{pubs}5/");
         let item = json!({ "pulp_href": selected, "repository_version": format!("{API}repositories/deb/apt/r/versions/1/") });
+        get(&server, &format!("{API}repositories/deb/apt/r/"), json!({ "name": "r" })).await;
         publication_action(&mut app, RepoType::Deb, Act::Distribute, item);
+        settle(&mut app, &mut rx).await;
         let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no form") };
         assert_eq!(keys(&form), ["dist", "base_path", "mode"]);
         submit(&mut app, &form).unwrap();
@@ -4836,7 +4848,9 @@ mod tests {
         let (mut app, mut rx) = connected(&server).await;
         let selected = format!("{pubs}5/");
         let item = json!({ "pulp_href": selected, "repository_version": format!("{API}repositories/rpm/rpm/r/versions/1/") });
+        get(&server, &format!("{API}repositories/rpm/rpm/r/"), json!({ "name": "r" })).await;
         publication_action(&mut app, RepoType::Rpm, Act::Distribute, item);
+        settle(&mut app, &mut rx).await;
         let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no form") };
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
@@ -4844,6 +4858,33 @@ mod tests {
         assert!(!sent.iter().any(|r| r.method.as_str() == "GET" && r.url.path() == pubs), "no lookup by version");
         let pinned: Vec<Value> = posts_to(&server, &dists).await.iter().map(|d| d["publication"].clone()).collect();
         assert_eq!(pinned, [json!(selected)]);
+    }
+
+    /// Distribute from a version or a publication offers the repository name (read from Pulp unless the Versions
+    /// screen came from that repository) and a base path made safe from it, not a fragment of the repository id.
+    #[tokio::test]
+    async fn distribute_from_a_version_or_publication_offers_the_repository_name() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let r = format!("{API}repositories/rpm/rpm/01a1a593-a5f8-7e0b-b8b3-2f2f0d3b6c11/");
+        get(&server, &r, json!({ "pulp_href": r, "name": "Rocky 9 BaseOS" })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let v = format!("{r}versions/2/");
+        let defaults = |app: &mut App| {
+            let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form: {:?}", app.notices.back().map(|n| &n.text)) };
+            ["dist", "base_path"].map(|k| form.fields.iter().find(|f| f.key == k).unwrap().value.clone())
+        };
+        app.last_repo = Some((RepoType::Rpm, format!("{API}repositories/rpm/rpm/other/"), "other".into()));
+        version_action(&mut app, Act::Distribute, json!({ "pulp_href": v, "number": 2 }));
+        settle(&mut app, &mut rx).await;
+        assert_eq!(defaults(&mut app), ["Rocky 9 BaseOS", "Rocky-9-BaseOS"]);
+        publication_action(&mut app, RepoType::Rpm, Act::Distribute, json!({ "pulp_href": "/p/5/", "repository_version": v }));
+        settle(&mut app, &mut rx).await;
+        assert_eq!(defaults(&mut app), ["Rocky 9 BaseOS", "Rocky-9-BaseOS"]);
+        // From the Versions screen of the repository: its name, no request.
+        app.last_repo = Some((RepoType::Rpm, r.clone(), "os/9".into()));
+        version_action(&mut app, Act::Distribute, json!({ "pulp_href": v, "number": 2 }));
+        assert_eq!(defaults(&mut app), ["os/9", "os-9"]);
     }
 
     /// pulpcore `Repository.cleanup_old_versions` (after each new version): with `retain_repo_versions` = 1, Pulp
@@ -6560,6 +6601,7 @@ mod tests {
         settle(&mut app, &mut rx).await;
         assert_eq!(last_error(&app), format!("distribute docs: {refusal}"));
         publication_action(&mut app, RepoType::File, Act::Distribute, p(1));
+        settle(&mut app, &mut rx).await;
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no distribute form") };
         set(&mut form, "dist", "docs");
         set(&mut form, "base_path", "docs");

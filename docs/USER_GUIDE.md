@@ -335,7 +335,10 @@ From a repository (**v**), or for all repositories. Columns: number, created, pr
 removed counts.
 
 * **o** content. **i** full JSON.
-* **P** publishes this version (always a new publication). **D** distributes it. On Deb, both ask
+* **P** publishes this version (always a new publication). **D** distributes it. The form offers
+  the repository name as the distribution name, and as the base path with every character other
+  than letters, digits, `-`, `_` and `.` changed to `-` (the same on Repositories and
+  Publications). On Deb, both ask
   for the optional signing service; **P** also asks for the kind (`apt` or `verbatim`, see
   Publications).
 * **b** points a distribution to this version (rollback, with a preview). It makes no version, so

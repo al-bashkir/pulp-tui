@@ -546,6 +546,26 @@ async fn rpm_prune_dry_run_then_prune_through_the_tui() {
     cleanup(&c, &[&repo, &remote]).await;
 }
 
+/// Distribute from Repository Versions (all repositories), whose rows have only hrefs: the form offers the
+/// repository name and a base path made safe from it, not a fragment of the repository id.
+#[tokio::test]
+async fn distribute_from_all_versions_offers_the_repository_name() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = format!("{} x", unique("it-dname"));
+    let repo = create(&c, RepoType::Rpm.repositories(), json!({ "name": name }), "/repositories/").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Versions(None);
+    run(&mut app, Act::Distribute, json!({ "pulp_href": format!("{repo}versions/0/"), "number": 0 }));
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form: {:?}", texts(&app)) };
+    let value = |k: &str| form.fields.iter().find(|f| f.key == k).unwrap().value.clone();
+    assert_eq!([value("dist"), value("base_path")], [name.clone(), name.replace(' ', "-")]);
+    cleanup(&c, &[&repo]).await;
+}
+
 /// Copy with filter rules through the TUI from the rpm fixture (alpha, beta, beta-debuginfo, an advisory of beta):
 /// the advisory comes along only when its package is chosen.
 #[tokio::test]
