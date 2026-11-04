@@ -194,6 +194,12 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
 * **A** (RPM) uploads one advisory: a JSON file with the fields of an updateinfo record. `id`,
   `issued` and `updated` are required, and each package needs `sum_type` (for example `sha256`).
   Example: `tests/fixtures/advisory.json`.
+* **M** (RPM) makes module content in the repository (a new version). Pick the kind (`modulemd`,
+  `modulemd_defaults` or `modulemd_obsoletes`; only those that the server takes), then fill its
+  required fields. A field marked `(JSON)` takes JSON, for example `["x-0:1.0-1.noarch"]`; a field
+  with `empty = ...` can stay empty and goes as that value (`null`, `[]` or `{}`). **snippet** is the YAML document that a publication
+  writes into `modules.yaml` unchanged, on one line: `--- {document: modulemd, version: 2, ...}`. A
+  modulemd made here lists no packages.
 * **P** publishes the latest version. It always makes a new publication, with the repository
   settings of that moment.
 * **D** distributes: pin the latest version (publication), or follow the repository latest. Pulp

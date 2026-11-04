@@ -65,6 +65,7 @@ General rules:
 | RPM ULN remotes                           | the plugin, `remotes/rpm/uln/`                                       | endpoint message on the screen (6)        |
 | File Git remotes                          | the plugin, `remotes/file/git/`                                      | endpoint message on the screen (7)        |
 | RPM comps, advisory upload (**U**, **A**) | `post` of `rpm/comps/`, `content/rpm/advisories/`                    | endpoint message                          |
+| RPM module content (**M**)                | `post` of `content/rpm/modulemds/` and the two others (8)            | kind not offered; none: endpoint message  |
 | Version repair (**F**)                    | `{rpm_rpm_repository_version_href}repair/` (4)                       | endpoint message                          |
 | Reclaim space (**R**)                     | `repositories/reclaim_space/`                                        | endpoint message                          |
 | RPM prune old packages (**O**)            | `post` of `rpm/prune/` (8)                                           | endpoint message                          |
@@ -370,6 +371,19 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   all. Langpacks have no id, so the compare keys them by `digest`. It warns when
   `content_summary.present` counts other units than it lists, and names types without an
   endpoint (older plugins), as the restore preview does.
+* **Module content create** (`content/rpm/modulemds/`, `modulemd_defaults/`,
+  `modulemd_obsoletes/`; the same fields in pulp_rpm 3.27.12, 3.34.0 and 3.39.5). The answer is a
+  task (`general_create`); with `repository` it adds the unit to a new version. Required:
+  modulemd `name`, `stream`, `version`, `context`, `arch`, `description`, `snippet`, and the
+  JSON `artifacts`, `dependencies`, `profiles`; defaults `module`, `stream`, `profiles` (JSON),
+  `snippet`; obsoletes `module_name`, `module_stream`, `modified`, `message`, `snippet` and five
+  fields that may be null (`null=True` columns). The modulemd serializer allows null for
+  `artifacts`, `dependencies` and `profiles`, but their columns are NOT NULL (`JSONField`,
+  default list, list, dict): null fails the task with `null value in column "dependencies" ...
+  violates not-null constraint` (seen on pulp1), so pulp-tui sends an empty one as `[]`, `[]`,
+  `{}`. `packages` is optional in the schema, but the modulemd serializer reads it with no
+  default, so pulp-tui sends `[]`. A publication writes
+  each `snippet` into `modules.yaml` unchanged.
 * **`sha256` is `null` until download** for `on_demand` and `streamed` RPM and File content
   (it comes from the stored file). Verify then uses `pkgId` when `checksum_type` is `sha256`
   (else it fails), and checks a File digest only where the API has one (paths always).

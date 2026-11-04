@@ -1,4 +1,4 @@
-//! RPM plugin operations: package listing, serving checks, the copy API, comps and advisory uploads, prune, scan.
+//! RPM plugin operations: package listing, serving checks, the copy API, comps, advisory and module content, prune, scan.
 
 use super::client::{Mutation, Page, PulpClient, PulpError, Result};
 use super::models::*;
@@ -116,6 +116,75 @@ pub async fn scan(c: &PulpClient, version: &str, on: super::ops::OnTask<'_>) -> 
     ];
     lines.extend(found);
     Ok(lines)
+}
+
+/// How a module content field goes into the request: text or JSON. An empty `NullText` goes as null, an empty
+/// `OptJson` as its JSON value: pulp_rpm 3.39.5 allows null there in the API, but the column is NOT NULL.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Input {
+    Text,
+    Json,
+    NullText,
+    OptJson(&'static str),
+}
+
+/// A kind of module content: name, endpoint, and the fields of the request.
+pub type ModuleKind = (&'static str, &'static str, &'static [(&'static str, Input)]);
+
+/// Module content that the API makes from fields (POST, a task): the required fields are the same in pulp_rpm
+/// 3.27.12, 3.34.0 and 3.39.5. The first two name the unit. `snippet` is the YAML document that a publication
+/// writes into modules.yaml as it is.
+pub const MODULE_KINDS: [ModuleKind; 3] = {
+    use Input::*;
+    [
+        (
+            "modulemd",
+            "content/rpm/modulemds/",
+            &[
+                ("name", Text),
+                ("stream", Text),
+                ("version", Text),
+                ("context", Text),
+                ("arch", Text),
+                ("description", Text),
+                ("artifacts", OptJson("[]")),
+                ("dependencies", OptJson("[]")),
+                ("profiles", OptJson("{}")),
+                ("snippet", Text),
+            ],
+        ),
+        (
+            "modulemd_defaults",
+            "content/rpm/modulemd_defaults/",
+            &[("module", Text), ("stream", Text), ("profiles", Json), ("snippet", Text)],
+        ),
+        (
+            "modulemd_obsoletes",
+            "content/rpm/modulemd_obsoletes/",
+            &[
+                ("module_name", Text),
+                ("module_stream", Text),
+                ("modified", Text),
+                ("message", Text),
+                ("override_previous", NullText),
+                ("module_context", NullText),
+                ("eol_date", NullText),
+                ("obsoleted_by_module_name", NullText),
+                ("obsoleted_by_module_stream", NullText),
+                ("snippet", Text),
+            ],
+        ),
+    ]
+};
+
+/// Make module content at `path` from `fields` in `repo` (a new version). pulp_rpm reads the `packages` of a
+/// modulemd with no default, so it goes as empty.
+pub async fn create_module(c: &PulpClient, path: &str, mut fields: Value, repo: &str) -> Result<Mutation> {
+    fields["repository"] = repo.into();
+    if path == MODULE_KINDS[0].1 {
+        fields["packages"] = json!([]);
+    }
+    c.post(&c.api(path), &fields).await
 }
 
 pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<Package>> {

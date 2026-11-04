@@ -1261,7 +1261,17 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
     if let Some(e) = snapshot_refusal(&item)
-        && matches!(act, Act::Sync | Act::Upload | Act::UploadComps | Act::UploadAdvisory | Act::CopyContent | Act::Reclaim | Act::Edit)
+        && matches!(
+            act,
+            Act::Sync
+                | Act::Upload
+                | Act::UploadComps
+                | Act::UploadAdvisory
+                | Act::CreateModule
+                | Act::CopyContent
+                | Act::Reclaim
+                | Act::Edit
+        )
     {
         app.error(e);
         return;
@@ -1369,6 +1379,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         }
         Act::Reclaim => reclaim(app, href),
         Act::PrunePackages => prune_packages(app, href),
+        Act::CreateModule => module_create(app, href, name),
         Act::UploadComps | Act::UploadAdvisory => {
             let comps = act == Act::UploadComps;
             let (what, ep) = if comps { ("comps.xml", rpm::COMPS) } else { ("advisory", rpm::ADVISORIES) };
@@ -2535,6 +2546,54 @@ fn new_version(app: &mut App, label: &str, t: &Task) {
         Some(v) => app.ok(format!("{label}: new version {}", version_number(&v))),
         None => app.ok(format!("{label}: no new version (the latest version already has this content)")),
     }
+}
+
+/// Module content in the RPM repository `repo`: pick the kind (those the server takes), then fill its fields.
+fn module_create(app: &mut App, repo: String, name: String) {
+    let kinds: Vec<String> = rpm::MODULE_KINDS
+        .iter()
+        .filter(|(_, path, _)| caps(app).is_none_or(|c| c.has_operation(path, "post")))
+        .map(|(kind, ..)| kind.to_string())
+        .collect();
+    if kinds.is_empty() {
+        return app.error(format!("not supported by this server: module content create ({})", rpm::MODULE_KINDS[0].1));
+    }
+    let form = Form::new(format!("Create module content in {name}"), vec![Field::new("kind", "Kind", FieldKind::Choice(kinds))]);
+    app.form(form, move |app, f| {
+        let Some(&(kind, path, inputs)) = rpm::MODULE_KINDS.iter().find(|(k, ..)| *k == f.get("kind")) else {
+            return Err("pick a kind".into());
+        };
+        let fields = inputs.iter().map(|&(k, input)| match input {
+            rpm::Input::Text => Field::text(k, k).required(),
+            rpm::Input::Json => Field::text(k, &format!("{k} (JSON)")).required(),
+            rpm::Input::NullText => Field::text(k, k).help("empty = null"),
+            rpm::Input::OptJson(empty) => Field::text(k, &format!("{k} (JSON)")).help(&format!("empty = {empty}")),
+        });
+        let note = "snippet: the YAML document that a publication writes into modules.yaml, on one line: --- {document: ...}";
+        let (repo, name) = (repo.clone(), name.clone());
+        app.form(Form::new(format!("New {kind} in {name}"), fields.collect()).note(note), move |app, f| {
+            let mut body = json!({});
+            for &(k, input) in inputs {
+                let v = match (f.get(k).trim(), input) {
+                    ("", rpm::Input::OptJson(empty)) => empty,
+                    (v, _) => v,
+                };
+                body[k] = match input {
+                    _ if v.is_empty() => Value::Null,
+                    rpm::Input::Json | rpm::Input::OptJson(_) => serde_json::from_str(v).map_err(|e| format!("{k}: invalid JSON: {e}"))?,
+                    rpm::Input::Text | rpm::Input::NullText => v.into(),
+                };
+            }
+            let label = format!("create {kind} {}:{} in {name}", f.get(inputs[0].0), f.get(inputs[1].0));
+            let repo = repo.clone();
+            app.job(label.clone(), move |ctx| async move {
+                let m = rpm::create_module(&ctx.client, path, body, &repo).await?;
+                ap(move |app| follow(app, m, label.clone(), move |app, t| new_version(app, &label, &t)))
+            });
+            Ok(())
+        });
+        Ok(())
+    });
 }
 
 fn content_action(app: &mut App, version: String, act: Act) {
@@ -7514,6 +7573,132 @@ mod tests {
         run(&mut app, Act::Scan, item);
         assert_eq!(last(&app), "read-only mode: this action changes the server");
         assert_eq!(posts_to(&server, &format!("{v}scan/")).await.len(), 1);
+    }
+
+    /// Module content: pick the kind, then fill its required fields. A JSON field must be JSON, an empty nullable
+    /// field goes as null, and the unit goes into the repository (a new version). A modulemd also sends `packages`.
+    #[tokio::test]
+    async fn module_content_is_made_from_its_required_fields_in_the_repository() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/rpm/rpm/r/");
+        for (n, p) in [(1, "modulemds"), (2, "modulemd_defaults"), (3, "modulemd_obsoletes")] {
+            answer(&server, "POST", &format!("{API}content/rpm/{p}/"), 202, json!({ "task": format!("{API}tasks/{n}/") })).await;
+            let created = json!([format!("{API}content/rpm/{p}/{n}/"), format!("{repo}versions/{}/", n + 1)]);
+            let href = format!("{API}tasks/{n}/");
+            get(&server, &href, json!({ "pulp_href": href, "state": "completed", "created_resources": created })).await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        let k = Kind::Repos(RepoType::Rpm, false);
+        app.list.kind = k.clone();
+        assert!(k.actions().contains(&Act::CreateModule) && Act::CreateModule.mutates(&k, false));
+        for t in [RepoType::File, RepoType::Deb] {
+            assert!(!Kind::Repos(t, false).actions().contains(&Act::CreateModule), "{t:?}");
+        }
+        let item = json!({ "pulp_href": repo, "name": "os" });
+        let last = |app: &App| app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        let open = |app: &mut App, kind: &str| -> (Form, super::super::app::Submit) {
+            run(app, Act::CreateModule, item.clone());
+            fill_and_submit(app, &[("kind", kind)]);
+            let Some(Modal::Form { form, submit }) = app.modal.take() else { panic!("no form") };
+            (form, submit)
+        };
+
+        run(&mut app, Act::CreateModule, item.clone());
+        let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no form") };
+        let kinds = vec!["modulemd".to_string(), "modulemd_defaults".into(), "modulemd_obsoletes".into()];
+        assert_eq!(form.fields[0].kind, FieldKind::Choice(kinds));
+        app.modal = None;
+
+        run(&mut app, Act::CreateModule, json!({ "pulp_href": repo, "name": "s", "pulp_labels": { "pulp_tui_cv": "web" } }));
+        assert!(app.modal.is_none() && last(&app).starts_with("refused: s is a snapshot repository"), "{}", last(&app));
+
+        let (mut form, mut submit) = open(&mut app, "modulemd");
+        assert_eq!(form.title, "New modulemd in os");
+        let want = ["name", "stream", "version", "context", "arch", "description", "artifacts", "dependencies", "profiles", "snippet"];
+        assert_eq!(keys(&form), want);
+        for (k, v) in [("name", "x"), ("stream", "1"), ("version", "20260101"), ("context", "c0ffee42"), ("arch", "noarch")] {
+            set(&mut form, k, v);
+        }
+        set(&mut form, "description", "X module");
+        set(&mut form, "snippet", "--- {document: modulemd, version: 2}");
+        set(&mut form, "artifacts", "{bad");
+        assert!(submit(&mut app, &form).unwrap_err().starts_with("artifacts: invalid JSON:"));
+        set(&mut form, "artifacts", r#"["x-0:1-1.noarch"]"#);
+        assert_eq!((form.fields[7].help.as_str(), form.fields[8].help.as_str()), ("empty = []", "empty = {}"));
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(last(&app), "create modulemd x:1 in os: new version 2");
+        // pulp_rpm 3.39.5: the columns are NOT NULL (JSONField default list, list, dict); null fails the task.
+        let body = json!({ "name": "x", "stream": "1", "version": "20260101", "context": "c0ffee42", "arch": "noarch",
+            "description": "X module", "artifacts": ["x-0:1-1.noarch"], "dependencies": [], "profiles": {},
+            "snippet": "--- {document: modulemd, version: 2}", "packages": [], "repository": repo });
+        assert_eq!(posts_to(&server, &format!("{API}content/rpm/modulemds/")).await, [body]);
+
+        let (mut form, mut submit) = open(&mut app, "modulemd_defaults");
+        assert_eq!(keys(&form), ["module", "stream", "profiles", "snippet"]);
+        for (k, v) in [("module", "x"), ("stream", "1"), ("snippet", "--- {document: modulemd-defaults}")] {
+            set(&mut form, k, v);
+        }
+        assert_eq!(form.validate(), Err("profiles (JSON) is required".into()), "not nullable");
+        set(&mut form, "profiles", r#"{"1": ["default"]}"#);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(last(&app), "create modulemd_defaults x:1 in os: new version 3");
+        let body = json!({ "module": "x", "stream": "1", "profiles": { "1": ["default"] }, "snippet": "--- {document: modulemd-defaults}", "repository": repo });
+        assert_eq!(posts_to(&server, &format!("{API}content/rpm/modulemd_defaults/")).await, [body]);
+
+        let (mut form, mut submit) = open(&mut app, "modulemd_obsoletes");
+        let want = [
+            "module_name",
+            "module_stream",
+            "modified",
+            "message",
+            "override_previous",
+            "module_context",
+            "eol_date",
+            "obsoleted_by_module_name",
+            "obsoleted_by_module_stream",
+            "snippet",
+        ];
+        assert_eq!(keys(&form), want);
+        for (k, v) in [
+            ("modified", "2026-01-01T00:00Z"),
+            ("module_name", "x"),
+            ("module_stream", "1"),
+            ("message", "gone"),
+            ("eol_date", "2026-06-01T00:00Z"),
+            ("snippet", "--- {document: modulemd-obsoletes}"),
+        ] {
+            set(&mut form, k, v);
+        }
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(last(&app), "create modulemd_obsoletes x:1 in os: new version 4");
+        let body = json!({ "modified": "2026-01-01T00:00Z", "module_name": "x", "module_stream": "1", "message": "gone",
+            "override_previous": null, "module_context": null, "eol_date": "2026-06-01T00:00Z", "obsoleted_by_module_name": null,
+            "obsoleted_by_module_stream": null, "snippet": "--- {document: modulemd-obsoletes}", "repository": repo });
+        assert_eq!(posts_to(&server, &format!("{API}content/rpm/modulemd_obsoletes/")).await, [body]);
+
+        // A server with modulemd defaults only offers that kind; one without any is refused before a form.
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/content/rpm/modulemd_defaults/": { "get": {}, "post": {} },
+            "/pulp/api/v3/content/rpm/modulemds/": { "get": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, Act::CreateModule, item.clone());
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.fields[0].kind, FieldKind::Choice(vec!["modulemd_defaults".into()]));
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/content/rpm/modulemds/": { "get": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, Act::CreateModule, item.clone());
+        assert!(app.modal.is_none());
+        assert_eq!(last(&app), "not supported by this server: module content create (content/rpm/modulemds/)");
+
+        let p = Profile { url: server.uri(), auth: AuthMethod::None, read_only: true, ..Default::default() };
+        app.conn.as_mut().unwrap().client = PulpClient::new("lab", &p, &app.cfg.settings).unwrap();
+        run(&mut app, Act::CreateModule, item);
+        assert_eq!(last(&app), "read-only mode: this action changes the server");
     }
 
     /// pulpcore 3.123 deletes a path that an edit removes from every ACS that has the same path.

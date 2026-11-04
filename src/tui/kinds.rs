@@ -158,6 +158,8 @@ pub enum Act {
     /// RPM: a comps.xml (`rpm/comps/`) or one advisory as JSON (POST `content/rpm/advisories/`) into the repository.
     UploadComps,
     UploadAdvisory,
+    /// RPM: a modulemd, modulemd defaults or modulemd obsoletes from its fields (`content/rpm/modulemds/`, ...).
+    CreateModule,
     Publish,
     Distribute,
     CopyContent,
@@ -261,7 +263,7 @@ impl Act {
             ImportRepos => 'J',
             CvFilters | FallbackReplicate | Repair | Filter => 'F',
             CvPreview | Password => 'w',
-            Promote | MigrateDb => 'M',
+            Promote | MigrateDb | CreateModule => 'M',
             CopyDb => 'Y',
             Resume | Replicate | Roles | Restore | Refresh | Reclaim => 'R',
             ToggleProtected => 'L',
@@ -285,6 +287,7 @@ impl Act {
             Upload => "Upload local file",
             UploadComps => "Upload comps.xml (package groups)",
             UploadAdvisory => "Upload advisory (JSON)",
+            CreateModule => "Create module content (modulemd, defaults, obsoletes)",
             Publish => "Publish",
             Distribute => "Distribute (create/re-point distribution)",
             CopyContent => "Copy content from another repository",
@@ -828,7 +831,7 @@ impl Kind {
                 match t {
                     RepoType::Rpm => {
                         actions.insert(9, PrunePackages); // after Reclaim
-                        actions.splice(5..5, [UploadComps, UploadAdvisory]);
+                        actions.splice(5..5, [UploadComps, UploadAdvisory, CreateModule]);
                     }
                     RepoType::File | RepoType::Deb => {}
                 }

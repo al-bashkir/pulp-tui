@@ -1,5 +1,5 @@
 //! Content features against a live Pulp: alternate content sources (RPM, File, Deb), RPM comps and
-//! advisory uploads, version repair, reclaim space.
+//! advisory uploads, module content made through the TUI, version repair, reclaim space.
 
 mod common;
 
@@ -7,6 +7,8 @@ use common::*;
 use pulp_tui::pulp::models::{RepoVersion, Task};
 use pulp_tui::pulp::ops;
 use pulp_tui::pulp::{Mutation, RepoType, rpm};
+use pulp_tui::tui::actions::run;
+use pulp_tui::tui::kinds::{Act, Kind};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -194,4 +196,36 @@ async fn reclaim_space_keeps_the_content_served_on_demand() {
     assert!(msg.contains("matching digest"), "{msg}");
     eprintln!("after reclaim: {msg}; {} package(s) with a file", stored().await.0);
     cleanup(&c, &[&dist, &repo, &remote]).await;
+}
+
+/// A modulemd made through the TUI goes into a new version of the repository and shows on its Content screen. Its
+/// empty JSON fields go as the empty values of their NOT NULL columns.
+#[tokio::test]
+async fn a_modulemd_made_through_the_tui_is_in_the_new_version() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("it-module"));
+    let repo = create(&c, RepoType::Rpm.repositories(), json!({ "name": name }), "/repositories/").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(RepoType::Rpm, false);
+    run(&mut app, Act::CreateModule, json!({ "pulp_href": repo, "name": name }));
+    fill(&mut app, &[("kind", "modulemd")]);
+    let snippet = format!(
+        "--- {{document: modulemd, version: 2, data: {{name: {name}, stream: '1', version: 1, context: c0ffee42, arch: noarch, \
+         summary: s, description: d, license: {{module: [MIT]}}}}}}"
+    );
+    let fields = [("name", name.as_str()), ("stream", "1"), ("version", "1"), ("context", "c0ffee42"), ("arch", "noarch")];
+    fill(&mut app, &[&fields[..], &[("description", "d"), ("snippet", &snippet)]].concat());
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).contains(&format!("create modulemd {name}:1 in {name}: new version 1")), "{:?}", texts(&app));
+    let v1 = latest(&c, &repo).await;
+    let q = [("repository_version", v1.clone()), ("fields", "artifacts,dependencies,profiles".into())];
+    let page: Value = c.get(&c.api("content/rpm/modulemds/"), &q).await.unwrap();
+    assert_eq!(page["results"], json!([{ "artifacts": [], "dependencies": [], "profiles": {} }]));
+    app.push(Kind::Content { version: v1, ctype: 2 });
+    settle(&mut app, &mut rx).await;
+    let shown: Vec<&str> = app.list.items.iter().map(|v| v["name"].as_str().unwrap_or_default()).collect();
+    assert_eq!(shown, [name.as_str()], "the Content screen (modulemds) lists it");
+    cleanup(&c, &[&repo]).await;
 }
