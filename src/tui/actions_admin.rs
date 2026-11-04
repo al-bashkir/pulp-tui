@@ -4,9 +4,11 @@ use super::actions::{ap, caps, submit, url_with_scheme};
 use super::app::{App, Level};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, s, short};
+use crate::pulp::client::Page;
 use crate::pulp::{PulpClient, RepoType, ops};
 use crate::replication::{self, PlanAction};
 use anyhow::{Context, bail};
+use futures::future::try_join_all;
 use serde_json::{Value, json};
 
 pub fn run(app: &mut App, act: Act, item: Value) {
@@ -131,13 +133,26 @@ fn user_action(app: &mut App, act: Act, item: Value) {
                 app.error("refused: you cannot delete the account you are logged in with");
                 return;
             }
-            let mut lines = vec![format!("Delete user {username} and all of their role assignments.")];
-            if item["is_staff"] == true {
-                lines.push("WARNING: this is a staff (administrator) account.".into());
-            }
-            lines.push("Prefer disabling (A) if the account may be needed again.".into());
-            app.confirm_danger(format!("Delete user {username}"), lines, &username.clone(), move |app| {
-                submit(app, format!("delete user {username}"), move |c| async move { Ok(c.delete(&href).await?) })
+            let staff = item["is_staff"] == true;
+            app.job(format!("impact of deleting user {username}"), move |ctx| async move {
+                let c = &ctx.client;
+                let user: Value = c.get(&href, &[]).await?;
+                let roles: Page<Value> = c.list(&format!("{href}roles/"), &[("limit", "100".into())]).await?;
+                let mut lines = vec![format!("Delete user {username}.")];
+                lines.push(match user["groups"].as_array() {
+                    Some(g) => counted(&format!("Member of {} group(s)", g.len()), g.iter().map(|g| s(g, "name"))),
+                    None => "Group memberships: not shown by this server".into(),
+                });
+                lines.push(assignments(&roles, "user"));
+                if staff {
+                    lines.push("WARNING: this is a staff (administrator) account.".into());
+                }
+                lines.push("Prefer disabling (A) if the account may be needed again.".into());
+                ap(move |app| {
+                    app.confirm_danger(format!("Delete user {username}"), lines, &username.clone(), move |app| {
+                        submit(app, format!("delete user {username}"), move |c| async move { Ok(c.delete(&href).await?) })
+                    })
+                })
             });
         }
         _ => {}
@@ -220,14 +235,51 @@ fn group_action(app: &mut App, act: Act, item: Value) {
                 Ok(())
             })
         }
-        Act::Delete => app.confirm_danger(
-            format!("Delete group {name}"),
-            vec!["Members lose all permissions granted through this group.".into()],
-            &name.clone(),
-            move |app| submit(app, format!("delete group {name}"), move |c| async move { Ok(c.delete(&href).await?) }),
-        ),
+        Act::Delete => app.job(format!("impact of deleting group {name}"), move |ctx| async move {
+            let c = &ctx.client;
+            let limit = [("limit", "100".to_string())];
+            let members: Page<Value> = c.list(&format!("{href}users/"), &limit).await?;
+            let roles: Page<Value> = c.list(&format!("{href}roles/"), &limit).await?;
+            let lines = vec![
+                format!("Delete group {name}."),
+                counted(
+                    &format!("{} member(s) lose the permissions of this group", members.count),
+                    members.results.iter().map(|u| s(u, "username")),
+                ),
+                assignments(&roles, "group"),
+            ];
+            ap(move |app| {
+                app.confirm_danger(format!("Delete group {name}"), lines, &name.clone(), move |app| {
+                    submit(app, format!("delete group {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+                })
+            })
+        }),
         _ => {}
     }
+}
+
+/// `what`, then the names after a colon when there are any: "2 member(s): ann, bob".
+fn counted(what: &str, names: impl Iterator<Item = String>) -> String {
+    let names: Vec<String> = names.collect();
+    if names.is_empty() { what.to_string() } else { format!("{what}: {}", names.join(", ")) }
+}
+
+/// The role assignments (a `roles/` page) that the delete of the `owner` (user or group) removes.
+fn assignments(roles: &Page<Value>, owner: &str) -> String {
+    let named = roles.results.iter().map(|r| match r["content_object"].as_str() {
+        Some(o) => format!("{} on {}", s(r, "role"), short(o)),
+        None => s(r, "role"),
+    });
+    counted(&format!("{} role assignment(s), removed with the {owner}", roles.count), named)
+}
+
+/// The names (`key`) of the users or groups (`collection`) that have `role`. Their lists have no role
+/// filter: each one's `roles/` is read with `role=`.
+async fn holders(c: &PulpClient, collection: &str, key: &str, role: &str) -> anyhow::Result<Vec<String>> {
+    let all: Vec<Value> = c.list_all(&c.api(collection), &[("fields", format!("pulp_href,{key}"))], 100_000).await?;
+    let q = [("role", role.to_string()), ("limit", "1".into()), ("fields", "pulp_href".into())];
+    let has = try_join_all(all.iter().map(async |x| c.list::<Value>(&format!("{}roles/", s(x, "pulp_href")), &q).await)).await?;
+    Ok(all.iter().zip(has).filter(|(_, p)| p.count > 0).map(|(x, _)| s(x, key)).collect())
 }
 
 fn member_action(app: &mut App, act: Act, item: Value, group: String, name: String) {
@@ -295,12 +347,21 @@ fn role_action(app: &mut App, act: Act, item: Value) {
                 app.error("system-defined (locked) roles cannot be deleted");
                 return;
             }
-            app.confirm_danger(
-                format!("Delete role {name}"),
-                vec!["All assignments of this role are removed.".into()],
-                &name.clone(),
-                move |app| submit(app, format!("delete role {name}"), move |c| async move { Ok(c.delete(&href).await?) }),
-            );
+            app.job(format!("impact of deleting role {name}"), move |ctx| async move {
+                let c = &ctx.client;
+                let users = holders(c, "users/", "username", &name).await?;
+                let groups = holders(c, "groups/", "name", &name).await?;
+                let lines = vec![
+                    format!("Delete role {name}. All assignments of this role are removed."),
+                    counted(&format!("{} user(s) have it", users.len()), users.into_iter()),
+                    counted(&format!("{} group(s) have it", groups.len()), groups.into_iter()),
+                ];
+                ap(move |app| {
+                    app.confirm_danger(format!("Delete role {name}"), lines, &name.clone(), move |app| {
+                        submit(app, format!("delete role {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+                    })
+                })
+            });
         }
         _ => {}
     }
@@ -1424,6 +1485,105 @@ mod tests {
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
         assert!(notices(&app).contains(&(Level::Ok, "rename group ops to ops-2: done".into())), "{:?}", notices(&app));
+    }
+
+    fn page(results: Value) -> Value {
+        json!({ "count": results.as_array().unwrap().len(), "next": null, "results": results })
+    }
+
+    /// Connected as `root`; `run` opens a delete. No confirm before its impact job; then the confirm's lines and typed word.
+    async fn delete_confirm(server: &MockServer, run: impl FnOnce(&mut App)) -> (Vec<String>, Option<String>) {
+        let (mut app, mut rx) = connected(server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let mut caps = (*app.conn.as_ref().unwrap().caps).clone();
+        caps.user = Some(crate::pulp::caps::CurrentUser { href: "/u/0/".into(), username: "root".into(), is_staff: Some(true) });
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app);
+        assert!(app.modal.is_none(), "the impact loads first");
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
+        (lines, typed)
+    }
+
+    #[tokio::test]
+    async fn user_delete_names_its_groups_and_role_assignments() {
+        let server = MockServer::start().await;
+        let u = "/pulp/api/v3/users/7/";
+        serve(&server, "GET", u, 200, json!({ "pulp_href": u, "username": "ann", "groups": [{ "name": "ops" }, { "name": "dev" }] })).await;
+        let roles = page(json!([{ "role": "core.task_viewer", "content_object": null },
+            { "role": "file.filerepository_owner", "content_object": "/pulp/api/v3/repositories/file/file/0190abcd-1234-5678/" }]));
+        serve(&server, "GET", &format!("{u}roles/"), 200, roles).await;
+        let item = json!({ "pulp_href": u, "username": "ann", "is_staff": true });
+        let (lines, typed) = delete_confirm(&server, |app| super::user_action(app, crate::tui::kinds::Act::Delete, item)).await;
+        assert_eq!(typed.as_deref(), Some("ann"));
+        assert_eq!(
+            lines,
+            [
+                "Delete user ann.",
+                "Member of 2 group(s): ops, dev",
+                "2 role assignment(s), removed with the user: core.task_viewer, file.filerepository_owner on 0190abcd-1234",
+                "WARNING: this is a staff (administrator) account.",
+                "Prefer disabling (A) if the account may be needed again.",
+            ]
+        );
+        // A server whose user has no `groups` field: the confirm does not claim "no group".
+        serve(&server, "GET", "/pulp/api/v3/users/8/", 200, json!({ "username": "bob" })).await;
+        serve(&server, "GET", "/pulp/api/v3/users/8/roles/", 200, page(json!([]))).await;
+        let item = json!({ "pulp_href": "/pulp/api/v3/users/8/", "username": "bob" });
+        let (lines, _) = delete_confirm(&server, |app| super::user_action(app, crate::tui::kinds::Act::Delete, item)).await;
+        assert_eq!(lines[1..3], ["Group memberships: not shown by this server", "0 role assignment(s), removed with the user"]);
+    }
+
+    #[tokio::test]
+    async fn group_delete_names_its_members_and_role_assignments() {
+        let server = MockServer::start().await;
+        let g = "/pulp/api/v3/groups/3/";
+        serve(&server, "GET", &format!("{g}users/"), 200, page(json!([{ "username": "ann" }, { "username": "bob" }]))).await;
+        serve(&server, "GET", &format!("{g}roles/"), 200, page(json!([{ "role": "rpm.rpmrepository_viewer", "content_object": null }])))
+            .await;
+        let item = json!({ "pulp_href": g, "name": "ops" });
+        let (lines, typed) = delete_confirm(&server, |app| super::group_action(app, crate::tui::kinds::Act::Delete, item)).await;
+        assert_eq!(typed.as_deref(), Some("ops"));
+        assert_eq!(
+            lines,
+            [
+                "Delete group ops.",
+                "2 member(s) lose the permissions of this group: ann, bob",
+                "1 role assignment(s), removed with the group: rpm.rpmrepository_viewer",
+            ]
+        );
+    }
+
+    /// `users/` and `groups/` have no role filter: each one's `roles/` is read with `role=`.
+    #[tokio::test]
+    async fn role_delete_names_the_users_and_groups_that_have_it() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        let (u7, u8, g3) = ("/pulp/api/v3/users/7/", "/pulp/api/v3/users/8/", "/pulp/api/v3/groups/3/");
+        serve(
+            &server,
+            "GET",
+            "/pulp/api/v3/users/",
+            200,
+            page(json!([{ "pulp_href": u7, "username": "ann" }, { "pulp_href": u8, "username": "bob" }])),
+        )
+        .await;
+        serve(&server, "GET", "/pulp/api/v3/groups/", 200, page(json!([{ "pulp_href": g3, "name": "ops" }]))).await;
+        for (owner, has) in [(u7, true), (u8, false), (g3, true)] {
+            let results = if has { json!([{ "role": "custom.viewer" }]) } else { json!([]) };
+            Mock::given(method("GET"))
+                .and(path(format!("{owner}roles/")))
+                .and(query_param("role", "custom.viewer"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page(results)))
+                .mount(&server)
+                .await;
+        }
+        let item = json!({ "pulp_href": "/pulp/api/v3/roles/9/", "name": "custom.viewer", "locked": false });
+        let (lines, typed) = delete_confirm(&server, |app| super::role_action(app, crate::tui::kinds::Act::Delete, item)).await;
+        assert_eq!(typed.as_deref(), Some("custom.viewer"));
+        assert_eq!(
+            lines,
+            ["Delete role custom.viewer. All assignments of this role are removed.", "1 user(s) have it: ann", "1 group(s) have it: ops"]
+        );
     }
 
     #[test]

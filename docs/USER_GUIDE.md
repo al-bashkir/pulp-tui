@@ -604,6 +604,10 @@ Disconnected import of a Pulp export. Copy the export files to a directory in th
   **A** enable/disable. Delete refuses your own user and warns for staff.
 * **Groups**: **o** members (**c** add a user, **d** remove), **R** roles, **c** create, **e**
   rename (members and roles stay), **d** delete.
+* Delete reads the impact first, then you type the name: for a user, its groups and its role
+  assignments; for a group, its members and its role assignments; for a role, the users and groups
+  that have it (pulp-tui reads the roles of each user and group, because the lists have no role
+  filter).
 * **Roles** of a user or group: **c** adds a role, an optional object, and an optional domain (when
   the server has domains). **d** removes. Owner and admin roles ask to confirm.
 * **Roles** screen: system roles are read-only. **c** / **e** / **d** a custom role (permissions as
