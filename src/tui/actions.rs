@@ -106,9 +106,10 @@ fn snapshot_refusal(repo: &Value) -> Option<String> {
     })
 }
 
-fn cv_distribution_refusal(d: &Value) -> anyhow::Result<()> {
+/// Refuse distribution `d` when a Content View owns it; `instead`: the view action that does the change.
+fn cv_distribution_refusal(d: &Value, instead: &str) -> anyhow::Result<()> {
     match cv_owner(d) {
-        Some(cv) => bail!("refused: distribution {} belongs to Content View {cv}; promote or roll back the view instead", s(d, "name")),
+        Some(cv) => bail!("refused: distribution {} belongs to Content View {cv}; {instead} instead", s(d, "name")),
         None => Ok(()),
     }
 }
@@ -1077,13 +1078,7 @@ async fn remote_delete_impact(c: &PulpClient, t: RepoType, href: &str, name: &st
 }
 
 fn distribution_delete_lines(item: &Value) -> Vec<String> {
-    let mut lines =
-        vec![format!("Delete distribution {}.", s(item, "name")), format!("{} will stop serving content.", s(item, "base_url"))];
-    if let Some(cv) = cv_owner(item) {
-        let env = item["pulp_labels"].get(crate::cv::LABEL_ENV).and_then(Value::as_str).unwrap_or("?");
-        lines.push(format!("WARNING: Content View {cv} serves environment {env} here; the view still records this binding."));
-    }
-    lines
+    vec![format!("Delete distribution {}.", s(item, "name")), format!("{} will stop serving content.", s(item, "base_url"))]
 }
 
 /// Delete the marked repositories, remotes or distributions: one impact report, one typed confirmation.
@@ -1099,7 +1094,7 @@ fn delete_marked(app: &mut App, kind: Kind) {
     app.job(format!("impact of deleting {n} {what}"), move |ctx| async move {
         let c = &ctx.client;
         let mut lines = vec![format!("Deletes {n} {what}:"), String::new()];
-        let mut targets = vec![];
+        let (mut targets, mut owned) = (vec![], vec![]);
         for href in hrefs {
             // Marks can be on other pages: fetch each object.
             let item: Value = c.get(&href, &[]).await?;
@@ -1107,10 +1102,19 @@ fn delete_marked(app: &mut App, kind: Kind) {
             lines.extend(match kind {
                 Kind::Repos(..) => repo_delete_impact(&ctx, t, &href, &name).await?,
                 Kind::Remotes(_) => remote_delete_impact(c, t, &href, &name).await?,
-                _ => distribution_delete_lines(&item),
+                _ => {
+                    owned.extend(cv_owner(&item).map(|cv| format!("{name} (view {cv})")));
+                    distribution_delete_lines(&item)
+                }
             });
             lines.push(String::new());
             targets.push((href, name));
+        }
+        if !owned.is_empty() {
+            bail!(
+                "refused: marked distributions belong to Content Views: {}; unmark them (unpromote a view to delete its distributions)",
+                owned.join(", ")
+            );
         }
         ap(move |app| {
             let typed = format!("delete {n} {what}");
@@ -1577,7 +1581,7 @@ async fn distribute(ctx: &Ctx, t: RepoType, dist: &str, bp: &str, binding: anyho
 /// The distribution of type `t` named `name`, if any; one that a Content View owns is refused.
 async fn existing_distribution(c: &PulpClient, t: RepoType, name: &str) -> anyhow::Result<Option<Value>> {
     let d = ops::find_by_name::<Value>(c, &c.api(t.distributions()), name).await?;
-    d.as_ref().map_or(Ok(()), cv_distribution_refusal)?;
+    d.as_ref().map_or(Ok(()), |d| cv_distribution_refusal(d, "promote or roll back the view"))?;
     Ok(d)
 }
 
@@ -2143,7 +2147,7 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
         let c = &ctx.client;
         let d: Value =
             ops::find_by_name(c, &c.api(t.distributions()), &dist).await?.ok_or_else(|| anyhow!("no {} distribution {dist}", t.label()))?;
-        cv_distribution_refusal(&d)?;
+        cv_distribution_refusal(&d, "promote or roll back the view")?;
         // The new publication keeps the mode of the served one: clients keep their paths and signatures.
         let (current, mode) = match served_now(c, &ctx.caps, t, &d).await? {
             Some((v, p, how)) => (format!("{} ({how})", short(&v)), pinned_mode(t, Some(&p), &version, None)),
@@ -2445,6 +2449,11 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         Act::Create => distribution_form(app, t, None),
         Act::Edit => distribution_form(app, t, Some(item)),
         Act::Delete => {
+            // The view still records the binding: only unpromote deletes its distributions.
+            let env = item["pulp_labels"].get(crate::cv::LABEL_ENV).and_then(Value::as_str).unwrap_or("?");
+            if let Err(e) = cv_distribution_refusal(&item, &format!("unpromote the view from environment {env}")) {
+                return app.error(e.to_string());
+            }
             let lines = distribution_delete_lines(&item);
             app.confirm_danger(format!("Delete distribution {name}"), lines, &name.clone(), move |app| {
                 submit(app, format!("delete distribution {name}"), move |c| async move { Ok(c.delete(&href).await?) })
@@ -5273,9 +5282,45 @@ mod tests {
             edited.fields.iter_mut().find(|f| f.key == key).unwrap().value = value.into();
             assert_eq!(submit(&mut app, &edited), Ok(()), "{key}={value}");
         }
+        // Delete is refused before the confirmation: the view still records the binding.
         distribution_action(&mut app, RepoType::Rpm, Act::Delete, item);
-        let Some(Modal::Confirm { lines, .. }) = &app.modal else { panic!("no confirm") };
-        assert!(lines.iter().any(|l| l.starts_with("WARNING: Content View web serves environment dev here")), "{lines:?}");
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.notices.back().map(|n| (n.level, n.text.as_str())),
+            Some((
+                Level::Error,
+                "refused: distribution web-os belongs to Content View web; unpromote the view from environment dev instead"
+            ))
+        );
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() != "DELETE"));
+    }
+
+    #[tokio::test]
+    async fn delete_marked_distributions_refuses_content_view_ones_before_the_confirmation() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        let (d1, d2) = (format!("{API}distributions/rpm/rpm/1/"), format!("{API}distributions/rpm/rpm/2/"));
+        let labels = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: "dev" });
+        get(&server, &d1, json!({ "pulp_href": d1, "name": "web-os", "base_url": "http://x/os/", "pulp_labels": labels })).await;
+        get(&server, &d2, json!({ "pulp_href": d2, "name": "plain", "base_url": "http://x/plain/" })).await;
+        wiremock::Mock::given(method("DELETE")).respond_with(wiremock::ResponseTemplate::new(204)).expect(0).mount(&server).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Distributions(RepoType::Rpm);
+        app.list.marked = [d1.clone(), d2.clone()].into();
+        run(&mut app, Act::Delete, json!({ "pulp_href": d2, "name": "plain" }));
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "refused before the confirmation");
+        let e = app.notices.back().map(|n| (n.level, n.text.clone()));
+        assert_eq!(
+            e,
+            Some((
+                Level::Error,
+                "impact of deleting 2 distributions: refused: marked distributions belong to Content Views: web-os (view web); \
+                 unmark them (unpromote a view to delete its distributions)"
+                    .into()
+            ))
+        );
+        assert_eq!(app.list.marked, [d1, d2].into(), "the marks stay");
     }
 
     #[tokio::test]

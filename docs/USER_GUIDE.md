@@ -353,9 +353,9 @@ LATEST** (a repository). **i** full JSON.
   * **Checkpoint**: serves the checkpoint publications at `<base path>/<timestamp>/`. Needs
     "follow repository latest".
   * **Serve config.repo** (RPM): Pulp serves a `.repo` file.
-* A Content View distribution: you can edit its base path and its other labels, and delete warns.
-  You cannot re-point, re-bind or rename it, or change its `pulp_tui_*` labels. Use promote or
-  roll back.
+* A Content View distribution: you can edit its base path and its other labels. You cannot
+  re-point, re-bind or rename it, or change its `pulp_tui_*` labels. Use promote or roll back.
+  You cannot delete it, also not as a marked item. Unpromote the view from the environment.
 
 ### Content Views
 
