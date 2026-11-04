@@ -816,7 +816,6 @@ impl Kind {
                     Delete,
                     Inspect,
                 ];
-                actions.retain(|a| *a != Upload || t.uploads());
                 match t {
                     RepoType::Rpm => drop(actions.splice(5..5, [UploadComps, UploadAdvisory])),
                     RepoType::File | RepoType::Deb => {}
@@ -1282,9 +1281,10 @@ mod tests {
     }
 
     #[test]
-    fn deb_repositories_have_no_upload_and_their_own_screens() {
-        assert!(!Kind::Repos(RepoType::Deb, false).actions().contains(&Act::Upload));
-        assert!(Kind::Repos(RepoType::File, false).actions().contains(&Act::Upload));
+    fn deb_repositories_upload_and_have_their_own_screens() {
+        for t in RepoType::ALL {
+            assert!(Kind::Repos(t, false).actions().contains(&Act::Upload), "{t:?}");
+        }
         assert!(NAV.iter().any(|(l, k)| *l == "Deb Repositories" && *k == Kind::Repos(RepoType::Deb, false)));
         let names = |k: &Kind| k.columns().iter().map(|c| c.title).collect::<Vec<_>>();
         let content = |ctype| Kind::Content { version: "/pulp/api/v3/repositories/deb/apt/1/versions/1/".into(), ctype };

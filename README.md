@@ -4,7 +4,7 @@ A keyboard-driven terminal application to manage one or more **Pulp 3** servers 
 the Pulp REST API:
 
 * **RPM, File and Deb repositories**: repositories and remotes (separate objects), sync with
-  policy previews, uploads (chunked, digest-verified; not for Deb), content browsing and
+  policy previews, uploads (chunked, digest-verified), content browsing and
   metadata, add/remove/copy content, versions and diffs, publications (Deb: optional signing
   service), distributions (pinned or following latest), rollback by re-pointing, restore
   of an older version as the new latest version, served-content verification.

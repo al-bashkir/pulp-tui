@@ -606,7 +606,7 @@ pub fn help_lines() -> Vec<String> {
         "server; cancel them explicitly in Tasks (X). Quitting never cancels server work.",
         "",
         "Typical workflows",
-        "  Repository: RPM/File Repositories -> c create -> u upload or f sync -> P publish -> D distribute",
+        "  Repository: Repositories -> c create -> u upload or f sync -> P publish -> D distribute",
         "  Rollback:   Versions (v) -> b on an older version -> choose distribution (history is kept)",
         "  Compare:    Versions -> Space on one version -> m on another",
         "  Content View: Content Views -> c create -> a add repos -> P publish (preview first)",

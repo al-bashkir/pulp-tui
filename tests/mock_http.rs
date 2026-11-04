@@ -553,14 +553,51 @@ async fn deb_publication_reuse_respects_signing_service() {
     server.verify().await;
 }
 
+/// A `.deb` goes to `content/deb/packages/` with the release that lists it, in one request or (above one chunk)
+/// through `uploads/`. The task names the new release records before the package: the digest is checked on the package.
 #[tokio::test]
-async fn deb_packages_cannot_be_uploaded() {
-    let server = MockServer::start().await;
-    let c = client(&server, |_, _| {});
-    let file = tempfile::NamedTempFile::new().unwrap();
-    let e = ops::upload(&c, RepoType::Deb, file.path(), None, None, &|_, _| {}, &no_progress).await.unwrap_err();
-    assert!(matches!(&e, PulpError::Unsupported(m) if m == "upload of Deb packages is not supported"), "{e}");
-    assert!(server.received_requests().await.unwrap().is_empty());
+async fn deb_package_upload_sends_the_release_and_checks_the_package() {
+    let repo = format!("{API}repositories/deb/apt/r/");
+    let pkg = format!("{API}content/deb/packages/1/");
+    let dir = tempfile::tempdir().unwrap();
+    for (size, release) in [(10, Some(("fixture", "main"))), (1024 * 1024 + 5, None)] {
+        let file = dir.path().join(format!("p{size}.deb"));
+        std::fs::write(&file, vec![7u8; size]).unwrap();
+        let sha = hex::encode(Sha256::digest(vec![7u8; size]));
+        let server = MockServer::start().await;
+        let answer = |verb: &str, p: &str, status: u16, body: Value| {
+            Mock::given(method(verb)).and(path(p.to_string())).respond_with(ResponseTemplate::new(status).set_body_json(body))
+        };
+        answer("POST", &format!("{API}uploads/"), 201, json!({ "pulp_href": format!("{API}uploads/1/") })).mount(&server).await;
+        answer("PUT", &format!("{API}uploads/1/"), 200, json!({})).mount(&server).await;
+        answer("POST", &format!("{API}content/deb/packages/"), 202, json!({ "task": format!("{API}tasks/1/") })).mount(&server).await;
+        let created = [format!("{API}content/deb/release_components/5/"), format!("{repo}versions/2/"), pkg.clone()];
+        let task = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": created });
+        answer("GET", &format!("{API}tasks/1/"), 200, task).mount(&server).await;
+        answer("GET", &pkg, 200, json!({ "sha256": sha })).mount(&server).await;
+        let c = client(&server, |_, s| s.upload_chunk_mb = 1);
+
+        let (dist, comp) = (release.map(|r| r.0), release.map(|r| r.1));
+        let r = deb::upload(&c, &file, Some(&repo), dist, comp, &|_, _| {}, &no_progress).await.unwrap();
+        assert_eq!((r.content_href, r.sha256), (pkg.clone(), sha));
+        let sent = server.received_requests().await.unwrap();
+        let post = sent.iter().find(|r| r.url.path() == format!("{API}content/deb/packages/")).unwrap();
+        let body = String::from_utf8_lossy(&post.body).replace("\r\n", "\n");
+        let field = |k: &str, v: &str| format!("name=\"{k}\"\n\n{v}\n");
+        assert!(body.contains(&field("repository", &repo)) && !body.contains("relative_path"), "{body}");
+        match release {
+            Some((d, cp)) => assert!(body.contains(&field("distribution", d)) && body.contains(&field("component", cp)), "{body}"),
+            None => assert!(!body.contains("distribution") && !body.contains("component"), "{body}"),
+        }
+        let puts = sent.iter().filter(|r| r.method.as_str() == "PUT").count();
+        if size > 1024 * 1024 {
+            assert!(body.contains(&field("upload", &format!("{API}uploads/1/"))) && !body.contains("filename="), "{body}");
+            assert_eq!(puts, 2, "two chunks");
+        } else {
+            assert!(body.contains("filename=\"p10.deb\"") && !body.contains("name=\"upload\""), "{body}");
+            assert_eq!(puts, 0);
+        }
+    }
 }
 
 #[tokio::test]

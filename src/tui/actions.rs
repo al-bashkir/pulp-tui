@@ -1315,10 +1315,16 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             match t {
                 RepoType::Rpm => {}
                 RepoType::File => fields.push(Field::text("relative_path", "Relative path in repository").help("default: file name")),
-                RepoType::Deb => {
-                    app.error("upload of Deb packages is not supported");
-                    return;
-                }
+                // The release whose indices list the package; older pulp_deb has no such fields.
+                RepoType::Deb => fields.extend(
+                    [
+                        ("distribution", "Distribution", "empty = pulp (server default)"),
+                        ("component", "Component", "empty = upload (server default)"),
+                    ]
+                    .into_iter()
+                    .filter(|(k, ..)| caps(app).is_none_or(|c| c.has_field("deb.Package", k)))
+                    .map(|(k, label, help)| Field::text(k, label).help(help)),
+                ),
             }
             app.form(
                 Form::new(format!("Upload to {name}"), fields)
@@ -1328,7 +1334,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                     if !path.is_file() {
                         return Err(format!("{} is not a readable file", path.display()));
                     }
-                    let rel = f.opt("relative_path").map(str::to_string);
+                    let [rel, dist, comp] = ["relative_path", "distribution", "component"].map(|k| f.opt(k).map(str::to_string));
                     let href = href.clone();
                     app.job(format!("upload {}", path.display()), move |ctx| async move {
                         if ops::chunked(&ctx.client, tokio::fs::metadata(&path).await?.len()) {
@@ -1338,9 +1344,20 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         let progress = move |d: u64, total: u64| {
                             p2.progress(format!("{:.1}/{:.1} MiB", d as f64 / 1048576.0, total as f64 / 1048576.0))
                         };
-                        let r = ops::upload(&ctx.client, t, &path, rel.as_deref(), Some(&href), &progress, &ctx.on_task()).await?;
+                        let (c, on) = (&ctx.client, ctx.on_task());
+                        let r = match t {
+                            RepoType::Deb => deb::upload(c, &path, Some(&href), dist.as_deref(), comp.as_deref(), &progress, &on).await?,
+                            RepoType::Rpm | RepoType::File => ops::upload(c, t, &path, rel.as_deref(), Some(&href), &progress, &on).await?,
+                        };
+                        let version = r.task.as_ref().and_then(|t| t.created_matching("/versions/"));
+                        let version = version.map(|v| format!(": new version {}", version_number(&v))).unwrap_or_default();
                         ap(move |app| {
-                            app.ok(format!("uploaded {} (sha256 {}…) as {}", path.display(), &r.sha256[..12], short(&r.content_href)));
+                            app.ok(format!(
+                                "uploaded {} (sha256 {}…) as {}{version}",
+                                path.display(),
+                                &r.sha256[..12],
+                                short(&r.content_href)
+                            ));
                             app.reload();
                         })
                     });
@@ -6808,6 +6825,57 @@ mod tests {
             assert!(app.modal.is_none(), "{act:?}");
             assert_eq!(last(&app), want);
         }
+    }
+
+    #[tokio::test]
+    async fn deb_upload_asks_for_the_release_and_reports_the_package_and_the_new_version() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (repo, pkg) = (format!("{API}repositories/deb/apt/r/"), format!("{API}content/deb/packages/0190abcd-1234/"));
+        answer(&server, "POST", &format!("{API}content/deb/packages/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        let created = json!([format!("{API}content/deb/package_release_components/3/"), format!("{repo}versions/2/"), pkg]);
+        get(
+            &server,
+            &format!("{API}tasks/1/"),
+            json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": created }),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let deb = dir.path().join("hello_1.0_amd64.deb");
+        std::fs::write(&deb, "not really a deb").unwrap();
+        get(&server, &pkg, json!({ "sha256": hex::encode(<sha2::Sha256 as sha2::Digest>::digest("not really a deb")) })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let item = json!({ "pulp_href": repo, "name": "apt" });
+        // The task callback also queues a write of the task row; its notice can come after the upload one.
+        let last = |app: &App| app.notices.iter().rfind(|n| n.level == Level::Ok).map(|n| n.text.clone()).unwrap_or_default();
+        let form = |app: &mut App, t| {
+            repo_action(app, t, Act::Upload, item.clone());
+            let Some(Modal::Form { form, submit }) = app.modal.take() else { panic!("no upload form") };
+            (form, submit)
+        };
+        assert_eq!(keys(&form(&mut app, RepoType::Rpm).0), ["path"]);
+        assert_eq!(keys(&form(&mut app, RepoType::File).0), ["path", "relative_path"]);
+
+        let (mut f, mut submit) = form(&mut app, RepoType::Deb);
+        assert_eq!(keys(&f), ["path", "distribution", "component"]);
+        set(&mut f, "path", &deb.display().to_string());
+        set(&mut f, "distribution", "bookworm");
+        set(&mut f, "component", "main");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(last(&app), format!("uploaded {} (sha256 2aa5b79a98d5…) as 0190abcd-1234: new version 2", deb.display()));
+        let sent = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&sent.iter().find(|r| r.method.as_str() == "POST").unwrap().body).replace("\r\n", "\n");
+        for (k, v) in [("repository", repo.as_str()), ("distribution", "bookworm"), ("component", "main")] {
+            assert!(body.contains(&format!("name=\"{k}\"\n\n{v}\n")), "{k}: {body}");
+        }
+        assert!(body.contains("filename=\"hello_1.0_amd64.deb\""), "{body}");
+
+        // A server whose package upload has no release fields (older pulp_deb): the form does not offer them.
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "components": { "schemas": { "deb.Package": { "properties": { "file": {}, "repository": {} } } } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        assert_eq!(keys(&form(&mut app, RepoType::Deb).0), ["path"]);
     }
 
     #[tokio::test]

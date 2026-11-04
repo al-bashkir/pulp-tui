@@ -693,9 +693,8 @@ pub fn chunked(c: &PulpClient, size: u64) -> bool {
     size as usize > c.upload_chunk()
 }
 
-/// Upload a local file as RPM package or File content, optionally adding it to a repository.
-/// Small files go in one request; large ones use the chunked upload API. The server's
-/// digest is compared with the local one, and an unfinished chunked upload is deleted on failure.
+/// Upload a local file as RPM package, File content or Deb package, optionally adding it to a repository
+/// (`relative_path`: File only; Deb sets the pool path itself, see `deb::upload` for its release).
 pub async fn upload(
     c: &PulpClient,
     t: RepoType,
@@ -705,18 +704,34 @@ pub async fn upload(
     progress: &(dyn Fn(u64, u64) + Send + Sync),
     on: OnTask<'_>,
 ) -> Result<UploadResult> {
-    let io = |e: std::io::Error| PulpError::Config(format!("{}: {e}", path.display()));
-    let size = tokio::fs::metadata(path).await.map_err(io)?.len();
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
     let mut fields: Vec<(&str, String)> = vec![];
     if let Some(r) = repository {
         fields.push(("repository", r.into()));
     }
     match t {
-        RepoType::Rpm => {}
-        RepoType::File => fields.push(("relative_path", relative_path.unwrap_or(&file_name).into())),
-        RepoType::Deb => return Err(PulpError::Unsupported("upload of Deb packages is not supported".into())),
+        RepoType::Rpm | RepoType::Deb => {}
+        RepoType::File => {
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("upload");
+            fields.push(("relative_path", relative_path.unwrap_or(file_name).into()));
+        }
     }
+    upload_fields(c, t, path, fields, progress, on).await
+}
+
+/// Upload a local file with the form `fields` of the content type of `t` (`repository`, ...).
+/// Small files go in one request; large ones use the chunked upload API. The server's
+/// digest is compared with the local one, and an unfinished chunked upload is deleted on failure.
+pub async fn upload_fields(
+    c: &PulpClient,
+    t: RepoType,
+    path: &Path,
+    mut fields: Vec<(&str, String)>,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+    on: OnTask<'_>,
+) -> Result<UploadResult> {
+    let io = |e: std::io::Error| PulpError::Config(format!("{}: {e}", path.display()));
+    let size = tokio::fs::metadata(path).await.map_err(io)?.len();
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
     let chunk = c.upload_chunk();
     let mut f = tokio::fs::File::open(path).await.map_err(io)?;
     let mut hasher = Sha256::new();
@@ -777,7 +792,8 @@ pub async fn upload(
             return Err(e);
         }
     };
-    let content_href = created_href(obj.as_ref(), task.as_ref(), "/content/")?;
+    // A Deb upload task also names the release records it made.
+    let content_href = created_href(obj.as_ref(), task.as_ref(), &format!("/{}", t.content()))?;
     let content: Value = c.get(&content_href, &[("fields", "sha256".into())]).await?;
     if content["sha256"].as_str() != Some(sha256.as_str()) {
         return Err(PulpError::Decode(format!("digest mismatch for {content_href}: local {sha256}, server {}", content["sha256"])));

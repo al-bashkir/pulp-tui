@@ -217,6 +217,39 @@ async fn a_served_verbatim_publication_protects_its_version() {
     cleanup(&c, &[&dist, &repo, &remote]).await;
 }
 
+/// Upload (u) of a `.deb` into a release of an empty repository makes a version with the package and its
+/// release records; the publication serves it under that release with the uploaded digest.
+#[tokio::test]
+async fn an_uploaded_deb_package_is_published_and_served() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Deb;
+    let name = unique("it-deb-upload");
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let file = fixtures().join("upstream/deb/pool/main/f/fixture-alpha/fixture-alpha_1.0-1_amd64.deb");
+    let up = deb::upload(&c, &file, Some(&repo), Some("uploads"), Some("main"), &|_, _| {}, &no_progress).await.unwrap();
+    assert!(up.content_href.contains("/content/deb/packages/"), "{}", up.content_href);
+    let v1 = up.task.as_ref().and_then(|t| t.created_matching("/versions/")).expect("a new version");
+    assert_eq!(v1, latest(&c, &repo).await);
+    assert_eq!(ops::content_keys(&c, t, Some(&v1)).await.unwrap().into_iter().collect::<Vec<_>>(), ["fixture-alpha_1.0-1_amd64"]);
+    let all = ops::all_content_keys(&c, &Capabilities::default(), t, &v1).await.unwrap();
+    assert!(all.iter().any(|k| k.starts_with("release component uploads/main")), "{all:?}");
+
+    let publication = ops::create_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
+    let d: Value = c.get(&dist, &[]).await.unwrap();
+    let base = d["base_url"].as_str().unwrap().to_string();
+    let pv: Value = c.get(&publication, &[]).await.unwrap();
+    let msg = ops::verify_served(&c, t, &base, &v1, &pv).await.unwrap();
+    assert!(msg.contains("matching digest (1 packages)"), "{msg}");
+    let (status, index) = served(&c, &format!("{base}dists/uploads/main/binary-amd64/Packages")).await;
+    let index = String::from_utf8_lossy(&index);
+    assert!(status == 200 && index.contains(&format!("SHA256: {}\n", up.sha256)), "{status} {index}");
+    cleanup(&c, &[&dist, &repo]).await;
+}
+
 /// An operator repository with its own signing service: a publication without one is signed by the
 /// repository's service, and after the edit form clears it (`signing_service: null`) it is not.
 #[tokio::test]

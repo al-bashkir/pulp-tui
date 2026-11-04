@@ -1,11 +1,12 @@
-//! Deb plugin operations: package listing, serving checks and the copy API.
+//! Deb plugin operations: package listing and upload, serving checks and the copy API.
 
 use super::client::{Mutation, Page, PulpClient, PulpError, Result};
 use super::models::*;
-use super::ops::CONTENT_PAGE;
+use super::ops::{self, CONTENT_PAGE, OnTask, UploadResult};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::path::Path;
 
 const FIELDS: &str = "pulp_href,package,version,architecture,relative_path,sha256";
 
@@ -121,6 +122,23 @@ async fn served_package(c: &PulpClient, base: &str, p: &DebPackage, index: &str)
         return Ok(Some(path));
     }
     fail(format!("package {path} not served with the expected digest"))
+}
+
+/// Upload a `.deb` (`ops::upload_fields`), optionally into `repository`. There pulp_deb lists it in component
+/// `component` of distribution `distribution` (it adds the release records); each one left out is the server
+/// default (`pulp`, `upload`). Pulp sets the pool path from the package.
+pub async fn upload(
+    c: &PulpClient,
+    path: &Path,
+    repository: Option<&str>,
+    distribution: Option<&str>,
+    component: Option<&str>,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+    on: OnTask<'_>,
+) -> Result<UploadResult> {
+    let fields = [("repository", repository), ("distribution", distribution), ("component", component)];
+    let fields = fields.into_iter().filter_map(|(k, v)| Some((k, v?.to_string()))).collect();
+    ops::upload_fields(c, RepoType::Deb, path, fields, progress, on).await
 }
 
 /// Hrefs of the release records (`PackageReleaseComponent`) in `version` whose package is in `packages`.

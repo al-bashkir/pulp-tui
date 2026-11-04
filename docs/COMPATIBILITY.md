@@ -100,6 +100,7 @@ General rules:
 | Remote                         | timeouts, `max_retries`, `headers`; Deb `excluded_package_metadata_fields`               |
 | Distribution                   | `hidden`, `checkpoint`; RPM `generate_repo_config`                                       |
 | Publication (**c**)            | options of `rpm.RpmPublication`, `file.FilePublication`, `deb.AptPublication`            |
+| Deb upload (**u**)             | `distribution`, `component` of `deb.Package`                                             |
 | Sync                           | `optimize` (RPM, File, Deb), `skip_types` (RPM): `{Rpm,File,Apt}RepositorySyncURL`       |
 | Upstream Pulp (`UpstreamPulp`) | `policy`, replica download policy, concurrency, retries, timeouts                        |
 
@@ -548,6 +549,13 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
 
 * **Package fields**: `package` (not `name`), `version`, `architecture`, `relative_path`,
   `sha256`.
+* **Package upload** (`content/deb/packages/` with `file` or `upload`, `repository`,
+  `distribution`, `component`; `SinglePackageUploadSerializer`). With a repository, pulp_deb
+  lists the package in that release (defaults `pulp` and `upload`, each on its own): the new
+  version also gets the release component, release architecture and PRC. The task's
+  `created_resources` also names these records when they are new, so pulp-tui takes the one
+  under `content/deb/packages/`. Pulp sets `relative_path` (`pool/...`) from the package and
+  reuses an equal package (same `sha256`, `relative_path` and metadata).
 * **`sha256` is `null` until download** for `on_demand` packages. Verify takes the digest
   from the served `Packages` index (what apt checks) and fails when the API differs.
 * **Structured copy.** `deb/copy/` with `structured: true` also copies the
@@ -640,8 +648,7 @@ or IpAddress(127.0.0.1)`.
 ## Unsupported or limited
 
 * Plugins other than pulp_rpm, pulp_file and pulp_deb (container, python, …).
-* pulp_deb: no `.deb` upload, no replication, no verbatim publications, no dependency
-  solving. A verbatim publication made elsewhere is served when newest (Verify and Rollback
+* pulp_deb: no replication, no verbatim publications, no dependency solving. A verbatim publication made elsewhere is served when newest (Verify and Rollback
   read it) and protects its version, so the delete impact lists `publications/deb/verbatim/`.
 * RPM layout `nested_by_digest`: served-content checks skip the package probe (metadata is
   still checked).

@@ -33,13 +33,6 @@ impl RepoType {
             RepoType::Deb => "Deb",
         }
     }
-    /// Whether local files can be uploaded into repositories of this type.
-    pub fn uploads(self) -> bool {
-        match self {
-            RepoType::Rpm | RepoType::File => true,
-            RepoType::Deb => false,
-        }
-    }
     /// The next type in `ALL`, wrapping around (type toggles on screens).
     pub fn next(self) -> RepoType {
         let i = Self::ALL.iter().position(|t| *t == self).map_or(0, |i| i + 1);
@@ -679,7 +672,6 @@ mod tests {
         assert_eq!((RepoType::Deb.repository_schema(), RepoType::Deb.remote_schema()), ("deb.AptRepository", "deb.AptRemote"));
         assert_eq!(RepoType::Deb.repositories(), "repositories/deb/apt/");
         assert_eq!(RepoType::Deb.content(), "content/deb/packages/");
-        assert_eq!([RepoType::Rpm, RepoType::File, RepoType::Deb].map(RepoType::uploads), [true, true, false]);
     }
 
     #[test]

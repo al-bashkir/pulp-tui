@@ -182,9 +182,13 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   * **Skip srpm**, **Skip treeinfo** (RPM): do not download source packages or `.treeinfo`.
   * The form refuses what Pulp refuses: skip types with `mirror_complete`, `mirror_complete` with
     autopublish on, and a mirror policy with **retain package versions** above 0.
-* **u** uploads a local file: an RPM package, or File content with its relative path. Large files
-  go in chunks with progress. pulp-tui verifies the server digest and deletes a failed chunked
-  upload. Upload of `.deb` files is not supported.
+* **u** uploads a local file: an RPM package, File content with its relative path, or a `.deb`
+  package. Large files go in chunks with progress. pulp-tui verifies the server digest and
+  deletes a failed chunked upload. The message names the new content and the new version.
+  * Deb: **Distribution** and **Component** name the release that lists the package (empty =
+    `pulp` and `upload`, the pulp_deb defaults). Pulp adds the release records to the new
+    version and sets the `pool/` path. A structured publication serves the package under
+    `dists/<distribution>/<component>/`.
 * **U** (RPM) uploads a comps.xml. Its package groups, categories, environments and langpacks go
   into a new version. **Replace** first removes the comps units of the repository.
 * **A** (RPM) uploads one advisory: a JSON file with the fields of an updateinfo record. `id`,
