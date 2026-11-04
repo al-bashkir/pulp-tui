@@ -179,19 +179,61 @@ pub fn sync_policies(caps: Option<&Capabilities>, t: RepoType) -> Vec<String> {
 }
 
 /// Runs `go` at once, or after the operator confirms the mirror warning when `policy` is a mirror policy.
-pub fn confirm_mirror(app: &mut App, policy: &str, go: impl FnOnce(&mut App) + 'static) {
+/// `repos`: the repositories that sync; the confirm is typed when the sync makes Pulp delete a current version.
+pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl FnOnce(&mut App) + Send + 'static) {
     if !policy.contains("mirror") {
         return go(app);
     }
-    let mut lines = vec![
-        "Mirror sync makes the NEW repository version match the upstream exactly:".into(),
-        "content that is not upstream is removed from the new version.".into(),
-        "Older versions are not changed and can still be published (rollback).".into(),
-    ];
-    if policy == "mirror_complete" {
-        lines.push("mirror_complete also publishes the upstream metadata unchanged (a publication is created).".into());
-    }
-    app.confirm("Confirm mirror sync", lines, go);
+    let complete = policy == "mirror_complete";
+    app.job("read the retention of the repositories", move |ctx| async move {
+        let mut goes = vec![];
+        for href in repos {
+            let r: Value = ctx.client.get(&href, &[]).await?;
+            if latest_goes(&ctx, &r).await? {
+                goes.push(s(&r, "name"));
+            }
+        }
+        ap(move |app| {
+            let mut lines = vec![
+                "Mirror sync makes the NEW repository version match the upstream exactly:".into(),
+                "content that is not upstream is removed from the new version.".into(),
+            ];
+            if goes.is_empty() {
+                lines.push("Older versions are not changed and can still be published (rollback).".into());
+            } else {
+                lines.extend(goes_lines(&goes.join(", "), "Content that is not upstream"));
+            }
+            if complete {
+                lines.push("mirror_complete also publishes the upstream metadata unchanged (a publication is created).".into());
+            }
+            if goes.is_empty() {
+                app.confirm("Confirm mirror sync", lines, go)
+            } else {
+                app.confirm_danger("Confirm mirror sync", lines, &goes.join(" "), go)
+            }
+        })
+    });
+}
+
+/// pulpcore `Repository.cleanup_old_versions`: after each new version, Pulp keeps the newest `retain_repo_versions`
+/// versions that no distribution serves (`protected_versions`) and deletes the others. True when the next version
+/// makes Pulp delete the current version of the repository `r`: retention 1 and no distribution serves it.
+async fn latest_goes(ctx: &Ctx, r: &Value) -> anyhow::Result<bool> {
+    // Version 0 is empty: its delete loses no content.
+    let latest = r["latest_version_href"].as_str().filter(|v| version_number(v) > 0);
+    let Some(v) = latest.filter(|_| r["retain_repo_versions"] == 1) else { return Ok(false) };
+    let t = RepoType::from_href(v).ok_or_else(|| anyhow!("unknown repository type: {v}"))?;
+    Ok(ops::version_protection(&ctx.client, &ctx.caps, t, v).await?.1.is_empty())
+}
+
+/// The confirm lines when the next version makes Pulp delete the current version of `names` (`latest_goes`).
+fn goes_lines(names: &str, what: &str) -> Vec<String> {
+    vec![
+        format!(
+            "WARNING: retain_repo_versions = 1 and no distribution serves the current version of {names}: Pulp deletes it after the new version."
+        ),
+        format!("{what} then stays only in older versions that distributions serve; orphan cleanup deletes content that no version has."),
+    ]
 }
 
 pub fn pretty(v: &Value) -> Vec<String> {
@@ -1000,6 +1042,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
         app.form(Form::new(format!("Sync {name}"), fields).note(note), move |app, f| {
             let (remote, policy) = (f.opt("remote").map(str::to_string), f.get("policy").to_string());
             let (href, name, options) = (href.clone(), name.clone(), sync_options(f));
+            let repos = vec![href.clone()];
             // pulp_rpm sync() answers HTTP 400 to these pairs; say it before any request.
             if policy == "mirror_complete" && options.get("skip_types").is_some() {
                 return Err("Pulp refuses skip types with mirror_complete: clear the Skip fields or choose another sync policy".into());
@@ -1023,7 +1066,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
                     Ok(ops::sync_with(&c, t, &href, r.as_deref(), &policy, options).await?)
                 })
             };
-            confirm_mirror(app, f.get("policy"), go);
+            confirm_mirror(app, f.get("policy"), repos, go);
             Ok(())
         });
     };
@@ -2316,32 +2359,40 @@ fn content_action(app: &mut App, version: String, act: Act) {
     }
     let repo = repo_of_version(&version);
     match act {
-        Act::RemoveContent => {
-            let lines = vec![
-                format!("Create a new version of {} without {} unit(s).", short(&repo), units.len()),
-                "The current and older versions are immutable and keep the content.".into(),
-            ];
-            app.confirm("Remove content", lines, move |app| {
-                let (n, label) = (units.len(), format!("remove {} unit(s)", units.len()));
-                app.job(label.clone(), move |ctx| async move {
-                    let c = &ctx.client;
-                    let r: Value = c.get(&repo, &[]).await?;
-                    if let Some(e) = snapshot_refusal(&r) {
-                        bail!(e);
-                    }
-                    let units = match t {
-                        RepoType::Deb => {
-                            let latest = r["latest_version_href"].as_str().ok_or_else(|| anyhow!("repository has no versions"))?;
-                            deb::with_release_records(c, latest, units).await?
+        Act::RemoveContent => app.job(format!("read repository {}", short(&repo)), move |ctx| async move {
+            // The retention of the repository decides whether older versions keep the content.
+            let r: Value = ctx.client.get(&repo, &[]).await?;
+            let (goes, name) = (latest_goes(&ctx, &r).await?, s(&r, "name"));
+            let mut lines = vec![format!("Create a new version of {name} without {} unit(s).", units.len())];
+            if goes {
+                lines.extend(goes_lines(&name, "The removed content"));
+            } else {
+                lines.push("The current and older versions are immutable and keep the content.".into());
+            }
+            ap(move |app| {
+                let go = move |app: &mut App| {
+                    let (n, label) = (units.len(), format!("remove {} unit(s)", units.len()));
+                    app.job(label.clone(), move |ctx| async move {
+                        let c = &ctx.client;
+                        let r: Value = c.get(&repo, &[]).await?;
+                        if let Some(e) = snapshot_refusal(&r) {
+                            bail!(e);
                         }
-                        RepoType::Rpm | RepoType::File => units,
-                    };
-                    let m = ops::remove_content(c, &repo, units).await?;
-                    // Only a success shows the new version (without marks): on a failure the operator keeps them.
-                    ap(move |app| follow(app, m, label, move |app, t| content_removed(app, &version, n, &t)))
-                });
-            });
-        }
+                        let units = match t {
+                            RepoType::Deb => {
+                                let latest = r["latest_version_href"].as_str().ok_or_else(|| anyhow!("repository has no versions"))?;
+                                deb::with_release_records(c, latest, units).await?
+                            }
+                            RepoType::Rpm | RepoType::File => units,
+                        };
+                        let m = ops::remove_content(c, &repo, units).await?;
+                        // Only a success shows the new version (without marks): on a failure the operator keeps them.
+                        ap(move |app| follow(app, m, label, move |app, t| content_removed(app, &version, n, &t)))
+                    });
+                };
+                if goes { app.confirm_danger("Remove content", lines, &name, go) } else { app.confirm("Remove content", lines, go) }
+            })
+        }),
         Act::AddToRepo => {
             if t == RepoType::Deb && unsupported(app, Feature::DebCopy) {
                 return;
@@ -3886,6 +3937,7 @@ mod tests {
         app.list.marked = [p1.clone()].into();
         // The browsed version is older: the removal starts from the latest one.
         content_action(&mut app, format!("{repo}versions/1/"), Act::RemoveContent);
+        settle(&mut app, &mut rx).await; // the repository is read before the confirm
         let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
         on_yes.unwrap()(&mut app);
         settle(&mut app, &mut rx).await;
@@ -3910,6 +3962,7 @@ mod tests {
         (app.screen, app.list) = (Screen::List(k.clone()), ListState::new(k));
         app.list.marked = [format!("{API}content/file/files/1/")].into();
         content_action(&mut app, format!("{repo}versions/1/"), Act::RemoveContent);
+        settle(&mut app, &mut rx).await; // the repository is read before the confirm
         let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
         on_yes.unwrap()(&mut app);
         if away {
@@ -4424,22 +4477,93 @@ mod tests {
         assert_eq!(pinned, [json!(selected)]);
     }
 
+    /// pulpcore `Repository.cleanup_old_versions` (after each new version): with `retain_repo_versions` = 1, Pulp
+    /// deletes the current version unless a distribution serves it (`protected_versions`).
+    #[tokio::test]
+    async fn remove_content_warns_when_retention_deletes_the_current_version() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = |n: &str| format!("{API}repositories/file/file/{n}/");
+        // `new` has only the empty version 0: its delete loses nothing.
+        let cases =
+            [("one", 1, json!(1), true), ("served", 2, json!(1), false), ("all", 2, Value::Null, false), ("two", 2, json!(2), false)];
+        let cases = cases.into_iter().chain([("new", 0, json!(1), false)]);
+        let latest = |n: &str, v: u64| format!("{API}repositories/file/file/{n}/versions/{v}/");
+        for (n, v, retain, _) in cases.clone() {
+            let r = json!({ "pulp_href": repo(n), "name": n, "latest_version_href": latest(n, v), "retain_repo_versions": retain });
+            get(&server, &repo(n), r).await;
+        }
+        get(&server, &format!("{API}publications/file/file/"), page(json!([]))).await;
+        let d = json!({ "pulp_href": format!("{API}distributions/file/file/1/"), "name": "d", "base_path": "d", "repository_version": latest("served", 2) });
+        get(&server, &format!("{API}distributions/file/file/"), page(json!([d]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.marked = [format!("{API}content/file/files/1/")].into();
+        let keep = "The current and older versions are immutable and keep the content.";
+        let warn = |n: &str| {
+            format!(
+                "WARNING: retain_repo_versions = 1 and no distribution serves the current version of {n}: Pulp deletes it after the new version."
+            )
+        };
+        for (n, v, _, goes) in cases {
+            content_action(&mut app, latest(n, v), Act::RemoveContent);
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, typed, .. }) = app.modal.take() else { panic!("no confirm for {n}") };
+            assert_eq!(typed.as_deref(), goes.then_some(n), "{n}: {lines:?}");
+            assert_eq!(lines[0], format!("Create a new version of {n} without 1 unit(s)."));
+            assert_eq!((lines.iter().any(|l| l == keep), lines.contains(&warn(n))), (!goes, goes), "{n}: {lines:?}");
+        }
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing sent before a yes");
+    }
+
+    /// The mirror confirm of a repository whose retention deletes its current version: typed, and says so.
+    #[tokio::test]
+    async fn mirror_sync_warns_when_retention_deletes_the_current_version() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/file/file/os/");
+        let r = json!({ "pulp_href": repo, "name": "os", "latest_version_href": format!("{repo}versions/3/"), "retain_repo_versions": 1 });
+        get(&server, &repo, r).await;
+        get(&server, &format!("{API}publications/file/file/"), page(json!([]))).await;
+        get(&server, &format!("{API}distributions/file/file/"), page(json!([]))).await;
+        answer(&server, "POST", &format!("{repo}sync/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        repo_action(&mut app, RepoType::File, Act::Sync, json!({ "pulp_href": repo, "name": "os", "remote": null }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        set(&mut form, "policy", "mirror");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed.as_deref(), Some("os"));
+        let warn = "WARNING: retain_repo_versions = 1 and no distribution serves the current version of os: Pulp deletes it after the new version.";
+        assert!(lines.iter().any(|l| l == warn), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("Older versions are not changed")), "{lines:?}");
+        assert!(posts_to(&server, &format!("{repo}sync/")).await.is_empty(), "nothing sent before a yes");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &format!("{repo}sync/")).await, [json!({ "mirror": true })]);
+    }
+
     #[tokio::test]
     async fn mirror_policies_ask_first() {
         use crate::tui::app::Modal;
-        use std::{cell::Cell, rc::Rc};
-        let st = std::sync::Arc::new(Store::open_in_memory().await.unwrap());
-        let mut app = App::new(crate::config::Config::default(), "/dev/null".into(), st.clone(), Ok(st));
-        let ran = Rc::new(Cell::new(false));
-        confirm_mirror(&mut app, "additive", {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/rpm/rpm/os/");
+        get(&server, &repo, json!({ "pulp_href": repo, "name": "os", "latest_version_href": format!("{repo}versions/3/") })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let ran = Arc::new(AtomicBool::new(false));
+        confirm_mirror(&mut app, "additive", vec![repo.clone()], {
             let r = ran.clone();
-            move |_| r.set(true)
+            move |_| r.store(true, Ordering::Relaxed)
         });
-        assert!(ran.get() && app.modal.is_none());
-        confirm_mirror(&mut app, "mirror_complete", |_| panic!("ran before the confirm"));
-        let Some(Modal::Confirm { title, lines, .. }) = &app.modal else { panic!("no confirm") };
-        assert_eq!((title.as_str(), lines.len()), ("Confirm mirror sync", 4));
-        confirm_mirror(&mut app, "mirror", |_| {});
+        assert!(ran.load(Ordering::Relaxed) && app.modal.is_none() && app.jobs.is_empty(), "additive: no request, no confirm");
+        confirm_mirror(&mut app, "mirror_complete", vec![repo.clone()], |_| panic!("ran before the confirm"));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, typed, .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!((title.as_str(), lines.len(), typed), ("Confirm mirror sync", 4, None));
+        assert_eq!(lines[2], "Older versions are not changed and can still be published (rollback).");
+        confirm_mirror(&mut app, "mirror", vec![repo], |_| {});
+        settle(&mut app, &mut rx).await;
         let Some(Modal::Confirm { lines, .. }) = &app.modal else { panic!("no confirm") };
         assert_eq!(lines.len(), 3);
     }

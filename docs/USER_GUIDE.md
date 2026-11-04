@@ -170,7 +170,9 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   repository). **i** full JSON.
 * **f** sync. Choose the remote (empty = the default remote) and the policy: RPM `additive`,
   `mirror_complete`, `mirror_content_only`; File and Deb `additive`, `mirror`. A mirror policy
-  shows a warning first. Options:
+  shows a warning first. With **Retain versions** 1, Pulp deletes the current version after the
+  sync, unless a distribution serves it: then the warning says so and you type the repository
+  name (on a Content View sync, the names of those repositories). Options:
   * **Optimize** (default on): turn it off for a full re-sync.
   * **Skip srpm**, **Skip treeinfo** (RPM): do not download source packages or `.treeinfo`.
   * The form refuses what Pulp refuses: skip types with `mirror_complete`, `mirror_complete` with
@@ -322,7 +324,10 @@ releases, components, indices and more). `/` searches package names or file path
 
 * **i** shows all metadata of the unit (requires, provides, files, ...).
 * **x** removes the marked (or selected) units: a new version. The screen then shows the new
-  version. The marks stay when the task fails.
+  version. The marks stay when the task fails. Older versions keep the units, but with
+  **Retain versions** 1 Pulp deletes the current version, unless a distribution serves it. Then
+  the confirm says so and you type the repository name: the units stay only in served versions,
+  else orphan cleanup can delete them.
 * **a** adds them to another repository: a new version. On Deb, it is a structured copy, only on
   the packages list.
 

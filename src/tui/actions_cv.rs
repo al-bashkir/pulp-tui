@@ -530,6 +530,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             app.form(form, move |app, f| {
                 let repos = new_cv_repos(&f.picked("repos"), "")?;
                 let (policy, name) = (f.get("policy").to_string(), name.clone());
+                let hrefs = repos.iter().map(|r| r.repo_href.clone()).collect();
                 let go = {
                     let policy = policy.clone();
                     move |app: &mut App| {
@@ -540,7 +541,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                         })
                     }
                 };
-                confirm_mirror(app, &policy, go);
+                confirm_mirror(app, &policy, hrefs, go);
                 Ok(())
             });
         }

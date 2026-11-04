@@ -264,6 +264,13 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   older checkpoint publication that it then serves (or nothing); a deleted publication that is
   not a checkpoint does not change what a checkpoint distribution serves. Servers without the
   field never send it, and pulp-tui reads it as `false`.
+* **Version retention** (`Repository.cleanup_old_versions`, 3.123.1 `models/repository.py:479`,
+  run after each new version, `:1536`). Pulp keeps the newest `retain_repo_versions` complete
+  versions that are not protected (above), and deletes the other unprotected versions;
+  `null` keeps all. So with 1, the next version deletes the current one, unless a
+  distribution serves it. The remove content and mirror sync confirms check this
+  (`latest_goes`): the content that leaves then stays only in served versions, or it is
+  orphaned.
 * **Publications and repositories are not protected** (read in the source of 3.123.1:
   `PublicationViewSet` is a plain `DestroyModelMixin`, `Distribution.publication` is
   `on_delete=SET_NULL`). A served publication is deleted without an error: a distribution
