@@ -132,6 +132,25 @@ async fn served_now(c: &PulpClient, caps: &Capabilities, t: RepoType, d: &Value)
     Ok(Some((s(&p, "repository_version"), p, how)))
 }
 
+/// The publication mode when a distribution is pinned to `version`: the mode of `served` (what it serves
+/// now) when that is of the same repository, else the repository default; `signing`, when picked, replaces
+/// the signing service. Unsigned is explicit, so a signed publication is never reused for the default.
+fn pinned_mode(t: RepoType, served: Option<&Value>, version: &str, signing: Option<String>) -> Value {
+    let same_repo = |p: &&Value| repo_of_version(&s(p, "repository_version")) == repo_of_version(version);
+    let mut mode = served.filter(same_repo).map_or_else(|| json!({ "signing_service": null }), |p| ops::publication_mode(t, p));
+    if signing.is_some() {
+        mode["signing_service"] = signing.into();
+    }
+    mode
+}
+
+/// "k=v, ..." of the set fields of a publication mode.
+fn mode_line(mode: &Value) -> String {
+    let set = mode.as_object().into_iter().flatten().filter(|(_, v)| !v.is_null());
+    let line = set.map(|(k, v)| format!("{k}={}", v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect::<Vec<_>>();
+    if line.is_empty() { "repository default settings".into() } else { line.join(", ") }
+}
+
 pub(super) fn caps(app: &App) -> Option<std::sync::Arc<Capabilities>> {
     app.conn.as_ref().map(|c| c.caps.clone())
 }
@@ -1484,7 +1503,7 @@ fn publish_form(app: &mut App, t: RepoType, title: String, go: impl Fn(&mut App,
 
 fn publish(app: &mut App, t: RepoType, name: &str, version: String, signing_service: Option<String>) {
     app.job(format!("publish {name} {}", short(&version)), move |ctx| async move {
-        let p = ops::create_publication(&ctx.client, t, &version, signing_service.as_deref(), &ctx.on_task()).await?;
+        let p = ops::create_publication(&ctx.client, t, &version, &json!({ "signing_service": signing_service }), &ctx.on_task()).await?;
         ap(move |app| app.ok(format!("publication {} for {}", short(&p), short(&version))))
     });
 }
@@ -1552,7 +1571,11 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
                     Some(p) => p,
                     None => {
                         let v = version.ok_or_else(|| anyhow!("repository has no versions"))?;
-                        ops::ensure_publication(c, t, &v, signing.as_deref(), &on).await?
+                        let served = match &existing {
+                            Some(d) => ops::served_publication(c, &ctx.caps, t, d).await?,
+                            None => None,
+                        };
+                        ops::ensure_publication(c, t, &v, &pinned_mode(t, served.as_ref(), &v, signing), &on).await?
                     }
                 };
                 ops::ensure_distribution(c, t, &dist, &bp, Some(&p), &json!({}), None, &on).await?
@@ -2085,15 +2108,16 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
         let d: Value =
             ops::find_by_name(c, &c.api(t.distributions()), &dist).await?.ok_or_else(|| anyhow!("no {} distribution {dist}", t.label()))?;
         cv_distribution_refusal(&d)?;
-        // The new publication keeps the signing service of the served one (a Deb publication can have its own).
-        let (current, signing) = match served_now(c, &ctx.caps, t, &d).await? {
-            Some((v, p, how)) => (format!("{} ({how})", short(&v)), p["signing_service"].as_str().map(str::to_string)),
-            None => ("nothing".into(), None),
+        // The new publication keeps the mode of the served one: clients keep their paths and signatures.
+        let (current, mode) = match served_now(c, &ctx.caps, t, &d).await? {
+            Some((v, p, how)) => (format!("{} ({how})", short(&v)), pinned_mode(t, Some(&p), &version, None)),
+            None => ("nothing".into(), pinned_mode(t, None, &version, None)),
         };
         let lines = vec![
             format!("Distribution {dist} ({})", s(&d, "base_url")),
             format!("  now serves:  {current}"),
             format!("  will serve:  {} (pinned)", short(&version)),
+            format!("  publication: {}", mode_line(&mode)),
             String::new(),
             "Newer versions and publications are kept.".into(),
             "Repository metadata switches immediately. Pulp may keep serving files of the previous".into(),
@@ -2105,7 +2129,7 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
                 app.job(format!("rollback {dist}"), move |ctx| async move {
                     let c = &ctx.client;
                     let on = ctx.on_task();
-                    let p = ops::ensure_publication(c, t, &version, signing.as_deref(), &on).await?;
+                    let p = ops::ensure_publication(c, t, &version, &mode, &on).await?;
                     let base = s(&d, "base_path");
                     ops::ensure_distribution(c, t, &dist, &base, Some(&p), &json!({}), None, &on).await?;
                     let pv: Value = c.get(&p, &[]).await?;
@@ -2297,12 +2321,11 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         Some(n) => version_of(&s(&r, "pulp_href"), n),
                         None => r["latest_version_href"].as_str().ok_or_else(|| anyhow!("no versions"))?.to_string(),
                     };
-                    let mut body = ops::publication_body(c, t, &v, None).await?;
+                    let mut body = ops::publication_body(c, t, &v, &options).await?;
                     if checkpoint {
                         body.as_object_mut().expect("an object").remove("repository_version");
                         body["repository"] = s(&r, "pulp_href").into();
                     }
-                    body.as_object_mut().expect("an object").extend(options.as_object().cloned().unwrap_or_default());
                     let p = ops::create(c, &c.api(t.publications()), &body, "/publications/", &ctx.on_task()).await?;
                     ap(move |app| {
                         app.ok(format!("publication {} of {}", short(&p), short(&v)));
@@ -2494,7 +2517,7 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 {
                     return Err(format!("refused: Content View {cv} finds this distribution by its name and pulp_tui labels; keep them"));
                 }
-                let href = href.clone();
+                let (href, current) = (href.clone(), v.clone());
                 let label = format!("{} distribution {}", if edit { "update" } else { "create" }, f.get("name"));
                 app.job(label.clone(), move |ctx| async move {
                     let c = &ctx.client;
@@ -2518,7 +2541,9 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                                 Some(n) => version_of(&rh, n),
                                 None => rv["latest_version_href"].as_str().ok_or_else(|| anyhow!("no versions"))?.to_string(),
                             };
-                            b["publication"] = ops::ensure_publication(c, t, &v, signing.as_deref(), &on).await?.into();
+                            let served = ops::served_publication(c, &ctx.caps, t, &current).await?;
+                            b["publication"] =
+                                ops::ensure_publication(c, t, &v, &pinned_mode(t, served.as_ref(), &v, signing), &on).await?.into();
                             b["repository"] = Value::Null;
                         }
                     }
@@ -4062,7 +4087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deb_rollback_keeps_the_signing_service_of_the_served_publication() {
+    async fn deb_rollback_keeps_the_mode_and_signing_service_of_the_served_publication() {
         use crate::tui::app::Modal;
         use wiremock::matchers::{method, path};
         let server = deb_distribute_server().await;
@@ -4078,8 +4103,19 @@ mod tests {
             .with_priority(1)
             .mount(&server)
             .await;
-        let served = json!({ "pulp_href": now, "repository_version": format!("{API}repositories/deb/apt/r/versions/2/"), "signing_service": "/ss/1/" });
+        let mode = json!({ "signing_service": "/ss/1/", "simple": true, "structured": false, "layout": "flat" });
+        let mut served = json!({ "pulp_href": now, "repository_version": format!("{API}repositories/deb/apt/r/versions/2/") });
+        served.as_object_mut().unwrap().extend(mode.as_object().unwrap().clone());
         get(&server, &now, served).await;
+        // A structured publication of the old version with the same signing service is not the served mode.
+        let structured =
+            json!({ "pulp_href": "/p/old/", "repository_version": old, "signing_service": "/ss/1/", "simple": false, "structured": true });
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}publications/deb/apt/")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([structured]))))
+            .with_priority(1)
+            .mount(&server)
+            .await;
         wiremock::Mock::given(method("PATCH"))
             .and(path(d.clone()))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": d })))
@@ -4088,14 +4124,35 @@ mod tests {
         let (mut app, mut rx) = connected(&server).await;
         rollback_preview(&mut app, RepoType::Deb, "prod".into(), old.clone());
         settle(&mut app, &mut rx).await;
-        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
+        let Some(Modal::Confirm { on_yes, lines, .. }) = app.modal.take() else { panic!("no confirm") };
+        assert!(
+            lines.contains(&"  publication: layout=flat, signing_service=/ss/1/, simple=true, structured=false".to_string()),
+            "{lines:?}"
+        );
         on_yes.unwrap()(&mut app);
         settle(&mut app, &mut rx).await;
         let pubs = format!("{API}publications/deb/apt/");
-        assert_eq!(posts_to(&server, &pubs).await, [json!({ "repository_version": old, "signing_service": "/ss/1/" })]);
+        let mut want = json!({ "repository_version": old });
+        want.as_object_mut().unwrap().extend(mode.as_object().unwrap().clone());
+        assert_eq!(posts_to(&server, &pubs).await, [want]);
         let sent = server.received_requests().await.unwrap();
         let patch: Value = sent.iter().find(|r| r.method.as_str() == "PATCH").unwrap().body_json().unwrap();
         assert_eq!(patch["publication"], json!(format!("{pubs}9/")));
+    }
+
+    #[test]
+    fn a_pinned_distribution_keeps_the_served_mode_of_the_same_repository_only() {
+        let v = "/r/a/versions/1/";
+        let served = json!({ "pulp_href": "/p/", "repository_version": "/r/a/versions/2/", "simple": true, "signing_service": "/ss/1/" });
+        assert_eq!(pinned_mode(RepoType::Deb, Some(&served), v, None), json!({ "simple": true, "signing_service": "/ss/1/" }));
+        assert_eq!(
+            pinned_mode(RepoType::Deb, Some(&served), v, Some("/ss/2/".into())),
+            json!({ "simple": true, "signing_service": "/ss/2/" })
+        );
+        let default = json!({ "signing_service": null });
+        assert_eq!(pinned_mode(RepoType::Deb, Some(&served), "/r/b/versions/1/", None), default, "another repository");
+        assert_eq!(pinned_mode(RepoType::Deb, None, v, None), default, "nothing served");
+        assert_eq!(mode_line(&default), "repository default settings");
     }
 
     #[tokio::test]

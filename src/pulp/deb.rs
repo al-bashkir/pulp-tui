@@ -34,21 +34,31 @@ fn served_entry(index: &str, p: &DebPackage) -> Option<(String, Option<String>)>
     })
 }
 
-/// The Release file must be served and the smallest package must be listed in a `Packages` index
-/// and downloadable with the expected digest. `base` ends with `/`.
-pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String> {
+/// The Release files of the modes of `publication` must be served and the smallest package must be
+/// listed in a `Packages` index and downloadable with the expected digest. `base` ends with `/`.
+/// A structured publication (the default) serves `dists/<release>/`; a simple one `dists/default/all/`.
+pub async fn verify(c: &PulpClient, base: &str, version: &str, publication: &Value) -> Result<String> {
     let fail = |m: String| Err(PulpError::Mismatch(m));
-    let q = [("repository_version", version.to_string()), ("fields", "distribution".into()), ("limit", "1".into())];
-    let releases: Page<Value> = c.list(&c.api("content/deb/releases/"), &q).await?;
-    let Some(dist) = releases.results.first().and_then(|r| r["distribution"].as_str()) else {
-        return fail("the version has no Release".into());
-    };
-    // pulp_deb publishes under `dists/<distribution without slashes>/<last part of the component>/`.
-    let dir = dist.trim_matches('/');
-    let probe = format!("dists/{dir}/Release");
-    let (status, _) = c.fetch_content(&format!("{base}{probe}"), 64 << 20).await?;
-    if status != 200 {
-        return fail(format!("{probe} returned HTTP {status}"));
+    let (simple, structured) = (publication["simple"] == true, publication["structured"] != false);
+    let mut dirs = vec![];
+    if structured {
+        let q = [("repository_version", version.to_string()), ("fields", "distribution".into()), ("limit", "1".into())];
+        let releases: Page<Value> = c.list(&c.api("content/deb/releases/"), &q).await?;
+        let Some(dist) = releases.results.first().and_then(|r| r["distribution"].as_str()) else {
+            return fail("the version has no Release".into());
+        };
+        // pulp_deb publishes under `dists/<distribution without slashes>/<last part of the component>/`.
+        dirs.push(dist.trim_matches('/').to_string());
+    }
+    if simple {
+        dirs.push("default".into());
+    }
+    for dir in dirs {
+        let probe = format!("dists/{dir}/Release");
+        let (status, _) = c.fetch_content(&format!("{base}{probe}"), 64 << 20).await?;
+        if status != 200 {
+            return fail(format!("{probe} returned HTTP {status}"));
+        }
     }
     let q = [
         ("repository_version", version.to_string()),
@@ -58,17 +68,20 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str) -> Result<String>
     ];
     let pkgs: Page<DebPackage> = c.list(&c.api("content/deb/packages/"), &q).await?;
     let Some(p) = pkgs.results.first() else { return Ok("Release served (no packages)".into()) };
-    let comps: Vec<Value> = c
-        .list_all(
+    let comps: Vec<Value> = if structured {
+        c.list_all(
             &c.api("content/deb/release_components/"),
             &[("repository_version", version.into()), ("fields", "plain_component,distribution".into())],
             10_000,
         )
-        .await?;
+        .await?
+    } else {
+        vec![]
+    };
     let mut tried = vec![];
     // The smallest package of the version can be in any of its distributions.
     let comps = comps.iter().filter_map(|r| Some((r["distribution"].as_str()?.trim_matches('/'), r["plain_component"].as_str()?)));
-    for (d, comp) in comps {
+    for (d, comp) in comps.chain(simple.then_some(("default", "all"))) {
         let index = format!("dists/{d}/{comp}/binary-{}/Packages", p.architecture);
         let (status, body) = c.fetch_content(&format!("{base}{index}"), 64 << 20).await?;
         let entry = if status == 200 { served_entry(&String::from_utf8_lossy(&body), p) } else { None };

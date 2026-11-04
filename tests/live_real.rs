@@ -133,7 +133,7 @@ async fn debian_main_real() {
     let units = deb::with_release_records(&c, &copied, hello).await.unwrap();
     let m = ops::remove_content(&c, &plain, units).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    let publication = ops::create_publication(&c, t, &latest(&c, &plain).await, None, &no_progress).await.unwrap();
+    let publication = ops::create_publication(&c, t, &latest(&c, &plain).await, &json!({}), &no_progress).await.unwrap();
     let rm_dist = ops::ensure_distribution(&c, t, &rm, &rm, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let d: Value = c.get(&rm_dist, &[]).await.unwrap();
     let (status, index) = served_text(&c, &format!("{}dists/{dist}/main/binary-amd64/Packages", d["base_url"].as_str().unwrap())).await;
@@ -177,11 +177,11 @@ async fn rocky9_baseos_real() {
     eprintln!("{name}: {} advisories in the snapshot, {} in the source", advisories(&c, &snapshot).await, advisories(&c, &v).await);
 
     // Operator Publish after a settings change: a reused publication keeps the settings of its time.
-    let p1 = ops::ensure_publication(&c, t, &v, None, &no_progress).await.unwrap();
+    let p1 = ops::ensure_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap();
     let m = c.patch(&repo, &json!({ "checksum_type": "sha512" })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    assert_eq!(ops::ensure_publication(&c, t, &v, None, &no_progress).await.unwrap(), p1, "ensure_publication reuses p1");
-    let p2 = ops::create_publication(&c, t, &v, None, &no_progress).await.unwrap();
+    assert_eq!(ops::ensure_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap(), p1, "ensure_publication reuses p1");
+    let p2 = ops::create_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap();
     assert_ne!(p2, p1, "create_publication makes a new one");
     let (old, new): (Value, Value) = (c.get(&p1, &[]).await.unwrap(), c.get(&p2, &[]).await.unwrap());
 

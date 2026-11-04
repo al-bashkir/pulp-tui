@@ -507,9 +507,9 @@ async fn deb_publication_reuse_respects_signing_service() {
         .mount(&server)
         .await;
     let c = client(&server, |_, _| {});
-    let signed = ops::ensure_publication(&c, RepoType::Deb, "/v/", Some("/ss/1/"), &no_progress).await.unwrap();
+    let signed = ops::ensure_publication(&c, RepoType::Deb, "/v/", &json!({ "signing_service": "/ss/1/" }), &no_progress).await.unwrap();
     assert_eq!(signed, format!("{coll}2/"));
-    let plain = ops::ensure_publication(&c, RepoType::Deb, "/v/", None, &no_progress).await.unwrap();
+    let plain = ops::ensure_publication(&c, RepoType::Deb, "/v/", &json!({ "signing_service": null }), &no_progress).await.unwrap();
     assert_eq!(plain, format!("{coll}1/"));
     server.verify().await;
 }
@@ -596,12 +596,12 @@ async fn deb_verify_checks_release_index_and_package_digest() {
     let pkg = |sha: &str| json!([{ "pulp_href": "/p/1/", "package": "fixture-beta", "version": "1.0-1", "architecture": "amd64", "relative_path": "pool/x.deb", "sha256": sha }]);
     let (server, base) = deb_server(pkg(&hex::encode(Sha256::digest(b"deb bytes")))).await;
     let c = client(&server, |_, _| {});
-    let ok = deb::verify(&c, &base, "/v/").await.unwrap();
+    let ok = deb::verify(&c, &base, "/v/", &json!({})).await.unwrap();
     assert_eq!(ok, "Release and pool/main/f/fixture-beta_1.0-1_amd64.deb served with matching digest (1 packages)");
 
     let (server, base) = deb_server(pkg("00")).await;
     let c = client(&server, |_, _| {});
-    let err = deb::verify(&c, &base, "/v/").await.unwrap_err();
+    let err = deb::verify(&c, &base, "/v/", &json!({})).await.unwrap_err();
     assert_eq!(
         err.to_string(),
         "served content differs: package pool/main/f/fixture-beta_1.0-1_amd64.deb not served with the expected digest"
@@ -609,7 +609,7 @@ async fn deb_verify_checks_release_index_and_package_digest() {
 
     let (server, base) = deb_server(json!([])).await;
     let c = client(&server, |_, _| {});
-    assert_eq!(deb::verify(&c, &base, "/v/").await.unwrap(), "Release served (no packages)");
+    assert_eq!(deb::verify(&c, &base, "/v/", &json!({})).await.unwrap(), "Release served (no packages)");
 }
 
 #[tokio::test]
@@ -631,9 +631,44 @@ async fn deb_verify_checks_the_digest_of_the_index_for_packages_not_downloaded_y
             .mount(&server)
             .await;
         let c = client(&server, |_, _| {});
-        let res = deb::verify(&c, &base, "/v/").await;
+        let res = deb::verify(&c, &base, "/v/", &json!({})).await;
         assert_eq!(res.is_ok(), ok, "api {api}, index {listed}: {res:?}");
     }
+}
+
+#[tokio::test]
+async fn deb_verify_probes_the_paths_of_the_publication_mode() {
+    let sha = hex::encode(Sha256::digest(b"deb bytes"));
+    let pkg = json!([{ "pulp_href": "/p/1/", "package": "fixture-beta", "version": "1.0-1", "architecture": "amd64", "relative_path": "pool/x.deb", "sha256": sha }]);
+    let simple = json!({ "simple": true, "structured": false });
+    // The server serves only the structured paths: a simple publication is not served.
+    let (server, base) = deb_server(pkg.clone()).await;
+    let c = client(&server, |_, _| {});
+    let err = deb::verify(&c, &base, "/v/", &simple).await.unwrap_err();
+    assert_eq!(err.to_string(), "served content differs: dists/default/Release returned HTTP 404");
+    // A simple publication: default/all, also when the version has no Release record.
+    let (server, base) = deb_server(pkg).await;
+    Mock::given(method("GET"))
+        .and(path(format!("{API}content/deb/releases/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 0, "next": null, "results": [] })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let index = "Package: fixture-beta\nVersion: 1.0-1\nArchitecture: amd64\nFilename: pool/all/f/fixture-beta_1.0-1_amd64.deb\n";
+    for (p, body) in [
+        ("dists/default/Release", "Suite: default\n"),
+        ("dists/default/all/binary-amd64/Packages", index),
+        ("pool/all/f/fixture-beta_1.0-1_amd64.deb", "deb bytes"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/pulp/content/d/{p}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+    }
+    let c = client(&server, |_, _| {});
+    let ok = deb::verify(&c, &base, "/v/", &simple).await.unwrap();
+    assert_eq!(ok, "Release and pool/all/f/fixture-beta_1.0-1_amd64.deb served with matching digest (1 packages)");
 }
 
 #[tokio::test]
@@ -662,8 +697,57 @@ async fn deb_verify_finds_the_package_in_another_distribution() {
             .await;
     }
     let c = client(&server, |_, _| {});
-    let ok = deb::verify(&c, &base, "/v/").await.unwrap();
+    let ok = deb::verify(&c, &base, "/v/", &json!({})).await.unwrap();
     assert_eq!(ok, format!("Release and {file} served with matching digest (1 packages)"));
+}
+
+/// An RPM repository version; its repository is `{API}repositories/rpm/rpm/r/`.
+const RPM_V: &str = "/pulp/api/v3/repositories/rpm/rpm/r/versions/1/";
+
+/// The repository of `RPM_V`, without a metadata signing service.
+async fn unsigned_repo(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("{API}repositories/rpm/rpm/r/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "metadata_signing_service": null })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn rpm_verify_needs_the_signature_when_the_repository_signs_its_metadata() {
+    let good = hex::encode(Sha256::digest(b"rpm bytes"));
+    let pkgs = json!([{ "location_href": "a.rpm", "sha256": good }]);
+    let mut asc = vec![];
+    for signed in [false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{API}content/rpm/packages/")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": pkgs })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{API}repositories/rpm/rpm/r/")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "metadata_signing_service": "/ss/1/" })))
+            .mount(&server)
+            .await;
+        let mut files = vec![("repodata/repomd.xml", "<repomd/>"), ("Packages/a/a.rpm", "rpm bytes")];
+        if signed {
+            files.push(("repodata/repomd.xml.asc", "-----BEGIN PGP SIGNATURE-----"));
+        }
+        for (p, body) in files {
+            Mock::given(method("GET"))
+                .and(path(format!("/pulp/content/d/{p}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+        }
+        let c = client(&server, |_, _| {});
+        asc.push(pulp_tui::pulp::rpm::verify(&c, &format!("{}/pulp/content/d/", server.uri()), RPM_V, "").await.map_err(|e| e.to_string()));
+    }
+    // A publication made before the repository got its signing service has no signature.
+    let unsigned = "served content differs: repodata/repomd.xml.asc returned HTTP 404 (the repository signs its metadata)";
+    assert_eq!(asc[0], Err(unsigned.into()));
+    assert_eq!(asc[1], Ok("repomd.xml, repomd.xml.asc and Packages/a/a.rpm served with matching digest (1 packages)".into()));
 }
 
 #[tokio::test]
@@ -693,8 +777,9 @@ async fn rpm_and_file_verify_units_not_downloaded_yet() {
             .await;
         served("repodata/repomd.xml", "<repomd/>").mount(&server).await;
         served("Packages/f/fixture-a.rpm", "rpm bytes").mount(&server).await;
+        unsigned_repo(&server).await;
         let c = client(&server, |_, _| {});
-        let res = pulp_tui::pulp::rpm::verify(&c, &format!("{}/pulp/content/d/", server.uri()), "/v/", "").await;
+        let res = pulp_tui::pulp::rpm::verify(&c, &format!("{}/pulp/content/d/", server.uri()), RPM_V, "").await;
         assert_eq!(res.is_ok(), ok, "api {api}, pkgId {pkg_id} ({kind}): {res:?}");
     }
 
@@ -764,7 +849,7 @@ async fn file_publication_takes_the_manifest_of_the_repository() {
             .mount(&server)
             .await;
         let c = client(&server, |_, _| {});
-        assert_eq!(ops::create_publication(&c, RepoType::File, &version, None, &no_progress).await.unwrap(), format!("{coll}1/"));
+        assert_eq!(ops::create_publication(&c, RepoType::File, &version, &json!({}), &no_progress).await.unwrap(), format!("{coll}1/"));
         server.verify().await;
     }
 }
@@ -820,11 +905,12 @@ async fn rpm_verify_reads_the_layout_of_the_publication() {
             .mount(&server)
             .await;
     }
+    unsigned_repo(&server).await;
     let c = client(&server, |_, _| {});
     let base = format!("{}/pulp/content/d/", server.uri());
     let verify = |p: Value| {
         let (c, base) = (&c, &base);
-        async move { ops::verify_served(c, RepoType::Rpm, base, "/v/", &p).await }
+        async move { ops::verify_served(c, RepoType::Rpm, base, RPM_V, &p).await }
     };
     let ok = "repomd.xml and Packages/bash-5.2-1.x86_64.rpm served with matching digest (1 packages)";
     assert_eq!(verify(json!({ "layout": "flat" })).await.unwrap(), ok);

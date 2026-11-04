@@ -45,8 +45,8 @@ pub fn package_path(layout: &str, location_href: &str) -> Option<String> {
     }
 }
 
-/// RPM metadata must be served and the smallest package must be downloadable with the
-/// expected digest. `base` ends with `/`.
+/// RPM metadata must be served (and signed, when the repository has a metadata signing service) and
+/// the smallest package must be downloadable with the expected digest. `base` ends with `/`.
 pub async fn verify(c: &PulpClient, base: &str, version: &str, layout: &str) -> Result<String> {
     let fail = |m: String| Err(PulpError::Mismatch(m));
     let probe = "repodata/repomd.xml";
@@ -54,6 +54,16 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str, layout: &str) -> 
     if status != 200 {
         return fail(format!("{probe} returned HTTP {status}"));
     }
+    // A publication made before the repository got its signing service has no signature.
+    let repo: Value = c.get(&super::ops::repo_of_version(version), &[("fields", "metadata_signing_service".into())]).await?;
+    let signed = repo["metadata_signing_service"].is_string();
+    if signed {
+        let (status, _) = c.fetch_content(&format!("{base}{probe}.asc"), 1 << 20).await?;
+        if status != 200 {
+            return fail(format!("{probe}.asc returned HTTP {status} (the repository signs its metadata)"));
+        }
+    }
+    let metadata = if signed { "repomd.xml, repomd.xml.asc" } else { "repomd.xml" };
     let q = [
         ("repository_version", version.to_string()),
         ("fields", "location_href,sha256,pkgId,checksum_type".into()),
@@ -61,7 +71,7 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str, layout: &str) -> 
         ("limit", "1".into()),
     ];
     let pkgs: Page<Value> = c.list(&c.api(RepoType::Rpm.content()), &q).await?;
-    let Some(p) = pkgs.results.first() else { return Ok("repomd.xml served (no packages)".into()) };
+    let Some(p) = pkgs.results.first() else { return Ok(format!("{metadata} served (no packages)")) };
     let loc = p["location_href"].as_str().unwrap_or_default();
     // `sha256` comes from the stored file: `null` for an on_demand package until a client downloads it.
     let Some(want) = p["sha256"].as_str().or_else(|| p["pkgId"].as_str().filter(|_| p["checksum_type"] == "sha256")) else {
@@ -72,7 +82,7 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str, layout: &str) -> 
     for path in &candidates {
         let (status, body) = c.fetch_content(&format!("{base}{path}"), 64 << 20).await?;
         if status == 200 && hex::encode(Sha256::digest(&body)) == want {
-            return Ok(format!("repomd.xml and {path} served with matching digest ({} packages)", pkgs.count));
+            return Ok(format!("{metadata} and {path} served with matching digest ({} packages)", pkgs.count));
         }
     }
     fail(format!("package {loc} not served with the expected digest (tried {})", candidates.join(", ")))

@@ -123,7 +123,7 @@ async fn filesystem_export_of_a_file_publication() {
     let name = unique("it-fsexport");
     let (repo, remote) = synced_repo(&c, t, &name, "file/PULP_MANIFEST", "mirror").await;
     let v = latest(&c, &repo).await;
-    let publication = ops::create_publication(&c, t, &v, None, &no_progress).await.unwrap();
+    let publication = ops::create_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap();
     let body = json!({ "name": name, "path": format!("{EXPORTS}/{name}"), "method": "write" });
     let exporter = create(&c, "exporters/core/filesystem/", body, "/exporters/").await;
 

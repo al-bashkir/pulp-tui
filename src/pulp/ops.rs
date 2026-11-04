@@ -250,62 +250,73 @@ pub async fn sync_with(c: &PulpClient, t: RepoType, repo: &str, remote: Option<&
     c.post(&format!("{repo}sync/"), &body).await
 }
 
-/// Reuse a publication of the version made with the same signing service, else create one.
+/// The publication fields that say how a publication of `t` publishes, not what: a rollback keeps them.
+fn mode_fields(t: RepoType) -> &'static [&'static str] {
+    match t {
+        RepoType::Rpm => &["checksum_type", "compression_type", "layout", "repo_config"],
+        RepoType::File => &["manifest"],
+        RepoType::Deb => &[
+            "simple",
+            "structured",
+            "layout",
+            "signing_service",
+            "publish_legacy_release_files",
+            "publish_upstream_release_fields",
+            "excluded_package_metadata_fields",
+        ],
+    }
+}
+
+/// The mode of publication `p` (a JSON object), for `ensure_publication`. A field that `p` lacks (an
+/// older server) is left out.
+pub fn publication_mode(t: RepoType, p: &Value) -> Value {
+    mode_fields(t).iter().filter_map(|&k| p.get(k).map(|v| (k.to_string(), v.clone()))).collect()
+}
+
+/// Reuse a publication of the version that has `mode`, else create one with it.
+/// `mode`: publication fields that must match (`null`: must be unset); other fields may be anything.
 /// A reused publication keeps the repository settings of the time it was made; the operator's
 /// Publish uses `create_publication` instead.
-pub async fn ensure_publication(
-    c: &PulpClient,
-    t: RepoType,
-    version: &str,
-    signing_service: Option<&str>,
-    on: OnTask<'_>,
-) -> Result<String> {
-    if let Some(p) = find_publication(c, t, version, signing_service).await? {
+pub async fn ensure_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value, on: OnTask<'_>) -> Result<String> {
+    if let Some(p) = find_publication(c, t, version, mode).await? {
         return Ok(p);
     }
-    create_publication(c, t, version, signing_service, on).await
+    create_publication(c, t, version, mode, on).await
 }
 
-/// A publication of the version made with the same signing service and, for File, with the manifest name
-/// that a new one would get (the reuse of `ensure_publication`).
-pub async fn find_publication(c: &PulpClient, t: RepoType, version: &str, signing_service: Option<&str>) -> Result<Option<String>> {
-    let all: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository_version", version.into())], 1_000).await?;
-    let manifest = match t {
-        RepoType::File if !all.is_empty() => Some(publication_body(c, t, version, None).await?["manifest"].as_str().map(str::to_string)),
-        _ => None,
-    };
-    let same = |p: &Publication| p.signing_service.as_deref() == signing_service && manifest.as_ref().is_none_or(|m| p.manifest == *m);
-    Ok(all.into_iter().find(same).map(|p| p.pulp_href))
+/// A publication of the version that has `mode` and, for File, the manifest name that a new one would get
+/// (the reuse of `ensure_publication`).
+pub async fn find_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> Result<Option<String>> {
+    let all: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository_version", version.into())], 1_000).await?;
+    let mut want = mode.as_object().cloned().unwrap_or_default();
+    if t == RepoType::File && !all.is_empty() && !want.contains_key("manifest") {
+        want.insert("manifest".into(), publication_body(c, t, version, mode).await?["manifest"].clone());
+    }
+    let same = |p: &&Value| want.iter().all(|(k, v)| p[k] == *v);
+    Ok(all.iter().find(same).map(|p| p["pulp_href"].as_str().unwrap_or_default().to_string()))
 }
 
-/// A new publication of `version`, made with the repository settings of now. `signing_service` is sent
-/// only when set: Deb is the only type that takes it.
-pub async fn create_publication(
-    c: &PulpClient,
-    t: RepoType,
-    version: &str,
-    signing_service: Option<&str>,
-    on: OnTask<'_>,
-) -> Result<String> {
-    let body = publication_body(c, t, version, signing_service).await?;
+/// A new publication of `version`, made with `mode` and else the repository settings of now.
+pub async fn create_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value, on: OnTask<'_>) -> Result<String> {
+    let body = publication_body(c, t, version, mode).await?;
     create(c, &c.api(t.publications()), &body, "/publications/", on).await
 }
 
-/// The request body of `create_publication`.
-pub async fn publication_body(c: &PulpClient, t: RepoType, version: &str, signing_service: Option<&str>) -> Result<Value> {
+/// The request body of `create_publication`: the set fields of `mode` (Pulp refuses `null` for some).
+pub async fn publication_body(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> Result<Value> {
     let mut body = json!({ "repository_version": version });
-    if let Some(s) = signing_service {
-        body["signing_service"] = s.into();
+    for (k, v) in mode.as_object().into_iter().flatten().filter(|(_, v)| !v.is_null()) {
+        body[k] = v.clone();
     }
     match t {
         // pulp_file reads the repository `manifest` only for autopublish; a publish request defaults to PULP_MANIFEST.
-        RepoType::File => {
+        RepoType::File if body.get("manifest").is_none() => {
             let r: Value = c.get(&repo_of_version(version), &[("fields", "manifest".into())]).await?;
             if let Some(m) = r.get("manifest") {
                 body["manifest"] = m.clone();
             }
         }
-        RepoType::Rpm | RepoType::Deb => {}
+        _ => {}
     }
     Ok(body)
 }
@@ -553,7 +564,7 @@ pub async fn publications_where(c: &PulpClient, caps: &Capabilities, t: RepoType
 }
 
 /// pulpcore's pick: the publication of the highest repository version, then the newest one.
-fn newest<'a>(pubs: impl Iterator<Item = &'a Value>) -> Option<&'a Value> {
+pub fn newest<'a>(pubs: impl Iterator<Item = &'a Value>) -> Option<&'a Value> {
     pubs.max_by_key(|p| (version_number(p["repository_version"].as_str().unwrap_or_default()), p["pulp_created"].as_str()))
 }
 
@@ -577,13 +588,13 @@ pub fn served_after_delete<'a>(d: &Distribution, href: &str, pubs: &'a [Value]) 
 /// Fetch what a distribution actually serves and compare it with a repository version:
 /// File manifests must list exactly the version's files; RPM and Deb metadata must be served and
 /// the smallest package must be downloadable with the expected digest. `publication` is the served
-/// one: its RPM `layout` and File `manifest` say where the content is.
+/// one: its RPM `layout`, File `manifest` and Deb `simple`/`structured` say where the content is.
 pub async fn verify_served(c: &PulpClient, t: RepoType, base_url: &str, version: &str, publication: &Value) -> Result<String> {
     let base = if base_url.ends_with('/') { base_url.to_string() } else { format!("{base_url}/") };
     match t {
         RepoType::Rpm => rpm::verify(c, &base, version, publication["layout"].as_str().unwrap_or_default()).await,
         RepoType::File => file::verify(c, &base, version, publication["manifest"].as_str()).await,
-        RepoType::Deb => deb::verify(c, &base, version).await,
+        RepoType::Deb => deb::verify(c, &base, version, publication).await,
     }
 }
 

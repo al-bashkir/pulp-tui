@@ -66,7 +66,7 @@ async fn deb_mirror_copy_publish_verify() {
     assert!(releases.count >= 1, "the copy has a Release");
 
     // Publish the copy, serve it, and check what clients would download.
-    let publication = ops::ensure_publication(&c, t, &v2, None, &no_progress).await.unwrap();
+    let publication = ops::ensure_publication(&c, t, &v2, &json!({}), &no_progress).await.unwrap();
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let d: Value = c.get(&dist, &[]).await.unwrap();
     let base = d["base_url"].as_str().unwrap().to_string();
@@ -83,9 +83,13 @@ async fn deb_mirror_copy_publish_verify() {
     let service: Value =
         ops::find_by_name(&c, &c.api("signing-services/"), "pulp-tui-deb-test").await.unwrap().expect("Deb test signing service");
     let service = service["pulp_href"].as_str().unwrap();
-    let signed = ops::ensure_publication(&c, t, &v1, Some(service), &no_progress).await.unwrap();
-    assert_eq!(ops::ensure_publication(&c, t, &v1, Some(service), &no_progress).await.unwrap(), signed, "signed publication is reused");
-    let plain = ops::ensure_publication(&c, t, &v1, None, &no_progress).await.unwrap();
+    let signed = ops::ensure_publication(&c, t, &v1, &json!({ "signing_service": service }), &no_progress).await.unwrap();
+    assert_eq!(
+        ops::ensure_publication(&c, t, &v1, &json!({ "signing_service": service }), &no_progress).await.unwrap(),
+        signed,
+        "signed publication is reused"
+    );
+    let plain = ops::ensure_publication(&c, t, &v1, &json!({ "signing_service": null }), &no_progress).await.unwrap();
     assert_ne!(plain, signed, "a signed publication is not reused for the repository default");
     let signed_name = format!("{name}-signed");
     let signed_dist =
@@ -121,7 +125,7 @@ async fn a_removed_deb_package_is_no_longer_served() {
     let m = ops::remove_content(&c, &repo, units).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
 
-    let publication = ops::ensure_publication(&c, t, &latest(&c, &repo).await, None, &no_progress).await.unwrap();
+    let publication = ops::ensure_publication(&c, t, &latest(&c, &repo).await, &json!({}), &no_progress).await.unwrap();
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let d: Value = c.get(&dist, &[]).await.unwrap();
     let base = d["base_url"].as_str().unwrap();
@@ -140,7 +144,7 @@ async fn a_removed_deb_package_is_no_longer_served() {
     assert!(synced.iter().any(|k| k.starts_with("package index ")), "the sync stored the index: {synced:?}");
     let want = ops::content_keys_except(&c, &Capabilities::default(), t, &v1, &deb::NEW_VERSION_DROPS).await.unwrap();
     assert_eq!(ops::all_content_keys(&c, &Capabilities::default(), t, &v3).await.unwrap(), want);
-    let publication = ops::create_publication(&c, t, &v3, None, &no_progress).await.unwrap();
+    let publication = ops::create_publication(&c, t, &v3, &json!({}), &no_progress).await.unwrap();
     ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let index = served(&c, &format!("{base}dists/fixture/main/binary-amd64/Packages")).await.1;
     assert!(String::from_utf8_lossy(&index).contains("Package: fixture-beta-dbg\n"), "restored");
@@ -199,7 +203,7 @@ async fn deb_repository_signs_with_its_own_service() {
     // Publish (P) sends no signing service: the repository's own one signs.
     let mut dists = vec![];
     for (suffix, expect) in [("signed", true), ("plain", false)] {
-        let publication = ops::create_publication(&c, t, &v1, None, &no_progress).await.unwrap();
+        let publication = ops::create_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
         let n = format!("{name}-{suffix}");
         let dist = ops::ensure_distribution(&c, t, &n, &n, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
         let d: Value = c.get(&dist, &[]).await.unwrap();
@@ -314,4 +318,53 @@ async fn deb_content_view() {
     svc.delete_view(comp, &quiet, &no_progress).await.unwrap();
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &[&repo, &remote]).await;
+}
+
+/// A rollback of a distribution that serves a simple publication (clients use `dists/default/`) gets a
+/// simple publication too: a structured one of the target version is not reused, and verify probes the
+/// simple paths.
+#[tokio::test]
+async fn deb_rollback_keeps_a_simple_publication() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Deb;
+    let name = unique("it-deb-simple");
+    let url = format!("{}/deb/", upstream());
+    let body = json!({ "name": name, "url": url, "policy": "immediate", "distributions": "fixture" });
+    let remote = create(&c, t.remotes(), body, "/remotes/").await;
+    let repo = create(&c, t.repositories(), json!({ "name": name, "remote": remote }), "/repositories/").await;
+    ops::settle(&c, ops::sync(&c, t, &repo, None, "mirror").await.unwrap(), &no_progress).await.unwrap();
+    let v1 = latest(&c, &repo).await;
+    let dbg = deb::packages_in(&c, &v1).await.unwrap().into_iter().find(|p| p.package.ends_with("-dbg")).unwrap();
+    ops::settle(&c, ops::remove_content(&c, &repo, vec![dbg.pulp_href]).await.unwrap(), &no_progress).await.unwrap();
+    let v2 = latest(&c, &repo).await;
+
+    // v1 has a structured publication; the distribution serves a simple-only one of v2.
+    let structured = ops::create_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
+    let simple = ops::create_publication(&c, t, &v2, &json!({ "simple": true, "structured": false }), &no_progress).await.unwrap();
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&simple), &json!({}), None, &no_progress).await.unwrap();
+    let d: Value = c.get(&dist, &[]).await.unwrap();
+    let base = d["base_url"].as_str().unwrap().to_string();
+    let now = ops::served_publication(&c, &Capabilities::default(), t, &d).await.unwrap().unwrap();
+    let msg = ops::verify_served(&c, t, &base, &v2, &now).await.unwrap();
+    assert!(msg.contains("pool/") && msg.contains("matching digest"), "{msg}");
+
+    // Roll back to v1 in the served mode.
+    let mode = ops::publication_mode(t, &now);
+    assert_eq!((mode["simple"].clone(), mode["structured"].clone()), (json!(true), json!(false)), "{mode}");
+    let p = ops::ensure_publication(&c, t, &v1, &mode, &no_progress).await.unwrap();
+    assert_ne!(p, structured, "the structured publication of v1 is not reused");
+    ops::ensure_distribution(&c, t, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
+    let pv: Value = c.get(&p, &[]).await.unwrap();
+    assert_eq!(pv["simple"], true, "{pv}");
+    let msg = ops::verify_served(&c, t, &base, &v1, &pv).await.unwrap();
+    assert!(msg.contains("matching digest"), "{msg}");
+    let (status, _) = served(&c, &format!("{base}dists/default/Release")).await;
+    assert_eq!(status, 200, "apt clients of the simple layout still get the Release file");
+    // A structured-only check of this publication fails: it serves no dists/fixture/.
+    let e = ops::verify_served(&c, t, &base, &v1, &json!({})).await.unwrap_err().to_string();
+    assert!(e.contains("dists/fixture/Release returned HTTP 404"), "{e}");
+    cleanup(&c, &[&dist, &repo, &remote]).await;
 }

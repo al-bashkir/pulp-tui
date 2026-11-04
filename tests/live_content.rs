@@ -161,7 +161,7 @@ async fn reclaim_space_keeps_the_content_served_on_demand() {
     let (c, t, name) = (client(), RepoType::Rpm, unique("it-reclaim"));
     let (repo, remote) = synced_repo(&c, t, &name, "rpm2/", "additive").await;
     let v1 = latest(&c, &repo).await;
-    let publication = ops::ensure_publication(&c, t, &v1, None, &ops::no_progress).await.unwrap();
+    let publication = ops::ensure_publication(&c, t, &v1, &json!({}), &ops::no_progress).await.unwrap();
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &ops::no_progress).await.unwrap();
     let base = c.get::<Value>(&dist, &[]).await.unwrap()["base_url"].as_str().unwrap().to_string();
     let stored = async || -> (usize, usize) {

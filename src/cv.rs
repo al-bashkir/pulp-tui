@@ -862,7 +862,7 @@ impl CvService {
         let reuse = match t {
             // A publication keeps the settings the repository had when it was made: after the PATCH, a reused one
             // (same version: the content did not change) would serve the old ones. A pending task is one already sent.
-            RepoType::Rpm | RepoType::File if !changed && vr.pending_task.is_none() => ops::find_publication(c, t, dv, None).await?,
+            RepoType::Rpm | RepoType::File if !changed && vr.pending_task.is_none() => ops::find_publication(c, t, dv, &json!({})).await?,
             // Deb: never reused: a publication signed with the repository's keys stores `signing_service: null`, so
             // one of another signing choice cannot be told apart.
             RepoType::Rpm | RepoType::File | RepoType::Deb => None,
@@ -870,8 +870,19 @@ impl CvService {
         if let Some(p) = reuse {
             return Ok(p);
         }
+        let src = vr.repo().repo_href.clone();
         // With `derived_version` set, `pending_task` is the publication task (the copy step clears it with the version).
-        let post = async { anyhow::Ok(c.post(&c.api(t.publications()), &ops::publication_body(c, t, dv, None).await?).await?) };
+        let post = async {
+            // Deb: the snapshot is published in the mode of the source's newest publication, so clients keep their
+            // paths (`simple`: dists/default/). The signing choice is the view's (`copy_settings`), not the source's.
+            let mut mode = json!({});
+            if t == RepoType::Deb {
+                let pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository", src)], 100_000).await?;
+                mode = ops::newest(pubs.iter()).map_or(mode, |p| ops::publication_mode(t, p));
+                mode["signing_service"] = Value::Null;
+            }
+            anyhow::Ok(c.post(&c.api(t.publications()), &ops::publication_body(c, t, dv, &mode).await?).await?)
+        };
         let task = self.tracked_task(vr, "publish", post, log, on).await?;
         let publication = task.created_matching("/publications/").ok_or_else(|| anyhow!("the publish task created no publication"))?;
         vr.pending_task = None;
@@ -2343,9 +2354,19 @@ mod tests {
         let svc = mock_service(&server).await;
         let (cv, mut vr) = copied_deb_version(&server, &svc).await;
         let svc = svc.locked(cv, "publish").await.unwrap();
+        let pubs = "/pulp/api/v3/publications/deb/apt/";
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/pulp/api/v3/publications/deb/apt/"))
+            .and(wiremock::matchers::path(pubs))
             .respond_with(LoseLockOnPost(svc.lock.as_ref().unwrap().lost.clone()))
+            .mount(&server)
+            .await;
+        // The source is published simple, flat and with its own signing service.
+        let source = json!({ "pulp_href": "/p/1/", "repository_version": "/pulp/api/v3/repositories/deb/apt/1/versions/1/",
+            "simple": true, "structured": false, "layout": "flat", "signing_service": "/ss/9/" });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(pubs))
+            .and(wiremock::matchers::query_param("repository", "/pulp/api/v3/repositories/deb/apt/1/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [source] })))
             .mount(&server)
             .await;
         let e = svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err();
@@ -2353,12 +2374,11 @@ mod tests {
         let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
         assert_eq!((saved.pending_task.as_deref(), saved.publication), (Some("/pulp/api/v3/tasks/1/"), None), "Resume re-attaches");
         let sent = server.received_requests().await.unwrap();
-        assert!(
-            sent.iter().all(|r| r.method.as_str() == "POST" || r.url.path() != "/pulp/api/v3/publications/deb/apt/"),
-            "no reuse lookup"
-        );
+        assert!(!sent.iter().any(|r| r.url.query().unwrap_or_default().contains("repository_version")), "no reuse lookup");
         let posts: Vec<Value> = sent.iter().filter(|r| r.method.as_str() == "POST").map(|r| r.body_json().unwrap()).collect();
-        assert_eq!(posts, [json!({ "repository_version": format!("{DEB_DERIVED}versions/1/") })], "the derived repository's keys apply");
+        let mode =
+            json!({ "repository_version": format!("{DEB_DERIVED}versions/1/"), "simple": true, "structured": false, "layout": "flat" });
+        assert_eq!(posts, [mode], "the source's mode; the derived repository's keys apply");
     }
 
     #[tokio::test(flavor = "multi_thread")]

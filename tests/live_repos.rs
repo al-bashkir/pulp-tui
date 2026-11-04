@@ -59,8 +59,8 @@ async fn rpm_lifecycle() {
     assert!(d.removed.is_empty());
 
     // Publish exact version and distribute it.
-    let pub1 = ops::ensure_publication(&c, t, &v1, None, &no_progress).await.unwrap();
-    assert_eq!(ops::ensure_publication(&c, t, &v1, None, &no_progress).await.unwrap(), pub1, "publication is reused");
+    let pub1 = ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
+    assert_eq!(ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap(), pub1, "publication is reused");
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
     let msg = ops::verify_served(&c, t, &base, &v1, &json!({ "layout": "nested_alphabetically" })).await.unwrap();
@@ -80,7 +80,7 @@ async fn rpm_lifecycle() {
     assert_eq!(d.added, vec!["fixture-alpha-1.1-1.noarch", "fixture-gamma-0.5-1.noarch"]);
     assert!(d.removed.is_empty());
 
-    let pub2 = ops::ensure_publication(&c, t, &v2, None, &no_progress).await.unwrap();
+    let pub2 = ops::ensure_publication(&c, t, &v2, &json!({}), &no_progress).await.unwrap();
     ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), None, &no_progress).await.unwrap();
     assert_eq!(served(&c, &alpha11).await.0, 200);
     assert_ne!(served(&c, &format!("{base}repodata/repomd.xml")).await.1, repomd1);
@@ -195,7 +195,7 @@ async fn file_lifecycle() {
     let (repo, remote) = synced_repo(&c, t, &name, "file/PULP_MANIFEST", "mirror").await;
     let v1 = latest(&c, &repo).await;
     assert_eq!(file::files_in(&c, &v1).await.unwrap().len(), 3);
-    let pub1 = ops::ensure_publication(&c, t, &v1, None, &no_progress).await.unwrap();
+    let pub1 = ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
     ops::verify_served(&c, t, &base, &v1, &c.get(&pub1, &[]).await.unwrap()).await.unwrap();
@@ -207,7 +207,7 @@ async fn file_lifecycle() {
     let m = c.post(&format!("{repo}modify/"), &json!({ "add_content_units": [&big.pulp_href] })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
     let v2 = latest(&c, &repo).await;
-    let pub2 = ops::ensure_publication(&c, t, &v2, None, &no_progress).await.unwrap();
+    let pub2 = ops::ensure_publication(&c, t, &v2, &json!({}), &no_progress).await.unwrap();
     ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), None, &no_progress).await.unwrap();
     assert_eq!(served(&c, &format!("{base}big.bin")).await.0, 200);
     ops::verify_served(&c, t, &base, &v2, &c.get(&pub2, &[]).await.unwrap()).await.unwrap();
@@ -222,7 +222,7 @@ async fn file_lifecycle() {
     let custom = create(&c, t.repositories(), custom, "/repositories/").await;
     let m = c.post(&format!("{custom}modify/"), &json!({ "add_content_units": [&big.pulp_href] })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    let published = ops::create_publication(&c, t, &latest(&c, &custom).await, None, &no_progress).await.unwrap();
+    let published = ops::create_publication(&c, t, &latest(&c, &custom).await, &json!({}), &no_progress).await.unwrap();
     assert_eq!(c.get::<Value>(&published, &[]).await.unwrap()["manifest"], "CUSTOM_MANIFEST");
     let m = c.post(&format!("{custom}modify/"), &json!({ "add_content_units": [&one.pulp_href] })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
@@ -254,10 +254,10 @@ async fn served_versions_are_protected_from_delete() {
         std::fs::write(&path, format!("{name} {i}\n")).unwrap();
         ops::upload(&c, t, &path, Some(&format!("{i}.txt")), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
         let version = latest(&c, &repo).await;
-        ops::ensure_publication(&c, t, &version, None, &no_progress).await.unwrap();
+        ops::ensure_publication(&c, t, &version, &json!({}), &no_progress).await.unwrap();
         v.push(version);
     }
-    let pub2 = ops::ensure_publication(&c, t, &v[1], None, &no_progress).await.unwrap();
+    let pub2 = ops::ensure_publication(&c, t, &v[1], &json!({}), &no_progress).await.unwrap();
     let pin = ops::ensure_distribution(&c, t, &format!("{name}-pin"), &format!("{name}-pin"), Some(&pub2), &json!({}), None, &no_progress)
         .await
         .unwrap();
@@ -304,7 +304,7 @@ async fn file_path_with_a_comma_is_served_and_verified() {
     std::fs::write(&path, format!("{name}\n")).unwrap();
     ops::upload(&c, t, &path, Some("reports/q1,2024.txt"), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
     let version = latest(&c, &repo).await;
-    let publication = ops::ensure_publication(&c, t, &version, None, &no_progress).await.unwrap();
+    let publication = ops::ensure_publication(&c, t, &version, &json!({}), &no_progress).await.unwrap();
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
     let msg = ops::verify_served(&c, t, &base, &version, &c.get(&publication, &[]).await.unwrap()).await;
@@ -336,7 +336,7 @@ async fn restored_version_is_served_after_publish() {
     let follow = json!({ "name": name, "base_path": name, "repository": repo });
     let follow = create(&c, t.distributions(), follow, "/distributions/").await;
     let base = dist_url(&c, &follow).await;
-    let p2: Value = c.get(&ops::create_publication(&c, t, &v[1], None, &no_progress).await.unwrap(), &[]).await.unwrap();
+    let p2: Value = c.get(&ops::create_publication(&c, t, &v[1], &json!({}), &no_progress).await.unwrap(), &[]).await.unwrap();
     ops::verify_served(&c, t, &base, &v[1], &p2).await.unwrap();
 
     let m = ops::restore_version(&c, &repo, &v[0]).await.unwrap();
@@ -350,7 +350,7 @@ async fn restored_version_is_served_after_publish() {
     );
     let _: Value = c.get(&v[1], &[]).await.unwrap(); // the newer version is kept
     ops::verify_served(&c, t, &base, &v[1], &p2).await.unwrap(); // not served before a publish
-    let p3: Value = c.get(&ops::create_publication(&c, t, &v3, None, &no_progress).await.unwrap(), &[]).await.unwrap();
+    let p3: Value = c.get(&ops::create_publication(&c, t, &v3, &json!({}), &no_progress).await.unwrap(), &[]).await.unwrap();
     assert_eq!(ops::verify_served(&c, t, &base, &v3, &p3).await.unwrap(), "PULP_MANIFEST matches 1 files");
 
     let m = ops::restore_version(&c, &repo, &v[0]).await.unwrap();
