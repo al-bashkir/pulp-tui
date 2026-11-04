@@ -517,6 +517,8 @@ impl App {
                 self.notify(Level::Warn, format!("stopped waiting for '{}' (Pulp tasks already submitted keep running)", j.label));
             }
         }
+        // Only the list load that this aborted would clear it.
+        self.list.loading = false;
     }
 
     pub fn handle_msg(&mut self, m: Msg) {
@@ -720,6 +722,12 @@ impl App {
         if let Some((d, _)) = &db {
             self.cv_store = Err(format!("{}: opening", d.display_url())); // never the previous profile's store
         }
+        // The rows and marks belong to the previous server; Servers and Logs are local and keep theirs.
+        if let Screen::List(k) = self.screen.clone()
+            && !matches!(k, Kind::Profiles | Kind::Logs { .. })
+        {
+            self.replace(k);
+        }
         let n = name.to_string();
         self.with_store(name, p.read_only, db, move |app, r| {
             if app.profile.as_deref() != Some(n.as_str()) {
@@ -762,6 +770,7 @@ impl App {
             ap(move |app| {
                 app.connecting = false;
                 app.error(format!("connection failed: {e}"));
+                app.reload(); // "connecting..." becomes "not connected"
             })
         });
     }
@@ -2435,6 +2444,71 @@ mod tests {
         app.handle_msg(m);
         let gets = server.received_requests().await.unwrap().len();
         assert_eq!((app.list.offset, app.jobs.len(), app.list.loading, gets), (0, 0, false, 1));
+    }
+
+    /// A profile "dead" on a server that answers 404 to everything: its Connect fails at once
+    /// (a closed port fails too, but only after the read retries).
+    async fn add_dead_profile(app: &mut App) -> wiremock::MockServer {
+        let dead = wiremock::MockServer::start().await;
+        app.cfg.profiles.insert("dead".into(), Profile { url: dead.uri(), auth: AuthMethod::None, ..Default::default() });
+        dead
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_drops_the_rows_of_the_previous_server() {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let rows: Vec<Value> = (0..2).map(|i| serde_json::json!({ "pulp_href": format!("/r/{i}/"), "name": format!("r{i}") })).collect();
+        let body = serde_json::json!({ "count": 2, "next": null, "results": rows });
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut app = on_rpm_repos(&server).await;
+        let mut rx = app.rx.take().unwrap();
+        app.reload();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.list.items.len(), 2);
+        app.list.marked.insert("/r/1/".into());
+        app.list.selected = 1;
+        let _dead = add_dead_profile(&mut app).await;
+        app.connect("dead");
+        assert!(app.list.items.is_empty() && app.list.marked.is_empty(), "the rows belong to the previous server");
+        assert_eq!(app.list.error.as_deref(), Some("connecting..."));
+        settle(&mut app, &mut rx).await;
+        assert!(app.conn.is_none() && !app.connecting);
+        assert!(app.notices.iter().any(|n| n.level == Level::Error && n.text.starts_with("connection failed: ")));
+        assert_eq!((app.list.items.len(), app.list.marked.len(), app.list.selected, app.list.loading), (0, 0, 0, false));
+        assert_eq!(app.list.error.as_deref(), Some("not connected: select a server profile in Servers"));
+    }
+
+    #[tokio::test]
+    async fn a_connect_never_leaves_an_aborted_load_loading() {
+        // Local lists keep their rows and cursor (Servers is where `o` connects).
+        for kind in [Kind::Profiles, Kind::Logs { polls: false }] {
+            let mut app = app_on(kind.clone()).await;
+            let mut rx = app.rx.take().unwrap();
+            let _dead = add_dead_profile(&mut app).await;
+            app.cfg.profiles.insert("other".into(), Profile::default());
+            for s in ["row-a", "row-b"] {
+                crate::session_log::record("notice", "lab", s.into(), vec![]);
+            }
+            app.reload();
+            settle(&mut app, &mut rx).await;
+            app.list.selected = 1;
+            // A Servers row has a name, a Logs row an id.
+            let id = |v: &Value| (v["name"].clone(), v["id"].clone());
+            let (rows, cursor) = (app.list.items.clone(), id(&app.list.items[1]));
+            app.reload(); // still in flight when the Connect aborts it
+            assert!(app.list.loading);
+            app.connect("dead");
+            assert!(!app.list.loading, "{kind:?}: the aborted load left the list loading");
+            assert_eq!((&app.list.items, app.list.selected), (&rows, 1), "{kind:?}");
+            settle(&mut app, &mut rx).await;
+            assert!(!app.list.loading, "{kind:?}");
+            assert_eq!(app.list.current().map(id), Some(cursor), "{kind:?}: the cursor stays on its row");
+        }
     }
 
     #[tokio::test]
