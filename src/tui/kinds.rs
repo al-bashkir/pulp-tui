@@ -27,6 +27,8 @@ pub enum Kind {
     },
     Publications(RepoType),
     Distributions(RepoType),
+    /// Content guards of all types; each row also names the distributions that use it.
+    ContentGuards,
     ContentViews,
     CvVersions {
         cv: i64,
@@ -83,6 +85,7 @@ pub const NAV: &[(&str, Kind)] = &[
     ("Repository Versions", Kind::Versions(None)),
     ("Publications", Kind::Publications(RepoType::Rpm)),
     ("Distributions", Kind::Distributions(RepoType::Rpm)),
+    ("Content Guards", Kind::ContentGuards),
     ("Content Views", Kind::ContentViews),
     ("Lifecycle Envs", Kind::Environments),
     ("Replication", Kind::UpstreamPulps),
@@ -225,6 +228,8 @@ pub enum Act {
     Filter,
     /// `tasks/purge/`: delete the records of finished tasks.
     PurgeTasks,
+    /// RBAC content guard: give or take the download role of users and groups.
+    GuardAccess,
     /// In no `actions()` list: offered on Connect and save; here so that `mutates` classifies them.
     MigrateDb,
     CopyDb,
@@ -247,7 +252,7 @@ impl Act {
             Distribute | CvDrift => 'D',
             CopyContent => 'C',
             RemoveContent | CvRemoveRepo | CvRemoveComponent => 'x',
-            AddToRepo | CvAddRepo | CvAddComponent | TrackTask => 'a',
+            AddToRepo | CvAddRepo | CvAddComponent | TrackTask | GuardAccess => 'a',
             Compare => 'm',
             Rollback => 'b',
             CopyUrl => 'y',
@@ -343,6 +348,7 @@ impl Act {
             Refresh => "Refresh (index the source)",
             Filter => "Filter (state, name, resource, start time)",
             PurgeTasks => "Purge finished tasks (whole server)",
+            GuardAccess => "Download access (users, groups)",
             MigrateDb => "Migrate database",
             CopyDb => "Copy Content View data",
         }
@@ -422,6 +428,7 @@ impl Kind {
             }
             Kind::Publications(t) => format!("{} Publications  [t: toggle type]", t.label()),
             Kind::Distributions(t) => format!("{} Distributions  [t: toggle type]", t.label()),
+            Kind::ContentGuards => "Content Guards (who may download from a distribution)".into(),
             Kind::ContentViews => "Content Views (managed by pulp-tui, not a Pulp API)".into(),
             Kind::CvVersions { name, .. } => format!("Content View {name}: versions"),
             Kind::Environments => "Lifecycle Environments (pulp-tui)".into(),
@@ -476,6 +483,7 @@ impl Kind {
             Kind::Roles => Feature::Roles,
             Kind::Workers => Feature::Workers,
             Kind::TaskGroups => Feature::TaskGroups,
+            Kind::ContentGuards => Feature::ContentGuards,
             _ => return None,
         };
         caps.require(f).err().map(|e| {
@@ -556,6 +564,7 @@ impl Kind {
             }
             Kind::Publications(t) => (t.publications().into(), vec![("ordering", "-pulp_created".into())], None),
             Kind::Distributions(t) => (t.distributions().into(), vec![("ordering", "name".into())], name),
+            Kind::ContentGuards => ("contentguards/".into(), vec![("ordering", "name".into())], name),
             Kind::UpstreamPulps => ("upstream-pulps/".into(), vec![], name),
             Kind::PulpExporters => ("exporters/core/pulp/".into(), vec![("ordering", "name".into())], name),
             Kind::FsExporters => ("exporters/core/filesystem/".into(), vec![("ordering", "name".into())], name),
@@ -705,6 +714,13 @@ impl Kind {
                     short(v["publication"].as_str().or(v["repository_version"].as_str()).or(v["repository"].as_str()).unwrap_or_default())
                 }),
             ],
+            Kind::ContentGuards => vec![
+                col("name", 24, |v| s(v, "name")),
+                col("type", 21, |v| guard_type(&s(v, "pulp_href"))),
+                col("distributions", 40, |v| {
+                    v["distributions"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
+                }),
+            ],
             Kind::ContentViews => vec![
                 col("name", 20, |v| s(v, "name")),
                 col("composite", 9, |v| if v["composite"] == true { "yes".into() } else { String::new() }),
@@ -849,6 +865,7 @@ impl Kind {
             Kind::Content { .. } => vec![Inspect, RemoveContent, AddToRepo],
             Kind::Publications(_) => vec![Create, Distribute, Delete, Inspect],
             Kind::Distributions(_) => vec![CopyUrl, Verify, Rollback, Create, Edit, Delete, Inspect],
+            Kind::ContentGuards => vec![GuardAccess, Create, Edit, Delete, Inspect],
             Kind::ContentViews => vec![
                 CvVersions,
                 CvSyncRepos,
@@ -902,8 +919,16 @@ impl Kind {
         if RepoType::from_href(&s(item, "pulp_href")) != Some(RepoType::Rpm) {
             actions.retain(|a| *a != Scan);
         }
+        if *self == Kind::ContentGuards && guard_type(&s(item, "pulp_href")) != "core/rbac" {
+            actions.retain(|a| *a != GuardAccess);
+        }
         actions
     }
+}
+
+/// `core/rbac` of `/pulp/api/v3/contentguards/core/rbac/<id>/`: the type collection below `contentguards/`.
+pub fn guard_type(href: &str) -> String {
+    href.split_once("contentguards/").map_or("", |(_, r)| r).split('/').take(2).collect::<Vec<_>>().join("/")
 }
 
 /// One page of the Deb Publications screen: APT and verbatim publications, newest first. The merge needs each
@@ -958,7 +983,13 @@ pub async fn load(
             q.push((p, filter.to_string()));
         }
         let href = if path.starts_with('/') { path } else { c.api(&path) };
-        let page: crate::pulp::client::Page<Value> = c.list(&href, &q).await?;
+        let mut page: crate::pulp::client::Page<Value> = c.list(&href, &q).await?;
+        if *k == Kind::ContentGuards {
+            let used = crate::pulp::ops::guarded_distributions(c).await?;
+            for g in &mut page.results {
+                g["distributions"] = json!(used.get(&s(g, "pulp_href")));
+            }
+        }
         return Ok((page.results, page.count));
     }
     let f = filter.to_lowercase();
@@ -1562,6 +1593,33 @@ mod tests {
         assert_eq!(git.unsupported(&caps).as_deref(), Some("not supported by this server: File Git remotes (remotes/file/git/)"));
         caps.paths.insert("remotes/file/git/".into());
         assert_eq!(git.unsupported(&caps), None);
+    }
+
+    #[test]
+    fn content_guard_screen_lists_type_and_distributions_and_manages_rbac_access() {
+        let k = Kind::ContentGuards;
+        assert!(NAV.iter().any(|(l, n)| *l == "Content Guards" && *n == k));
+        assert_eq!(k.source().unwrap().0, "contentguards/");
+        assert!(k.searchable());
+        let row =
+            json!({ "name": "certs", "pulp_href": "/pulp/api/v3/contentguards/certguard/x509/0190abcd/", "distributions": ["a", "b"] });
+        assert_eq!(k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["certs", "certguard/x509", "a, b"]);
+        assert_eq!(k.item_actions(&row), [Act::Create, Act::Edit, Act::Delete, Act::Inspect], "access is for RBAC guards only");
+        let rbac = json!({ "pulp_href": "/pulp/api/v3/contentguards/core/rbac/1/" });
+        assert_eq!(k.item_actions(&rbac), [Act::GuardAccess, Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
+        assert_eq!(Act::GuardAccess.key(), 'a');
+        for a in [Act::GuardAccess, Act::Create, Act::Edit, Act::Delete] {
+            assert!(a.mutates(&k, false), "{a:?}");
+        }
+        assert!(!Act::Inspect.mutates(&k, false));
+        let mut caps = Capabilities::default();
+        caps.paths.insert("distributions/".into());
+        assert_eq!(
+            k.unsupported(&caps).as_deref(),
+            Some("not supported by this server: content guards API (contentguards/, distributions/)")
+        );
+        caps.paths.insert("contentguards/".into());
+        assert_eq!(k.unsupported(&caps), None);
     }
 
     #[test]

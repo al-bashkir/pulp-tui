@@ -3,7 +3,7 @@
 use super::actions::{ap, caps, group_progress, submit, url_with_scheme};
 use super::app::{App, Level};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
-use super::kinds::{Act, Kind, s, short};
+use super::kinds::{Act, Kind, guard_type, s, short};
 use crate::pulp::client::Page;
 use crate::pulp::{PulpClient, RepoType, ops};
 use crate::replication::{self, PlanAction};
@@ -19,6 +19,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         Kind::GroupRoles { group, name } => role_assignment(app, act, item, group, name, true),
         Kind::GroupUsers { group, name } => member_action(app, act, item, group, name),
         Kind::Roles => role_action(app, act, item),
+        Kind::ContentGuards => guard_action(app, act, item),
         Kind::UpstreamPulps => upstream_action(app, act, item),
         Kind::PulpExporters | Kind::FsExporters => exporter_action(app, act, item),
         Kind::Exports { .. } => export_action(app, act, item),
@@ -387,6 +388,169 @@ fn role_action(app: &mut App, act: Act, item: Value) {
         }
         _ => {}
     }
+}
+
+// ---- content guards ---------------------------------------------------------------------
+
+/// Content guard types: the collection below `contentguards/`, the request schema, the fields beyond name and description.
+const GUARD_TYPES: [(&str, &str, &[&str]); 7] = [
+    ("core/rbac", "RBACContentGuard", &[]),
+    ("core/header", "HeaderContentGuard", &["header_name", "header_value", "jq_filter"]),
+    ("core/envvar_header", "EnvVarHeaderContentGuard", &["header_name", "env_var"]),
+    ("core/content_redirect", "ContentRedirectContentGuard", &[]),
+    ("core/composite", "CompositeContentGuard", &["guards"]),
+    ("certguard/x509", "certguard.X509CertGuard", &["ca_certificate"]),
+    ("certguard/rhsm", "certguard.RHSMCertGuard", &["ca_certificate"]),
+];
+
+/// The locked role with `download_rbaccontentguard`, which an RBAC guard checks.
+const GUARD_DOWNLOADER: &str = "core.rbaccontentguard_downloader";
+
+fn guard_action(app: &mut App, act: Act, item: Value) {
+    let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
+    match act {
+        Act::Create => {
+            let caps = caps(app);
+            let has = |t: &String| caps.as_ref().is_none_or(|c| c.has_endpoint(&format!("contentguards/{t}/")));
+            let types: Vec<String> = GUARD_TYPES.iter().map(|(t, ..)| t.to_string()).filter(has).collect();
+            let form = Form::new("New content guard", vec![Field::new("type", "Type", FieldKind::Choice(types))]);
+            app.form(form, |app, f| {
+                guard_form(app, f.get("type").to_string(), Value::Null);
+                Ok(())
+            });
+        }
+        // The list has only name and description: the fields of the type come with the guard itself.
+        Act::Edit => app.job(format!("read content guard {name}"), move |ctx| async move {
+            let v: Value = ctx.client.get(&href, &[]).await?;
+            ap(move |app| guard_form(app, guard_type(&href), v))
+        }),
+        Act::GuardAccess => guard_access(app, href, name),
+        Act::Delete => app.job(format!("impact of deleting content guard {name}"), move |ctx| async move {
+            let c = &ctx.client;
+            let used = ops::guarded_distributions(c).await?;
+            let mut lines = vec![format!("Delete content guard {name} ({}).", guard_type(&href))];
+            match used.get(&href) {
+                // pulpcore: `Distribution.content_guard` is `on_delete=SET_NULL`.
+                Some(ds) => {
+                    let n = ds.len();
+                    lines.push(format!(
+                        "Pulp removes the guard from {n} distribution(s): they become PUBLIC, anyone can download their content:"
+                    ));
+                    lines.extend(ds.iter().map(|d| format!("  {d}")));
+                }
+                None => lines.push("No distribution uses it.".into()),
+            }
+            let composites = "contentguards/core/composite/";
+            let all = if ctx.caps.has_endpoint(composites) { c.list_all::<Value>(&c.api(composites), &[], 100_000).await? } else { vec![] };
+            for g in all {
+                let members: Vec<&str> = g["guards"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                let (cname, also) = (s(&g, "name"), used.get(&s(&g, "pulp_href")).map(|ds| format!(", also on {}", ds.join(", "))));
+                lines.extend(match members.len() {
+                    _ if !members.contains(&href.as_str()) => None,
+                    // pulpcore `CompositeContentGuard.permit`: no guards = allowed.
+                    1 => Some(format!(
+                        "Composite guard {cname} loses its only guard: a composite without guards allows everyone{}",
+                        also.unwrap_or_default()
+                    )),
+                    n => Some(format!("Composite guard {cname} loses it and keeps {} other guard(s).", n - 1)),
+                });
+            }
+            ap(move |app| {
+                app.confirm_danger(format!("Delete content guard {name}"), lines, &name.clone(), move |app| {
+                    submit(app, format!("delete content guard {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+                })
+            })
+        }),
+        _ => {}
+    }
+}
+
+/// Create (`v` null) or edit (`v`: the guard) a content guard of type `t` (`core/header`). A secret or a
+/// certificate is never shown: on edit, empty keeps it.
+fn guard_form(app: &mut App, t: String, v: Value) {
+    let edit = !v.is_null();
+    let Some((_, schema, extra)) = GUARD_TYPES.iter().find(|(x, ..)| *x == t) else {
+        return app.error(format!("unknown content guard type {t}"));
+    };
+    let (caps, href) = (caps(app), s(&v, "pulp_href"));
+    let keep = |f: Field| if edit { f.help("empty = unchanged") } else { f.required() };
+    let mut fields = vec![
+        Field::text("name", "Name").required().value(s(&v, "name")),
+        Field::text("description", "Description").value(s(&v, "description")),
+    ];
+    for &k in extra.iter().filter(|k| caps.as_ref().is_none_or(|c| c.has_field(schema, k))) {
+        fields.push(match k {
+            "header_name" => Field::text(k, "Header name").required().value(s(&v, k)),
+            "header_value" => keep(Field::new(k, "Header value", FieldKind::Secret)),
+            "jq_filter" => Field::text(k, "jq filter").value(s(&v, k)).help("applied to the header (JSON) first, e.g. .identity.org_id"),
+            "env_var" => Field::text(k, "Environment variable").required().value(s(&v, k)).help("its name on the Pulp server"),
+            "guards" => {
+                let guards: Vec<&str> = v[k].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                let mut f = Field::pick(k, "Guards", Source::ContentGuards).multi().value(guards.join("\n")).exclude(vec![href.clone()]);
+                if !guards.is_empty() {
+                    f.shown = format!("{} selected", guards.len());
+                }
+                f.help("one that allows is enough; none = everyone may download")
+            }
+            _ => keep(Field::text(k, "CA certificate (PEM file path)")),
+        });
+    }
+    let title = if edit { format!("Edit content guard {}", s(&v, "name")) } else { format!("New {t} content guard") };
+    app.form(Form::new(title, fields), move |app, f| {
+        let (mut b, mut cert) = (json!({}), None);
+        for fld in f.fields.iter().filter(|x| !edit || x.changed()) {
+            match (fld.key.as_str(), f.get(&fld.key)) {
+                ("ca_certificate", path) => cert = Some(path.to_string()),
+                ("guards", g) => b["guards"] = g.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>().into(),
+                // Pulp refuses an empty string; null clears an optional field.
+                (k, "") if edit => b[k] = Value::Null,
+                (_, "") => {}
+                (k, val) => b[k] = val.into(),
+            }
+        }
+        let (href, collection) = (href.clone(), format!("contentguards/{t}/"));
+        submit(app, format!("{} content guard {}", if edit { "update" } else { "create" }, f.get("name")), move |c| async move {
+            if let Some(path) = cert {
+                b["ca_certificate"] = tokio::fs::read_to_string(&path).await.with_context(|| format!("read {path}"))?.into();
+            }
+            Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api(&collection), &b).await? })
+        });
+        Ok(())
+    });
+}
+
+/// Give or take the download role of an RBAC guard (`add_role/`, `remove_role/`); the form shows who has it now.
+fn guard_access(app: &mut App, href: String, name: String) {
+    let endpoint = "{r_b_a_c_content_guard_href}add_role/";
+    if caps(app).is_some_and(|c| !c.has_endpoint(endpoint)) {
+        return app.error(format!("not supported by this server: RBAC guard roles ({endpoint})"));
+    }
+    app.job(format!("read content guard {name}"), move |ctx| async move {
+        let v: Value = ctx.client.get(&href, &[]).await?;
+        let who = |k: &str, f: &str| {
+            let names: Vec<String> = v[k].as_array().into_iter().flatten().map(|x| s(x, f)).collect();
+            if names.is_empty() { "none".into() } else { names.join(", ") }
+        };
+        let now = format!("May download now: users {}; groups {}", who("users", "username"), who("groups", "name"));
+        ap(move |app| {
+            let fields = vec![
+                Field::new("change", "Change", FieldKind::Choice(vec!["allow".into(), "remove".into()])),
+                Field::pick("users", "Users", Source::Users).multi(),
+                Field::pick("groups", "Groups", Source::Groups).multi(),
+            ];
+            app.form(Form::new(format!("Download access of content guard {name}"), fields).note(now), move |app, f| {
+                let list = |k: &str| f.get(k).split('\n').filter(|x| !x.is_empty()).map(String::from).collect::<Vec<_>>();
+                let (users, groups) = (list("users"), list("groups"));
+                if users.is_empty() && groups.is_empty() {
+                    return Err("pick a user or a group".into());
+                }
+                let (verb, path) = if f.get("change") == "allow" { ("allow", "add_role/") } else { ("remove", "remove_role/") };
+                let (url, b) = (format!("{href}{path}"), json!({ "role": GUARD_DOWNLOADER, "users": users, "groups": groups }));
+                submit(app, format!("{verb} download from {name}"), move |c| async move { Ok(c.post(&url, &b).await?) });
+                Ok(())
+            });
+        })
+    });
 }
 
 // ---- replication ------------------------------------------------------------------------
@@ -2154,5 +2318,288 @@ mod tests {
         );
         let row = app.tasks.items.iter().find(|t| t.href == GROUP).expect("the group is in the Task Center");
         assert_eq!((row.label.as_str(), row.state.as_str()), ("import dvd", "completed"), "final without all_tasks_dispatched");
+    }
+
+    const GUARDS: &str = "/pulp/api/v3/contentguards/";
+    const RBAC: &str = "/pulp/api/v3/contentguards/core/rbac/1/";
+    const HDR: &str = "/pulp/api/v3/contentguards/core/header/2/";
+    const COMP: &str = "/pulp/api/v3/contentguards/core/composite/3/";
+
+    /// `distributions/` of all types: docs and web use the RBAC guard, edge the composite, base none.
+    async fn guarded(server: &MockServer) {
+        let d = |n: &str, g: Option<&str>| json!({ "name": n, "content_guard": g });
+        let all = json!({ "count": 4, "next": null, "results": [d("docs", Some(RBAC)), d("base", None), d("web", Some(RBAC)), d("edge", Some(COMP))] });
+        serve(server, "GET", "/pulp/api/v3/distributions/", 200, all).await;
+    }
+
+    async fn on_guards(server: &MockServer) -> (App, UnboundedReceiver<Msg>) {
+        let (mut app, rx) = connected(server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::ContentGuards;
+        (app, rx)
+    }
+
+    /// A copy of the open form (it stays open for `submit_open`).
+    fn open_now(app: &App) -> super::Form {
+        let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no form: {:?}", notices(app)) };
+        form.clone()
+    }
+
+    /// The form that the job of `act` opens.
+    async fn loaded_form(app: &mut App, rx: &mut UnboundedReceiver<Msg>, act: crate::tui::kinds::Act, item: Value) -> super::Form {
+        super::run(app, act, item);
+        settle(app, rx).await;
+        open_now(app)
+    }
+
+    fn submit_open(app: &mut App, f: &super::Form) -> Result<(), String> {
+        let Some(Modal::Form { mut submit, .. }) = app.modal.take() else { panic!("no form") };
+        submit(app, f)
+    }
+
+    #[tokio::test]
+    async fn content_guards_list_the_distributions_that_use_each_guard() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        guarded(&server).await;
+        let rows =
+            json!({ "count": 2, "next": null, "results": [{ "name": "staff", "pulp_href": RBAC }, { "name": "token", "pulp_href": HDR }] });
+        Mock::given(method("GET"))
+            .and(path(GUARDS))
+            .and(query_param("ordering", "name"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(rows))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = on_guards(&server).await;
+        app.open(crate::tui::app::Screen::List(Kind::ContentGuards));
+        settle(&mut app, &mut rx).await;
+        let cells: Vec<Vec<String>> =
+            app.list.items.iter().map(|r| Kind::ContentGuards.columns().iter().map(|c| (c.get)(r)).collect()).collect();
+        assert_eq!(cells, [["staff", "core/rbac", "docs, web"], ["token", "core/header", ""]], "{:?}", app.list.error);
+        let reqs = server.received_requests().await.unwrap();
+        let q = reqs.iter().find(|r| r.url.path() == "/pulp/api/v3/distributions/").unwrap().url.query().unwrap_or_default().to_string();
+        assert!(q.contains("fields=name%2Ccontent_guard"), "only the two fields: {q}");
+    }
+
+    #[tokio::test]
+    async fn a_content_guard_is_created_with_the_fields_of_its_type() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        serve(&server, "POST", "/pulp/api/v3/contentguards/core/header/", 201, json!({ "pulp_href": HDR })).await;
+        serve(&server, "POST", "/pulp/api/v3/contentguards/certguard/x509/", 201, json!({ "pulp_href": "/x/" })).await;
+        let (mut app, mut rx) = on_guards(&server).await;
+        let types = [
+            "core/rbac",
+            "core/header",
+            "core/envvar_header",
+            "core/content_redirect",
+            "core/composite",
+            "certguard/x509",
+            "certguard/rhsm",
+        ];
+        let (mut f, mut submit) = open_form(&mut app, Act::Create, Value::Null);
+        assert_eq!(f.fields[0].kind, super::FieldKind::Choice(types.map(String::from).to_vec()), "no OpenAPI: every type");
+        set(&mut f, "type", "core/header");
+        submit(&mut app, &f).unwrap();
+        let mut f = open_now(&app);
+        assert_eq!(f.title, "New core/header content guard");
+        let keys: Vec<&str> = f.fields.iter().map(|x| x.key.as_str()).collect();
+        assert_eq!(keys, ["name", "description", "header_name", "header_value", "jq_filter"]);
+        assert_eq!(f.fields[3].kind, super::FieldKind::Secret, "the header value is a shared secret");
+        set(&mut f, "name", "token");
+        assert_eq!(f.validate(), Err("Header name is required".into()));
+        set(&mut f, "header_name", "X-Token");
+        assert_eq!(f.validate(), Err("Header value is required".into()));
+        set(&mut f, "header_value", "s3cret");
+        submit_open(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        // x509: Pulp takes the PEM text; the form takes the path of a local file.
+        let dir = tempfile::tempdir().unwrap();
+        let pem = dir.path().join("ca.pem");
+        std::fs::write(&pem, "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n").unwrap();
+        let (mut f, mut submit) = open_form(&mut app, Act::Create, Value::Null);
+        set(&mut f, "type", "certguard/x509");
+        submit(&mut app, &f).unwrap();
+        let mut f = open_now(&app);
+        assert_eq!(f.fields.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(), ["name", "description", "ca_certificate"]);
+        set(&mut f, "name", "certs");
+        set(&mut f, "ca_certificate", pem.to_str().unwrap());
+        submit_open(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(
+            sent(&server).await,
+            [
+                (
+                    "POST".into(),
+                    "/pulp/api/v3/contentguards/core/header/".into(),
+                    json!({ "name": "token", "header_name": "X-Token", "header_value": "s3cret" })
+                ),
+                (
+                    "POST".into(),
+                    "/pulp/api/v3/contentguards/certguard/x509/".into(),
+                    json!({ "name": "certs", "ca_certificate": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n" })
+                ),
+            ],
+            "empty optional fields are left out (Pulp refuses an empty string)"
+        );
+
+        // Only the types that the server has.
+        let mut caps = crate::pulp::Capabilities::default();
+        caps.paths.extend(["contentguards/".into(), "contentguards/core/rbac/".into(), "contentguards/certguard/rhsm/".into()]);
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let (f, _) = open_form(&mut app, Act::Create, Value::Null);
+        assert_eq!(f.fields[0].kind, super::FieldKind::Choice(vec!["core/rbac".into(), "certguard/rhsm".into()]));
+    }
+
+    #[tokio::test]
+    async fn a_content_guard_edit_loads_the_guard_and_sends_only_what_changed() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        let hdr = json!({ "pulp_href": HDR, "name": "token", "description": "old", "header_name": "X-Token", "header_value": "s3cret", "jq_filter": ".a" });
+        serve(&server, "GET", HDR, 200, hdr).await;
+        serve(&server, "PATCH", HDR, 200, json!({ "pulp_href": HDR })).await;
+        serve(&server, "GET", COMP, 200, json!({ "pulp_href": COMP, "name": "any", "guards": [RBAC, HDR] })).await;
+        serve(&server, "PATCH", COMP, 200, json!({ "pulp_href": COMP })).await;
+        let (mut app, mut rx) = on_guards(&server).await;
+
+        let mut f = loaded_form(&mut app, &mut rx, Act::Edit, json!({ "pulp_href": HDR, "name": "token" })).await;
+        assert_eq!(f.title, "Edit content guard token");
+        let shown = ["name", "description", "header_name", "header_value", "jq_filter"].map(|k| f.get(k).to_string());
+        assert_eq!(shown, ["token", "old", "X-Token", "", ".a"], "the header value is never shown");
+        assert!(f.validate().is_ok(), "an edit keeps the header value when the field stays empty");
+        set(&mut f, "header_name", "X-Key");
+        set(&mut f, "jq_filter", "");
+        submit_open(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        // A composite never lists itself as one of its guards.
+        let mut f = loaded_form(&mut app, &mut rx, Act::Edit, json!({ "pulp_href": COMP, "name": "any" })).await;
+        let g = f.fields.iter().find(|x| x.key == "guards").unwrap();
+        assert_eq!(
+            (g.value.clone(), g.shown.as_str(), g.exclude.clone()),
+            (format!("{RBAC}\n{HDR}"), "2 selected", vec![COMP.to_string()])
+        );
+        set(&mut f, "guards", RBAC);
+        submit_open(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(
+            sent(&server).await,
+            [
+                ("PATCH".into(), HDR.into(), json!({ "header_name": "X-Key", "jq_filter": null })),
+                ("PATCH".into(), COMP.into(), json!({ "guards": [RBAC] })),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_content_guard_names_the_distributions_that_become_public() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        guarded(&server).await;
+        // `any` has only the RBAC guard; `both` keeps the header guard.
+        let comps = json!({ "count": 2, "next": null, "results": [
+            { "name": "any", "pulp_href": COMP, "guards": [RBAC] }, { "name": "both", "pulp_href": "/c/4/", "guards": [HDR, RBAC] }] });
+        serve(&server, "GET", "/pulp/api/v3/contentguards/core/composite/", 200, comps).await;
+        serve(&server, "DELETE", RBAC, 204, Value::Null).await;
+        let (mut app, mut rx) = on_guards(&server).await;
+
+        super::run(&mut app, Act::Delete, json!({ "pulp_href": HDR, "name": "token" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
+        assert_eq!(
+            lines,
+            [
+                "Delete content guard token (core/header).",
+                "No distribution uses it.",
+                "Composite guard both loses it and keeps 1 other guard(s)."
+            ]
+        );
+
+        super::run(&mut app, Act::Delete, json!({ "pulp_href": RBAC, "name": "staff" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, typed: Some(typed), on_yes: Some(yes), .. }) = app.modal.take() else {
+            panic!("no confirm")
+        };
+        assert_eq!((title.as_str(), typed.as_str()), ("Delete content guard staff", "staff"));
+        assert_eq!(
+            lines,
+            [
+                "Delete content guard staff (core/rbac).",
+                "Pulp removes the guard from 2 distribution(s): they become PUBLIC, anyone can download their content:",
+                "  docs",
+                "  web",
+                "Composite guard any loses its only guard: a composite without guards allows everyone, also on edge",
+                "Composite guard both loses it and keeps 1 other guard(s).",
+            ]
+        );
+        assert!(sent(&server).await.is_empty(), "nothing deleted before the confirmation");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(sent(&server).await, [("DELETE".into(), RBAC.into(), Value::Null)]);
+    }
+
+    #[tokio::test]
+    async fn rbac_guard_access_shows_who_may_download_and_sends_the_downloader_role() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        let detail = json!({ "pulp_href": RBAC, "name": "staff", "users": [{ "username": "admin" }, { "username": "alice" }], "groups": [{ "name": "ops" }] });
+        serve(&server, "GET", RBAC, 200, detail).await;
+        serve(&server, "POST", &format!("{RBAC}add_role/"), 201, json!({})).await;
+        serve(&server, "POST", &format!("{RBAC}remove_role/"), 201, json!({})).await;
+        let (mut app, mut rx) = on_guards(&server).await;
+        let item = json!({ "pulp_href": RBAC, "name": "staff" });
+
+        let f = loaded_form(&mut app, &mut rx, Act::GuardAccess, item.clone()).await;
+        assert_eq!(f.title, "Download access of content guard staff");
+        assert_eq!(f.notes, ["May download now: users admin, alice; groups ops"]);
+        assert_eq!(f.fields.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(), ["change", "users", "groups"]);
+        assert_eq!(submit_open(&mut app, &f), Err("pick a user or a group".into()));
+        let mut f = loaded_form(&mut app, &mut rx, Act::GuardAccess, item.clone()).await;
+        set(&mut f, "users", "bob\ncarol");
+        submit_open(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let mut f = loaded_form(&mut app, &mut rx, Act::GuardAccess, item.clone()).await;
+        set(&mut f, "change", "remove");
+        set(&mut f, "groups", "ops");
+        submit_open(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let role = "core.rbaccontentguard_downloader";
+        assert_eq!(
+            sent(&server).await,
+            [
+                ("POST".into(), format!("{RBAC}add_role/"), json!({ "role": role, "users": ["bob", "carol"], "groups": [] })),
+                ("POST".into(), format!("{RBAC}remove_role/"), json!({ "role": role, "users": [], "groups": ["ops"] })),
+            ]
+        );
+
+        let mut caps = crate::pulp::Capabilities::default();
+        caps.paths.insert("contentguards/".into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        super::run(&mut app, Act::GuardAccess, item);
+        assert!(app.modal.is_none() && app.jobs.is_empty());
+        let n = notices(&app);
+        assert_eq!(n.last().unwrap().1, "not supported by this server: RBAC guard roles ({r_b_a_c_content_guard_href}add_role/)");
+    }
+
+    #[tokio::test]
+    async fn read_only_mode_offers_and_runs_no_change_on_the_admin_screens() {
+        use crate::config::{AuthMethod, Config, Profile};
+        use crate::tui::kinds::Act::*;
+        let mut cfg = Config::default();
+        let p = Profile { url: "https://pulp.example.com".into(), auth: AuthMethod::None, read_only: true, ..Default::default() };
+        cfg.profiles.insert("lab".into(), p);
+        let local = Arc::new(crate::store::Store::open_in_memory().await.unwrap());
+        let mut app = App::new(cfg, "/dev/null".into(), local, Err(String::new()));
+        app.profile = Some("lab".into());
+        let rbac = json!({ "pulp_href": RBAC, "name": "staff" });
+        for (k, item, offered, refused) in [(Kind::ContentGuards, rbac, vec![Inspect], vec![GuardAccess, Create, Edit, Delete])] {
+            app.list.kind = k.clone();
+            assert_eq!(app.available_actions(&item), offered, "{k:?}");
+            for a in refused {
+                crate::tui::actions::run(&mut app, a, item.clone());
+                assert!(app.modal.is_none() && app.jobs.is_empty(), "{k:?} {a:?}");
+                assert_eq!(notices(&app).last().unwrap().1, "read-only mode: this action changes the server", "{k:?} {a:?}");
+            }
+        }
     }
 }

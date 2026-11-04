@@ -37,6 +37,7 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
         Source::SigningServices => vec![("signing-services/", NAME_HREF, "name", "pulp_href", "")],
         Source::Roles => vec![("roles/", "name", "name", "name", "")],
         Source::Users => vec![("users/", "username", "username", "username", "")],
+        Source::Groups => vec![("groups/", "name", "name", "name", "")],
         // The role form shows a Domain field only when the server has domains enabled.
         Source::Domains => vec![("domains/", NAME_HREF, "name", "pulp_href", "")],
         Source::RoleObjects => return role_objects(ctx, role).await,

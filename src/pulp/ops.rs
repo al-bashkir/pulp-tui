@@ -177,6 +177,18 @@ pub async fn distributions(c: &PulpClient, t: RepoType) -> Result<Vec<Distributi
     c.list_all(&c.api(t.distributions()), &[], 100_000).await
 }
 
+/// Content guard href -> names of the distributions (all types) that use it. `distributions/` has no guard filter.
+pub async fn guarded_distributions(c: &PulpClient) -> Result<BTreeMap<String, Vec<String>>> {
+    let q = [("fields", "name,content_guard".to_string()), ("ordering", "name".into())];
+    let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for d in c.list_all::<Value>(&c.api("distributions/"), &q, 100_000).await? {
+        if let (Some(g), Some(n)) = (d["content_guard"].as_str(), d["name"].as_str()) {
+            by.entry(g.into()).or_default().push(n.into());
+        }
+    }
+    Ok(by)
+}
+
 /// `/…/repositories/rpm/rpm/<id>/versions/3/` -> repository href.
 pub fn repo_of_version(v: &str) -> String {
     v.split("versions/").next().unwrap_or(v).to_string()

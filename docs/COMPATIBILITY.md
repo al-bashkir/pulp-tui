@@ -78,6 +78,9 @@ General rules:
 | Pulp importers, import check              | `importers/core/pulp/`, `importers/core/pulp/import-check/`          | screen not supported                      |
 | Delete a task; purge finished tasks       | `delete` on `{task_href}`; `tasks/purge/`                            | endpoint message                          |
 | Workers, Task groups screens              | `workers/`, `task-groups/`                                           | screen not supported                      |
+| Content guards screen                     | `contentguards/` and `distributions/`                                | screen not supported                      |
+| Content guard types (**c**)               | `contentguards/<type>/`, for example `contentguards/core/rbac/`      | type not offered                          |
+| RBAC guard download access (**a**)        | `{r_b_a_c_content_guard_href}add_role/`                              | endpoint message                          |
 | Task group cancel                         | `patch` on `{task_group_href}`                                       | endpoint message                          |
 
 1. For the copy action. A Content View publish gets the server's error.
@@ -482,6 +485,26 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   repositories copy it from the source). Verify reads the manifest that the publication
   names; with none, it says that it compared no files.
 
+### Content guards
+
+Read in pulpcore 3.123.1 (models and serializers in `pulpcore/app/`) and live on pulp1.
+
+* **A guard delete makes its distributions public.** `Distribution.content_guard` is
+  `on_delete=SET_NULL`. The delete answers 204 at once (no task).
+* **A composite without guards allows everyone** (`CompositeContentGuard.permit`). Its
+  `guards` is a many-to-many field, so a deleted member just leaves the composite. Pulp does
+  not refuse a composite that lists itself; the form never offers it.
+* **RBAC guard `users` and `groups`** are the holders of `core.download_rbaccontentguard` on
+  the guard. `add_role/` and `remove_role/` take `{role, users, groups}` (user and group
+  names); the role is `core.rbaccontentguard_downloader`. The user that creates the guard
+  gets that role at once, and `add_role/` refuses a role that the user already has (400).
+* **`header_value` of a header guard is readable on GET.** pulp-tui masks it like a secret.
+* `description` and `jq_filter` take `null`, not an empty string (`minLength` 1). The
+  certguard types take the PEM text of the CA certificate in `ca_certificate`.
+* `contentguards/` lists every type with name and description only; the type is in the
+  href. `distributions/` has no `content_guard` filter, so the screen reads `name` and
+  `content_guard` of all distributions.
+
 ### Sync and remotes
 
 * **Refused sync pairs** (pulp_rpm 3.39.5, HTTP 400): `mirror_complete` with `skip_types`
@@ -741,7 +764,8 @@ or IpAddress(127.0.0.1)`.
 * RPM `osv_config` (the ecosystems of a version scan) is not in the repository form; set it with
   the API. An edit that changes the Labels of a repository that has it gets HTTP 400 from
   pulp_rpm; with the `osv.rpm.config` label taken out of the field, the edit removes the config.
-* Content guards are only shown and set by href, not created or replicated.
+* Content guards are not replicated (fallback replication), and object roles other than the
+  RBAC guard's download role are not managed.
 * Reusable filter sets are not implemented; filters are per view repository, so a later
   table can be added without a change to published versions. A composite has no filters
   and cannot be a component of another composite.

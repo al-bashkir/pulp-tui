@@ -103,6 +103,7 @@ snapshot to the Task Center (`actions::group_progress`), so a restart re-attache
 | Owner    | Objects                                                                       |
 | -------- | ----------------------------------------------------------------------------- |
 | Pulp     | Repository, Remote, Repository Version, Publication, Distribution             |
+|          | Content Guard                                                                 |
 |          | Task, Task Group, User, Group, Role, Upstream Pulp                            |
 |          | Exporter, Export, Importer, Import                                            |
 | pulp-tui | Content View, Content View Version, Lifecycle Environment, Promotion, Binding |
@@ -452,7 +453,8 @@ client clock).
 * `Authorization` is marked sensitive and never recorded. The log file holds method, path
   and status only.
 * Forms never pre-fill write-only fields and mask them. Inspect, Details and Logs mask the
-  same keys (a remote's `headers` and tokens are readable on GET).
+  same keys (a remote's `headers` and tokens, and a header guard's `header_value`, are
+  readable on GET).
 * The Logs screen (`src/session_log.rs`) keeps the last 1000 entries in memory, bodies cut
   at 64 KiB, secret keys redacted (any case), upload bodies replaced by their size. It is
   never written to disk.
@@ -460,5 +462,5 @@ client clock).
 * Pulp enforces RBAC. pulp-tui warns on owner/admin grants, `is_staff` and changes to
   one's own access, refuses to delete the logged-in account, and never works around a 403.
 * Destructive operations show the impact first. Deletes of repositories, distributions,
-  users, roles, Content Views, ACSs and protected promotions, and reclaim space, need the
-  typed name. Production profiles show a red banner and a warning line.
+  users, roles, content guards, Content Views, ACSs and protected promotions, and reclaim
+  space, need the typed name. Production profiles show a red banner and a warning line.

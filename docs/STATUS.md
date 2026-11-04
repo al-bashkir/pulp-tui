@@ -216,8 +216,7 @@ Not run again on 2026-11-02 (the results below are older):
 
 ### Not supported
 
-* Plugins other than RPM, File and Deb; creation of content guards and signing services;
-  OIDC token refresh.
+* Plugins other than RPM, File and Deb; creation of signing services; OIDC token refresh.
 * Deb: dependency solving on copy; fallback replication of source packages. Deb Content
   View publications are never reused, and a Content View never makes a verbatim
   publication.

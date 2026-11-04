@@ -452,6 +452,31 @@ LATEST** (a repository) or **CHECKPOINTS** (a checkpoint distribution of a repos
   re-point, re-bind or rename it, or change its `pulp_tui_*` labels. Use promote or roll back.
   You cannot delete it, also not as a marked item. Unpromote the view from the environment.
 
+### Content Guards
+
+A content guard decides who may download from the distributions that use it. The list shows
+every guard of the server: name, type (`core/rbac`, `core/header`, `certguard/x509`, …) and
+the distributions that use it. **i** full JSON.
+
+* **c** asks for the type (only the types that the server has), then for its fields:
+  * `core/header`: header name, header value, optional jq filter. The value is a shared
+    secret: pulp-tui never shows it (Inspect, Details and Logs show `•••`).
+  * `core/envvar_header`: header name and the name of an environment variable on the Pulp
+    server.
+  * `core/composite`: the guards of the composite. One guard that allows is enough. A
+    composite without guards allows everyone.
+  * `certguard/x509`, `certguard/rhsm`: the path of a local PEM file with the CA certificate.
+    pulp-tui sends its content.
+  * `core/rbac`, `core/content_redirect`: name and description only.
+* **e** edits a guard. The header value and the CA certificate are not shown: empty keeps
+  them.
+* **a** (RBAC guard): download access. The form shows the users and groups that may download
+  now, then allows or removes the users and groups that you pick (the role
+  `core.rbaccontentguard_downloader`). The user that created the guard is in the list too.
+* **d** deletes after you type the name. The impact lists the distributions that use the
+  guard: Pulp removes the guard from them, so they become **public**. It also lists the
+  composite guards that contain it; a composite that loses its only guard allows everyone.
+
 ### Content Views
 
 Managed by pulp-tui, not by Pulp (see [ARCHITECTURE.md](ARCHITECTURE.md)). Columns: composite,
@@ -748,7 +773,7 @@ All events of this session, newest first, with UTC times. It works without a con
 (hidden by default).
 
 The log never records the `Authorization` header. It shows as `•••` the JSON values of
-`password`, `token`, `secret`, `client_key`, `authorization`, `headers`, and of keys that end in
+`password`, `token`, `secret`, `client_key`, `authorization`, `headers`, `header_value`, and of keys that end in
 `_password`, `_token` or `_secret`, in any letter case. An upload shows only its size. A body is
 cut at 64 KiB. The log keeps 1000 rows in memory only and is gone when you quit.
 

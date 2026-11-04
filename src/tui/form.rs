@@ -19,6 +19,7 @@ pub enum Source {
     SigningServices,
     Roles,
     Users,
+    Groups,
     Domains,
     RoleObjects,
     /// Normal (not composite) Content Views of the active server; the value is the view id.

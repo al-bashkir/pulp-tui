@@ -51,6 +51,7 @@ pub enum Feature {
     TaskPurge,
     Workers,
     TaskGroups,
+    ContentGuards,
 }
 
 impl Feature {
@@ -74,6 +75,7 @@ impl Feature {
             Feature::TaskPurge => "task purge (tasks/purge/)",
             Feature::Workers => "workers API (workers/)",
             Feature::TaskGroups => "task groups API (task-groups/)",
+            Feature::ContentGuards => "content guards API (contentguards/, distributions/)",
         }
     }
 }
@@ -202,6 +204,8 @@ impl Capabilities {
             Feature::TaskPurge => self.has_endpoint("tasks/purge/"),
             Feature::Workers => self.has_endpoint("workers/"),
             Feature::TaskGroups => self.has_endpoint("task-groups/"),
+            // The screen lists the distributions that use each guard: `distributions/` has no guard filter.
+            Feature::ContentGuards => self.has_endpoint("contentguards/") && self.has_endpoint("distributions/"),
         }
     }
 

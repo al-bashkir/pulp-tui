@@ -361,3 +361,76 @@ async fn remote_delete_refused_while_an_acs_uses_it() {
     c.get::<Value>(&remote, &[]).await.expect("the remote is still there");
     cleanup(&c, &[&acs, &remote]).await;
 }
+
+/// The Content Guards screen: a header guard made with the forms, used by a File distribution. The list
+/// names the distribution; an edit keeps the header value it never shows; the delete impact names the
+/// distribution, and after the delete Pulp serves it without a guard (`on_delete=SET_NULL`).
+#[tokio::test]
+async fn content_guard_create_edit_and_delete_name_its_distribution() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = unique("admin-guard");
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::ContentGuards;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("type", "core/header")]);
+    fill(&mut app, &[("name", &name), ("header_name", "X-Pulp-Tui"), ("header_value", "s3cret")]);
+    settle(&mut app, &mut rx).await;
+    let guard: Value = ops::find_by_name(&c, &c.api("contentguards/"), &name).await.unwrap().unwrap_or_else(|| panic!("{:?}", texts(&app)));
+    let href = guard["pulp_href"].as_str().unwrap().to_string();
+    let body = json!({ "name": name, "base_path": name, "content_guard": href });
+    let dist = create(&c, RepoType::File.distributions(), body, "/distributions/").await;
+
+    app.open(Screen::List(Kind::ContentGuards));
+    app.list.filter = name.clone();
+    app.reload();
+    settle(&mut app, &mut rx).await;
+    let row = app.list.items.iter().find(|r| r["name"] == name.as_str()).cloned().unwrap_or_else(|| panic!("{:?}", app.list.error));
+    let cells: Vec<String> = Kind::ContentGuards.columns().iter().map(|col| (col.get)(&row)).collect();
+    assert_eq!(cells, [name.clone(), "core/header".into(), name.clone()]);
+
+    run(&mut app, Act::Edit, row.clone());
+    settle(&mut app, &mut rx).await;
+    fill(&mut app, &[("header_name", "X-Other")]);
+    settle(&mut app, &mut rx).await;
+    let g: Value = c.get(&href, &[]).await.unwrap();
+    assert_eq!((g["header_name"].as_str(), g["header_value"].as_str()), (Some("X-Other"), Some("s3cret")), "{:?}", texts(&app));
+
+    run(&mut app, Act::Delete, row);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some(name.as_str()));
+    assert!(lines[1].contains("they become PUBLIC") && lines[2] == format!("  {name}"), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    assert_eq!(c.get::<Value>(&href, &[]).await.unwrap_err().status(), Some(404), "{:?}", texts(&app));
+    assert_eq!(c.get::<Value>(&dist, &[]).await.unwrap()["content_guard"], Value::Null, "Pulp clears the guard");
+    cleanup(&c, &[&dist]).await;
+}
+
+/// Download access of an RBAC guard: the form sends the downloader role; Pulp then lists the user.
+#[tokio::test]
+async fn rbac_guard_access_allows_and_removes_a_user() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = unique("admin-rbac");
+    let user = create(&c, "users/", json!({ "username": name }), "/users/").await;
+    let href = create(&c, "contentguards/core/rbac/", json!({ "name": name }), "/contentguards/").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::ContentGuards;
+    let users = async || {
+        let g: Value = c.get(&href, &[]).await.unwrap();
+        g["users"].as_array().unwrap().iter().filter_map(|u| u["username"].as_str().map(String::from)).collect::<Vec<_>>()
+    };
+    for change in ["allow", "remove"] {
+        run(&mut app, Act::GuardAccess, json!({ "pulp_href": href, "name": name }));
+        settle(&mut app, &mut rx).await;
+        fill(&mut app, &[("change", change), ("users", &name)]);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(users().await.contains(&name), change == "allow", "{change}: {:?}", texts(&app));
+    }
+    cleanup(&c, &[&href, &user]).await;
+}
