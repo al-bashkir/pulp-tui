@@ -404,6 +404,9 @@ client clock).
 * Locked: publish, resume, promote, rollback, unpromote, delete. Not locked: preview,
   compare, verify, edits. A relabel locks all views of the environment. A composite publish
   locks only the composite.
+* `Store::delete_env` locks the environment row first (SQLite: the write lock; PostgreSQL:
+  `FOR UPDATE`), then checks for bindings and later environments, and deletes in the same
+  transaction. A promotion into it or a new successor waits for that commit.
 
 ### Read-only mode and `db copy`
 

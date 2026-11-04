@@ -1108,18 +1108,29 @@ impl Store {
         Ok(())
     }
 
+    /// Delete environment `id` and its served rows, in one transaction. Refused while a view is bound to it or
+    /// an environment follows it.
     pub async fn delete_env(&self, id: i64) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        // Lock before the check: a binding or successor that another operator adds waits for this commit.
+        // SQLite: the first write takes the database write lock. PostgreSQL: FOR UPDATE blocks their foreign key checks.
+        let lock = match self.backend {
+            Backend::Sqlite => "UPDATE environments SET protected = protected WHERE id = $1",
+            Backend::Postgres => "SELECT id FROM environments WHERE id = $1 FOR UPDATE",
+        };
+        sqlx::query(lock).bind(id).execute(&mut *tx).await?;
         let used: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM bindings WHERE env_id = $1) + (SELECT COUNT(*) FROM environments WHERE prior_id = $1)",
         )
         .bind(id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
         if used > 0 {
             bail!("environment is in use (bindings or successor environments exist)");
         }
-        sqlx::query("DELETE FROM binding_repos WHERE env_id = $1").bind(id).execute(&self.pool).await?;
-        sqlx::query("DELETE FROM environments WHERE id = $1 AND prior_id IS NOT NULL").bind(id).execute(&self.pool).await?;
+        sqlx::query("DELETE FROM binding_repos WHERE env_id = $1").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM environments WHERE id = $1 AND prior_id IS NOT NULL").bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2079,6 +2090,47 @@ mod tests {
 
         s.delete_cv(cv).await.unwrap();
         assert!(s.versions(cv).await.unwrap().is_empty());
+    }
+
+    /// Another operator's promotion binds a view in Dev while Dev is deleted: the delete waits for its
+    /// commit, then refuses, and the served rows stay.
+    #[tokio::test]
+    async fn delete_env_waits_for_a_promotion_and_then_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(Store::open(&dir.path().join("db.sqlite")).await.unwrap());
+        let cv = s.create_cv("lab", "web", "").await.unwrap();
+        let v = s.begin_version(cv, "", &[]).await.unwrap();
+        let lib = s.ensure_library("lab").await.unwrap();
+        let dev = s.create_env("lab", "Dev", lib, false).await.unwrap();
+        let row = BindingRepo {
+            env_id: dev,
+            cv_id: cv,
+            repo_href: "/r/1/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: "/d/1/".into(),
+            base_path: "dev/web/os".into(),
+            publication: Some("/p/1/".into()),
+        };
+        s.save_binding_repo(&row).await.unwrap(); // served rows without a binding: Dev can be deleted
+        let mut promotion = s.pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO bindings(env_id, cv_id, version_id, state, updated_at) VALUES ($1, $2, $3, 'promoting', 't')")
+            .bind(dev)
+            .bind(cv)
+            .bind(v.id)
+            .execute(&mut *promotion)
+            .await
+            .unwrap();
+        let del = tokio::spawn({
+            let s = s.clone();
+            async move { s.delete_env(dev).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await; // the delete runs up to the write lock the promotion holds
+        promotion.commit().await.unwrap();
+        let e = del.await.unwrap().unwrap_err().to_string();
+        assert!(e.contains("environment is in use"), "{e}");
+        assert_eq!(s.binding_repos(dev, cv).await.unwrap(), [row], "the served rows stay");
+        assert!(s.environments("lab").await.unwrap().iter().any(|e| e.id == dev));
     }
 
     #[test]

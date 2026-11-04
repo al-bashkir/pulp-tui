@@ -9,7 +9,7 @@ use crate::filters::{format_rules, parse_rules};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, RepoType};
 use crate::store::{Component, CvRepo, CvVersion, LIBRARY, Store};
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use futures::future::join_all;
 use serde_json::Value;
 use std::future::Future;
@@ -1063,26 +1063,65 @@ fn env_action(app: &mut App, scope: &str, act: Act, item: Value) {
         }
         Act::ToggleProtected => {
             let prot = item["protected"] != true;
-            local(app, "toggle protected", async move |st| {
-                st.set_env_protected(id, prot).await?;
-                Ok(format!("{name} protected: {prot}"))
-            });
+            let (title, typed) = (format!("Remove protection from {name}"), name.clone());
+            let lines = vec![
+                format!("Promote and roll back to {name} (for Library also publish and Resume) stop asking to type its name."),
+                "With a shared database, this applies to every operator.".into(),
+            ];
+            let toggle = move |app: &mut App| {
+                local(app, "toggle protected", async move |st| {
+                    st.set_env_protected(id, prot).await?;
+                    Ok(format!("{name} protected: {prot}"))
+                })
+            };
+            // Adding protection only adds a question to later changes: no confirmation.
+            if prot { toggle(app) } else { app.confirm_danger(title, lines, &typed, toggle) }
         }
         Act::Delete => {
             if name == LIBRARY && item["prior"] == "" {
                 app.error("Library cannot be deleted");
                 return;
             }
-            app.confirm(
-                format!("Delete environment {name}"),
-                vec!["Only allowed when no content view is bound and no environment follows it.".into()],
-                move |app| {
-                    local(app, "delete environment", async move |st| {
-                        st.delete_env(id).await?;
-                        Ok(format!("environment {name} deleted"))
+            let Some(st) = cv_store(app) else { return };
+            app.spawn(format!("read what deleting {name} removes"), true, async move {
+                let envs = st.environments(&p).await?;
+                let env = envs.iter().find(|e| e.id == id).ok_or_else(|| anyhow!("unknown environment {name}"))?;
+                let after: Vec<&str> = envs.iter().filter(|e| e.prior_id == Some(id)).map(|e| e.name.as_str()).collect();
+                let (mut bound, mut served) = (vec![], vec![]);
+                for cv in st.env_cv_ids(id).await? {
+                    let view = st.content_view(cv).await?.name;
+                    if st.binding(id, cv).await?.is_some() {
+                        bound.push(view.clone());
+                    }
+                    for b in st.binding_repos(id, cv).await? {
+                        served.push(format!("  {view}/{}  /{}  {}", b.repo_name, b.base_path, b.distribution));
+                    }
+                }
+                // The refusal of `Store::delete_env`, with the names, before the typed confirmation.
+                let mut why = vec![];
+                if !bound.is_empty() {
+                    why.push(format!("views bound to it: {} (unpromote them first)", bound.join(", ")));
+                }
+                if !after.is_empty() {
+                    why.push(format!("environments after it: {} (delete them first)", after.join(", ")));
+                }
+                if !why.is_empty() {
+                    bail!("{name} is in use: {}", why.join("; "));
+                }
+                let mut lines = vec![format!("Delete lifecycle environment {name} (label {}). No view is bound to it.", env.label)];
+                if !served.is_empty() {
+                    lines.push("pulp-tui forgets these served rows; their distributions stay in Pulp:".into());
+                    lines.extend(served);
+                }
+                ap(move |app| {
+                    app.confirm_danger(format!("Delete environment {name}"), lines, &name.clone(), move |app| {
+                        local(app, "delete environment", async move |st| {
+                            st.delete_env(id).await?;
+                            Ok(format!("environment {name} deleted"))
+                        })
                     })
-                },
-            );
+                })
+            });
         }
         _ => {}
     }
@@ -2247,5 +2286,90 @@ mod tests {
         drain(&mut app, &mut rx).await;
         assert_eq!(confirm_lines(&mut app), ["Delete web version 1. Nothing in Pulp is deleted.", "The version number is never reused."]);
         assert!(server.received_requests().await.unwrap().is_empty(), "no derived repository to read");
+    }
+
+    #[tokio::test]
+    async fn removing_protection_asks_to_type_the_environment() {
+        let (mut app, mut rx, st) = composite_app().await;
+        let lib = st.ensure_library("lab").await.unwrap();
+        let prod = st.create_env("lab", "Prod", lib, false).await.unwrap();
+        app.push(Kind::Environments);
+        drain(&mut app, &mut rx).await;
+        let protected = async || st.environments("lab").await.unwrap()[1].protected;
+        let toggle = |app: &mut App, now: bool| {
+            env_action(app, "lab", Act::ToggleProtected, json!({ "id": prod, "name": "Prod", "protected": now }));
+        };
+        toggle(&mut app, false);
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "adding protection asks nothing");
+        assert!(protected().await);
+
+        toggle(&mut app, true);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, typed, on_yes, .. }) = app.modal.take() else { panic!("no confirmation") };
+        assert_eq!((title.as_str(), typed.as_deref()), ("Remove protection from Prod", Some("Prod")));
+        assert!(protected().await, "nothing before the confirmation");
+        on_yes.unwrap()(&mut app);
+        drain(&mut app, &mut rx).await;
+        assert!(!protected().await);
+        assert_eq!(last_notice(&app), (Level::Ok, "Prod protected: false"));
+    }
+
+    #[tokio::test]
+    async fn delete_environment_shows_what_it_has_then_asks_to_type_its_name() {
+        let (mut app, mut rx, st) = composite_app().await;
+        let lib = st.ensure_library("lab").await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        // Dev: a bound view and a later environment. QA: a served row without a binding.
+        let dev = st.create_env("lab", "Dev", lib, false).await.unwrap();
+        st.create_env("lab", "Prod", dev, false).await.unwrap();
+        let v = publish_empty(&st, web).await;
+        st.set_binding(dev, web, v.id, "active").await.unwrap();
+        let qa = st.create_env("lab", "QA", lib, false).await.unwrap();
+        let dist = "/pulp/api/v3/distributions/rpm/rpm/1/";
+        let row = crate::store::BindingRepo {
+            env_id: qa,
+            cv_id: web,
+            repo_href: format!("{REPOS}rpm/rpm/1/"),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: dist.into(),
+            base_path: "qa/web/os".into(),
+            publication: Some("/p/1/".into()),
+        };
+        st.save_binding_repo(&row).await.unwrap();
+        app.push(Kind::Environments);
+        drain(&mut app, &mut rx).await;
+        let delete = |app: &mut App, id: i64, name: &str| {
+            env_action(app, "lab", Act::Delete, json!({ "id": id, "name": name, "prior": "Library", "label": name.to_lowercase() }));
+        };
+        let exists = async |id: i64| st.environments("lab").await.unwrap().iter().any(|e| e.id == id);
+
+        delete(&mut app, dev, "Dev");
+        assert!(app.jobs.iter().all(|j| j.is_load), "reading the impact changes nothing: quit does not warn");
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "a refusal shows before the typed confirmation");
+        let why = "read what deleting Dev removes: Dev is in use: views bound to it: web (unpromote them first); \
+                   environments after it: Prod (delete them first)";
+        assert_eq!(last_notice(&app), (Level::Error, why));
+
+        delete(&mut app, qa, "QA");
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, typed, on_yes, .. }) = app.modal.take() else { panic!("no confirmation") };
+        assert_eq!((title.as_str(), typed.as_deref()), ("Delete environment QA", Some("QA")));
+        assert_eq!(
+            lines,
+            [
+                "Delete lifecycle environment QA (label qa). No view is bound to it.".to_string(),
+                "pulp-tui forgets these served rows; their distributions stay in Pulp:".into(),
+                format!("  web/os  /qa/web/os  {dist}"),
+            ]
+        );
+        assert!(exists(qa).await, "nothing before the confirmation");
+        on_yes.unwrap()(&mut app);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Ok, "environment QA deleted"));
+        assert!(!exists(qa).await);
+        assert!(st.binding_repos(qa, web).await.unwrap().is_empty());
     }
 }

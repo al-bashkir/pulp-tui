@@ -544,8 +544,11 @@ Library exists by default. With a shared database, all operators see the same en
 
 * **c** creates an environment after an existing one. Paths can branch.
 * **L** toggles protection. To change what a protected environment serves, you type its name
-  (promote, roll back; for Library also publish and *Resume*).
-* **d** deletes an unused environment.
+  (promote, roll back; for Library also publish and *Resume*). To remove protection, you also
+  type its name (with a shared database, it applies to all operators). Adding it asks nothing.
+* **d** deletes an unused environment. First it shows why it is refused (bound views, later
+  environments), or the served rows that pulp-tui forgets (their distributions stay in Pulp).
+  Then you type the environment name.
 * **e** edits the **label**, the part of the served path that names the environment. A new
   environment gets its name in lower case (`Dev` gives `dev`). A label has 1-64 characters of
   `a-z 0-9 - _ .` and is unique on the server. A label must not be equal to, a parent of, or a
