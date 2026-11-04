@@ -5,10 +5,11 @@ use super::app::{App, Focus, Level, Modal, Screen, item_key};
 use super::form::{Field, FieldKind, Form, Picker};
 use super::kinds::{self, Kind, s};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Widget, Wrap};
 use std::time::Duration;
 
 const MIN_W: u16 = 60;
@@ -415,15 +416,14 @@ fn draw_modal(f: &mut Frame, m: &Modal, app: &App, area: Rect) {
 
 fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
     let label_w = form.fields.iter().map(|x| x.label.chars().count()).max().unwrap_or(10) + 2;
-    // Wrapped note height (as in the Confirm modal), so the fields and the error line below stay visible.
-    let inner_w = 100.min(area.width.saturating_sub(2)).saturating_sub(2).max(1) as usize;
-    let notes: usize = form.notes.iter().map(|n| n.chars().count().max(1).div_ceil(inner_w)).sum();
-    let h = form.fields.len() + notes + 6;
-    let r = centered(area, 100, h as u16);
+    let inner_w = 100.min(area.width.saturating_sub(2)).saturating_sub(2).max(1);
+    let rows = |ls: &[Line]| ls.iter().map(|l| wrapped_rows(l, inner_w)).sum::<usize>();
     let mut lines: Vec<Line> = form.notes.iter().map(|n| Line::styled(n.clone(), Style::default().fg(Color::Yellow))).collect();
     if !form.notes.is_empty() {
         lines.push(Line::raw(""));
     }
+    // Rows above the focused field, and up to its end.
+    let mut focus = (0, 0);
     for (i, fld) in form.fields.iter().enumerate() {
         let focused = i == form.focus;
         let req = if fld.required { "*" } else { " " };
@@ -435,25 +435,58 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
         } else {
             fld.display()
         };
-        lines.push(Line::from(vec![Span::raw(label), if focused { Span::styled(value, sel()) } else { Span::raw(value) }]));
+        let line = Line::from(vec![Span::raw(label), if focused { Span::styled(value, sel()) } else { Span::raw(value) }]);
+        if focused {
+            let start = rows(&lines);
+            focus = (start, start + wrapped_rows(&line, inner_w));
+        }
+        lines.push(line);
     }
-    lines.push(Line::raw(""));
+    let mut bottom = vec![Line::raw("")];
     if let Some(h) = form.fields.get(form.focus).map(|x| x.help.clone()).filter(|h| !h.is_empty()) {
-        lines.push(Line::styled(h, Style::default().fg(Color::DarkGray)));
+        bottom.push(Line::styled(h, Style::default().fg(Color::DarkGray)));
     }
+    let pre = rows(&bottom);
     if let Some(e) = &form.error {
-        lines.push(Line::styled(format!("Error: {e}"), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+        bottom.push(Line::styled(format!("Error: {e}"), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
     }
+    let (top_h, bottom_h) = (rows(&lines), rows(&bottom));
+    // Room for the help and a one-row error, so the box does not jump when an error comes.
+    let r = centered(area, 100, (top_h + bottom_h.max(3) + 2) as u16);
+    let block = Block::bordered().borders(Borders::ALL).title(format!(" {} ", form.title)).title_bottom(format!(" {} ", form_hint(form)));
+    let inner = block.inner(r);
+    // Help and error have their own rows below the fields, so long values cannot push them out; one row stays for the fields.
+    let b = (bottom_h as u16).min(inner.height.saturating_sub(1));
+    let top = Rect { height: (top_h as u16).min(inner.height - b), ..inner };
+    let low = Rect { y: top.bottom(), height: inner.height - top.height, ..inner };
+    // Scrolled so the focused field is visible, its first row first.
+    let scroll = focus.1.saturating_sub(top.height as usize).min(focus.0) as u16;
+    // Short of rows, the gap and the help hide first, then the end of the error.
+    let low_scroll = (bottom_h as u16).saturating_sub(low.height).min(pre as u16);
     f.render_widget(Clear, r);
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::bordered().borders(Borders::ALL).title(format!(" {} ", form.title)).title_bottom(format!(" {} ", form_hint(form))),
-        ),
-        r,
-    );
+    f.render_widget(block, r);
+    f.render_widget(Paragraph::new(lines).wrap(FORM_WRAP).scroll((scroll, 0)), top);
+    f.render_widget(Paragraph::new(bottom).wrap(FORM_WRAP).scroll((low_scroll, 0)), low);
     if let Some(p) = &form.picker {
         draw_picker(f, form, p, r, area);
     }
+}
+
+/// Wrap of the form text; `wrapped_rows` counts its rows. Indented field labels need `trim: false`.
+const FORM_WRAP: Wrap = Wrap { trim: false };
+
+/// Rows that `line` takes in a `FORM_WRAP` paragraph `w` columns wide. It is drawn off screen and the
+/// drawn rows are counted, because `Paragraph::line_count` needs an unstable ratatui feature.
+fn wrapped_rows(line: &Line, w: u16) -> usize {
+    let width = line.width();
+    if width <= w as usize {
+        return 1;
+    }
+    // Word wrap puts more than `w` cells in each two rows, so this height is enough.
+    let mut buf = Buffer::empty(Rect::new(0, 0, w, (2 * width.div_ceil(w as usize)) as u16));
+    // The mark shows the drawn cells, also on a row of spaces only.
+    Paragraph::new(line.clone().patch_style(Modifier::HIDDEN)).wrap(FORM_WRAP).render(buf.area, &mut buf);
+    buf.content.chunks(w as usize).rposition(|row| row.iter().any(|c| c.modifier.contains(Modifier::HIDDEN))).map_or(1, |y| y + 1)
 }
 
 /// Keys of the form itself (the picker has its own hint). At most 90 characters: the box is 98 wide.
@@ -597,9 +630,62 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn screen(form: &Form) -> String {
-        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        screen_at(form, 100, 30)
+    }
+
+    fn screen_at(form: &Form, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw_form(f, form, f.area())).unwrap();
         t.backend().to_string()
+    }
+
+    #[test]
+    fn form_error_and_help_stay_visible_below_long_values_and_errors() {
+        let fields = vec![Field::text("name", "Name"), Field::text("url", "URL"), Field::text("db", "Database").value("d".repeat(150))];
+        let mut form = Form::new("t", fields).note("A note above the fields.");
+        form.fields[2].help = "a file path".into();
+        form.focus = 2;
+        form.error = Some("auth Basic needs a secret reference".into());
+        let s = screen(&form);
+        assert!(s.contains("a file path") && s.contains("Error: auth Basic needs a secret reference"), "{s}");
+        // Everything fits: the note shows, and the labels keep their indent.
+        assert!(s.contains("A note above the fields.") && s.contains("│  URL"), "{s}");
+        // A tiny area must not panic.
+        screen_at(&form, 3, 3);
+        // A long error wraps over several rows; its end stays in the box.
+        form.error = Some(format!("{}last-word", "word ".repeat(60)));
+        let s = screen(&form);
+        assert!(s.contains("a file path") && s.contains("Error: word") && s.contains("last-word"), "{s}");
+    }
+
+    #[test]
+    fn form_at_the_smallest_size_shows_the_focused_field_and_the_error() {
+        let fields = (0..17).map(|i| Field::text(&format!("f{i}"), &format!("Field {i:02}"))).collect();
+        let mut form = Form::new("t", fields).note("A note above the fields.");
+        form.fields[5].value = "v".repeat(150);
+        form.error = Some(format!("{}last-word", "word ".repeat(15)));
+        for focus in [0, 5, 8, 16] {
+            form.focus = focus;
+            let s = screen_at(&form, MIN_W, MIN_H);
+            assert!(s.contains(&format!("▶ Field {focus:02}")) && s.contains("Error: word") && s.contains("last-word"), "{focus}: {s}");
+        }
+        // Taller than the box: the focused field shows its label row, the error its start.
+        form.focus = 5;
+        form.fields[5].value = "v".repeat(1000);
+        form.error = Some("word ".repeat(200));
+        let s = screen_at(&form, MIN_W, MIN_H);
+        assert!(s.contains("▶ Field 05") && s.contains("Error: word") && s.contains("Esc: cancel ┘"), "{s}");
+    }
+
+    #[test]
+    fn wrapped_rows_counts_the_rows_of_word_wrap() {
+        assert_eq!(wrapped_rows(&Line::raw(""), 10), 1);
+        assert_eq!(wrapped_rows(&Line::raw("x".repeat(10)), 10), 1);
+        assert_eq!(wrapped_rows(&Line::raw("x".repeat(25)), 10), 3);
+        // Each word on its own row: more rows than the cells need.
+        assert_eq!(wrapped_rows(&Line::raw("aaaaaa aaaaaa aaaaaa"), 10), 3);
+        // The last row holds a space only.
+        assert_eq!(wrapped_rows(&Line::raw(format!("{}  ", "a".repeat(10))), 10), 2);
     }
 
     #[test]
