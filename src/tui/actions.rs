@@ -309,6 +309,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         (Kind::Remotes(t, alt), _) => remote_action(app, *t, *alt, act, item),
         (Kind::Acs(t), _) => acs_action(app, *t, act, item),
         (Kind::Versions(_), Act::PruneOrphans) => prune_orphans(app),
+        (Kind::Artifacts, Act::RepairServer) => repair_server(app),
         (Kind::Versions(_), _) => version_action(app, act, item),
         (Kind::Content { version, .. }, _) => content_action(app, version.clone(), act),
         (Kind::Publications(t), _) => publication_action(app, *t, act, item),
@@ -2432,6 +2433,42 @@ fn repair(app: &mut App, t: RepoType, version: String, number: String) {
     });
 }
 
+/// `repair/`: the files of all content of the server (of the profile's domain). Count, typed profile name, then
+/// the task; one repair at a time (pulpcore reserves `pdrn:<domain>:repair`), other tasks go on.
+fn repair_server(app: &mut App) {
+    if caps(app).is_some_and(|c| !c.has_endpoint("repair/")) {
+        return app.error("not supported by this server: server repair (repair/)");
+    }
+    let help = "on = read every file and compare its digest (very slow on a big server); off = check only that each file exists";
+    let verify = Field::new("verify_checksums", "Verify checksums", FieldKind::Bool).help(help);
+    app.form(Form::new("Repair all files", vec![verify]), |app, f| {
+        let (verify, profile) = (f.bool("verify_checksums"), app.profile.clone().unwrap_or_default());
+        app.job("count content to repair", move |ctx| async move {
+            let c = &ctx.client;
+            let n = c.list::<Value>(&c.api("content/"), &[("limit", "1".into())]).await?.count;
+            let lines = vec![
+                format!("Repair on {profile}: Pulp checks the files of all {n} content unit(s)."),
+                if verify { "It reads every file and compares its digest (slow)." } else { "It checks only that each file exists." }.into(),
+                "It downloads a missing or corrupt file again from a remote that has it,".into(),
+                "and deletes a corrupt file that no remote can give again.".into(),
+                "It can take long; the Task Center shows the task.".into(),
+            ];
+            ap(move |app| {
+                let typed = profile.clone();
+                app.confirm_danger("Repair all files", lines, &typed, move |app| {
+                    let label = format!("repair all files on {profile}");
+                    app.job(label.clone(), move |ctx| async move {
+                        let c = &ctx.client;
+                        let m = c.post(&c.api("repair/"), &json!({ "verify_checksums": verify })).await?;
+                        ap(move |app| follow(app, m, label.clone(), move |app, t| repaired(app, &label, &t)))
+                    })
+                })
+            })
+        });
+        Ok(())
+    });
+}
+
 /// The repair task ended: what its progress reports counted.
 fn repaired(app: &mut App, label: &str, t: &Task) {
     let done = |code: &str| t.progress_reports.iter().find(|r| r.code == code).and_then(|r| r.done).unwrap_or(0);
@@ -4035,6 +4072,72 @@ mod tests {
         assert_eq!(post, json!({ "orphan_protection_time": 60 }));
         let texts: Vec<&String> = app.notices.iter().map(|n| &n.text).collect();
         assert!(texts.iter().any(|t| *t == "prune orphans on lab: deleted 12 content unit(s) and 30 artifact(s)"), "{texts:?}");
+    }
+
+    #[tokio::test]
+    async fn server_repair_counts_the_content_and_needs_the_typed_profile_name() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}content/")))
+            .and(query_param("limit", "1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 40, "next": null, "results": [] })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(format!("{API}repair/")))
+            .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reports = json!([
+            { "code": "repair.missing", "message": "Identify missing units", "done": 2 },
+            { "code": "repair.corrupted", "message": "Identify corrupted units", "done": 0 },
+            { "code": "repair.repaired", "message": "Repair corrupted units", "done": 1 },
+        ]);
+        let task = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "name": "repair_all_artifacts", "progress_reports": reports });
+        get(&server, &format!("{API}tasks/1/"), task).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Artifacts;
+        run(&mut app, Act::RepairServer, Value::Null);
+        let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.title, "Repair all files");
+        let f = &form.fields[0];
+        assert_eq!(
+            (f.key.as_str(), f.value.as_str()),
+            ("verify_checksums", "false"),
+            "existence only unless asked: reading every file is slow"
+        );
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!((title.as_str(), typed.as_deref()), ("Repair all files", Some("lab")), "the operator types the profile name");
+        assert_eq!(
+            lines,
+            [
+                "Repair on lab: Pulp checks the files of all 40 content unit(s).",
+                "It checks only that each file exists.",
+                "It downloads a missing or corrupt file again from a remote that has it,",
+                "and deletes a corrupt file that no remote can give again.",
+                "It can take long; the Task Center shows the task.",
+            ]
+        );
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let requests = server.received_requests().await.unwrap();
+        let post: Value = requests.iter().find(|r| r.method.as_str() == "POST").unwrap().body_json().unwrap();
+        assert_eq!(post, json!({ "verify_checksums": false }));
+        let texts: Vec<&String> = app.notices.iter().map(|n| &n.text).collect();
+        let summary = "repair all files on lab: 2 missing, 0 corrupt, 1 repaired; see the task for the others";
+        assert!(texts.iter().any(|t| *t == summary), "{texts:?}");
+
+        let mut caps = plugins();
+        caps.paths.insert("artifacts/".into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, Act::RepairServer, Value::Null);
+        assert!(app.modal.is_none());
+        assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("not supported by this server: server repair (repair/)"));
     }
 
     #[tokio::test]

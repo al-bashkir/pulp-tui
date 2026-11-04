@@ -464,5 +464,5 @@ client clock).
   and changes to one's own access, refuses to delete the logged-in account, and never works around a 403.
 * Destructive operations show the impact first. Deletes of repositories, distributions,
   users, roles, content guards, domains, Content Views, ACSs and protected promotions, reclaim
-  space and a domain storage migration need the typed name. Production profiles show a red
+  space, a domain storage migration and a server repair need the typed name. Production profiles show a red
   banner and a warning line.

@@ -823,6 +823,13 @@ There is no delete: Pulp marks the artifact delete as deprecated, and its defaul
 it. *Prune orphan content* (**O** on Repository Versions) deletes the artifacts that no content
 uses.
 
+**F** repairs the files of all content of the server (of the profile's domain), also with an
+empty list. *Verify checksums* is off by default: Pulp then checks only that each file exists;
+on, it reads every file and compares its digest (slow on a big server). pulp-tui counts the
+content, then you type the profile name. Pulp downloads a missing or corrupt file again from a
+remote that has it, and deletes a corrupt file that no remote can give again. The Task Center
+shows the task; at the end pulp-tui reports the missing, corrupt and repaired counts.
+
 ### Logs
 
 All events of this session, newest first, with UTC times. It works without a connection.

@@ -70,6 +70,7 @@ General rules:
 | RPM comps, advisory upload (**U**, **A**) | `post` of `rpm/comps/`, `content/rpm/advisories/`                    | endpoint message                          |
 | RPM module content (**M**)                | `post` of `content/rpm/modulemds/` and the two others (8)            | kind not offered; none: endpoint message  |
 | Version repair (**F**)                    | `{rpm_rpm_repository_version_href}repair/` (4)                       | endpoint message                          |
+| Server repair (**F** on Artifacts)        | `repair/`                                                            | endpoint message                          |
 | Reclaim space (**R**)                     | `repositories/reclaim_space/`                                        | endpoint message                          |
 | RPM prune old packages (**O**)            | `post` of `rpm/prune/` (8)                                           | endpoint message                          |
 | RPM version scan (**V**)                  | `post` of `{rpm_rpm_repository_version_href}scan/` (9)               | endpoint message                          |
@@ -326,6 +327,10 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   corrupt file from the remote artifacts, else deletes the stored file. A version without
   content repairs every artifact of the domain (pulpcore `tasks/repository.py`), so
   pulp-tui refuses it.
+* **Server repair** (`repair/`, pulpcore `views/repair.py`): the same task code for every
+  content unit of the request's domain, with the same progress reports. It reserves only
+  `pdrn:<domain>:repair`, so a second repair waits and other tasks go on. pulp-tui sends
+  `verify_checksums: false` unless the operator asks for it (reading every file is slow).
 * **Reclaim space** (`repositories/reclaim_space/`: `repo_hrefs`, optional
   `repo_versions_keeplist`; progress report `reclaim-space.artifact`). It deletes the stored
   file of each unit that no other repository has, that has a remote artifact (not an

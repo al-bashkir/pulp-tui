@@ -2843,6 +2843,7 @@ mod tests {
             (Kind::Uploads, json!({ "pulp_href": U1 }), vec![ObjectRoles, Inspect], vec![Delete]),
             (Kind::TaskSchedules, json!({ "pulp_href": "/s/1/", "last_task": "/t/1/" }), vec![WatchTask, ObjectRoles, Inspect], vec![]),
             (Kind::Domains, json!({ "pulp_href": "/d/1/", "name": "edge" }), vec![Inspect], vec![MigrateStorage, Create, Edit, Delete]),
+            (Kind::Artifacts, json!({ "pulp_href": "/a/1/", "sha256": "ab" }), vec![Inspect], vec![RepairServer]),
         ] {
             app.list.kind = k.clone();
             assert_eq!(app.available_actions(&item), offered, "{k:?}");

@@ -554,3 +554,26 @@ async fn artifacts_screen_lists_and_finds_a_sha256() {
     let found: Vec<&str> = app.list.items.iter().filter_map(|r| r["sha256"].as_str()).collect();
     assert_eq!(found, [cells[2].as_str()], "{:?}", app.list.error);
 }
+
+/// Server repair in its smallest scope (`verify_checksums: false`: Pulp only checks that each file exists): the
+/// content count, the typed profile name, then the task ends and pulp-tui reports what it counted.
+#[tokio::test]
+async fn server_repair_checks_that_the_files_exist() {
+    if !live_enabled() {
+        return;
+    }
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Artifacts;
+    run(&mut app, Act::RepairServer, Value::Null);
+    fill(&mut app, &[("verify_checksums", "false")]);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some("pulp1"));
+    assert!(
+        lines[0].starts_with("Repair on pulp1: Pulp checks the files of all ") && lines[1] == "It checks only that each file exists.",
+        "{lines:?}"
+    );
+    settle(&mut app, &mut rx).await;
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x.starts_with("repair all files on pulp1: ") && x.contains(" missing, ")), "{t:?}");
+}

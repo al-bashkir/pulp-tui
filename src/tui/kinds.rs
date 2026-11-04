@@ -190,6 +190,8 @@ pub enum Act {
     Restore,
     /// Download missing or corrupt files of a repository version again (`{version}repair/`).
     Repair,
+    /// The same for the files of all content of the server (`repair/`).
+    RepairServer,
     /// RPM: scan a repository version for known vulnerabilities (`{version}scan/`, osv.dev).
     Scan,
     CopyUrl,
@@ -282,7 +284,7 @@ impl Act {
             ImportCv | Import => 'I',
             ExportRepos => 'X',
             ImportRepos => 'J',
-            CvFilters | FallbackReplicate | Repair | Filter => 'F',
+            CvFilters | FallbackReplicate | Repair | Filter | RepairServer => 'F',
             CvPreview | Password => 'w',
             Promote | MigrateDb | CreateModule | MigrateStorage => 'M',
             CopyDb => 'Y',
@@ -321,6 +323,7 @@ impl Act {
             Rollback => "Roll back a distribution to this",
             Restore => "Restore as latest version (new version)",
             Repair => "Repair (download missing or corrupt files again)",
+            RepairServer => "Repair all files (whole server)",
             CopyUrl => "Copy content URL",
             Verify => "Verify served content",
             Scan => "Scan for vulnerabilities (osv.dev)",
@@ -426,6 +429,7 @@ impl Act {
                 | Act::PruneOrphans
                 | Act::Filter
                 | Act::PurgeTasks
+                | Act::RepairServer
         )
     }
 }
@@ -962,7 +966,8 @@ impl Kind {
             Kind::TaskGroups => vec![CancelTask, Inspect],
             Kind::Uploads => vec![Delete, ObjectRoles, Inspect],
             Kind::TaskSchedules => vec![WatchTask, ObjectRoles, Inspect],
-            Kind::Workers | Kind::Logs { .. } | Kind::Artifacts => vec![Inspect],
+            Kind::Artifacts => vec![RepairServer, Inspect],
+            Kind::Workers | Kind::Logs { .. } => vec![Inspect],
         }
     }
 
@@ -1764,7 +1769,11 @@ mod tests {
         let sha = "8ad22026c8f6461cf3b292ab6637d6398e0d0fb1e7ef5ddbf20add80a37061f3";
         let row = json!({ "pulp_created": "2026-11-04T23:18:16.481567Z", "size": 6711, "sha256": sha, "file": "artifact/8a/d220" });
         assert_eq!(k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["2026-11-04 23:18:16", "6711", sha]);
-        assert_eq!(k.actions(), [Act::Inspect], "Pulp's default policy refuses an artifact delete");
+        assert_eq!(k.actions(), [Act::RepairServer, Act::Inspect], "no delete: Pulp's default policy refuses it");
+        assert!(
+            Act::RepairServer.key() == 'F' && Act::RepairServer.mutates(&k, false) && !Act::RepairServer.needs_item(),
+            "also on an empty list"
+        );
         let mut caps = Capabilities::default();
         caps.paths.insert("status/".into());
         assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: artifacts API (artifacts/)"));
