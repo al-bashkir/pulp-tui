@@ -215,10 +215,9 @@ Not run again on 2026-11-02 (the results below are older):
 
 * Plugins other than RPM, File and Deb; creation of content guards and signing services;
   OIDC token refresh.
-* Deb: replication (a Deb distribution is skipped with a note),
-  creation of verbatim publications (pulp-tui reads existing ones for protection, verify
-  and rollback), dependency solving on copy. Deb Content View publications are never
-  reused.
+* Deb: replication (a Deb distribution is skipped with a note), dependency solving on
+  copy. Deb Content View publications are never reused, and a Content View never makes a
+  verbatim publication.
 * The signing service pickers list the services of all plugins (pulpcore has no type
   filter); Pulp refuses a wrong one.
 * The **K** key cannot store the password of the top-level `[database]`. Use `env:` or

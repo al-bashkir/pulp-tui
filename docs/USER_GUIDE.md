@@ -199,6 +199,7 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
 * **D** distributes: pin the latest version (publication), or follow the repository latest. Pulp
   cannot pin a checkpoint distribution: **D** refuses it before any change (see Distributions).
 * **P** and **D** on Deb ask for an optional signing service (empty = the keys of the repository).
+  **P** also asks for the kind: `apt`, or `verbatim` (see Publications).
   **D** reuses a publication only when its signing service is the same. On RPM, **D** never
   reuses a publication when the repository has a metadata signing service: Pulp signs a new one.
 * **C** copies content from another repository, with the filter rules of Content Views (see
@@ -316,10 +317,12 @@ removed counts.
 
 * **o** content. **i** full JSON.
 * **P** publishes this version (always a new publication). **D** distributes it. On Deb, both ask
-  for the optional signing service.
+  for the optional signing service; **P** also asks for the kind (`apt` or `verbatim`, see
+  Publications).
 * **b** points a distribution to this version (rollback, with a preview). It makes no version, so
   the distributions that follow the repository and the next sync still use the newest version. On
-  Deb, the new publication keeps the signing service of the one the distribution serves now. The
+  Deb, the new publication keeps the signing service of the one the distribution serves now, and
+  stays verbatim when that one is verbatim (**D** too, unless you pick a signing service). The
   preview says if it reuses a publication of the version or makes a new one. On RPM, a repository
   with a metadata signing service always gets a new publication, signed with that service: an
   older one can be unsigned. A checkpoint distribution is refused before any change (see
@@ -364,10 +367,17 @@ releases, components, indices and more). `/` searches package names or file path
 
 `t` toggles RPM/File/Deb. **D** distributes exactly this publication. **i** full JSON.
 
+* Deb lists the APT publications and the verbatim ones, newest first. The *kind* column shows
+  `apt` or `verbatim`. A verbatim publication serves the files of its version as they are: the
+  synced upstream `Release` files (with their signatures) and indices. pulp_deb drops these files
+  from a version made by upload, copy or modify, so only a synced version gives a usable verbatim
+  publication.
 * **c** creates a publication (always a new one): a repository, an optional version number, and
-  for Deb an optional signing service. It also has the publication options of the server. Empty
-  means the repository setting or the server default. (**P** in Repositories and Versions uses no
-  options.)
+  for Deb the **Kind** (`apt` or `verbatim`, when the server has verbatim publications) and an
+  optional signing service. It also has the publication options of the server. Empty means the
+  repository setting or the server default. A verbatim publication takes no signing service and
+  no options. (**P** in Repositories and Versions asks only for the kind and the signing
+  service.)
   * **Checksum type**, **Metadata compression**, **Repo config** (RPM): as the repository fields.
   * **Package layout** (RPM, Deb).
   * **Simple** / **Structured** (Deb): one component, or the upstream components (default). One of
@@ -376,7 +386,8 @@ releases, components, indices and more). `/` searches package names or file path
   * **Publish upstream Release fields**, **Excluded package metadata fields** (Deb).
   * **Checkpoint**: a checkpoint publication. Pulp then publishes the latest version, so the form
     refuses a version number.
-* **d** deletes. It names the distributions that serve the publication, and you type its id.
+* **d** deletes. It names the distributions that serve the publication (an APT or a verbatim one)
+  and what each one serves after, and you type its id.
 
 ### Distributions
 
@@ -393,7 +404,7 @@ LATEST** (a repository) or **CHECKPOINTS** (a checkpoint distribution of a repos
   fetches `Release`, a `Packages` index and the smallest `.deb`, and compares the digest. A
   difference reads `MISMATCH: served content differs: …`.
 * **b** re-points to a version, with a preview. On Deb, it keeps the signing service of the
-  publication that it serves now. On RPM, it makes a new signed publication when the repository
+  publication that it serves now, or a verbatim publication stays verbatim. On RPM, it makes a new signed publication when the repository
   has a metadata signing service. Pulp cannot pin a checkpoint distribution, so the preview
   refuses it before any change and says what it serves now. To pin it, edit the distribution,
   clear **Checkpoint**, then re-point it.

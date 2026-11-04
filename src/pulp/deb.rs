@@ -10,8 +10,14 @@ use std::path::Path;
 
 const FIELDS: &str = "pulp_href,package,version,architecture,relative_path,sha256";
 
-/// Publications that serve the synced upstream metadata as is; pulp-tui does not create them.
+/// Publications that serve the files of a version as they are (the synced upstream Release files and indices).
 pub const VERBATIM_PUBLICATIONS: &str = "publications/deb/verbatim/";
+/// The key of the publication mode (`ops::publication_mode`) of a verbatim publication; not a Pulp field.
+pub const VERBATIM: &str = "verbatim";
+
+pub fn is_verbatim(publication: &str) -> bool {
+    publication.contains("/publications/deb/verbatim/")
+}
 
 /// Content types that pulp_deb removes from every new version (`AptRepository.initialize_new_version`);
 /// only a sync adds them again.

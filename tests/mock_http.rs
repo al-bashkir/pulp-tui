@@ -553,6 +553,36 @@ async fn deb_publication_reuse_respects_signing_service() {
     server.verify().await;
 }
 
+/// The mode of a verbatim publication is `verbatim`: a publication in that mode is a verbatim one of the version,
+/// reused or made with only the version (pulp_deb has no options for it).
+#[tokio::test]
+async fn deb_verbatim_mode_reuses_or_makes_a_verbatim_publication() {
+    let server = MockServer::start().await;
+    let coll = format!("{API}publications/deb/verbatim/");
+    for (v, listed) in [("/v1/", json!([{ "pulp_href": format!("{coll}1/"), "repository_version": "/v1/" }])), ("/v2/", json!([]))] {
+        let page = json!({ "count": listed.as_array().unwrap().len(), "next": null, "results": listed });
+        Mock::given(method("GET"))
+            .and(path(&coll))
+            .and(query_param("repository_version", v))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(&coll))
+        .and(body_json(json!({ "repository_version": "/v2/" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{coll}2/") })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+    let verbatim = json!({ "verbatim": true });
+    assert_eq!(ops::publication_mode(RepoType::Deb, &json!({ "pulp_href": format!("{coll}1/"), "repository_version": "/v1/" })), verbatim);
+    assert_eq!(ops::ensure_publication(&c, RepoType::Deb, "/v1/", &verbatim, &no_progress).await.unwrap(), format!("{coll}1/"));
+    assert_eq!(ops::ensure_publication(&c, RepoType::Deb, "/v2/", &verbatim, &no_progress).await.unwrap(), format!("{coll}2/"));
+    server.verify().await;
+}
+
 /// A `.deb` goes to `content/deb/packages/` with the release that lists it, in one request or (above one chunk)
 /// through `uploads/`. The task names the new release records before the package: the digest is checked on the package.
 #[tokio::test]

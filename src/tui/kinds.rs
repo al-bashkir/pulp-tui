@@ -4,7 +4,7 @@ use super::app::{Ctx, PAGE};
 use super::form::format_labels;
 use crate::config::Config;
 use crate::filters::format_rules;
-use crate::pulp::{Capabilities, Feature, RepoType};
+use crate::pulp::{Capabilities, Feature, RepoType, deb};
 use crate::store::{LIBRARY, Store};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -670,7 +670,10 @@ impl Kind {
                 ];
                 // Only File publications have the field; Delete looks up the distributions for every type.
                 match t {
-                    RepoType::Rpm | RepoType::Deb => {}
+                    RepoType::Rpm => {}
+                    RepoType::Deb => {
+                        c.push(col("kind", 8, |v| if deb::is_verbatim(&s(v, "pulp_href")) { "verbatim" } else { "apt" }.into()))
+                    }
                     RepoType::File => {
                         c.push(col("distributions", 6, |v| v["distributions"].as_array().map(|a| a.len().to_string()).unwrap_or_default()))
                     }
@@ -885,6 +888,20 @@ impl Kind {
     }
 }
 
+/// One page of the Deb Publications screen: APT and verbatim publications, newest first. The merge needs each
+/// collection from its start to the end of the page; then the page is cut out.
+async fn deb_publications(c: &crate::pulp::PulpClient, offset: u64) -> Result<(Vec<Value>, u64)> {
+    let q = [("ordering", "-pulp_created".to_string()), ("offset", "0".into()), ("limit", (offset + PAGE).to_string())];
+    let (mut items, mut count) = (vec![], 0);
+    for coll in [RepoType::Deb.publications(), deb::VERBATIM_PUBLICATIONS] {
+        let page: crate::pulp::client::Page<Value> = c.list(&c.api(coll), &q).await?;
+        count += page.count;
+        items.extend(page.results);
+    }
+    items.sort_by(|a, b| b["pulp_created"].as_str().cmp(&a["pulp_created"].as_str()));
+    Ok((items.into_iter().skip(offset as usize).take(PAGE as usize).collect(), count))
+}
+
 fn sum_counts(v: &Value) -> String {
     v.as_object().map(|m| m.values().filter_map(|x| x["count"].as_u64()).sum::<u64>().to_string()).unwrap_or_default()
 }
@@ -910,6 +927,11 @@ pub async fn load(
     offset: u64,
     filter: &str,
 ) -> Result<(Vec<Value>, u64)> {
+    if let (Kind::Publications(RepoType::Deb), Some(ctx)) = (k, ctx)
+        && ctx.caps.has_endpoint(deb::VERBATIM_PUBLICATIONS)
+    {
+        return deb_publications(&ctx.client, offset).await;
+    }
     if let Some((path, mut q, search)) = k.source() {
         let c = &ctx.ok_or_else(|| anyhow::anyhow!("not connected"))?.client;
         q.push(("limit", PAGE.to_string()));

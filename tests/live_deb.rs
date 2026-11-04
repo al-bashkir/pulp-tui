@@ -217,6 +217,51 @@ async fn a_served_verbatim_publication_protects_its_version() {
     cleanup(&c, &[&dist, &repo, &remote]).await;
 }
 
+/// A verbatim publication (P or c, kind verbatim) of a synced version serves the upstream Release as it is;
+/// Distribute pins it, Verify passes, and its delete leaves the distribution serving nothing, as the impact says.
+#[tokio::test]
+async fn a_verbatim_publication_is_made_distributed_verified_and_deleted() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Deb;
+    let name = unique("it-deb-verbatim-pub");
+    let body = json!({ "name": name, "url": format!("{}/deb/", upstream()), "policy": "immediate", "distributions": "fixture" });
+    let remote = create(&c, t.remotes(), body, "/remotes/").await;
+    let repo = create(&c, t.repositories(), json!({ "name": name, "remote": remote }), "/repositories/").await;
+    let m = ops::sync(&c, t, &repo, None, "mirror").await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let v1 = latest(&c, &repo).await;
+
+    let verbatim = json!({ "verbatim": true });
+    let p = ops::create_publication(&c, t, &v1, &verbatim, &no_progress).await.unwrap();
+    assert!(p.contains("/publications/deb/verbatim/"), "{p}");
+    let pv: Value = c.get(&p, &[]).await.unwrap();
+    assert_eq!(ops::publication_mode(t, &pv), verbatim, "a rollback keeps it verbatim");
+    assert_eq!(ops::ensure_publication(&c, t, &v1, &verbatim, &no_progress).await.unwrap(), p, "reused");
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
+    let d: Value = c.get(&dist, &[]).await.unwrap();
+    let base = d["base_url"].as_str().unwrap().to_string();
+    let caps = Capabilities::detect(&c).await.unwrap();
+    let now = ops::served_publication(&c, &caps, t, &d).await.unwrap().expect("a served publication");
+    assert_eq!(now["pulp_href"], p.as_str());
+    let msg = ops::verify_served(&c, t, &base, &v1, &now).await.unwrap();
+    assert!(msg.contains("matching digest (4 packages)"), "{msg}");
+    let upstream = std::fs::read(fixtures().join("upstream/deb/dists/fixture/Release")).unwrap();
+    assert_eq!(served(&c, &format!("{base}dists/fixture/Release")).await, (200, upstream), "the upstream Release as it is");
+
+    let pubs = ops::publications_where(&c, &caps, t, ("repository", &repo)).await.unwrap();
+    let ds = ops::distributions(&c, t).await.unwrap();
+    let ours = ds.iter().find(|x| x.name == name).unwrap();
+    assert_eq!(ops::served_after_delete(ours, &p, &pubs), Some(None), "the delete impact: then serves nothing");
+    let m = c.delete(&p).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let d: Value = c.get(&dist, &[]).await.unwrap();
+    assert!(d["publication"].is_null(), "{d}");
+    cleanup(&c, &[&dist, &repo, &remote]).await;
+}
+
 /// Upload (u) of a `.deb` into a release of an empty repository makes a version with the package and its
 /// release records; the publication serves it under that release with the uploaded digest.
 #[tokio::test]

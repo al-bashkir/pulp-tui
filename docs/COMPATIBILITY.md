@@ -57,6 +57,7 @@ General rules:
 | RPM, File, Deb screens                    | `status/` component `rpm`, `file`, `deb`                             | plugin message                            |
 | RPM copy (copy action, Content Views)     | component `rpm` and `rpm/copy/`                                      | endpoint message (1)                      |
 | Deb copy (copy, Add to repository, CVs)   | component `deb` and `deb/copy/`                                      | endpoint message (2)                      |
+| Deb verbatim publications (kind, list)    | `publications/deb/verbatim/`                                         | APT publications only                     |
 | Chunked upload                            | `uploads/` and `{upload_href}`                                       | message for files above `upload_chunk_mb` |
 | Native replication                        | pulpcore ≥ 3.23, `upstream-pulps/`, `{upstream_pulp_href}replicate/` | screen points to the fallback             |
 | Fallback replication of a type            | `status/` component on source and destination                        | dry run stops (3)                         |
@@ -595,6 +596,14 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
   (removed with `modify/`, seen live). With `simple`, a structured `default` is dropped. A
   version without release components gets `dists/default/` (component `empty`) on 3.11.1,
   and no structured release on 3.5.4 and 3.8.1 (read in their source). Verify probes each.
+* **Verbatim publications** (`publications/deb/verbatim/`, `VerbatimPublicationSerializer`):
+  the request takes only `repository_version` or `repository`; the answer has no `checkpoint`
+  and no mode field, so pulp-tui tells one by its href. It publishes every file of the version at
+  its path, so the served `Release` is the synced upstream one. A version made by upload, copy or
+  modify has no Release or index files (`NEW_VERSION_DROPS`), so its verbatim publication serves
+  only the packages. A Deb distribution takes a verbatim publication, and a delete unbinds it, as
+  an APT one. The Deb Publications screen reads both collections from the start of the list
+  (DRF `LimitOffsetPagination` has no `max_limit`) and merges them by `pulp_created`.
 * **`signing-services/` has no type filter**, so Deb and RPM services look the same.
 * **No publication reuse for Deb Content Views.** A publication signed with the repository
   keys stores `signing_service: null`, as an unsigned one, and an unchanged copy makes no
@@ -648,8 +657,7 @@ or IpAddress(127.0.0.1)`.
 ## Unsupported or limited
 
 * Plugins other than pulp_rpm, pulp_file and pulp_deb (container, python, …).
-* pulp_deb: no replication, no verbatim publications, no dependency solving. A verbatim publication made elsewhere is served when newest (Verify and Rollback
-  read it) and protects its version, so the delete impact lists `publications/deb/verbatim/`.
+* pulp_deb: no replication, no dependency solving.
 * RPM layout `nested_by_digest`: served-content checks skip the package probe (metadata is
   still checked).
 * ULN: a sync from a ULN remote is tested with mock HTTP only (it needs a ULN account).

@@ -268,10 +268,18 @@ fn mode_fields(t: RepoType) -> &'static [&'static str] {
     }
 }
 
-/// The mode of publication `p` (a JSON object), for `ensure_publication`. A field that `p` lacks (an
-/// older server) is left out.
+/// The mode of publication `p` (a JSON object), for `ensure_publication`: `{"verbatim": true}` for a Deb verbatim
+/// publication (`publications_for`), else its mode fields. A field that `p` lacks (an older server) is left out.
 pub fn publication_mode(t: RepoType, p: &Value) -> Value {
+    if deb::is_verbatim(p["pulp_href"].as_str().unwrap_or_default()) {
+        return json!({ deb::VERBATIM: true });
+    }
     mode_fields(t).iter().filter_map(|&k| p.get(k).map(|v| (k.to_string(), v.clone()))).collect()
+}
+
+/// The publications of `mode`: Deb verbatim ones for `{"verbatim": true}` (they have no options), else those of `t`.
+pub fn publications_for(t: RepoType, mode: &Value) -> &'static str {
+    if mode[deb::VERBATIM] == true { deb::VERBATIM_PUBLICATIONS } else { t.publications() }
 }
 
 /// Reuse a publication of the version that has `mode` (`reusable_publication`), else create one with it.
@@ -297,8 +305,9 @@ pub async fn reusable_publication(c: &PulpClient, t: RepoType, version: &str, mo
 
 /// A publication of the version that has `mode` and, for File, the manifest name that a new one would get.
 pub async fn find_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> Result<Option<String>> {
-    let all: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository_version", version.into())], 1_000).await?;
+    let all: Vec<Value> = c.list_all(&c.api(publications_for(t, mode)), &[("repository_version", version.into())], 1_000).await?;
     let mut want = mode.as_object().cloned().unwrap_or_default();
+    want.remove(deb::VERBATIM);
     if t == RepoType::File && !all.is_empty() && !want.contains_key("manifest") {
         want.insert("manifest".into(), publication_body(c, t, version, mode).await?["manifest"].clone());
     }
@@ -309,13 +318,13 @@ pub async fn find_publication(c: &PulpClient, t: RepoType, version: &str, mode: 
 /// A new publication of `version`, made with `mode` and else the repository settings of now.
 pub async fn create_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value, on: OnTask<'_>) -> Result<String> {
     let body = publication_body(c, t, version, mode).await?;
-    create(c, &c.api(t.publications()), &body, "/publications/", on).await
+    create(c, &c.api(publications_for(t, mode)), &body, "/publications/", on).await
 }
 
 /// The request body of `create_publication`: the set fields of `mode` (Pulp refuses `null` for some).
 pub async fn publication_body(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> Result<Value> {
     let mut body = json!({ "repository_version": version });
-    for (k, v) in mode.as_object().into_iter().flatten().filter(|(_, v)| !v.is_null()) {
+    for (k, v) in mode.as_object().into_iter().flatten().filter(|(k, v)| !v.is_null() && *k != deb::VERBATIM) {
         body[k] = v.clone();
     }
     match t {

@@ -156,11 +156,13 @@ async fn served_now(c: &PulpClient, caps: &Capabilities, t: RepoType, d: &Value)
 
 /// The publication mode when a distribution is pinned to `version`: the mode of `served` (what it serves
 /// now) when that is of the same repository, else the repository default; `signing`, when picked, replaces
-/// the signing service. Unsigned is explicit, so a signed publication is never reused for the default.
+/// the signing service (and asks for an APT publication where a verbatim one is served). Unsigned is explicit,
+/// so a signed publication is never reused for the default.
 fn pinned_mode(t: RepoType, served: Option<&Value>, version: &str, signing: Option<String>) -> Value {
     let same_repo = |p: &&Value| repo_of_version(&s(p, "repository_version")) == repo_of_version(version);
     let mut mode = served.filter(same_repo).map_or_else(|| json!({ "signing_service": null }), |p| ops::publication_mode(t, p));
     if signing.is_some() {
+        mode.as_object_mut().map(|m| m.remove(deb::VERBATIM));
         mode["signing_service"] = signing.into();
     }
     mode
@@ -1403,7 +1405,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             None => app.error("repository has no versions"),
             Some(v) => {
                 let v = v.to_string();
-                publish_form(app, t, format!("Publish {name}"), move |app, sv| publish(app, t, &name, v.clone(), sv));
+                publish_form(app, t, format!("Publish {name}"), move |app, mode| publish(app, t, &name, v.clone(), mode));
             }
         },
         Act::Distribute => {
@@ -1571,6 +1573,29 @@ fn signing_field(app: &App, t: RepoType) -> Option<Field> {
     }
 }
 
+/// The kind of a new Deb publication, when the server has verbatim publications: `apt` (pulp_deb writes the
+/// metadata) or `verbatim` (the files of the version as they are).
+fn kind_field(app: &App, t: RepoType) -> Option<Field> {
+    match t {
+        RepoType::Rpm | RepoType::File => None,
+        RepoType::Deb => caps(app).is_none_or(|c| c.has_endpoint(deb::VERBATIM_PUBLICATIONS)).then(|| {
+            Field::new("kind", "Kind", FieldKind::Choice(["apt", "verbatim"].map(String::from).to_vec()))
+                .help("verbatim = the synced Release files and indices as they are; no options (a version made by upload, copy or modify has none)")
+        }),
+    }
+}
+
+/// The mode of a new publication: `options` for kind `apt`, the verbatim mode for kind `verbatim` (no options).
+fn publish_mode(f: &Form, options: Value) -> Result<Value, String> {
+    if f.get("kind") != "verbatim" {
+        return Ok(options);
+    }
+    if options.as_object().is_some_and(|o| o.values().any(|v| !v.is_null())) {
+        return Err("a verbatim publication serves the synced Release files as they are: clear the signing service and options".into());
+    }
+    Ok(json!({ deb::VERBATIM: true }))
+}
+
 /// Publication options of the server's publication schema. Each starts empty: the repository setting or the server default.
 fn publication_fields(caps: Option<&Capabilities>, t: RepoType) -> Vec<Field> {
     let schema = t.publication_schema();
@@ -1604,7 +1629,7 @@ fn publication_fields(caps: Option<&Capabilities>, t: RepoType) -> Vec<Field> {
 /// The publication options (and signing service) that the operator set; empty ones are not sent.
 fn publication_options(f: &Form) -> Result<Value, String> {
     let mut b = json!({});
-    for fld in f.fields.iter().filter(|x| !matches!(x.key.as_str(), "repo" | "number")) {
+    for fld in f.fields.iter().filter(|x| !matches!(x.key.as_str(), "repo" | "number" | "kind")) {
         let v = fld.value.trim();
         if v.is_empty() {
             continue;
@@ -1623,20 +1648,22 @@ fn publication_options(f: &Form) -> Result<Value, String> {
     Ok(b)
 }
 
-/// Run `go` with the signing service of a publish: asked first when `signing_field` offers one, else `None`.
-fn publish_form(app: &mut App, t: RepoType, title: String, go: impl Fn(&mut App, Option<String>) + 'static) {
-    match signing_field(app, t) {
-        None => go(app, None),
-        Some(field) => app.form(Form::new(title, vec![field]), move |app, f| {
-            go(app, f.opt("signing_service").map(str::to_string));
-            Ok(())
-        }),
+/// Run `go` with the mode of a publish: the kind (`kind_field`) and the signing service (`signing_field`) are
+/// asked first when the server offers them, else the repository default.
+fn publish_form(app: &mut App, t: RepoType, title: String, go: impl Fn(&mut App, Value) + 'static) {
+    let fields: Vec<Field> = kind_field(app, t).into_iter().chain(signing_field(app, t)).collect();
+    if fields.is_empty() {
+        return go(app, json!({ "signing_service": null }));
     }
+    app.form(Form::new(title, fields), move |app, f| {
+        go(app, publish_mode(f, json!({ "signing_service": f.opt("signing_service") }))?);
+        Ok(())
+    });
 }
 
-fn publish(app: &mut App, t: RepoType, name: &str, version: String, signing_service: Option<String>) {
+fn publish(app: &mut App, t: RepoType, name: &str, version: String, mode: Value) {
     app.job(format!("publish {name} {}", short(&version)), move |ctx| async move {
-        let p = ops::create_publication(&ctx.client, t, &version, &json!({ "signing_service": signing_service }), &ctx.on_task()).await?;
+        let p = ops::create_publication(&ctx.client, t, &version, &mode, &ctx.on_task()).await?;
         ap(move |app| app.ok(format!("publication {} for {}", short(&p), short(&version))))
     });
 }
@@ -2150,7 +2177,7 @@ fn version_action(app: &mut App, act: Act, item: Value) {
         Act::Content => app.push(Kind::Content { version: href, ctype: 0 }),
         Act::Publish => {
             let name = app.last_repo.as_ref().filter(|r| r.1 == repo).map(|r| r.2.clone()).unwrap_or_else(|| short(&repo));
-            publish_form(app, t, format!("Publish version {number}"), move |app, sv| publish(app, t, &name, href.clone(), sv));
+            publish_form(app, t, format!("Publish version {number}"), move |app, mode| publish(app, t, &name, href.clone(), mode));
         }
         Act::Distribute => {
             let name = app.last_repo.as_ref().filter(|r| r.1 == repo).map(|r| r.2.clone()).unwrap_or_else(|| short(&repo));
@@ -2528,11 +2555,12 @@ fn publication_create(app: &mut App, t: RepoType) {
         Field::pick("repo", "Repository", Source::Repos(Some(t))).required(),
         Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
     ];
+    fields.extend(kind_field(app, t));
     fields.extend(signing_field(app, t));
     fields.extend(publication_fields(caps(app).as_deref(), t));
     let form = Form::new(format!("New {} publication", t.label()), fields);
     app.form(form, move |app, f| {
-        let (repo, number, options) = (f.get("repo").to_string(), f.number("number"), publication_options(f)?);
+        let (repo, number, options) = (f.get("repo").to_string(), f.number("number"), publish_mode(f, publication_options(f)?)?);
         // Pulp takes `checkpoint` only with `repository`, and then publishes the latest version.
         let checkpoint = options["checkpoint"] == true;
         if checkpoint && number.is_some() {
@@ -2547,7 +2575,7 @@ fn publication_create(app: &mut App, t: RepoType) {
                 body.as_object_mut().expect("an object").remove("repository_version");
                 body["repository"] = s(&r, "pulp_href").into();
             }
-            let p = ops::create(c, &c.api(t.publications()), &body, "/publications/", &ctx.on_task()).await?;
+            let p = ops::create(c, &c.api(ops::publications_for(t, &options)), &body, "/publications/", &ctx.on_task()).await?;
             ap(move |app| {
                 app.ok(format!("publication {} of {}", short(&p), short(&v)));
                 app.reload();
@@ -4128,11 +4156,10 @@ mod tests {
 
         repo_action(&mut app, RepoType::Deb, Act::Publish, repo("deb/apt"));
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
-        assert_eq!(form.fields.len(), 1);
-        assert_eq!(form.fields[0].key, "signing_service");
+        assert_eq!(keys(&form), ["kind", "signing_service"]);
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
-        form.fields[0].value = "/ss/1/".into();
+        set(&mut form, "signing_service", "/ss/1/");
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
 
@@ -4232,7 +4259,7 @@ mod tests {
         };
         publication_action(&mut app, RepoType::Deb, Act::Create, Value::Null);
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
-        assert_eq!(keys(&form)[..3], ["repo", "number", "signing_service"], "then the publication options");
+        assert_eq!(keys(&form)[..4], ["repo", "number", "kind", "signing_service"], "then the publication options");
         set(&mut form, &[("repo", "r"), ("signing_service", "/ss/1/")]);
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
@@ -4326,7 +4353,7 @@ mod tests {
         app.conn.as_mut().unwrap().caps = Default::default();
         let (mut form, mut submit) = open(&mut app, RepoType::Deb);
         let deb_keys = ["simple", "structured", "publish_legacy_release_files", "layout", "publish_upstream_release_fields"];
-        assert_eq!(keys(&form)[3..], [&deb_keys[..], &["excluded_package_metadata_fields", "checkpoint"]].concat());
+        assert_eq!(keys(&form)[4..], [&deb_keys[..], &["excluded_package_metadata_fields", "checkpoint"]].concat());
         set(&mut form, &[("repo", "r"), ("structured", "false")]);
         assert_eq!(submit(&mut app, &form).unwrap_err(), "Structured: off needs Simple on (Pulp publishes in at least one mode)");
         set(&mut form, &[("simple", "true"), ("publish_legacy_release_files", "true"), ("excluded_package_metadata_fields", "X-A, X-B,")]);
@@ -4372,8 +4399,8 @@ mod tests {
         let v = format!("{API}repositories/deb/apt/r/versions/1/");
         version_action(&mut app, Act::Publish, json!({ "pulp_href": v, "number": 1 }));
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
-        assert_eq!(keys(&form), ["signing_service"]);
-        form.fields[0].value = "/ss/1/".into();
+        assert_eq!(keys(&form), ["kind", "signing_service"]);
+        set(&mut form, "signing_service", "/ss/1/");
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
         assert_eq!(
@@ -4394,6 +4421,8 @@ mod tests {
         let (mut app, mut rx) = connected(&server).await;
         let mut caps = Capabilities::default();
         caps.schemas.insert("deb.AptPublication".into(), ["repository_version"].map(String::from).into());
+        // No verbatim publications either: nothing to ask.
+        caps.paths.insert("publications/deb/apt/".into());
         app.conn.as_mut().unwrap().caps = Arc::new(caps);
         let r = format!("{API}repositories/deb/apt/r/");
         let repo = json!({ "pulp_href": r, "name": "r", "latest_version_href": "/v/" });
@@ -6876,6 +6905,164 @@ mod tests {
         caps.load_openapi(&json!({ "components": { "schemas": { "deb.Package": { "properties": { "file": {}, "repository": {} } } } } }));
         app.conn.as_mut().unwrap().caps = Arc::new(caps);
         assert_eq!(keys(&form(&mut app, RepoType::Deb).0), ["path"]);
+    }
+
+    #[tokio::test]
+    async fn deb_publications_list_verbatim_ones_too_newest_first() {
+        let server = wiremock::MockServer::start().await;
+        let (apt, verbatim) = (format!("{API}publications/deb/apt/"), format!("{API}publications/deb/verbatim/"));
+        let p = |coll: &str, id: u8| {
+            let v = format!("{API}repositories/deb/apt/r/versions/{id}/");
+            json!({ "pulp_href": format!("{coll}{id}/"), "repository_version": v, "pulp_created": format!("2026-01-0{id}T00:00:00Z") })
+        };
+        get(&server, &apt, json!({ "count": 2, "next": null, "results": [p(&apt, 3), p(&apt, 1)] })).await;
+        get(&server, &verbatim, json!({ "count": 1, "next": null, "results": [p(&verbatim, 2)] })).await;
+        let (mut app, _rx) = connected(&server).await;
+        let (k, cfg) = (Kind::Publications(RepoType::Deb), crate::config::Config::default());
+        let ids = |rows: &[Value]| rows.iter().map(|r| short(&s(r, "pulp_href"))).collect::<Vec<_>>();
+        let ctx = app.ctx().unwrap();
+        let (rows, n) = super::super::kinds::load(&k, Some(&ctx), Err("none"), "lab", "lab", &cfg, 0, "").await.unwrap();
+        assert_eq!((ids(&rows), n), (vec!["3".to_string(), "2".into(), "1".into()], 3));
+        let kind = k.columns().into_iter().find(|c| c.title == "kind").expect("a kind column");
+        assert_eq!(rows.iter().map(|r| (kind.get)(r)).collect::<Vec<_>>(), ["apt", "verbatim", "apt"]);
+        // A later page: each collection from its start, cut after the merge.
+        let (rows, _) = super::super::kinds::load(&k, Some(&ctx), Err("none"), "lab", "lab", &cfg, 2, "").await.unwrap();
+        assert_eq!(ids(&rows), ["1"]);
+        let sent = server.received_requests().await.unwrap();
+        let asked: Vec<&str> = sent.iter().filter(|r| r.url.path() == verbatim).map(|r| r.url.query().unwrap_or_default()).collect();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked.iter().all(|q| q.contains("ordering=-pulp_created") && q.contains("offset=0")), "{asked:?}");
+        assert!(asked[1].contains("limit=102"), "{asked:?}");
+
+        // A server without verbatim publications: only the APT ones, and no request for the others.
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/publications/deb/apt/": { "get": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let ctx = app.ctx().unwrap();
+        let (rows, n) = super::super::kinds::load(&k, Some(&ctx), Err("none"), "lab", "lab", &cfg, 0, "").await.unwrap();
+        assert_eq!((ids(&rows), n), (vec!["3".to_string(), "1".into()], 2));
+        assert_eq!(server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == verbatim).count(), 2);
+        for t in [RepoType::Rpm, RepoType::File] {
+            assert!(!Kind::Publications(t).columns().iter().any(|c| c.title == "kind"), "{t:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deb_publish_offers_a_verbatim_publication_of_the_version() {
+        use crate::tui::app::Modal;
+        let server = deb_distribute_server().await;
+        let verbatim = format!("{API}publications/deb/verbatim/");
+        answer(&server, "POST", &verbatim, 201, json!({ "pulp_href": format!("{verbatim}9/") })).await;
+        let r = json!({ "pulp_href": format!("{API}repositories/deb/apt/r/"), "name": "r", "latest_version_href": "/v/" });
+        get(&server, &format!("{API}repositories/deb/apt/"), page(json!([r.clone()]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+
+        // Repositories P (Versions P has the same form): the kind, then the signing service of an APT publication.
+        repo_action(&mut app, RepoType::Deb, Act::Publish, r.clone());
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["kind", "signing_service"]);
+        set(&mut form, "kind", "verbatim");
+        set(&mut form, "signing_service", "/ss/1/");
+        let e = submit(&mut app, &form).unwrap_err();
+        assert!(e.contains("verbatim publication serves the synced Release files as they are"), "{e}");
+        set(&mut form, "signing_service", "");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        // Publications c: a verbatim publication has no options.
+        publication_action(&mut app, RepoType::Deb, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form)[..4], ["repo", "number", "kind", "signing_service"]);
+        set(&mut form, "repo", "r");
+        set(&mut form, "kind", "verbatim");
+        set(&mut form, "simple", "true");
+        let e = submit(&mut app, &form).unwrap_err();
+        assert!(e.contains("verbatim publication serves the synced Release files as they are"), "{e}");
+        set(&mut form, "simple", "");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &verbatim).await, vec![json!({ "repository_version": "/v/" }); 2]);
+        assert!(posts_to(&server, &format!("{API}publications/deb/apt/")).await.is_empty());
+
+        // A server without verbatim publications: no kind to choose.
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/publications/deb/apt/": { "post": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        repo_action(&mut app, RepoType::Deb, Act::Publish, r);
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["signing_service"]);
+        publication_action(&mut app, RepoType::Deb, Act::Create, Value::Null);
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
+        assert!(!keys(&form).contains(&"kind".to_string()));
+    }
+
+    #[tokio::test]
+    async fn deb_verbatim_publication_delete_names_the_distributions_that_serve_it() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let pubn = format!("{API}publications/deb/verbatim/0190cccc-0001/");
+        let version = format!("{API}repositories/deb/apt/r/versions/1/");
+        let dist = json!({ "pulp_href": format!("{API}distributions/deb/apt/1/"), "name": "prod", "base_path": "prod",
+            "base_url": "https://h/prod/", "publication": pubn });
+        get(&server, &format!("{API}distributions/deb/apt/"), page(json!([dist]))).await;
+        get(&server, &format!("{API}publications/deb/apt/"), page(json!([]))).await;
+        get(&server, &format!("{API}publications/deb/verbatim/"), page(json!([{ "pulp_href": pubn, "repository_version": version }])))
+            .await;
+        answer(&server, "DELETE", &pubn, 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        publication_action(&mut app, RepoType::Deb, Act::Delete, json!({ "pulp_href": pubn, "repository_version": version }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, on_yes, .. }) = app.modal.take() else {
+            panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text))
+        };
+        assert_eq!(typed.as_deref(), Some("0190cccc-0001"));
+        assert!(lines.contains(&"  prod (https://h/prod/): then serves nothing".to_string()), "{lines:?}");
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert!(server.received_requests().await.unwrap().iter().any(|r| r.method.as_str() == "DELETE" && r.url.path() == pubn));
+    }
+
+    /// Rollback (and pinned Distribute) keep the kind of what the distribution serves: a verbatim publication of the
+    /// other version, reused or new. A picked signing service asks for a signed APT publication instead.
+    #[tokio::test]
+    async fn deb_rollback_of_a_served_verbatim_publication_stays_verbatim() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = deb_distribute_server().await;
+        let verbatim = format!("{API}publications/deb/verbatim/");
+        let (old, now, d) =
+            (format!("{API}repositories/deb/apt/r/versions/1/"), format!("{verbatim}5/"), format!("{API}distributions/deb/apt/1/"));
+        let dist = json!({ "pulp_href": d, "name": "prod", "base_path": "prod", "base_url": "http://h/prod/", "publication": now });
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}distributions/deb/apt/")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([dist]))))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        get(&server, &d, dist.clone()).await;
+        let served = json!({ "pulp_href": now, "repository_version": format!("{API}repositories/deb/apt/r/versions/2/") });
+        get(&server, &now, served.clone()).await;
+        get(&server, &verbatim, page(json!([]))).await;
+        answer(&server, "POST", &verbatim, 201, json!({ "pulp_href": format!("{verbatim}9/") })).await;
+        get(&server, &format!("{verbatim}9/"), json!({ "pulp_href": format!("{verbatim}9/"), "repository_version": old })).await;
+        answer(&server, "PATCH", &d, 200, json!({ "pulp_href": d })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        rollback_preview(&mut app, RepoType::Deb, "prod".into(), old.clone());
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes, lines, .. }) = app.modal.take() else {
+            panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text))
+        };
+        assert!(lines.contains(&"  publication: new (verbatim=true)".to_string()), "{lines:?}");
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &verbatim).await, [json!({ "repository_version": old })]);
+        assert!(posts_to(&server, &format!("{API}publications/deb/apt/")).await.is_empty());
+        let sent = server.received_requests().await.unwrap();
+        let patch: Value = sent.iter().find(|r| r.method.as_str() == "PATCH").unwrap().body_json().unwrap();
+        assert_eq!(patch["publication"], json!(format!("{verbatim}9/")));
+
+        assert_eq!(pinned_mode(RepoType::Deb, Some(&served), &old, None), json!({ "verbatim": true }));
+        assert_eq!(pinned_mode(RepoType::Deb, Some(&served), &old, Some("/ss/1/".into())), json!({ "signing_service": "/ss/1/" }));
     }
 
     #[tokio::test]
