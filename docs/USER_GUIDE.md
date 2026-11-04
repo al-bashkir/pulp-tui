@@ -813,6 +813,16 @@ stay until you delete them. **i** shows the chunks.
   content, artifact or repository changes. A client that still sends that upload fails and
   must start again.
 
+### Artifacts
+
+The files that Pulp stores, newest first: created, size (bytes) and sha256. Pulp's default
+policy lets only an administrator list them. `/` finds one artifact by its full sha256 (the API
+has no partial match). **i** full JSON, with the other digests and the storage path.
+
+There is no delete: Pulp marks the artifact delete as deprecated, and its default policy refuses
+it. *Prune orphan content* (**O** on Repository Versions) deletes the artifacts that no content
+uses.
+
 ### Logs
 
 All events of this session, newest first, with UTC times. It works without a connection.

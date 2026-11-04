@@ -75,6 +75,8 @@ pub enum Kind {
     TaskSchedules,
     /// Pulp domains (DOMAIN_ENABLED): name, storage backend.
     Domains,
+    /// Stored files, newest first (read-only: Pulp's default policy refuses a delete).
+    Artifacts,
     /// This session's requests, actions and notices; `polls` also shows task polling.
     Logs {
         polls: bool,
@@ -104,6 +106,7 @@ pub const NAV: &[(&str, Kind)] = &[
     ("Tasks", Kind::Tasks),
     ("Task Schedules", Kind::TaskSchedules),
     ("Uploads", Kind::Uploads),
+    ("Artifacts", Kind::Artifacts),
     ("Logs", Kind::Logs { polls: false }),
 ];
 
@@ -472,6 +475,7 @@ impl Kind {
             Kind::Uploads => "Uploads (chunked uploads not committed, oldest first)".into(),
             Kind::TaskSchedules => "Task Schedules (read-only)".into(),
             Kind::Domains => "Domains (each has its own objects, content and storage)".into(),
+            Kind::Artifacts => "Artifacts (stored files, newest first; / finds one sha256)".into(),
             Kind::Logs { polls } => {
                 format!("Logs (this session, UTC)  [t: show/hide task polling]{}", if *polls { " — polling shown" } else { "" })
             }
@@ -508,6 +512,7 @@ impl Kind {
             Kind::Uploads => Feature::ChunkedUpload,
             Kind::TaskSchedules => Feature::TaskSchedules,
             Kind::Domains => Feature::Domains,
+            Kind::Artifacts => Feature::Artifacts,
             _ => return None,
         };
         caps.require(f).err().map(|e| {
@@ -602,6 +607,8 @@ impl Kind {
             Kind::GroupRoles { group, .. } => (format!("{group}roles/"), vec![], None),
             Kind::Roles => ("roles/".into(), vec![("ordering", "name".into())], name),
             Kind::Domains => ("domains/".into(), vec![("ordering", "name".into())], name),
+            // The API filters on the exact digest only.
+            Kind::Artifacts => ("artifacts/".into(), vec![("ordering", "-pulp_created".into())], Some("sha256")),
             Kind::Workers => ("workers/".into(), vec![("ordering", "name".into())], name),
             // The stale ones first; the API filters only on size.
             Kind::Uploads => ("uploads/".into(), vec![("ordering", "pulp_created".into())], None),
@@ -816,6 +823,11 @@ impl Kind {
                 col("storage", 16, |v| s(v, "storage_class").rsplit('.').next().unwrap_or_default().into()),
                 col("description", 40, |v| s(v, "description")),
             ],
+            Kind::Artifacts => vec![
+                col("created", 19, |v| ts(v, "pulp_created")),
+                col("size", 12, |v| s(v, "size")),
+                col("sha256", 64, |v| s(v, "sha256")),
+            ],
             Kind::GroupUsers { .. } => vec![col("username", 30, |v| s(v, "username"))],
             Kind::Roles => vec![
                 col("name", 40, |v| s(v, "name")),
@@ -950,7 +962,7 @@ impl Kind {
             Kind::TaskGroups => vec![CancelTask, Inspect],
             Kind::Uploads => vec![Delete, ObjectRoles, Inspect],
             Kind::TaskSchedules => vec![WatchTask, ObjectRoles, Inspect],
-            Kind::Workers | Kind::Logs { .. } => vec![Inspect],
+            Kind::Workers | Kind::Logs { .. } | Kind::Artifacts => vec![Inspect],
         }
     }
 
@@ -1741,6 +1753,23 @@ mod tests {
             assert!(!k.actions().contains(&Act::ObjectRoles), "{k:?}: Pulp has no list_roles/ there");
         }
         assert_eq!(Act::ObjectRoles.key(), 'B');
+    }
+
+    #[test]
+    fn artifacts_screen_is_read_only_and_finds_one_sha256() {
+        let k = Kind::Artifacts;
+        assert!(NAV.iter().any(|(l, n)| *l == "Artifacts" && *n == k));
+        assert_eq!(k.source().unwrap(), ("artifacts/".into(), vec![("ordering", "-pulp_created".into())], Some("sha256")));
+        assert!(k.title().contains("/ finds one sha256"), "the API filters on the exact digest only");
+        let sha = "8ad22026c8f6461cf3b292ab6637d6398e0d0fb1e7ef5ddbf20add80a37061f3";
+        let row = json!({ "pulp_created": "2026-11-04T23:18:16.481567Z", "size": 6711, "sha256": sha, "file": "artifact/8a/d220" });
+        assert_eq!(k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["2026-11-04 23:18:16", "6711", sha]);
+        assert_eq!(k.actions(), [Act::Inspect], "Pulp's default policy refuses an artifact delete");
+        let mut caps = Capabilities::default();
+        caps.paths.insert("status/".into());
+        assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: artifacts API (artifacts/)"));
+        caps.paths.insert("artifacts/".into());
+        assert_eq!(k.unsupported(&caps), None);
     }
 
     #[test]

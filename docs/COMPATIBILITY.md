@@ -61,6 +61,7 @@ General rules:
 | Chunked upload                            | `uploads/` and `{upload_href}`                                       | message for files above `upload_chunk_mb` |
 | Uploads screen                            | `uploads/` and `{upload_href}`                                       | screen not supported                      |
 | Task Schedules screen                     | `task-schedules/`                                                    | screen not supported                      |
+| Artifacts screen                          | `artifacts/`                                                         | screen not supported                      |
 | Native replication                        | pulpcore ≥ 3.23, `upstream-pulps/`, `{upstream_pulp_href}replicate/` | screen points to the fallback             |
 | Fallback replication of a type            | `status/` component on source and destination                        | dry run stops (3)                         |
 | Alternate content sources                 | the plugin, `acs/rpm/rpm/`, `acs/file/file/`, `acs/deb/deb/`         | endpoint message on the screen            |
@@ -516,6 +517,17 @@ Read in pulpcore 3.123.1 (models and serializers in `pulpcore/app/`) and live on
 * `contentguards/` lists every type with name and description only; the type is in the
   href. `distributions/` has no `content_guard` filter, so the screen reads `name` and
   `content_guard` of all distributions.
+
+### Artifacts
+
+Read in pulpcore 3.123.1 (`ArtifactViewSet`, `ArtifactFilter`) and live on pulp1.
+
+* The default policy allows `list`, `retrieve` and `create` to `admin` only, and has no
+  `destroy` statement: a delete is refused unless an operator changed the policy. Pulp marks
+  the delete as deprecated ("use orphan cleanup instead") and answers 409 for an artifact that
+  content uses. pulp-tui offers no delete.
+* `artifacts/` filters on the exact digests (`md5` … `sha512`), `repository_version` and
+  `orphaned_for`; no partial match. `md5` and `sha1` are null unless the server allows them.
 
 ### Object roles
 

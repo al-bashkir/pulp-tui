@@ -534,3 +534,23 @@ async fn object_roles_add_and_remove_a_viewer_on_a_repository() {
     }
     cleanup(&c, &[&repo, &user]).await;
 }
+
+/// The Artifacts screen lists the newest artifacts with size and sha256; `/` with a full sha256 finds that one.
+#[tokio::test]
+async fn artifacts_screen_lists_and_finds_a_sha256() {
+    if !live_enabled() {
+        return;
+    }
+    let (mut app, mut rx) = app().await;
+    app.open(Screen::List(Kind::Artifacts));
+    settle(&mut app, &mut rx).await;
+    assert_eq!(app.list.error, None);
+    let Some(first) = app.list.items.first().cloned() else { return };
+    let cells: Vec<String> = Kind::Artifacts.columns().iter().map(|col| (col.get)(&first)).collect();
+    assert!(cells[1].parse::<u64>().is_ok() && cells[2].len() == 64, "{cells:?}");
+    app.list.filter = cells[2].clone();
+    app.reload();
+    settle(&mut app, &mut rx).await;
+    let found: Vec<&str> = app.list.items.iter().filter_map(|r| r["sha256"].as_str()).collect();
+    assert_eq!(found, [cells[2].as_str()], "{:?}", app.list.error);
+}
