@@ -446,12 +446,20 @@ fn check_database(app: &mut App, name: &str) {
     });
 }
 
+/// What a saved profile changes in the running session.
+const SAVED: &str = "(read-only and production apply at once; the rest at the next Connect)";
+
 /// Save the config file with the profile, then use it and reload. A failed save leaves the config in memory as it was.
+/// The session of this profile takes `read_only` at once; `production` is read from the config.
 fn put_profile(app: &mut App, name: &str, p: Profile) -> Result<(), String> {
     let mut next = app.cfg.clone();
+    let read_only = p.read_only;
     next.profiles.insert(name.to_string(), p);
     save_config(app, &next)?;
     app.cfg = next;
+    if let Some(c) = app.conn.as_ref().filter(|c| c.client.profile() == name) {
+        c.client.set_read_only(read_only);
+    }
     app.reload();
     Ok(())
 }
@@ -463,7 +471,7 @@ fn location(db: &Option<(Database, String)>, local_db: &Path) -> String {
 /// Save a profile whose database changed, and open the new one.
 fn switch_database(app: &mut App, name: &str, p: Profile) -> Result<(), String> {
     put_profile(app, name, p)?;
-    app.ok(format!("profile {name} saved (reconnect to apply)"));
+    app.ok(format!("profile {name} saved {SAVED}"));
     check_database(app, name);
     Ok(())
 }
@@ -553,7 +561,7 @@ fn offer_copy(
                         r.views, r.versions, r.environments
                     );
                     match put_profile(app, &n, p) {
-                        Ok(()) => app.ok(format!("{copied}; profile {n} saved (reconnect to apply)")),
+                        Ok(()) => app.ok(format!("{copied}; profile {n} saved {SAVED}")),
                         Err(e) => app.error(format!("{copied}, but profile {n} was not saved: {e}")),
                     }
                 })
@@ -622,7 +630,7 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
                     change_database(app, name.clone(), edited, old, new);
                 } else {
                     put_profile(app, &name, edited)?;
-                    app.ok(format!("profile {name} saved (reconnect to apply)"));
+                    app.ok(format!("profile {name} saved {SAVED}"));
                     if old != new {
                         check_database(app, &name);
                     }
@@ -631,6 +639,10 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
             });
         }
         Act::Delete => {
+            // The session reads its PRODUCTION banner and typed confirms from this profile.
+            if app.profile.as_deref() == Some(name.as_str()) {
+                return app.error(format!("refused: {name} is the profile of this session; connect to another profile first"));
+            }
             let kept = match app.cfg.database_for(&name) {
                 Some((d, _)) => format!("stay in the database {} (they belong to the server, not to the profile name)", d.display_url()),
                 None => "stay in the local database file".into(),
@@ -3580,6 +3592,42 @@ mod tests {
         let e = put_profile(&mut app, "lab", new).unwrap_err();
         assert!(e.starts_with("cannot save "), "{e}");
         assert_eq!(app.cfg.profiles["lab"], old, "memory and file still agree");
+    }
+
+    /// Without the profile the session would lose its PRODUCTION banner and typed confirms while it stays connected.
+    #[tokio::test]
+    async fn the_connected_profile_is_not_deleted_and_its_edit_applies_read_only_and_production_at_once() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (mut app, _rx) = connected(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        app.cfg_path = dir.path().join("config.toml");
+        app.cfg.profiles.insert("other".into(), app.cfg.profiles["lab"].clone());
+        let texts = |app: &App| app.notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>();
+        profile_action(&mut app, Act::Delete, json!({ "name": "lab" }));
+        assert!(app.modal.is_none(), "no confirm");
+        assert!(app.cfg.profiles.contains_key("lab"));
+        assert_eq!(texts(&app), ["refused: lab is the profile of this session; connect to another profile first"]);
+        profile_action(&mut app, Act::Delete, json!({ "name": "other" }));
+        assert!(matches!(app.modal.take(), Some(Modal::Confirm { typed: Some(t), .. }) if t == "other"), "another profile asks");
+
+        let edit = |app: &mut App, flag: &str| {
+            profile_action(app, Act::Edit, json!({ "name": "lab" }));
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
+            for k in ["read_only", "production"] {
+                form.fields.iter_mut().find(|f| f.key == k).unwrap().value = flag.into();
+            }
+            submit(app, &form).unwrap();
+        };
+        edit(&mut app, "true");
+        assert!(app.read_only(), "the session is read-only at once");
+        let refused = app.conn.as_ref().unwrap().client.delete(&format!("{API}repositories/rpm/rpm/1/")).await;
+        assert!(matches!(refused, Err(PulpError::ReadOnly(_))), "its client refuses mutations: {refused:?}");
+        app.confirm_prod("Sync", vec![], "lab", |_| {});
+        assert!(matches!(app.modal.take(), Some(Modal::Confirm { typed: Some(t), .. }) if t == "lab"), "production: typed");
+        assert_eq!(texts(&app).last().unwrap(), "profile lab saved (read-only and production apply at once; the rest at the next Connect)");
+        edit(&mut app, "false");
+        assert!(!app.read_only() && !app.conn.as_ref().unwrap().client.read_only(), "and read-write at once");
     }
 
     #[test]

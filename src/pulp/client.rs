@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
@@ -117,7 +118,8 @@ struct Inner {
     /// Basic-auth username; identifies the current user on servers without `login/`.
     username: Option<String>,
     sem: Semaphore,
-    read_only: bool,
+    /// Atomic: an Edit of the connected profile changes it for every clone at once.
+    read_only: AtomicBool,
     max_bytes: u64,
     poll: (Duration, Duration),
     upload_chunk: usize,
@@ -186,7 +188,7 @@ impl PulpClient {
                 auth,
                 username: p.username.clone().filter(|_| p.auth == AuthMethod::Basic),
                 sem: Semaphore::new(settings.max_concurrent_requests.max(1)),
-                read_only: p.read_only,
+                read_only: AtomicBool::new(p.read_only),
                 max_bytes: settings.max_response_mb.max(1) * 1024 * 1024,
                 poll: settings.poll_bounds(),
                 upload_chunk: (settings.upload_chunk_mb.max(1) * 1024 * 1024) as usize,
@@ -199,7 +201,10 @@ impl PulpClient {
         &self.inner.profile
     }
     pub fn read_only(&self) -> bool {
-        self.inner.read_only
+        self.inner.read_only.load(Ordering::Relaxed)
+    }
+    pub fn set_read_only(&self, on: bool) {
+        self.inner.read_only.store(on, Ordering::Relaxed);
     }
     pub fn username(&self) -> Option<&str> {
         self.inner.username.as_deref()
@@ -275,7 +280,7 @@ impl PulpClient {
     }
 
     async fn mutate(&self, m: Method, href: &str, body: Option<&impl Serialize>) -> Result<Mutation> {
-        if self.inner.read_only {
+        if self.read_only() {
             return Err(PulpError::ReadOnly(format!("{m} {href}")));
         }
         let (status, v) = self.request(m, href, &[], body).await?;
@@ -285,7 +290,7 @@ impl PulpClient {
     /// POST as multipart form with text fields (content creation endpoints reject JSON).
     /// `file` is an optional (file name, bytes) part sent as field `file`.
     pub async fn post_form(&self, href: &str, fields: &[(&str, String)], file: Option<(String, Vec<u8>)>) -> Result<Mutation> {
-        if self.inner.read_only {
+        if self.read_only() {
             return Err(PulpError::ReadOnly(format!("POST {href}")));
         }
         let url = self.url_for(href)?;
@@ -311,7 +316,7 @@ impl PulpClient {
 
     /// One chunk of the chunked upload API (`PUT {upload_href}` with Content-Range).
     pub async fn put_chunk(&self, href: &str, range: (u64, u64, u64), data: Vec<u8>) -> Result<()> {
-        if self.inner.read_only {
+        if self.read_only() {
             return Err(PulpError::ReadOnly(format!("PUT {href}")));
         }
         let url = self.url_for(href)?;

@@ -1585,7 +1585,7 @@ mod tests {
             app.handle_msg(m);
         }
         let key = format!("{}/pulp/#default", server.uri());
-        // Edit says "reconnect to apply": the client still talks to the old server, so the scope stays.
+        // Edit applies the URL at the next Connect: the client still talks to the old server, so the scope stays.
         app.cfg.profiles.get_mut("lab").unwrap().url = "https://other.example.com".into();
         assert_eq!(app.ctx().unwrap().scope, key);
         assert_eq!(app.scope("lab"), Ok(key));

@@ -137,8 +137,11 @@ ends.
 The profiles of the config file. See "Server profiles" and "Content View database".
 
 * **o** connect. **T** test the connection (user, content origin, plugin versions).
-* **c** / **e** create / edit. **d** removes the profile from the config. It does not change Pulp
-  or the Content View database, and the dialog names the database that keeps the definitions.
+* **c** / **e** create / edit. An edit of the connected profile applies **Read-only** and
+  **Production** at once; the other fields apply at the next Connect.
+* **d** removes the profile from the config. It does not change Pulp or the Content View
+  database, and the dialog names the database that keeps the definitions. The profile of the
+  session cannot be removed: connect to another profile first.
 * **K** stores a secret in the system keyring. When the profile uses a database (its own or the
   top-level `[database]`), it asks if the secret is for the "Pulp server" or the "database".
 * **E** / **I** export / import Content View definitions, as `export-cv` and `import-cv`. **I**

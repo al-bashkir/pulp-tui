@@ -771,7 +771,7 @@ mod tests {
         let mut app = App::new(cfg, "/dev/null".into(), st.clone(), Ok(st));
         app.profile = Some("lab".into());
         app.conn = Some(rw);
-        app.cfg.profiles.get_mut("lab").unwrap().read_only = true; // edited after Connect: applies on the next one
+        app.cfg.profiles.get_mut("lab").unwrap().read_only = true; // the config alone: the banner shows what the client enforces
         let shown = |app: &App| {
             let mut t = Terminal::new(TestBackend::new(140, 30)).unwrap();
             t.draw(|f| draw(f, app)).unwrap();
