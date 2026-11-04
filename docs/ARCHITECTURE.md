@@ -284,13 +284,20 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
   canceled or skipped one gives a warning. Pulp owns the deletion policy; the form puts
   `nodelete` first. Every other policy may delete local objects, so saving or replicating
   with it needs typed confirmation.
-* **Fallback** (`src/replication.rs`): content sync only, RPM and File. Per upstream
+* **Fallback** (`src/replication.rs`): content sync only, RPM, File and Deb. Per upstream
   distribution it creates or updates a remote (the served URL), a repository and a
   pinned distribution with the same name and path, labeled
   `pulp_tui_replica=<source profile>`.
   * A dry run shows CREATE / SYNC / SKIP. The run checks the label again.
   * Objects without the label are conflicts and are skipped.
   * A File item without a readable served manifest is skipped (no URL guess).
+  * Deb: the remote's `distributions` are the `dists/` directories of the served
+    publication (`deb::layout`, as verify probes them). The replica publishes in the mode of
+    that publication (`ops::publication_mode`, verbatim too), without its signing service:
+    that is an href of the upstream server. The dry run notes an upstream APT publication
+    that is signed (its service, else its repository's service or release overrides) when
+    the replica repository has no signing service. It reads only the API: the upstream
+    `base_url` is for the destination server and may not resolve on the client.
   * It never deletes and does not copy content guards, labels or metadata.
   * It reuses a publication of the synced version (`ops::find_publication`), also for an
     RPM repository with a metadata signing service (a new one on every run would pile up).

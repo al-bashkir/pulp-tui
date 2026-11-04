@@ -85,7 +85,7 @@ async fn served(c: &PulpClient, base: &str, path: &str) -> Result<()> {
 /// flat-repo>/<last part of the component>/`; without release components, `default` with component `empty`
 /// (pulp_deb 3.11.1; 3.5.4 and 3.8.1 publish no structured release then). Simple: `default` with component
 /// `all`, which replaces a structured `default`.
-async fn layout(c: &PulpClient, version: &str, publication: &Value) -> Result<(Vec<String>, Vec<(String, String)>)> {
+pub async fn layout(c: &PulpClient, version: &str, publication: &Value) -> Result<(Vec<String>, Vec<(String, String)>)> {
     let simple = publication["simple"] == true;
     let (mut releases, mut indices) = (vec![], vec![]);
     if publication["structured"] != false {

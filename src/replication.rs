@@ -2,7 +2,7 @@
 //!
 //! * Native: pulpcore's Upstream Pulp API (technology preview). It replicates distributions,
 //!   repositories and remotes as Pulp metadata, governed by the server-side `policy`.
-//! * Fallback: content synchronization only. For each selected upstream RPM/File
+//! * Fallback: content synchronization only. For each selected upstream RPM, File or Deb
 //!   distribution an ordinary remote (pointing at the published upstream content), a
 //!   repository and a pinned distribution are created on the destination and synced.
 //!   It does not replicate content guards, labels or other distribution metadata, and it
@@ -12,7 +12,7 @@
 use crate::pulp::client::{Mutation, PulpClient};
 use crate::pulp::models::{Distribution, Repository, TaskGroup};
 use crate::pulp::ops::{self, OnTask};
-use crate::pulp::{Capabilities, RepoType};
+use crate::pulp::{Capabilities, PulpError, RepoType, deb};
 use crate::store::Store;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -55,6 +55,10 @@ pub struct PlanItem {
     pub remote_url: String,
     /// File: the manifest name that the upstream publication serves; the replica publishes under it too.
     pub manifest: Option<String>,
+    /// Deb: the `dists/` directories that the upstream publication serves (space separated); the replica remote syncs them.
+    pub distributions: Option<String>,
+    /// The publication mode of the replica (`ops::publication_mode`). Deb: the mode of the upstream publication.
+    pub mode: Value,
     pub action: PlanAction,
     pub note: String,
 }
@@ -114,6 +118,8 @@ pub async fn plan(
                 base_path: d.base_path.clone(),
                 remote_url: String::new(),
                 manifest: None,
+                distributions: None,
+                mode: json!({}),
                 action: PlanAction::Skip,
                 note: String::new(),
             };
@@ -130,6 +136,7 @@ pub async fn plan(
                 continue;
             }
             let base = if base.ends_with('/') { base } else { format!("{base}/") };
+            let mut upstream_signed = false;
             it.remote_url = match t {
                 RepoType::Rpm => base,
                 RepoType::File => {
@@ -152,11 +159,17 @@ pub async fn plan(
                         }
                     }
                 }
-                RepoType::Deb => {
-                    it.note = "Deb replication is not supported".into();
-                    out.push(it);
-                    continue;
-                }
+                RepoType::Deb => match deb_source(src, &d).await {
+                    Ok((dists, mode, signed)) => {
+                        (it.distributions, it.mode, upstream_signed) = (Some(dists), mode, signed);
+                        base
+                    }
+                    Err(note) => {
+                        it.note = note;
+                        out.push(it);
+                        continue;
+                    }
+                },
             };
             let repo = ops::find_by_name::<Repository>(dst, &dst.api(t.repositories()), &d.name).await?;
             let remote = ops::find_by_name::<Value>(dst, &dst.api(t.remotes()), &d.name).await?;
@@ -183,10 +196,45 @@ pub async fn plan(
                 it.action = PlanAction::Create;
                 it.note = "new remote + repository + distribution".into();
             }
+            // pulp_deb signs a publication without a service with the repository's (COMPATIBILITY.md).
+            let replica_signs = repo.as_ref().is_some_and(|r| r.extra.get("signing_service").is_some_and(|s| !s.is_null()));
+            if it.action != PlanAction::Skip && upstream_signed && !replica_signs {
+                it.note += "; upstream Release is signed, the replica will be unsigned (the destination repository has no signing service)";
+            }
             out.push(it);
         }
     }
     Ok(out)
+}
+
+/// What the Deb replica of upstream distribution `d` syncs and how it publishes: the `dists/` directories of the
+/// served publication (`deb::layout`), the publication's mode without its signing service (an upstream href), and
+/// whether upstream signs that APT publication. pulp_deb signs with the publication's service, else with the
+/// repository's release override (structured releases only) or service. A verbatim publication serves the synced
+/// signatures as they are, so its replica serves them too. Only the API is read: `base_url` is the upstream content
+/// origin as the destination server reaches it, which this client may not resolve. `Err`: the note of a SKIP row.
+/// shortcut: a verbatim publication of a flat repository (`/`) is served at the root, but `layout` gives `flat-repo`;
+/// read the synced Release files when a flat upstream must be replicated.
+async fn deb_source(src: &PulpClient, d: &Distribution) -> std::result::Result<(String, Value, bool), String> {
+    let unreadable = |e: PulpError| format!("upstream publication not readable: {e}");
+    // No OpenAPI: unknown endpoints count as present, so the verbatim publications of a repository are read too.
+    let Some(p) = ops::served_publication(src, &Capabilities::default(), RepoType::Deb, &json!(d)).await.map_err(unreadable)? else {
+        return Err("upstream distribution serves nothing (no publication)".into());
+    };
+    let version = p["repository_version"].as_str().unwrap_or_default();
+    let (dists, _) = deb::layout(src, version, &p).await.map_err(unreadable)?;
+    let mut mode = ops::publication_mode(RepoType::Deb, &p);
+    if let Some(m) = mode.as_object_mut() {
+        m.remove("signing_service");
+    }
+    let signed = mode[deb::VERBATIM] != true
+        && (!p["signing_service"].is_null() || {
+            let q = [("fields", "signing_service,signing_service_release_overrides".to_string())];
+            let r: Value = src.get(&ops::repo_of_version(version), &q).await.map_err(unreadable)?;
+            let overrides = r["signing_service_release_overrides"].as_object().is_some_and(|o| !o.is_empty());
+            !r["signing_service"].is_null() || (p["structured"] != false && overrides)
+        });
+    Ok((dists.join(" "), mode, signed))
 }
 
 /// Execute a plan. `mirror` makes new versions match upstream (old versions are kept).
@@ -218,12 +266,10 @@ pub async fn run(
 
 async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror: bool, on: OnTask<'_>) -> Result<String> {
     let t = it.t;
-    // First, so that an unsupported type changes nothing on the server.
     let policy = match (t, mirror) {
+        (_, false) => "additive",
         (RepoType::Rpm, true) => "mirror_content_only",
-        (RepoType::File, true) => "mirror",
-        (RepoType::Rpm | RepoType::File, false) => "additive",
-        (RepoType::Deb, _) => bail!("Deb replication is not supported"),
+        (_, true) => "mirror",
     };
     let labels = json!({ LABEL_REPLICA: src_profile });
     let remote = replica_remote(c, src_profile, it, &labels, on).await?;
@@ -231,11 +277,11 @@ async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror:
     ops::settle(c, ops::sync(c, t, &repo, Some(&remote), policy).await?, on).await?;
     let r: Repository = c.get(&repo, &[]).await?;
     let version = r.latest_version_href.ok_or_else(|| anyhow!("no repository version after sync"))?;
-    // Not `ensure_publication`: a signing replica would get a new publication on every run. A reused unsigned one
-    // fails `verify_served` below (repomd.xml.asc).
-    let publication = match ops::find_publication(c, t, &version, &json!({})).await? {
+    // Not `ensure_publication`: a signing replica would get a new publication on every run. A reused unsigned RPM one
+    // fails `verify_served` below (repomd.xml.asc); Deb verify does not check signatures.
+    let publication = match ops::find_publication(c, t, &version, &it.mode).await? {
         Some(p) => p,
-        None => ops::create_publication(c, t, &version, &json!({}), on).await?,
+        None => ops::create_publication(c, t, &version, &it.mode, on).await?,
     };
     let dist = ops::ensure_distribution(c, t, &it.name, &it.base_path, Some(&publication), &labels, None, on).await?;
     let d: Distribution = c.get(&dist, &[]).await?;
@@ -249,19 +295,26 @@ fn foreign(kind: &str, it: &PlanItem) -> anyhow::Error {
     anyhow!("a local {kind} named {} exists and is not managed by this replication", it.name)
 }
 
-/// The replica remote of `it`, pointed at the upstream URL.
+/// The replica remote of `it`, pointed at the upstream URL (Deb: and at the dists that upstream serves).
 async fn replica_remote(c: &PulpClient, src_profile: &str, it: &PlanItem, labels: &Value, on: OnTask<'_>) -> Result<String> {
+    let mut want = json!({ "url": it.remote_url });
+    if let Some(d) = &it.distributions {
+        want["distributions"] = d.as_str().into();
+    }
     match ops::find_by_name::<Value>(c, &c.api(it.t.remotes()), &it.name).await? {
         Some(r) if !owned(&labels_of(&r), src_profile) => Err(foreign("remote", it)),
         Some(r) => {
             let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
-            if r["url"].as_str() != Some(it.remote_url.as_str()) {
-                ops::settle(c, c.patch(&h, &json!({ "url": it.remote_url })).await?, on).await?;
+            if want.as_object().into_iter().flatten().any(|(k, v)| r[k] != *v) {
+                ops::settle(c, c.patch(&h, &want).await?, on).await?;
             }
             Ok(h)
         }
         None => {
-            let body = json!({ "name": it.name, "url": it.remote_url, "policy": "immediate", "pulp_labels": labels });
+            let mut body = want;
+            body["name"] = it.name.as_str().into();
+            body["policy"] = "immediate".into();
+            body["pulp_labels"] = labels.clone();
             Ok(ops::create(c, &c.api(it.t.remotes()), &body, "/remotes/", on).await?)
         }
     }
@@ -322,6 +375,8 @@ mod tests {
             base_path: "os".into(),
             remote_url: "https://up/os/".into(),
             manifest: None,
+            distributions: None,
+            mode: json!({}),
             action: PlanAction::Create,
             note: String::new(),
         };
@@ -331,26 +386,213 @@ mod tests {
         assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed: {sent:?}");
     }
 
+    /// A Deb replica syncs the `dists/` directories that the upstream publication serves (`deb::layout`) and
+    /// publishes in its mode, without the upstream signing service. The note says when the replica loses the
+    /// upstream signature: an APT publication signed upstream (by its own service, else by its repository's service
+    /// or, when structured, a release override), and no signing service on the replica repository. The client may
+    /// not reach the upstream content origin, so only the API is read.
     #[tokio::test]
-    async fn deb_distributions_are_skipped_and_never_replicated() {
+    async fn a_deb_replica_syncs_the_served_dists_and_takes_the_upstream_mode() {
+        use wiremock::matchers::{method, path, query_param};
+        let (up, down) = (wiremock::MockServer::start().await, wiremock::MockServer::start().await);
+        serve_status(&up, &["deb"]).await;
+        serve_status(&down, &["deb"]).await;
+        let page = |r: Value| json!({ "count": r.as_array().map_or(0, Vec::len), "next": null, "results": r });
+        let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+        let get = |p: &str| wiremock::Mock::given(method("GET")).and(path(format!("/pulp/api/v3/{p}")));
+        // Served from a content origin that this client cannot resolve (only the destination server can).
+        let base = |name: &str| format!("http://unresolvable.invalid/pulp/content/{name}/");
+        let dist = |name: &str, k: &str, v: &str| {
+            json!({ "pulp_href": format!("/pulp/api/v3/distributions/deb/apt/{name}/"), "name": name, "base_path": name,
+                "base_url": base(name), k: v })
+        };
+        let repo = |n: u32| format!("/pulp/api/v3/repositories/deb/apt/{n}/");
+        let publication = |n: u32| format!("/pulp/api/v3/publications/deb/apt/{n}/");
+        let dists = json!([
+            dist("apt", "publication", &publication(1)),
+            dist("flat", "publication", &publication(2)),
+            dist("plain", "publication", &publication(4)),
+            dist("simple", "publication", &publication(3)),
+            dist("verb", "repository", &repo(9)),
+        ]);
+        get("distributions/deb/apt/").respond_with(ok(page(dists))).mount(&up).await;
+        // Publications that sign with a service of the upstream server (1), with a release override of their
+        // repository (2, structured), with the service of their repository (3, simple). A simple release does not
+        // use a release override (4).
+        let apt = |n: u32, mode: Value, service: Value| {
+            let mut p = json!({ "pulp_href": publication(n), "repository_version": format!("{}versions/1/", repo(n)),
+                "signing_service": service });
+            p.as_object_mut().unwrap().extend(mode.as_object().unwrap().clone());
+            p
+        };
+        let structured = json!({ "simple": false, "structured": true, "publish_upstream_release_fields": true });
+        let service = |n: u32| json!(format!("/pulp/api/v3/signing-services/{n}/"));
+        get("publications/deb/apt/1/").respond_with(ok(apt(1, structured.clone(), service(7)))).mount(&up).await;
+        get("publications/deb/apt/2/").respond_with(ok(apt(2, structured.clone(), Value::Null))).mount(&up).await;
+        let simple = json!({ "simple": true, "structured": false });
+        get("publications/deb/apt/3/").respond_with(ok(apt(3, simple.clone(), Value::Null))).mount(&up).await;
+        get("publications/deb/apt/4/").respond_with(ok(apt(4, simple.clone(), Value::Null))).mount(&up).await;
+        let signs =
+            |service: Value, overrides: Value| ok(json!({ "signing_service": service, "signing_service_release_overrides": overrides }));
+        get("repositories/deb/apt/2/").respond_with(signs(Value::Null, json!({ "fixture": service(7) }))).mount(&up).await;
+        get("repositories/deb/apt/3/").respond_with(signs(service(8), json!({}))).mount(&up).await;
+        get("repositories/deb/apt/4/").respond_with(signs(Value::Null, json!({ "default": service(7) }))).mount(&up).await;
+        // The repository of "verb" serves its newest publication: a verbatim one, which serves the synced signatures.
+        get("repositories/deb/apt/9/").respond_with(signs(service(9), json!({}))).mount(&up).await;
+        get("publications/deb/apt/").and(query_param("repository", repo(9))).respond_with(ok(page(json!([])))).mount(&up).await;
+        let v9 = format!("{}versions/3/", repo(9));
+        let p9 = json!([{ "pulp_href": "/pulp/api/v3/publications/deb/verbatim/3/", "repository_version": v9,
+            "pulp_created": "2026-01-01T00:00:00Z" }]);
+        get("publications/deb/verbatim/").and(query_param("repository", repo(9))).respond_with(ok(page(p9))).mount(&up).await;
+        let comp = |d: &str| json!({ "distribution": d, "plain_component": "main" });
+        for (version, comps) in [
+            (format!("{}versions/1/", repo(1)), json!([comp("fixture")])),
+            (format!("{}versions/1/", repo(2)), json!([comp("fixture"), comp("/")])),
+            (v9, json!([comp("fixture")])),
+        ] {
+            get("content/deb/release_components/")
+                .and(query_param("repository_version", version.as_str()))
+                .respond_with(ok(page(comps)))
+                .mount(&up)
+                .await;
+        }
+        // The destination has a replica of "apt", whose repository signs with its own service.
+        let r = json!({ "pulp_href": "/pulp/api/v3/repositories/deb/apt/1/", "name": "apt",
+            "signing_service": "/pulp/api/v3/signing-services/1/", "pulp_labels": { LABEL_REPLICA: "up" } });
+        get("repositories/deb/apt/").and(query_param("name", "apt")).respond_with(ok(page(json!([r])))).mount(&down).await;
+        wiremock::Mock::given(method("GET")).respond_with(ok(page(json!([])))).with_priority(10).mount(&down).await;
+        let plan = plan(&client(&up, "up"), &client(&down, "down"), &[RepoType::Deb], "", None).await.unwrap();
+        let rows: Vec<_> =
+            plan.iter().map(|i| (i.name.as_str(), &i.action, i.remote_url.clone(), i.distributions.as_deref(), i.mode.clone())).collect();
+        assert_eq!(
+            rows,
+            [
+                ("apt", &PlanAction::Update, base("apt"), Some("fixture"), structured.clone()),
+                ("flat", &PlanAction::Create, base("flat"), Some("fixture flat-repo"), structured),
+                ("plain", &PlanAction::Create, base("plain"), Some("default"), simple.clone()),
+                ("simple", &PlanAction::Create, base("simple"), Some("default"), simple),
+                ("verb", &PlanAction::Create, base("verb"), Some("fixture"), json!({ "verbatim": true })),
+            ]
+        );
+        let new = "new remote + repository + distribution";
+        let loses_signature =
+            format!("{new}; upstream Release is signed, the replica will be unsigned (the destination repository has no signing service)");
+        let notes: Vec<_> = plan.iter().map(|i| i.note.as_str()).collect();
+        assert_eq!(notes, ["re-sync existing replica", &loses_signature, new, &loses_signature, new]);
+    }
+
+    /// A Deb replica: the remote syncs the served dists, the publication has the upstream mode, the distribution
+    /// is made, and what it serves is verified.
+    #[tokio::test]
+    async fn a_deb_replica_is_synced_published_in_the_upstream_mode_distributed_and_verified() {
+        use sha2::Digest;
+        use wiremock::matchers::{method, path};
         let server = wiremock::MockServer::start().await;
-        let p = crate::config::Profile { url: server.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
-        let c = PulpClient::new("up", &p, &crate::config::Settings::default()).unwrap();
-        serve_status(&server, &["deb"]).await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/pulp/api/v3/distributions/deb/apt/"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null,
-                "results": [{ "pulp_href": "/pulp/api/v3/distributions/deb/apt/1/", "name": "apt", "base_path": "apt",
-                    "base_url": "https://up/pulp/content/apt", "publication": "/pulp/api/v3/publications/deb/apt/1/" }] })))
-            .mount(&server)
-            .await;
-        let plan = plan(&c, &c, &[RepoType::Deb], "", None).await.unwrap();
-        assert_eq!((plan.len(), &plan[0].action, plan[0].note.as_str()), (1, &PlanAction::Skip, "Deb replication is not supported"));
-        let it = PlanItem { action: PlanAction::Create, ..plan[0].clone() };
-        let e = replicate_one(&c, "up", &it, true, &ops::no_progress).await.unwrap_err();
-        assert_eq!(e.to_string(), "Deb replication is not supported");
+        let c = client(&server, "dst");
+        let page = |r: Value| json!({ "count": r.as_array().map_or(0, Vec::len), "next": null, "results": r });
+        let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+        let task = |n: u32| wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("/pulp/api/v3/tasks/{n}/") }));
+        let at = |m: &str, p: &str| wiremock::Mock::given(method(m)).and(path(p.to_string()));
+        let (remotes, repos, pubs, dists) = (
+            "/pulp/api/v3/remotes/deb/apt/",
+            "/pulp/api/v3/repositories/deb/apt/",
+            "/pulp/api/v3/publications/deb/apt/",
+            "/pulp/api/v3/distributions/deb/apt/",
+        );
+        let (remote, repo, publication, dist) = (format!("{remotes}1/"), format!("{repos}1/"), format!("{pubs}1/"), format!("{dists}1/"));
+        let v1 = format!("{repo}versions/1/");
+        let base = format!("{}/pulp/content/apt/", server.uri());
+        // Nothing exists yet: every list is empty unless a mock below answers.
+        wiremock::Mock::given(method("GET")).respond_with(ok(page(json!([])))).with_priority(10).mount(&server).await;
+        let created = |h: &str| wiremock::ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": h }));
+        at("POST", remotes).respond_with(created(&remote)).mount(&server).await;
+        at("POST", repos).respond_with(created(&repo)).mount(&server).await;
+        at("POST", &format!("{repo}sync/")).respond_with(task(1)).mount(&server).await;
+        at("POST", pubs).respond_with(task(2)).mount(&server).await;
+        at("POST", dists).respond_with(task(3)).mount(&server).await;
+        for (n, made) in [(1, json!([])), (2, json!([publication])), (3, json!([dist]))] {
+            let t = json!({ "pulp_href": format!("/pulp/api/v3/tasks/{n}/"), "state": "completed", "created_resources": made });
+            at("GET", &format!("/pulp/api/v3/tasks/{n}/")).respond_with(ok(t)).mount(&server).await;
+        }
+        at("GET", &repo).respond_with(ok(json!({ "pulp_href": repo, "name": "apt", "latest_version_href": v1 }))).mount(&server).await;
+        let d = json!({ "pulp_href": dist, "name": "apt", "base_path": "apt", "base_url": base, "publication": publication });
+        at("GET", &dist).respond_with(ok(d)).mount(&server).await;
+        let p = json!({ "pulp_href": publication, "repository_version": v1, "simple": true, "structured": false });
+        at("GET", &publication).respond_with(ok(p)).mount(&server).await;
+        // What a simple publication serves (`deb::verify`).
+        let pkg = json!([{ "pulp_href": "/p/1/", "package": "fixture-beta", "version": "1.0-1", "architecture": "amd64",
+            "relative_path": "pool/x.deb", "sha256": hex::encode(sha2::Sha256::digest(b"deb bytes")) }]);
+        at("GET", "/pulp/api/v3/content/deb/packages/").respond_with(ok(page(pkg))).mount(&server).await;
+        let file = "pool/all/f/fixture-beta_1.0-1_amd64.deb";
+        let index = format!("Package: fixture-beta\nVersion: 1.0-1\nArchitecture: amd64\nFilename: {file}\n");
+        for (p, body) in [
+            ("dists/default/Release", "Suite: default\n"),
+            ("dists/default/all/binary-amd64/Packages", index.as_str()),
+            (file, "deb bytes"),
+        ] {
+            let served = wiremock::ResponseTemplate::new(200).set_body_string(body);
+            at("GET", &format!("/pulp/content/apt/{p}")).respond_with(served).mount(&server).await;
+        }
+        let it = PlanItem {
+            t: RepoType::Deb,
+            name: "apt".into(),
+            base_path: "apt".into(),
+            remote_url: "https://up/pulp/content/apt/".into(),
+            manifest: None,
+            distributions: Some("default".into()),
+            mode: json!({ "simple": true, "structured": false }),
+            action: PlanAction::Create,
+            note: String::new(),
+        };
+        let done = replicate_one(&c, "up", &it, true, &ops::no_progress).await.unwrap();
+        assert_eq!(done, format!("version 1 served at {base} (Release and {file} served with matching digest (1 packages))"));
         let sent = server.received_requests().await.unwrap();
-        assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed: {sent:?}");
+        let posts = |p: &str| -> Vec<Value> {
+            sent.iter().filter(|r| r.method.as_str() == "POST" && r.url.path() == p).map(|r| r.body_json().unwrap()).collect()
+        };
+        let labels = json!({ LABEL_REPLICA: "up" });
+        let remote_body = json!({ "name": "apt", "url": "https://up/pulp/content/apt/", "distributions": "default",
+            "policy": "immediate", "pulp_labels": labels });
+        assert_eq!(posts(remotes), [remote_body]);
+        assert_eq!(posts(&format!("{repo}sync/")), [json!({ "remote": remote, "mirror": true })]);
+        assert_eq!(posts(pubs), [json!({ "repository_version": v1, "simple": true, "structured": false })]);
+        assert_eq!(posts(dists), [json!({ "name": "apt", "base_path": "apt", "publication": publication, "pulp_labels": labels })]);
+    }
+
+    /// An existing Deb replica remote follows the upstream: a PATCH only when its URL or dists differ.
+    #[tokio::test]
+    async fn a_deb_replica_remote_is_patched_only_when_the_served_dists_change() {
+        use wiremock::matchers::{method, path};
+        for (had, patched) in [("fixture", true), ("default", false)] {
+            let server = wiremock::MockServer::start().await;
+            let c = client(&server, "dst");
+            let one = |o: Value| wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [o] }));
+            let (remote, url) = ("/pulp/api/v3/remotes/deb/apt/1/", "https://up/pulp/content/apt/");
+            let r = json!({ "pulp_href": remote, "name": "apt", "url": url, "distributions": had, "pulp_labels": { LABEL_REPLICA: "up" } });
+            wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/remotes/deb/apt/")).respond_with(one(r)).mount(&server).await;
+            let done = wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": remote }));
+            wiremock::Mock::given(method("PATCH")).and(path(remote)).respond_with(done).mount(&server).await;
+            // A repository of the same name that is not this replication's: the run stops there.
+            let r = json!({ "pulp_href": "/pulp/api/v3/repositories/deb/apt/1/", "name": "apt", "pulp_labels": {} });
+            wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/repositories/deb/apt/")).respond_with(one(r)).mount(&server).await;
+            let it = PlanItem {
+                t: RepoType::Deb,
+                name: "apt".into(),
+                base_path: "apt".into(),
+                remote_url: url.into(),
+                manifest: None,
+                distributions: Some("default".into()),
+                mode: json!({}),
+                action: PlanAction::Update,
+                note: String::new(),
+            };
+            let e = replicate_one(&c, "up", &it, false, &ops::no_progress).await.unwrap_err();
+            assert_eq!(e.to_string(), "a local repository named apt exists and is not managed by this replication");
+            let sent = server.received_requests().await.unwrap();
+            let patches: Vec<Value> = sent.iter().filter(|r| r.method.as_str() == "PATCH").map(|r| r.body_json().unwrap()).collect();
+            let want = if patched { vec![json!({ "url": url, "distributions": "default" })] } else { vec![] };
+            assert_eq!(patches, want, "the remote had {had}");
+        }
     }
 
     fn client(s: &wiremock::MockServer, name: &str) -> PulpClient {
@@ -392,49 +634,53 @@ mod tests {
         assert_eq!(plan(&client(&up, "up"), &client(&down, "down"), &[RepoType::Rpm], "", None).await.unwrap().len(), 0);
     }
 
+    /// The sync has the policy of the type and mode; a skipped one stops the run.
     #[tokio::test]
     async fn a_skipped_sync_is_not_published_or_reported_as_done() {
         use wiremock::matchers::{method, path};
-        let server = wiremock::MockServer::start().await;
-        let p = crate::config::Profile { url: server.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
-        let c = PulpClient::new("dst", &p, &crate::config::Settings::default()).unwrap();
-        let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
-        let (remote, repo) = ("/pulp/api/v3/remotes/file/file/1/", "/pulp/api/v3/repositories/file/file/1/");
-        let one = |o: Value| json!({ "count": 1, "next": null, "results": [o] });
-        let labels = json!({ LABEL_REPLICA: "up" });
-        let r = json!({ "pulp_href": remote, "name": "files", "url": "https://up/files/PULP_MANIFEST", "pulp_labels": labels.clone() });
-        wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/remotes/file/file/")).respond_with(ok(one(r))).mount(&server).await;
-        // The repository has the version of an earlier run.
-        let v1 = format!("{repo}versions/1/");
-        let r =
-            json!({ "pulp_href": repo, "name": "files", "latest_version_href": v1, "manifest": "PULP_MANIFEST", "pulp_labels": labels });
-        wiremock::Mock::given(method("GET"))
-            .and(path("/pulp/api/v3/repositories/file/file/"))
-            .respond_with(ok(one(r.clone())))
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(method("GET")).and(path(repo)).respond_with(ok(r)).mount(&server).await;
-        wiremock::Mock::given(method("POST"))
-            .and(path(format!("{repo}sync/")))
-            .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": "/pulp/api/v3/tasks/1/" })))
-            .mount(&server)
-            .await;
-        let skipped = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "skipped", "name": "sync" });
-        wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/tasks/1/")).respond_with(ok(skipped)).mount(&server).await;
-        let it = PlanItem {
-            t: RepoType::File,
-            name: "files".into(),
-            base_path: "files".into(),
-            remote_url: "https://up/files/PULP_MANIFEST".into(),
-            manifest: Some("PULP_MANIFEST".into()),
-            action: PlanAction::Update,
-            note: String::new(),
-        };
-        let e = replicate_one(&c, "up", &it, false, &ops::no_progress).await.unwrap_err();
-        assert_eq!(e.to_string(), "task skipped: ");
-        let sent = server.received_requests().await.unwrap();
-        let changes: Vec<_> = sent.iter().filter(|r| r.method.as_str() != "GET").map(|r| r.url.path().to_string()).collect();
-        assert_eq!(changes, [format!("{repo}sync/")], "no publication, no distribution");
+        let cases =
+            [(RepoType::File, false, json!({ "mirror": false })), (RepoType::Rpm, true, json!({ "sync_policy": "mirror_content_only" }))];
+        for (t, mirror, mut want) in cases {
+            let server = wiremock::MockServer::start().await;
+            let c = client(&server, "dst");
+            let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+            let (remotes, repos) = (format!("/pulp/api/v3/{}", t.remotes()), format!("/pulp/api/v3/{}", t.repositories()));
+            let (remote, repo) = (format!("{remotes}1/"), format!("{repos}1/"));
+            let one = |o: Value| json!({ "count": 1, "next": null, "results": [o] });
+            let labels = json!({ LABEL_REPLICA: "up" });
+            let r = json!({ "pulp_href": remote, "name": "files", "url": "https://up/files/PULP_MANIFEST", "pulp_labels": labels.clone() });
+            wiremock::Mock::given(method("GET")).and(path(remotes)).respond_with(ok(one(r))).mount(&server).await;
+            // The repository has the version of an earlier run.
+            let v1 = format!("{repo}versions/1/");
+            let r = json!({ "pulp_href": repo, "name": "files", "latest_version_href": v1, "manifest": "PULP_MANIFEST", "pulp_labels": labels });
+            wiremock::Mock::given(method("GET")).and(path(repos)).respond_with(ok(one(r.clone()))).mount(&server).await;
+            wiremock::Mock::given(method("GET")).and(path(repo.as_str())).respond_with(ok(r)).mount(&server).await;
+            wiremock::Mock::given(method("POST"))
+                .and(path(format!("{repo}sync/")))
+                .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": "/pulp/api/v3/tasks/1/" })))
+                .mount(&server)
+                .await;
+            let skipped = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "skipped", "name": "sync" });
+            wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/tasks/1/")).respond_with(ok(skipped)).mount(&server).await;
+            let it = PlanItem {
+                t,
+                name: "files".into(),
+                base_path: "files".into(),
+                remote_url: "https://up/files/PULP_MANIFEST".into(),
+                manifest: (t == RepoType::File).then(|| "PULP_MANIFEST".into()),
+                distributions: None,
+                mode: json!({}),
+                action: PlanAction::Update,
+                note: String::new(),
+            };
+            let e = replicate_one(&c, "up", &it, mirror, &ops::no_progress).await.unwrap_err();
+            assert_eq!(e.to_string(), "task skipped: ");
+            let sent = server.received_requests().await.unwrap();
+            let changes: Vec<_> = sent.iter().filter(|r| r.method.as_str() != "GET").collect();
+            want["remote"] = remote.into();
+            assert_eq!(changes.len(), 1, "{t:?}: no publication, no distribution");
+            assert_eq!((changes[0].url.path(), changes[0].body_json::<Value>().unwrap()), (format!("{repo}sync/").as_str(), want));
+        }
     }
 
     #[tokio::test]
@@ -573,6 +819,8 @@ mod tests {
             base_path: "files".into(),
             remote_url: url.into(),
             manifest: Some("CUSTOM".into()),
+            distributions: None,
+            mode: json!({}),
             action: PlanAction::Update,
             note: String::new(),
         };

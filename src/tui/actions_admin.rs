@@ -624,11 +624,12 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
     }
 }
 
-/// The types a "Types" choice of the fallback form selects. Deb has no fallback replication.
+/// The types a "Types" choice of the fallback form selects. Deb is a choice of its own: the default must not need pulp_deb.
 fn replication_types(choice: &str) -> Vec<RepoType> {
     match choice {
         "rpm" => vec![RepoType::Rpm],
         "file" => vec![RepoType::File],
+        "deb" => vec![RepoType::Deb],
         _ => vec![RepoType::Rpm, RepoType::File],
     }
 }
@@ -649,7 +650,7 @@ pub fn fallback(app: &mut App) {
         format!("Fallback replication into {dst}"),
         vec![
             Field::new("source", "Source profile", FieldKind::Choice(others)),
-            Field::new("types", "Types", FieldKind::Choice(vec!["rpm+file".into(), "rpm".into(), "file".into()])),
+            Field::new("types", "Types", FieldKind::Choice(vec!["rpm+file".into(), "rpm".into(), "file".into(), "deb".into()])),
             Field::text("filter", "Distribution name contains"),
             Field::new("mirror", "Mirror (new versions match upstream)", FieldKind::Bool).help("off = additive (non-destructive)"),
         ],
@@ -1084,10 +1085,11 @@ mod tests {
     use crate::pulp::RepoType;
 
     #[test]
-    fn replication_types_stay_rpm_and_file() {
+    fn replication_types_offer_deb_alone_and_keep_the_rpm_and_file_default() {
         assert_eq!(super::replication_types("rpm+file"), [RepoType::Rpm, RepoType::File]);
         assert_eq!(super::replication_types("rpm"), [RepoType::Rpm]);
         assert_eq!(super::replication_types("file"), [RepoType::File]);
+        assert_eq!(super::replication_types("deb"), [RepoType::Deb]);
     }
 
     #[tokio::test]

@@ -72,6 +72,9 @@ then the test.
   `live_replication::canceled_native_replication_is_not_complete`
 * Fallback: dry run, create, idempotent rerun, upstream update, loop and self guards.
   `live_replication::fallback_replication`
+* Fallback of Deb: a structured and a simple publication on pulp2; each replica syncs the
+  served dists, publishes in the same mode, serves only the paths of that mode, and reruns.
+  `live_replication::deb_fallback_replication`
 * Repository and remote definitions pulp2 → pulp1: secrets are not in the file, the
   repositories get the remote of the same name, a rerun keeps all objects.
   `live_replication::repo_definitions_move_between_servers`
@@ -215,9 +218,9 @@ Not run again on 2026-11-02 (the results below are older):
 
 * Plugins other than RPM, File and Deb; creation of content guards and signing services;
   OIDC token refresh.
-* Deb: replication (a Deb distribution is skipped with a note), dependency solving on
-  copy. Deb Content View publications are never reused, and a Content View never makes a
-  verbatim publication.
+* Deb: dependency solving on copy; fallback replication of source packages. Deb Content
+  View publications are never reused, and a Content View never makes a verbatim
+  publication.
 * The signing service pickers list the services of all plugins (pulpcore has no type
   filter); Pulp refuses a wrong one.
 * The **K** key cannot store the password of the top-level `[database]`. Use `env:` or

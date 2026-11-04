@@ -196,6 +196,60 @@ async fn fallback_replication() {
     assert!(plan.iter().all(|p| p.action == PlanAction::Skip && p.note.contains("loop")), "{plan:?}");
 }
 
+/// Deb fallback replication: a structured and a simple publication of one synced repository on pulp2. Each replica
+/// on pulp1 syncs the dists that its upstream serves, publishes in the same mode and serves the packages; a rerun
+/// re-syncs.
+#[tokio::test]
+async fn deb_fallback_replication() {
+    if !live_enabled() {
+        return;
+    }
+    let (dst, up) = (client(), upstream_client());
+    let t = RepoType::Deb;
+    let prefix = unique("fbdeb");
+    let body = json!({ "name": prefix, "url": format!("{}/deb/", upstream()), "policy": "immediate", "distributions": "fixture" });
+    let remote = create(&up, t.remotes(), body, "/remotes/").await;
+    let repo = create(&up, t.repositories(), json!({ "name": prefix, "remote": remote }), "/repositories/").await;
+    ops::settle(&up, ops::sync(&up, t, &repo, None, "mirror").await.unwrap(), &no_progress).await.unwrap();
+    let v = latest(&up, &repo).await;
+    let (apt, simple) = (format!("{prefix}-apt"), format!("{prefix}-simple"));
+    for (k, mode) in [("apt", json!({})), ("simple", json!({ "simple": true, "structured": false }))] {
+        let p = ops::create_publication(&up, t, &v, &mode, &no_progress).await.unwrap();
+        let (name, base_path) = (format!("{prefix}-{k}"), format!("{prefix}/{k}"));
+        ops::ensure_distribution(&up, t, &name, &base_path, Some(&p), &json!({}), None, &no_progress).await.unwrap();
+    }
+    let store = Store::open_in_memory().await.unwrap();
+
+    let plan = replication::plan(&up, &dst, &[t], &prefix, Some("http://127.0.0.1:8080/pulp/content/")).await.unwrap();
+    let rows: Vec<_> = plan.iter().map(|p| (p.name.clone(), p.action.clone(), p.distributions.clone(), p.mode["simple"].clone())).collect();
+    assert_eq!(
+        rows,
+        [
+            (apt.clone(), PlanAction::Create, Some("fixture".to_string()), json!(false)),
+            (simple.clone(), PlanAction::Create, Some("default".to_string()), json!(true)),
+        ],
+        "{plan:?}"
+    );
+    let res = replication::run(&dst, &store, up.profile(), &plan, true, &|_| {}, &no_progress).await.unwrap();
+    assert!(res.iter().all(|l| l.starts_with("completed") && l.contains("matching digest")), "{res:?}");
+    // Each replica serves the paths of its mode only.
+    for (name, served_path, absent) in [
+        (&apt, "dists/fixture/Release", "dists/default/all/binary-amd64/Packages"),
+        (&simple, "dists/default/Release", "dists/fixture/Release"),
+    ] {
+        let d: Distribution = ops::find_by_name(&dst, &dst.api(t.distributions()), name).await.unwrap().unwrap();
+        let base = d.base_url.unwrap();
+        assert_eq!(served(&dst, &format!("{base}{served_path}")).await.0, 200, "{name}: {served_path}");
+        assert_eq!(served(&dst, &format!("{base}{absent}")).await.0, 404, "{name}: {absent}");
+    }
+
+    // A rerun re-syncs the replicas and reuses their publications.
+    let plan = replication::plan(&up, &dst, &[t], &prefix, None).await.unwrap();
+    assert!(plan.iter().all(|p| p.action == PlanAction::Update), "{plan:?}");
+    let res = replication::run(&dst, &store, up.profile(), &plan, true, &|_| {}, &no_progress).await.unwrap();
+    assert!(res.iter().all(|l| l.starts_with("completed")), "{res:?}");
+}
+
 /// `export-repos` on pulp2 and `import-repos` on pulp1: a repository gets the remote of the same name on pulp1,
 /// no secret is in the file, and a rerun keeps everything.
 #[tokio::test]

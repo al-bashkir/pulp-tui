@@ -587,12 +587,17 @@ Native Upstream Pulp objects (tech preview).
     may delete local objects and needs a typed confirmation, also on Replicate;
   * **Replica download policy** (`immediate`, `on_demand` or `streamed`), concurrency, max
     retries, timeouts. Pulp copies them to the replica remotes.
-* **F** fallback: sync from another profile. Choose types (RPM, File), a name filter, and additive
-  or mirror mode. A dry run lists `CREATE` / `SYNC` / `SKIP` per distribution before anything
-  changes. You can run it again safely.
+* **F** fallback: sync from another profile. Choose types (RPM and File, RPM, File, or Deb), a name
+  filter, and additive or mirror mode. A dry run lists `CREATE` / `SYNC` / `SKIP` per distribution
+  before anything changes. You can run it again safely.
   * Both servers need the plugin of each type.
-  * A File distribution without a readable publication or manifest is a `SKIP` row with the
-    reason.
+  * A File or Deb distribution without a readable publication is a `SKIP` row with the reason;
+    so is a File one without a manifest.
+  * A Deb replica syncs the releases (`dists/`) that the upstream publication serves and publishes
+    them in the same mode: structured, simple or verbatim. It is signed only when its repository
+    has a signing service; the dry run row says when the upstream is signed and the replica will
+    not be. Set the service before the first run: a rerun reuses the publication of an unchanged
+    version.
   * It does not follow an upstream base path change: the row shows a 409 conflict. Delete or move
     the replica distribution by hand.
 

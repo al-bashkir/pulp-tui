@@ -472,6 +472,20 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   `canceled 1`. pulp-tui reports canceled or skipped tasks as not complete.
 * **History** pages through `task-groups/` for `Replication of <upstream>` and stops at
   five matches or 2000 groups.
+* **Deb replica (fallback).** A structured APT publication serves each release of its
+  release components under `dists/<release>/`, and a flat `/` as an ordinary release under
+  `dists/flat-repo/` (pulp_deb 3.11.1 `_ReleaseHelper`); a simple one serves `dists/default/`
+  with component `all`. So the replica remote syncs those directories. Without
+  `components`, `architectures` and `sync_sources`, it syncs every component and
+  architecture of the served Release and no source packages (pulp_deb defaults). An APT
+  publication without its own `signing_service` is signed with the repository's
+  (`release_signing_service`, structured releases only; a simple release uses the
+  repository's `signing_service`). A verbatim one serves the synced Release files and
+  signatures as they are.
+* **Upstream `base_url`** is the upstream's content origin: in the test containers
+  `http://host.containers.internal:8081`, which pulp1 reaches and the host does not resolve
+  (seen live). So the fallback reads the upstream through its API only; the replica
+  remote gets that URL as it is.
 * **`api_root`** of an Upstream Pulp is relative and needs a trailing slash (`pulp/`).
 * **Deletion policy.** In 3.123.1, `remove_missing` deletes for every policy but `nodelete`:
   `labeled` deletes the objects labeled with this Upstream Pulp that are gone upstream, `all`
@@ -657,7 +671,9 @@ or IpAddress(127.0.0.1)`.
 ## Unsupported or limited
 
 * Plugins other than pulp_rpm, pulp_file and pulp_deb (container, python, …).
-* pulp_deb: no replication, no dependency solving.
+* pulp_deb: no dependency solving. Fallback replication copies binary packages only (no
+  source packages, udebs or installer files), and not a verbatim publication of a flat
+  repository (it is served at the root, not under `dists/`).
 * RPM layout `nested_by_digest`: served-content checks skip the package probe (metadata is
   still checked).
 * ULN: a sync from a ULN remote is tested with mock HTTP only (it needs a ULN account).
