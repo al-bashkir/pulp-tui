@@ -1528,59 +1528,18 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
         .note("Pinned: serves exactly one immutable publication. Following latest: serves the newest publication (RPM: use autopublish).")
         .note("An existing distribution with this name is re-pointed; base paths of other distributions are never taken over.");
     app.form(form, move |app, f| {
-        let (dist, bp, follow) =
-            (f.get("dist").to_string(), f.get("base_path").trim_matches('/').to_string(), f.get("mode").starts_with("follow"));
-        let (version, repo, publication) = (version.clone(), repo.clone(), publication.clone());
-        let signing = f.opt("signing_service").map(str::to_string);
+        let (dist, bp) = (f.get("dist").to_string(), f.get("base_path").trim_matches('/').to_string());
+        let binding = match (f.get("mode").starts_with("follow"), &publication) {
+            (true, _) => repo.clone().map(Binding::Follow).ok_or_else(|| anyhow!("no repository")),
+            (false, Some(p)) => Ok(Binding::Publication(p.clone())),
+            (false, None) => version
+                .clone()
+                .map(|v| Binding::Version(v, f.opt("signing_service").map(str::to_string)))
+                .ok_or_else(|| anyhow!("repository has no versions")),
+        };
         app.job(format!("distribute {dist}"), move |ctx| async move {
-            let c = &ctx.client;
-            let on = ctx.on_task();
-            let existing = ops::find_by_name::<Value>(c, &c.api(t.distributions()), &dist).await?;
-            if let Some(d) = &existing {
-                cv_distribution_refusal(d)?;
-            }
-            let href = if follow {
-                let repo = repo.ok_or_else(|| anyhow!("no repository"))?;
-                match existing {
-                    Some(d) => {
-                        if s(&d, "base_path") != bp {
-                            bail!("distribution {dist} serves {} instead of {bp}", s(&d, "base_path"));
-                        }
-                        let h = s(&d, "pulp_href");
-                        let mut b = json!({ "repository": repo, "publication": null });
-                        // Pulp keeps a field that a PATCH leaves out, and refuses two bindings (HTTP 400).
-                        if d["repository_version"].is_string() {
-                            b["repository_version"] = Value::Null;
-                        }
-                        ops::settle(c, c.patch(&h, &b).await?, &on).await?;
-                        h
-                    }
-                    None => {
-                        ops::create(
-                            c,
-                            &c.api(t.distributions()),
-                            &json!({ "name": dist, "base_path": bp, "repository": repo }),
-                            "/distributions/",
-                            &on,
-                        )
-                        .await?
-                    }
-                }
-            } else {
-                let p = match publication {
-                    Some(p) => p,
-                    None => {
-                        let v = version.ok_or_else(|| anyhow!("repository has no versions"))?;
-                        let served = match &existing {
-                            Some(d) => ops::served_publication(c, &ctx.caps, t, d).await?,
-                            None => None,
-                        };
-                        ops::ensure_publication(c, t, &v, &pinned_mode(t, served.as_ref(), &v, signing), &on).await?
-                    }
-                };
-                ops::ensure_distribution(c, t, &dist, &bp, Some(&p), &json!({}), None, &on).await?
-            };
-            let d: Value = c.get(&href, &[]).await?;
+            let href = distribute(&ctx, t, &dist, &bp, binding).await?;
+            let d: Value = ctx.client.get(&href, &[]).await?;
             let url = s(&d, "base_url");
             ap(move |app| {
                 app.ok(format!("distribution {dist} serves {url}"));
@@ -1589,6 +1548,83 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
         });
         Ok(())
     });
+}
+
+/// What Distribute binds a distribution to.
+enum Binding {
+    /// Follows the repository (href): serves its newest publication.
+    Follow(String),
+    /// Pinned to this publication.
+    Publication(String),
+    /// Pinned to a publication of this version, in the mode that the distribution serves now; with the
+    /// picked signing service, if any.
+    Version(String, Option<String>),
+}
+
+/// Create or re-point distribution `dist` at base path `bp`, and return its href. `binding` is an error
+/// when the form had nothing to bind to; it is reported after the Content View refusal.
+async fn distribute(ctx: &Ctx, t: RepoType, dist: &str, bp: &str, binding: anyhow::Result<Binding>) -> anyhow::Result<String> {
+    let (c, on) = (&ctx.client, ctx.on_task());
+    let existing = existing_distribution(c, t, dist).await?;
+    let p = match binding? {
+        Binding::Follow(repo) => return follow_repository(c, t, existing, dist, bp, &repo, &on).await,
+        Binding::Publication(p) => p,
+        Binding::Version(v, signing) => pinned_publication(ctx, t, existing.as_ref(), &v, signing).await?,
+    };
+    Ok(ops::ensure_distribution(c, t, dist, bp, Some(&p), &json!({}), None, &on).await?)
+}
+
+/// The distribution of type `t` named `name`, if any; one that a Content View owns is refused.
+async fn existing_distribution(c: &PulpClient, t: RepoType, name: &str) -> anyhow::Result<Option<Value>> {
+    let d = ops::find_by_name::<Value>(c, &c.api(t.distributions()), name).await?;
+    d.as_ref().map_or(Ok(()), cv_distribution_refusal)?;
+    Ok(d)
+}
+
+/// A publication of version `v` in the mode that distribution `existing` serves now (`pinned_mode`), reused or new.
+async fn pinned_publication(ctx: &Ctx, t: RepoType, existing: Option<&Value>, v: &str, signing: Option<String>) -> anyhow::Result<String> {
+    let c = &ctx.client;
+    let served = match existing {
+        Some(d) => ops::served_publication(c, &ctx.caps, t, d).await?,
+        None => None,
+    };
+    Ok(ops::ensure_publication(c, t, v, &pinned_mode(t, served.as_ref(), v, signing), &ctx.on_task()).await?)
+}
+
+/// Version `n` of repository `r` (JSON), or its latest version when `n` is empty.
+fn version_or_latest(r: &Value, n: Option<i64>) -> anyhow::Result<String> {
+    match n {
+        Some(n) => Ok(version_of(&s(r, "pulp_href"), n)),
+        None => r["latest_version_href"].as_str().map(str::to_string).ok_or_else(|| anyhow!("no versions")),
+    }
+}
+
+/// Bind `existing`, or a new distribution `dist` at `bp`, to repository `repo`. An existing distribution
+/// at another base path is refused.
+async fn follow_repository(
+    c: &PulpClient,
+    t: RepoType,
+    existing: Option<Value>,
+    dist: &str,
+    bp: &str,
+    repo: &str,
+    on: ops::OnTask<'_>,
+) -> anyhow::Result<String> {
+    let Some(d) = existing else {
+        let body = json!({ "name": dist, "base_path": bp, "repository": repo });
+        return Ok(ops::create(c, &c.api(t.distributions()), &body, "/distributions/", on).await?);
+    };
+    if s(&d, "base_path") != bp {
+        bail!("distribution {dist} serves {} instead of {bp}", s(&d, "base_path"));
+    }
+    let h = s(&d, "pulp_href");
+    let mut b = json!({ "repository": repo, "publication": null });
+    // Pulp keeps a field that a PATCH leaves out, and refuses two bindings (HTTP 400).
+    if d["repository_version"].is_string() {
+        b["repository_version"] = Value::Null;
+    }
+    ops::settle(c, c.patch(&h, &b).await?, on).await?;
+    Ok(h)
 }
 
 // ---- remotes -------------------------------------------------------------------------
@@ -2296,90 +2332,97 @@ fn content_action(app: &mut App, version: String, act: Act) {
 // ---- publications and distributions --------------------------------------------------------
 
 fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
-    let href = s(&item, "pulp_href");
+    let (href, version) = (s(&item, "pulp_href"), s(&item, "repository_version"));
     match act {
-        Act::Create => {
-            let mut fields = vec![
-                Field::pick("repo", "Repository", Source::Repos(Some(t))).required(),
-                Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
-            ];
-            fields.extend(signing_field(app, t));
-            fields.extend(publication_fields(caps(app).as_deref(), t));
-            let form = Form::new(format!("New {} publication", t.label()), fields);
-            app.form(form, move |app, f| {
-                let (repo, number, options) = (f.get("repo").to_string(), f.number("number"), publication_options(f)?);
-                // Pulp takes `checkpoint` only with `repository`, and then publishes the latest version.
-                let checkpoint = options["checkpoint"] == true;
-                if checkpoint && number.is_some() {
-                    return Err("Checkpoint publishes the latest version: leave Version number empty".into());
-                }
-                app.job(format!("publish {repo}"), move |ctx| async move {
-                    let c = &ctx.client;
-                    let r: Value =
-                        ops::find_by_name(c, &c.api(t.repositories()), &repo).await?.ok_or_else(|| anyhow!("no repository {repo}"))?;
-                    let v = match number {
-                        Some(n) => version_of(&s(&r, "pulp_href"), n),
-                        None => r["latest_version_href"].as_str().ok_or_else(|| anyhow!("no versions"))?.to_string(),
-                    };
-                    let mut body = ops::publication_body(c, t, &v, &options).await?;
-                    if checkpoint {
-                        body.as_object_mut().expect("an object").remove("repository_version");
-                        body["repository"] = s(&r, "pulp_href").into();
-                    }
-                    let p = ops::create(c, &c.api(t.publications()), &body, "/publications/", &ctx.on_task()).await?;
-                    ap(move |app| {
-                        app.ok(format!("publication {} of {}", short(&p), short(&v)));
-                        app.reload();
-                    })
-                });
-                Ok(())
-            });
-        }
-        Act::Distribute => {
-            let v = s(&item, "repository_version");
-            distribute_form(app, t, short(&repo_of_version(&v)), Some(v), None, Some(href));
-        }
-        Act::Delete => {
-            let (id, version) = (short(&href), s(&item, "repository_version"));
-            app.job(format!("impact of deleting publication {id}"), move |ctx| async move {
-                // Fails closed: without the Content View store the snapshot check cannot run.
-                let st = ctx.cv()?.store;
-                if let Some((_, cv, env)) = st.served_publications(&ctx.scope).await?.into_iter().find(|p| p.0 == href) {
-                    bail!("refused: Content View {cv} serves publication {id} in {env}; promote or roll back the view instead");
-                }
-                if st.protected_versions(&ctx.scope).await?.contains(&version) {
-                    bail!("refused: publication {id} is of a Content View snapshot (delete the Content View version instead)");
-                }
-                let pubs = ops::publications_where(&ctx.client, &ctx.caps, t, ("repository", &ops::repo_of_version(&version))).await?;
-                let users: Vec<String> = ops::distributions(&ctx.client, t)
-                    .await?
-                    .iter()
-                    .filter_map(|d| {
-                        let after = match ops::served_after_delete(d, &href, &pubs)? {
-                            Some(p) => format!(
-                                "publication {} (version {})",
-                                short(&s(p, "pulp_href")),
-                                ops::version_number(&s(p, "repository_version"))
-                            ),
-                            None => "nothing".into(),
-                        };
-                        Some(format!("  {} ({}): then serves {after}", d.name, d.base_url.as_deref().unwrap_or(&d.base_path)))
-                    })
-                    .collect();
-                let mut lines = vec![format!("Delete publication {id} of {}. The repository version is not affected.", short(&version))];
-                if !users.is_empty() {
-                    lines.push(format!("WARNING: {} distribution(s) serve this publication now:", users.len()));
-                    lines.extend(users);
-                }
-                ap(move |app| {
-                    app.confirm_danger("Delete publication", lines, &id, move |app| {
-                        submit(app, "delete publication", move |c| async move { Ok(c.delete(&href).await?) })
-                    })
-                })
-            });
-        }
+        Act::Create => publication_create(app, t),
+        Act::Distribute => distribute_form(app, t, short(&repo_of_version(&version)), Some(version), None, Some(href)),
+        Act::Delete => publication_delete(app, t, href, version),
         _ => {}
     }
+}
+
+/// The New publication form: a repository version (or a checkpoint of the latest one) with the options set.
+fn publication_create(app: &mut App, t: RepoType) {
+    let mut fields = vec![
+        Field::pick("repo", "Repository", Source::Repos(Some(t))).required(),
+        Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
+    ];
+    fields.extend(signing_field(app, t));
+    fields.extend(publication_fields(caps(app).as_deref(), t));
+    let form = Form::new(format!("New {} publication", t.label()), fields);
+    app.form(form, move |app, f| {
+        let (repo, number, options) = (f.get("repo").to_string(), f.number("number"), publication_options(f)?);
+        // Pulp takes `checkpoint` only with `repository`, and then publishes the latest version.
+        let checkpoint = options["checkpoint"] == true;
+        if checkpoint && number.is_some() {
+            return Err("Checkpoint publishes the latest version: leave Version number empty".into());
+        }
+        app.job(format!("publish {repo}"), move |ctx| async move {
+            let c = &ctx.client;
+            let r = repo_by_name(c, t, &repo).await?;
+            let v = version_or_latest(&r, number)?;
+            let mut body = ops::publication_body(c, t, &v, &options).await?;
+            if checkpoint {
+                body.as_object_mut().expect("an object").remove("repository_version");
+                body["repository"] = s(&r, "pulp_href").into();
+            }
+            let p = ops::create(c, &c.api(t.publications()), &body, "/publications/", &ctx.on_task()).await?;
+            ap(move |app| {
+                app.ok(format!("publication {} of {}", short(&p), short(&v)));
+                app.reload();
+            })
+        });
+        Ok(())
+    });
+}
+
+/// Delete publication `href` of `version` after the typed confirm, which names each distribution that serves
+/// it and what it serves after. A publication that a Content View serves or owns is refused.
+fn publication_delete(app: &mut App, t: RepoType, href: String, version: String) {
+    let id = short(&href);
+    app.job(format!("impact of deleting publication {id}"), move |ctx| async move {
+        cv_publication_refusal(&ctx, &href, &version).await?;
+        let pubs = ops::publications_where(&ctx.client, &ctx.caps, t, ("repository", &ops::repo_of_version(&version))).await?;
+        let users = served_after_delete_lines(&ops::distributions(&ctx.client, t).await?, &href, &pubs);
+        let mut lines = vec![format!("Delete publication {id} of {}. The repository version is not affected.", short(&version))];
+        if !users.is_empty() {
+            lines.push(format!("WARNING: {} distribution(s) serve this publication now:", users.len()));
+            lines.extend(users);
+        }
+        ap(move |app| {
+            app.confirm_danger("Delete publication", lines, &id, move |app| {
+                submit(app, "delete publication", move |c| async move { Ok(c.delete(&href).await?) })
+            })
+        })
+    });
+}
+
+/// An error when a Content View serves publication `href` (of `version`), or `version` is a Content View
+/// snapshot. Fails closed: without the Content View store the check cannot run.
+async fn cv_publication_refusal(ctx: &Ctx, href: &str, version: &str) -> anyhow::Result<()> {
+    let (st, id) = (ctx.cv()?.store, short(href));
+    if let Some((_, cv, env)) = st.served_publications(&ctx.scope).await?.into_iter().find(|p| p.0 == href) {
+        bail!("refused: Content View {cv} serves publication {id} in {env}; promote or roll back the view instead");
+    }
+    if st.protected_versions(&ctx.scope).await?.iter().any(|v| v == version) {
+        bail!("refused: publication {id} is of a Content View snapshot (delete the Content View version instead)");
+    }
+    Ok(())
+}
+
+/// "  name (URL): then serves X" for each distribution of `ds` that serves publication `href` now
+/// (`ops::served_after_delete`; `pubs`: the publications of its repository).
+fn served_after_delete_lines(ds: &[Distribution], href: &str, pubs: &[Value]) -> Vec<String> {
+    let after = |p: Option<&Value>| match p {
+        Some(p) => format!("publication {} (version {})", short(&s(p, "pulp_href")), version_number(&s(p, "repository_version"))),
+        None => "nothing".into(),
+    };
+    ds.iter()
+        .filter_map(|d| {
+            let then = after(ops::served_after_delete(d, href, pubs)?);
+            Some(format!("  {} ({}): then serves {then}", d.name, d.base_url.as_deref().unwrap_or(&d.base_path)))
+        })
+        .collect()
 }
 
 /// Distribution flags (key, label, help), each shown when the server's distribution schema has it.
@@ -2390,173 +2433,17 @@ const DIST_FLAGS: [(&str, &str, &str); 3] = [
 ];
 
 fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
-    let href = s(&item, "pulp_href");
-    let name = s(&item, "name");
+    let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
     match act {
         Act::CopyUrl => {
             let url = s(&item, "base_url");
             copy_to_clipboard(&url);
             app.ok(format!("copied {url}"));
         }
-        Act::Verify => app.job(format!("verify {name}"), move |ctx| async move {
-            let c = &ctx.client;
-            let d: Value = c.get(&href, &[]).await?;
-            let Some((version, publication, how)) = served_now(c, &ctx.caps, t, &d).await? else {
-                bail!("distribution serves nothing (no binding, or no publication of its repository or version)");
-            };
-            let res = ops::verify_served(c, t, &s(&d, "base_url"), &version, &publication).await;
-            let lines = vec![
-                format!("{name}: {how}"),
-                format!("expected content: {}", short(&version)),
-                format!("URL: {}", s(&d, "base_url")),
-                String::new(),
-                match res {
-                    Ok(m) => format!("OK: {m}"),
-                    Err(e) => format!("MISMATCH: {e}"),
-                },
-            ];
-            ap(move |app| app.text(format!("Verify {name}"), lines))
-        }),
-        Act::Rollback => {
-            let form = Form::new(
-                format!("Re-point {name}"),
-                vec![
-                    Field::pick("repo", "Repository", Source::Repos(Some(t))).required(),
-                    Field::new("number", "Version number", FieldKind::Number).required(),
-                ],
-            );
-            app.form(form, move |app, f| {
-                let (repo, n, dist) = (f.get("repo").to_string(), f.number("number").unwrap_or(0), name.clone());
-                app.job("resolve version", move |ctx| async move {
-                    let h = href_by_name(&ctx.client, t.repositories(), &repo).await?;
-                    ap(move |app| rollback_preview(app, t, dist, version_of(&h, n)))
-                });
-                Ok(())
-            });
-        }
-        Act::Create | Act::Edit => {
-            let edit = act == Act::Edit;
-            let v = if edit { item.clone() } else { Value::Null };
-            let modes = ["publication of a repository version", "follow repository latest", "none"].map(String::from).to_vec();
-            let (owner, bound_to_version) = (cv_owner(&v), v["repository_version"].is_string());
-            // Promote finds a view's distribution by its name and ownership labels.
-            let ownership =
-                |labels: &Value| [crate::cv::LABEL_CV, crate::cv::LABEL_ENV, crate::cv::LABEL_DB].map(|k| labels.get(k).cloned());
-            let owned_labels = ownership(&v["pulp_labels"]);
-            let mut fields = vec![
-                Field::text("name", "Name").required().value(s(&v, "name")),
-                Field::text("base_path", "Base path").required().value(s(&v, "base_path")),
-                Field::new("mode", "Serve", FieldKind::Choice(modes)).value(if v["repository"].is_string() {
-                    "follow repository latest"
-                } else {
-                    "publication of a repository version"
-                }),
-                Field::pick("repo", "Repository", Source::Repos(Some(t)))
-                    .help("required unless Serve = none; empty on edit = keep binding"),
-                Field::new("number", "Version number", FieldKind::Number).help("empty = latest version"),
-            ];
-            fields.extend(signing_field(app, t));
-            fields.extend([
-                Field::pick("content_guard", "Content guard", Source::ContentGuards).value(s(&v, "content_guard")),
-                Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
-            ]);
-            let caps = caps(app);
-            for (k, label, help) in DIST_FLAGS {
-                if caps.as_ref().is_none_or(|c| c.has_field(t.distribution_schema(), k))
-                    && (k != "generate_repo_config" || t == RepoType::Rpm)
-                {
-                    let on = if v[k] == true { "true" } else { "false" };
-                    fields.push(Field::new(k, label, FieldKind::Bool).value(on).help(help));
-                }
-            }
-            let mut form =
-                Form::new(if edit { format!("Edit distribution {name}") } else { format!("New {} distribution", t.label()) }, fields)
-                    .note("Changing the base path or binding changes what consumers receive at this URL.");
-            if let Some(cv) = &owner {
-                form = form.note(format!(
-                    "Content View {cv} owns this distribution: change what it serves with promote or roll back. Later promotions keep a changed base path."
-                ));
-            }
-            app.form(form, move |app, f| {
-                let mut b = json!({});
-                for k in ["name", "base_path", "content_guard"] {
-                    if !edit || f.changed(k) {
-                        // An href keeps its slashes; names and base paths do not.
-                        b[k] = f
-                            .opt(k)
-                            .map(|x| Value::from(if k == "content_guard" { x } else { x.trim_matches('/') }))
-                            .unwrap_or(Value::Null);
-                    }
-                }
-                if !edit || f.changed("labels") {
-                    b["pulp_labels"] = parse_labels(f.get("labels"))?;
-                }
-                for (k, ..) in DIST_FLAGS {
-                    // Create: only what is on (off is Pulp's default).
-                    if if edit { f.changed(k) } else { f.bool(k) } {
-                        b[k] = f.bool(k).into();
-                    }
-                }
-                let (mode, repo, n) = (f.get("mode").to_string(), f.opt("repo").map(str::to_string), f.number("number"));
-                // Pulp refuses it with a publication or version binding (HTTP 400).
-                if f.bool("checkpoint") && !mode.starts_with("follow") {
-                    return Err(
-                        "Checkpoint needs Serve = follow repository latest: Pulp serves the checkpoint publications of a repository".into(),
-                    );
-                }
-                let signing = f.opt("signing_service").map(str::to_string);
-                if repo.is_none() && mode != "none" && !edit {
-                    return Err("repository is required".into());
-                }
-                let rebind = mode == "none" || repo.is_some();
-                if let (Some(cv), true) = (&owner, rebind) {
-                    return Err(format!("refused: Content View {cv} owns this distribution; promote or roll back the view instead"));
-                }
-                if let Some(cv) = &owner
-                    && (f.changed("name") || (f.changed("labels") && ownership(&b["pulp_labels"]) != owned_labels))
-                {
-                    return Err(format!("refused: Content View {cv} finds this distribution by its name and pulp_tui labels; keep them"));
-                }
-                let (href, current) = (href.clone(), v.clone());
-                let label = format!("{} distribution {}", if edit { "update" } else { "create" }, f.get("name"));
-                app.job(label.clone(), move |ctx| async move {
-                    let c = &ctx.client;
-                    let on = ctx.on_task();
-                    // Pulp keeps a field that a PATCH leaves out, and refuses two bindings (HTTP 400).
-                    if rebind && bound_to_version {
-                        b["repository_version"] = Value::Null;
-                    }
-                    if mode == "none" {
-                        b["publication"] = Value::Null;
-                        b["repository"] = Value::Null;
-                    } else if let Some(r) = repo {
-                        let rv: Value =
-                            ops::find_by_name(c, &c.api(t.repositories()), &r).await?.ok_or_else(|| anyhow!("no repository {r}"))?;
-                        let rh = s(&rv, "pulp_href");
-                        if mode.starts_with("follow") {
-                            b["repository"] = rh.into();
-                            b["publication"] = Value::Null;
-                        } else {
-                            let v = match n {
-                                Some(n) => version_of(&rh, n),
-                                None => rv["latest_version_href"].as_str().ok_or_else(|| anyhow!("no versions"))?.to_string(),
-                            };
-                            let served = ops::served_publication(c, &ctx.caps, t, &current).await?;
-                            b["publication"] =
-                                ops::ensure_publication(c, t, &v, &pinned_mode(t, served.as_ref(), &v, signing), &on).await?.into();
-                            b["repository"] = Value::Null;
-                        }
-                    }
-                    let m = if edit { c.patch(&href, &b).await? } else { c.post(&c.api(t.distributions()), &b).await? };
-                    ops::settle(c, m, &on).await?;
-                    ap(move |app| {
-                        app.ok(format!("{label}: done"));
-                        app.reload();
-                    })
-                });
-                Ok(())
-            });
-        }
+        Act::Verify => distribution_verify(app, t, href, name),
+        Act::Rollback => repoint_form(app, t, name),
+        Act::Create => distribution_form(app, t, None),
+        Act::Edit => distribution_form(app, t, Some(item)),
         Act::Delete => {
             let lines = distribution_delete_lines(&item);
             app.confirm_danger(format!("Delete distribution {name}"), lines, &name.clone(), move |app| {
@@ -2565,6 +2452,208 @@ fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         }
         _ => {}
     }
+}
+
+/// Compare what distribution `href` serves with the repository version of that publication.
+fn distribution_verify(app: &mut App, t: RepoType, href: String, name: String) {
+    app.job(format!("verify {name}"), move |ctx| async move {
+        let c = &ctx.client;
+        let d: Value = c.get(&href, &[]).await?;
+        let Some((version, publication, how)) = served_now(c, &ctx.caps, t, &d).await? else {
+            bail!("distribution serves nothing (no binding, or no publication of its repository or version)");
+        };
+        let res = ops::verify_served(c, t, &s(&d, "base_url"), &version, &publication).await;
+        let lines = vec![
+            format!("{name}: {how}"),
+            format!("expected content: {}", short(&version)),
+            format!("URL: {}", s(&d, "base_url")),
+            String::new(),
+            match res {
+                Ok(m) => format!("OK: {m}"),
+                Err(e) => format!("MISMATCH: {e}"),
+            },
+        ];
+        ap(move |app| app.text(format!("Verify {name}"), lines))
+    });
+}
+
+/// Ask for a repository version, then show the rollback preview of distribution `name` to it.
+fn repoint_form(app: &mut App, t: RepoType, name: String) {
+    let form = Form::new(
+        format!("Re-point {name}"),
+        vec![
+            Field::pick("repo", "Repository", Source::Repos(Some(t))).required(),
+            Field::new("number", "Version number", FieldKind::Number).required(),
+        ],
+    );
+    app.form(form, move |app, f| {
+        let (repo, n, dist) = (f.get("repo").to_string(), f.number("number").unwrap_or(0), name.clone());
+        app.job("resolve version", move |ctx| async move {
+            let h = href_by_name(&ctx.client, t.repositories(), &repo).await?;
+            ap(move |app| rollback_preview(app, t, dist, version_of(&h, n)))
+        });
+        Ok(())
+    });
+}
+
+/// What the distribution form serves.
+enum Serve {
+    /// Unbound: serves nothing.
+    Nothing,
+    /// An edit without a repository: the binding stays.
+    Keep,
+    /// Follows the repository (name): serves its newest publication.
+    Follow(String),
+    /// Pinned to a publication of version `number` (empty: latest) of the repository (name), in the mode that
+    /// the distribution serves now; with the picked signing service, if any.
+    Pin(String, Option<i64>, Option<String>),
+}
+
+/// The labels that promote finds a Content View's distribution by.
+fn ownership(labels: &Value) -> [Option<Value>; 3] {
+    [crate::cv::LABEL_CV, crate::cv::LABEL_ENV, crate::cv::LABEL_DB].map(|k| labels.get(k).cloned())
+}
+
+/// The New / Edit distribution form; `current`: the distribution to edit.
+fn distribution_form(app: &mut App, t: RepoType, current: Option<Value>) {
+    let edit = current.is_some();
+    let v = current.unwrap_or(Value::Null);
+    let owner = cv_owner(&v);
+    let owned_labels = ownership(&v["pulp_labels"]);
+    let title = if edit { format!("Edit distribution {}", s(&v, "name")) } else { format!("New {} distribution", t.label()) };
+    let mut form = Form::new(title, distribution_fields(app, t, &v))
+        .note("Changing the base path or binding changes what consumers receive at this URL.");
+    if let Some(cv) = &owner {
+        form = form.note(format!(
+            "Content View {cv} owns this distribution: change what it serves with promote or roll back. Later promotions keep a changed base path."
+        ));
+    }
+    app.form(form, move |app, f| {
+        let b = distribution_changes(f, edit)?;
+        let serve = serve_choice(f, edit)?;
+        if let Some(cv) = &owner {
+            owner_refusal(cv, &serve, f, &b, &owned_labels)?;
+        }
+        let current = v.clone();
+        let label = format!("{} distribution {}", if edit { "update" } else { "create" }, f.get("name"));
+        app.job(label.clone(), move |ctx| async move {
+            save_distribution(&ctx, t, edit.then_some(&current), b, serve).await?;
+            ap(move |app| {
+                app.ok(format!("{label}: done"));
+                app.reload();
+            })
+        });
+        Ok(())
+    });
+}
+
+/// The edit of distribution `b` that Content View `cv` owns keeps its binding, name and ownership labels:
+/// promote finds the distribution by them.
+fn owner_refusal(cv: &str, serve: &Serve, f: &Form, b: &Value, owned_labels: &[Option<Value>; 3]) -> Result<(), String> {
+    if !matches!(serve, Serve::Keep) {
+        return Err(format!("refused: Content View {cv} owns this distribution; promote or roll back the view instead"));
+    }
+    if f.changed("name") || (f.changed("labels") && ownership(&b["pulp_labels"]) != *owned_labels) {
+        return Err(format!("refused: Content View {cv} finds this distribution by its name and pulp_tui labels; keep them"));
+    }
+    Ok(())
+}
+
+/// The fields of the distribution form, with the values of `v` (`Null`: a new distribution). Each flag of
+/// `DIST_FLAGS` is shown when the server's distribution schema has it.
+fn distribution_fields(app: &App, t: RepoType, v: &Value) -> Vec<Field> {
+    let modes = ["publication of a repository version", "follow repository latest", "none"].map(String::from).to_vec();
+    let mode = if v["repository"].is_string() { "follow repository latest" } else { "publication of a repository version" };
+    let mut fields = vec![
+        Field::text("name", "Name").required().value(s(v, "name")),
+        Field::text("base_path", "Base path").required().value(s(v, "base_path")),
+        Field::new("mode", "Serve", FieldKind::Choice(modes)).value(mode),
+        Field::pick("repo", "Repository", Source::Repos(Some(t))).help("required unless Serve = none; empty on edit = keep binding"),
+        Field::new("number", "Version number", FieldKind::Number).help("empty = latest version"),
+    ];
+    fields.extend(signing_field(app, t));
+    fields.extend([
+        Field::pick("content_guard", "Content guard", Source::ContentGuards).value(s(v, "content_guard")),
+        Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
+    ]);
+    let caps = caps(app);
+    let shown = |k: &str| {
+        caps.as_ref().is_none_or(|c| c.has_field(t.distribution_schema(), k)) && (k != "generate_repo_config" || t == RepoType::Rpm)
+    };
+    for (k, label, help) in DIST_FLAGS.into_iter().filter(|(k, ..)| shown(k)) {
+        let on = if v[k] == true { "true" } else { "false" };
+        fields.push(Field::new(k, label, FieldKind::Bool).value(on).help(help));
+    }
+    fields
+}
+
+/// The request body of the distribution form without the binding: on edit only what changed; on create every
+/// field, and of the flags only those that are on (off is Pulp's default).
+fn distribution_changes(f: &Form, edit: bool) -> Result<Value, String> {
+    let mut b = json!({});
+    for k in ["name", "base_path", "content_guard"].into_iter().filter(|k| !edit || f.changed(k)) {
+        // An href keeps its slashes; names and base paths do not.
+        b[k] = f.opt(k).map(|x| Value::from(if k == "content_guard" { x } else { x.trim_matches('/') })).unwrap_or(Value::Null);
+    }
+    if !edit || f.changed("labels") {
+        b["pulp_labels"] = parse_labels(f.get("labels"))?;
+    }
+    for (k, ..) in DIST_FLAGS.into_iter().filter(|(k, ..)| if edit { f.changed(k) } else { f.bool(k) }) {
+        b[k] = f.bool(k).into();
+    }
+    Ok(b)
+}
+
+/// What the distribution form serves. A new distribution needs a repository unless Serve = none.
+fn serve_choice(f: &Form, edit: bool) -> Result<Serve, String> {
+    let (mode, repo) = (f.get("mode"), f.opt("repo").map(str::to_string));
+    // Pulp refuses it with a publication or version binding (HTTP 400).
+    if f.bool("checkpoint") && !mode.starts_with("follow") {
+        return Err("Checkpoint needs Serve = follow repository latest: Pulp serves the checkpoint publications of a repository".into());
+    }
+    Ok(match repo {
+        _ if mode == "none" => Serve::Nothing,
+        None if edit => Serve::Keep,
+        None => return Err("repository is required".into()),
+        Some(r) if mode.starts_with("follow") => Serve::Follow(r),
+        Some(r) => Serve::Pin(r, f.number("number"), f.opt("signing_service").map(str::to_string)),
+    })
+}
+
+/// The repository of type `t` named `name`.
+async fn repo_by_name(c: &PulpClient, t: RepoType, name: &str) -> anyhow::Result<Value> {
+    ops::find_by_name(c, &c.api(t.repositories()), name).await?.ok_or_else(|| anyhow!("no repository {name}"))
+}
+
+/// The binding fields to send for `serve` (none: the binding stays), also `repository_version: null` for a
+/// distribution on a version. `current`: the distribution that is edited (a pinned one keeps the mode of what it
+/// serves).
+async fn binding_fields(ctx: &Ctx, t: RepoType, current: Option<&Value>, serve: Serve) -> anyhow::Result<serde_json::Map<String, Value>> {
+    let c = &ctx.client;
+    let (repository, publication) = match serve {
+        Serve::Keep => return Ok(serde_json::Map::new()),
+        Serve::Nothing => (Value::Null, Value::Null),
+        Serve::Follow(r) => (s(&repo_by_name(c, t, &r).await?, "pulp_href").into(), Value::Null),
+        Serve::Pin(r, n, signing) => {
+            let v = version_or_latest(&repo_by_name(c, t, &r).await?, n)?;
+            (Value::Null, pinned_publication(ctx, t, current, &v, signing).await?.into())
+        }
+    };
+    // Pulp keeps a field that a PATCH leaves out, and refuses two bindings (HTTP 400).
+    let on_version = current.filter(|d| d["repository_version"].is_string()).map(|_| ("repository_version".into(), Value::Null));
+    Ok([("repository".into(), repository), ("publication".into(), publication)].into_iter().chain(on_version).collect())
+}
+
+/// Create a distribution with `b` and the binding of `serve`, or PATCH `current` with them.
+async fn save_distribution(ctx: &Ctx, t: RepoType, current: Option<&Value>, mut b: Value, serve: Serve) -> anyhow::Result<()> {
+    let (c, on) = (&ctx.client, ctx.on_task());
+    b.as_object_mut().expect("an object").extend(binding_fields(ctx, t, current, serve).await?);
+    let m = match current {
+        Some(d) => c.patch(&s(d, "pulp_href"), &b).await?,
+        None => c.post(&c.api(t.distributions()), &b).await?,
+    };
+    ops::settle(c, m, &on).await?;
+    Ok(())
 }
 
 // ---- tasks ----------------------------------------------------------------------------------
@@ -5154,6 +5243,7 @@ mod tests {
         assert_eq!(flag(&bodies[0]), [None, None, None], "untouched edit: not sent");
         assert_eq!(flag(&bodies[1]), [Some(json!(false)), Some(json!(true)), None], "the changes");
         assert_eq!(flag(&bodies[2]), [None, None, Some(json!(true))], "create: only what is on");
+        assert_eq!(bodies[2].get("content_guard"), Some(&Value::Null), "create: every field, also an empty one");
         assert_eq!(bodies.len(), 3);
     }
 
@@ -5176,6 +5266,12 @@ mod tests {
             let mut edited = form.clone();
             edited.fields.iter_mut().find(|f| f.key == key).unwrap().value = value.into();
             assert_eq!(submit(&mut app, &edited).unwrap_err(), keep, "{key}={value}");
+        }
+        // Promote keeps a changed base path, and other labels may change.
+        for (key, value) in [("base_path", "prod/web/os"), ("labels", "pulp_tui_cv=web,pulp_tui_env=dev,team=ops")] {
+            let mut edited = form.clone();
+            edited.fields.iter_mut().find(|f| f.key == key).unwrap().value = value.into();
+            assert_eq!(submit(&mut app, &edited), Ok(()), "{key}={value}");
         }
         distribution_action(&mut app, RepoType::Rpm, Act::Delete, item);
         let Some(Modal::Confirm { lines, .. }) = &app.modal else { panic!("no confirm") };
@@ -5469,6 +5565,198 @@ mod tests {
         assert!(e.contains("serves old instead of new"), "{e}");
         let sent = server.received_requests().await.unwrap();
         assert!(!sent.iter().any(|r| r.method.as_str() == "PATCH"), "a PATCH was sent");
+    }
+
+    /// The bodies of the requests with `verb` to `p`.
+    async fn bodies(server: &wiremock::MockServer, verb: &str, p: &str) -> Vec<Value> {
+        let sent = server.received_requests().await.unwrap();
+        sent.iter().filter(|r| r.method.as_str() == verb && r.url.path() == p).map(|r| r.body_json().unwrap_or(Value::Null)).collect()
+    }
+
+    #[tokio::test]
+    async fn distribute_follows_or_pins_and_re_points_an_existing_distribution() {
+        use crate::tui::app::Modal;
+        let r = format!("{API}repositories/rpm/rpm/r/");
+        let (dists, d, pubs) =
+            (format!("{API}distributions/rpm/rpm/"), format!("{API}distributions/rpm/rpm/1/"), format!("{API}publications/rpm/rpm/"));
+        let repo = json!({ "pulp_href": r, "name": "r", "latest_version_href": format!("{r}versions/2/") });
+        // Distribute `repo` in `mode` while the distributions list is `existing`.
+        let run = async |server: &wiremock::MockServer, existing: Value, mode: &str| {
+            get(server, &dists, page(existing)).await;
+            get(server, &format!("{API}distributions/"), page(json!([]))).await;
+            get(server, &d, json!({ "pulp_href": d, "base_url": "http://h/r/" })).await;
+            answer(server, "POST", &dists, 201, json!({ "pulp_href": d })).await;
+            answer(server, "PATCH", &d, 200, json!({ "pulp_href": d })).await;
+            let (mut app, mut rx) = connected(server).await;
+            repo_action(&mut app, RepoType::Rpm, Act::Distribute, repo.clone());
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            set(&mut form, "mode", mode);
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+            app.notices.back().map(|n| n.text.clone()).unwrap_or_default()
+        };
+        let follow = "follow repository latest";
+
+        let server = wiremock::MockServer::start().await;
+        assert_eq!(run(&server, json!([]), follow).await, "distribution r serves http://h/r/");
+        assert_eq!(bodies(&server, "POST", &dists).await, [json!({ "name": "r", "base_path": "r", "repository": r })]);
+
+        // An existing distribution on a version: re-pointed, and the version binding is cleared.
+        let server = wiremock::MockServer::start().await;
+        let on_version =
+            json!({ "pulp_href": d, "name": "r", "base_path": "r", "repository_version": format!("{r}versions/1/"), "pulp_labels": {} });
+        assert_eq!(run(&server, json!([on_version]), follow).await, "distribution r serves http://h/r/");
+        let cleared = json!({ "repository": r, "publication": null, "repository_version": null });
+        assert_eq!(bodies(&server, "PATCH", &d).await, [cleared]);
+
+        // Pinned: the new publication of version 2 keeps the mode of the one the distribution serves.
+        let server = wiremock::MockServer::start().await;
+        let p1 = format!("{pubs}1/");
+        get(
+            &server,
+            &p1,
+            json!({ "pulp_href": p1, "repository_version": format!("{r}versions/1/"), "layout": "flat", "checksum_type": "sha256" }),
+        )
+        .await;
+        get(&server, &pubs, page(json!([]))).await;
+        answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}2/") })).await;
+        let pinned = json!({ "pulp_href": d, "name": "r", "base_path": "r", "publication": p1, "pulp_labels": {} });
+        assert_eq!(run(&server, json!([pinned]), "pin this version").await, "distribution r serves http://h/r/");
+        let mode = json!({ "repository_version": format!("{r}versions/2/"), "layout": "flat", "checksum_type": "sha256" });
+        assert_eq!(bodies(&server, "POST", &pubs).await, [mode]);
+        assert_eq!(bodies(&server, "PATCH", &d).await, [json!({ "publication": format!("{pubs}2/"), "repository": null })]);
+    }
+
+    #[tokio::test]
+    async fn publication_create_delete_and_snapshot_refusal() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (r, pubs) = (format!("{API}repositories/rpm/rpm/r/"), format!("{API}publications/rpm/rpm/"));
+        get(&server, &format!("{API}repositories/rpm/rpm/"), page(json!([{ "pulp_href": r, "name": "r" }]))).await;
+        get(&server, &pubs, page(json!([]))).await;
+        get(&server, &format!("{API}distributions/rpm/rpm/"), page(json!([]))).await;
+        answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}3/") })).await;
+        answer(&server, "DELETE", &format!("{pubs}1/"), 204, json!({})).await;
+        let (mut app, mut rx) = connected(&server).await;
+
+        // Create with a version number publishes that version.
+        publication_action(&mut app, RepoType::Rpm, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        set(&mut form, "repo", "r");
+        set(&mut form, "number", "3");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &pubs).await, [json!({ "repository_version": format!("{r}versions/3/") })]);
+        assert_eq!(app.notices.back().unwrap().text, "publication 3 of r@v3");
+
+        // Delete asks for the typed id, then deletes.
+        let item = |n: u32| json!({ "pulp_href": format!("{pubs}{n}/"), "repository_version": format!("{r}versions/{n}/") });
+        publication_action(&mut app, RepoType::Rpm, Act::Delete, item(1));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes, typed, .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed.as_deref(), Some("1"));
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(bodies(&server, "DELETE", &format!("{pubs}1/")).await.len(), 1);
+
+        // A publication of a Content View snapshot is refused before any dialog.
+        let st = app.store.clone();
+        let cv = st.create_cv("lab", "web", "").await.unwrap();
+        let cv_repo = crate::store::CvRepo { repo_href: r.clone(), repo_name: "r".into(), repo_type: RepoType::Rpm, filters: vec![] };
+        let v = st.begin_version(cv, "", &[cv_repo]).await.unwrap();
+        let mut row = st.version_repos(v.id).await.unwrap().remove(0);
+        row.derived_version = Some(format!("{r}versions/2/"));
+        st.save_version_repo(&row).await.unwrap();
+        publication_action(&mut app, RepoType::Rpm, Act::Delete, item(2));
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.notices.back().unwrap().text,
+            "impact of deleting publication 2: refused: publication 2 is of a Content View snapshot (delete the Content View version instead)"
+        );
+    }
+
+    #[tokio::test]
+    async fn distribution_copy_re_point_create_edit_and_delete() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (r, dists, d, pubs) = (
+            format!("{API}repositories/rpm/rpm/r/"),
+            format!("{API}distributions/rpm/rpm/"),
+            format!("{API}distributions/rpm/rpm/1/"),
+            format!("{API}publications/rpm/rpm/"),
+        );
+        let item = json!({ "pulp_href": d, "name": "docs", "base_path": "docs", "base_url": "http://h/docs/", "pulp_labels": {} });
+        get(
+            &server,
+            &format!("{API}repositories/rpm/rpm/"),
+            page(json!([{ "pulp_href": r, "name": "r", "latest_version_href": format!("{r}versions/4/") }])),
+        )
+        .await;
+        get(&server, &dists, page(json!([item]))).await;
+        get(&server, &pubs, page(json!([]))).await;
+        answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}2/") })).await;
+        answer(&server, "PATCH", &d, 200, json!({ "pulp_href": d })).await;
+        answer(&server, "DELETE", &d, 204, json!({})).await;
+        answer(&server, "POST", &dists, 201, json!({ "pulp_href": d })).await;
+        let (mut app, mut rx) = connected(&server).await;
+
+        distribution_action(&mut app, RepoType::Rpm, Act::CopyUrl, item.clone());
+        assert_eq!(app.notices.back().unwrap().text, "copied http://h/docs/");
+
+        // Re-point resolves the version, then shows the rollback preview.
+        distribution_action(&mut app, RepoType::Rpm, Act::Rollback, item.clone());
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no re-point form") };
+        set(&mut form, "repo", "r");
+        set(&mut form, "number", "2");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no preview: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert!(lines.contains(&"  will serve:  r@v2 (pinned)".to_string()), "{lines:?}");
+
+        // Create needs a repository unless Serve = none.
+        distribution_action(&mut app, RepoType::Rpm, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        set(&mut form, "name", "/new/");
+        set(&mut form, "base_path", "/new/");
+        assert_eq!(submit(&mut app, &form).unwrap_err(), "repository is required");
+        // Serve = none: every field is sent; names and base paths lose their slashes, a content guard href keeps them.
+        let guard = format!("{API}contentguards/core/rbac/1/");
+        set(&mut form, "mode", "none");
+        set(&mut form, "content_guard", &guard);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let created = json!({ "name": "new", "base_path": "new", "content_guard": guard, "pulp_labels": {}, "publication": null, "repository": null });
+        assert_eq!(posts_to(&server, &dists).await, [created]);
+
+        // Edit: follow the repository, then pin version 2 of it.
+        let edit = |app: &mut App, mode: &str, number: &str| {
+            distribution_action(app, RepoType::Rpm, Act::Edit, item.clone());
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
+            set(&mut form, "mode", mode);
+            set(&mut form, "repo", "r");
+            set(&mut form, "number", number);
+            submit(app, &form).unwrap();
+        };
+        edit(&mut app, "follow repository latest", "");
+        settle(&mut app, &mut rx).await;
+        edit(&mut app, "publication of a repository version", "2");
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.notices.back().unwrap().text, "update distribution docs: done");
+        assert_eq!(posts_to(&server, &pubs).await, [json!({ "repository_version": format!("{r}versions/2/") })]);
+        let patches = bodies(&server, "PATCH", &d).await;
+        assert_eq!(
+            patches,
+            [json!({ "repository": r, "publication": null }), json!({ "publication": format!("{pubs}2/"), "repository": null })]
+        );
+
+        // Delete asks for the typed name, then deletes.
+        distribution_action(&mut app, RepoType::Rpm, Act::Delete, item);
+        let Some(Modal::Confirm { on_yes, typed, .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed.as_deref(), Some("docs"));
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(bodies(&server, "DELETE", &d).await.len(), 1);
     }
 
     async fn answer(server: &wiremock::MockServer, verb: &str, p: &str, status: u16, body: Value) {
