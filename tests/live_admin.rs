@@ -319,3 +319,59 @@ async fn task_group_cancel() {
     drop(stall);
     cleanup(&c, &[&acs, &remote]).await;
 }
+
+/// A checkpoint distribution, driven through the Distributions screen: Verify reads the newest checkpoint
+/// publication at `<base>/<timestamp>/`; Re-point (rollback) is refused before any write.
+#[tokio::test]
+async fn checkpoint_distribution_verifies_and_refuses_rollback() {
+    if !live_enabled() {
+        return;
+    }
+    let (mut app, mut rx) = app().await;
+    let t = RepoType::File;
+    if !app.conn.as_ref().unwrap().caps.has_field(t.distribution_schema(), "checkpoint") {
+        eprintln!("skipping: this server's distributions have no `checkpoint` field (older pulpcore)");
+        return;
+    }
+    let c = client();
+    let name = unique("it-checkpoint");
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let dir = tempfile::tempdir().unwrap();
+    for i in 1..=2 {
+        let path = dir.path().join(format!("{i}.txt"));
+        // Unique bytes, so a rerun does not find the content unit of an earlier run.
+        std::fs::write(&path, format!("{name} {i}\n")).unwrap();
+        ops::upload(&c, t, &path, Some(&format!("{i}.txt")), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
+        // Pulp makes a checkpoint publication only with `repository` (of its latest version).
+        create(&c, t.publications(), json!({ "repository": repo, "checkpoint": true }), "/publications/").await;
+    }
+    let dist = create(
+        &c,
+        t.distributions(),
+        json!({ "name": name, "base_path": name, "repository": repo, "checkpoint": true }),
+        "/distributions/",
+    )
+    .await;
+    let item: Value = c.get(&dist, &[]).await.unwrap();
+    let pubs = || async { c.list_all::<Value>(&c.api(t.publications()), &[("repository", repo.clone())], 100).await.unwrap().len() };
+    assert_eq!(pubs().await, 2);
+
+    app.list.kind = Kind::Distributions(t);
+    run(&mut app, Act::Verify, item.clone());
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verify result: {:?}", texts(&app)) };
+    assert!(lines[0].starts_with(&format!("{name}: checkpoint distribution of repository ")), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some("OK: PULP_MANIFEST matches 2 files"), "{lines:?}");
+
+    run(&mut app, Act::Rollback, item.clone());
+    fill(&mut app, &[("repo", &name), ("number", "1")]);
+    settle(&mut app, &mut rx).await;
+    assert!(app.modal.is_none(), "no preview to confirm");
+    let e = texts(&app).pop().unwrap_or_default();
+    assert!(e.contains(&format!("distribution {name} is a checkpoint distribution and Pulp refuses to pin it")), "{e}");
+    // Nothing changed on the server: no new publication, the same binding.
+    assert_eq!(pubs().await, 2);
+    assert_eq!(c.get::<Value>(&dist, &[]).await.unwrap(), item);
+
+    cleanup(&c, &[&dist, &repo]).await;
+}

@@ -128,6 +128,11 @@ async fn served_now(c: &PulpClient, caps: &Capabilities, t: RepoType, d: &Value)
     let how = match (d["publication"].as_str(), d["repository_version"].as_str()) {
         (Some(x), _) => format!("pinned to publication {}", short(x)),
         (None, Some(_)) => "pinned to repository version".into(),
+        (None, None) if d["checkpoint"] == true => format!(
+            "checkpoint distribution of repository {}: newest checkpoint publication {}",
+            short(&s(d, "repository")),
+            short(&s(&p, "pulp_href"))
+        ),
         (None, None) => format!("follows repository {}: newest publication {}", short(&s(d, "repository")), short(&s(&p, "pulp_href"))),
     };
     Ok(Some((s(&p, "repository_version"), p, how)))
@@ -1593,7 +1598,10 @@ async fn existing_distribution(c: &PulpClient, t: RepoType, name: &str) -> anyho
 async fn pinned_publication(ctx: &Ctx, t: RepoType, existing: Option<&Value>, v: &str, signing: Option<String>) -> anyhow::Result<String> {
     let c = &ctx.client;
     let served = match existing {
-        Some(d) => ops::served_publication(c, &ctx.caps, t, d).await?,
+        Some(d) => {
+            ops::refuse_checkpoint(&s(d, "name"), d["checkpoint"] == true)?;
+            ops::served_publication(c, &ctx.caps, t, d).await?
+        }
         None => None,
     };
     Ok(ops::ensure_publication(c, t, v, &pinned_mode(t, served.as_ref(), v, signing), &ctx.on_task()).await?)
@@ -2157,6 +2165,7 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
             Some((v, p, how)) => (format!("{} ({how})", short(&v)), pinned_mode(t, Some(&p), &version, None)),
             None => ("nothing".into(), pinned_mode(t, None, &version, None)),
         };
+        ops::refuse_checkpoint(&dist, d["checkpoint"] == true).map_err(|e| anyhow!("{e}; it now serves {current}"))?;
         let signs = t == RepoType::Rpm && rpm::signs_metadata(c, &version).await?;
         let publication = match ops::reusable_publication(c, t, &version, &mode).await? {
             Some(p) => format!("existing {}", short(&p)),
@@ -2179,6 +2188,9 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
                 app.job(format!("rollback {dist}"), move |ctx| async move {
                     let c = &ctx.client;
                     let on = ctx.on_task();
+                    // Checkpoint may have been set since the preview: refuse before the publication is made.
+                    let now: Value = c.get(&s(&d, "pulp_href"), &[]).await?;
+                    ops::refuse_checkpoint(&dist, now["checkpoint"] == true)?;
                     let p = ops::ensure_publication(c, t, &version, &mode, &on).await?;
                     let base = s(&d, "base_path");
                     ops::ensure_distribution(c, t, &dist, &base, Some(&p), &json!({}), None, &on).await?;
@@ -2431,10 +2443,12 @@ fn served_after_delete_lines(ds: &[Distribution], href: &str, pubs: &[Value]) ->
         Some(p) => format!("publication {} (version {})", short(&s(p, "pulp_href")), version_number(&s(p, "repository_version"))),
         None => "nothing".into(),
     };
+    let deleted = pubs.iter().find(|p| p["pulp_href"] == href).unwrap_or(&Value::Null);
     ds.iter()
         .filter_map(|d| {
             let then = after(ops::served_after_delete(d, href, pubs)?);
-            Some(format!("  {} ({}): then serves {then}", d.name, d.base_url.as_deref().unwrap_or(&d.base_path)))
+            let url = ops::served_url(d.base_url.as_deref().unwrap_or(&d.base_path), d.checkpoint, deleted);
+            Some(format!("  {} ({url}): then serves {then}", d.name))
         })
         .collect()
 }
@@ -2481,11 +2495,12 @@ fn distribution_verify(app: &mut App, t: RepoType, href: String, name: String) {
         let Some((version, publication, how)) = served_now(c, &ctx.caps, t, &d).await? else {
             bail!("distribution serves nothing (no binding, or no publication of its repository or version)");
         };
-        let res = ops::verify_served(c, t, &s(&d, "base_url"), &version, &publication).await;
+        let url = ops::served_url(&s(&d, "base_url"), d["checkpoint"] == true, &publication);
+        let res = ops::verify_served(c, t, &url, &version, &publication).await;
         let lines = vec![
             format!("{name}: {how}"),
             format!("expected content: {}", short(&version)),
-            format!("URL: {}", s(&d, "base_url")),
+            format!("URL: {url}"),
             String::new(),
             match res {
                 Ok(m) => format!("OK: {m}"),
@@ -4219,6 +4234,7 @@ mod tests {
             .with_priority(1)
             .mount(&server)
             .await;
+        get(&server, &d, dist.clone()).await; // the confirm reads it again
         let mode = json!({ "signing_service": "/ss/1/", "simple": true, "structured": false, "layout": "flat" });
         let mut served = json!({ "pulp_href": now, "repository_version": format!("{API}repositories/deb/apt/r/versions/2/") });
         served.as_object_mut().unwrap().extend(mode.as_object().unwrap().clone());
@@ -4272,6 +4288,7 @@ mod tests {
             let server = wiremock::MockServer::start().await;
             let dist = json!({ "pulp_href": d, "name": "prod", "base_path": "prod", "base_url": "http://h/prod/", "publication": now });
             get(&server, &dists, page(json!([dist]))).await;
+            get(&server, &d, dist).await; // the confirm reads it again
             get(&server, &format!("{API}distributions/"), page(json!([]))).await;
             get(&server, &r, json!({ "metadata_signing_service": service })).await;
             get(&server, &now, json!({ "pulp_href": now, "repository_version": format!("{r}versions/2/"), "checksum_type": "sha256" }))
@@ -4526,6 +4543,28 @@ mod tests {
         assert!(lines.contains(&"  follower (f): then serves publication 0190aaaa-0001 (version 1)".to_string()), "{lines:?}");
         assert!(lines.contains(&"  on-v2 (v2): then serves nothing".to_string()), "{lines:?}");
         assert!(!lines.iter().any(|l| l.contains("on-v1") || l.contains("other-repo")), "{lines:?}");
+    }
+
+    /// A checkpoint distribution serves a checkpoint publication only at its own `<base>/<timestamp>/`; after the
+    /// delete, that path serves the newest checkpoint publication created before it.
+    #[test]
+    fn publication_delete_impact_of_a_checkpoint_distribution_names_its_timestamp_path() {
+        let p = |n: u32, checkpoint: bool| {
+            json!({ "pulp_href": format!("/p/{n}/"), "repository_version": format!("/r/versions/{n}/"),
+                    "pulp_created": format!("2026-01-0{n}T00:00:00Z"), "checkpoint": checkpoint })
+        };
+        let pubs = [p(1, true), p(2, false), p(3, true)];
+        let ds: Vec<Distribution> = serde_json::from_value(json!([
+            { "pulp_href": "/d/1/", "name": "cp", "base_path": "cp", "base_url": "http://h/cp/", "repository": "/r/", "checkpoint": true },
+            { "pulp_href": "/d/2/", "name": "other", "base_path": "o", "repository": "/x/", "checkpoint": true },
+        ]))
+        .unwrap();
+        assert_eq!(
+            served_after_delete_lines(&ds, "/p/3/", &pubs),
+            ["  cp (http://h/cp/20260103T000000Z/): then serves publication 1 (version 1)"]
+        );
+        assert_eq!(served_after_delete_lines(&ds, "/p/1/", &pubs), ["  cp (http://h/cp/20260101T000000Z/): then serves nothing"]);
+        assert!(served_after_delete_lines(&ds, "/p/2/", &pubs).is_empty(), "a publication that is not a checkpoint is not served");
     }
 
     #[tokio::test]
@@ -5605,6 +5644,151 @@ mod tests {
         assert!(app.modal.is_none(), "no OK result");
         let e = app.notices.iter().find(|n| n.level == Level::Error).expect("no error").text.clone();
         assert!(e.contains("distribution serves nothing"), "{e}");
+    }
+
+    /// pulpcore serves a checkpoint distribution only at `<base>/<timestamp>/`, from the newest checkpoint publication.
+    #[tokio::test]
+    async fn verify_of_a_checkpoint_distribution_reads_the_newest_checkpoint_under_its_timestamp() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let (repo, dist) = (format!("{API}repositories/file/file/r/"), format!("{API}distributions/file/file/d/"));
+        let base = format!("{}/pulp/content/docs/", server.uri());
+        get(&server, &dist, json!({ "pulp_href": dist, "name": "docs", "base_url": base, "repository": repo, "checkpoint": true })).await;
+        let p = |n: u32, created: &str, checkpoint: bool| {
+            json!({ "pulp_href": format!("/p/{n}/"), "repository_version": format!("{repo}versions/{n}/"), "pulp_created": created,
+                    "manifest": "PULP_MANIFEST", "checkpoint": checkpoint })
+        };
+        // A newer publication that is not a checkpoint is not served.
+        let pubs =
+            json!([p(1, "2026-01-01T00:00:00Z", true), p(2, "2026-01-02T03:04:05.123456Z", true), p(3, "2026-01-03T00:00:00Z", false)]);
+        get(&server, &format!("{API}publications/file/file/"), page(pubs)).await;
+        get(
+            &server,
+            &format!("{API}content/file/files/"),
+            page(json!([{ "pulp_href": "/f/a/", "relative_path": "a.txt", "sha256": "ab" }])),
+        )
+        .await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/content/docs/20260102T030405Z/PULP_MANIFEST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("a.txt,ab,3\n"))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        distribution_action(&mut app, RepoType::File, Act::Verify, json!({ "pulp_href": dist, "name": "docs" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no result: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert_eq!(lines[0], "docs: checkpoint distribution of repository r: newest checkpoint publication 2", "{lines:?}");
+        assert_eq!(lines[1..3], ["expected content: r@v2".to_string(), format!("URL: {base}20260102T030405Z/")], "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("OK: PULP_MANIFEST matches 1 files"), "{lines:?}");
+    }
+
+    /// Pulp refuses a publication on a checkpoint distribution (HTTP 400): rollback and pinned Distribute refuse it first.
+    #[tokio::test]
+    async fn rollback_and_pinned_distribute_of_a_checkpoint_distribution_are_refused_before_any_write() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (r, dists, d, pubs) = (
+            format!("{API}repositories/file/file/r/"),
+            format!("{API}distributions/file/file/"),
+            format!("{API}distributions/file/file/1/"),
+            format!("{API}publications/file/file/"),
+        );
+        let cp = json!({ "pulp_href": d, "name": "docs", "base_path": "docs", "base_url": "http://h/docs/", "repository": r,
+                         "checkpoint": true, "pulp_labels": {} });
+        let repo = json!({ "pulp_href": r, "name": "r", "latest_version_href": format!("{r}versions/2/") });
+        get(&server, &format!("{API}repositories/file/file/"), page(json!([repo]))).await;
+        get(&server, &dists, page(json!([cp]))).await;
+        get(&server, &format!("{API}distributions/"), page(json!([]))).await;
+        get(&server, &r, json!({ "manifest": "PULP_MANIFEST" })).await;
+        let p = |n: u32| {
+            json!({ "pulp_href": format!("{pubs}{n}/"), "repository_version": format!("{r}versions/{n}/"),
+                    "pulp_created": format!("2026-01-0{n}T00:00:00Z"), "manifest": "PULP_MANIFEST", "checkpoint": true })
+        };
+        // Version 2 has no publication yet: pinning it would make one (a write) before the PATCH that Pulp refuses.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(pubs.clone()))
+            .and(wiremock::matchers::query_param("repository_version", format!("{r}versions/2/")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([]))))
+            .mount(&server)
+            .await;
+        get(&server, &pubs, page(json!([p(1), p(2)]))).await;
+        answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}3/") })).await;
+        answer(&server, "PATCH", &d, 200, json!({ "pulp_href": d })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let refusal = "conflict [409]: distribution docs is a checkpoint distribution and Pulp refuses to pin it; \
+                       edit the distribution, clear Checkpoint, then pin it";
+        let last_error = |app: &App| app.notices.iter().rfind(|n| n.level == Level::Error).map(|n| n.text.clone()).unwrap_or_default();
+
+        // Re-point to version 1: the preview refuses, and says what the distribution serves now.
+        distribution_action(&mut app, RepoType::File, Act::Rollback, cp.clone());
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no re-point form") };
+        set(&mut form, "repo", "r");
+        set(&mut form, "number", "1");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no preview to confirm");
+        assert_eq!(
+            last_error(&app),
+            format!(
+                "rollback preview docs: {refusal}; it now serves r@v2 (checkpoint distribution of repository r: newest checkpoint publication 2)"
+            )
+        );
+
+        // Pinned Distribute of a version, and of a publication.
+        repo_action(&mut app, RepoType::File, Act::Distribute, repo.clone());
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no distribute form") };
+        set(&mut form, "dist", "docs");
+        set(&mut form, "base_path", "docs");
+        set(&mut form, "mode", "pin this version");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(last_error(&app), format!("distribute docs: {refusal}"));
+        publication_action(&mut app, RepoType::File, Act::Distribute, p(1));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no distribute form") };
+        set(&mut form, "dist", "docs");
+        set(&mut form, "base_path", "docs");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(last_error(&app), format!("distribute docs: {refusal}"));
+
+        assert_eq!((bodies(&server, "POST", &pubs).await, bodies(&server, "PATCH", &d).await), (vec![], vec![]), "no write");
+    }
+
+    /// Checkpoint set after the preview: the confirm reads the distribution again and refuses before any write.
+    #[tokio::test]
+    async fn rollback_confirm_refuses_a_distribution_made_checkpoint_after_the_preview() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (r, dists, d, pubs) = (
+            format!("{API}repositories/file/file/r/"),
+            format!("{API}distributions/file/file/"),
+            format!("{API}distributions/file/file/1/"),
+            format!("{API}publications/file/file/"),
+        );
+        let follow = json!({ "pulp_href": d, "name": "docs", "base_path": "docs", "base_url": "http://h/docs/", "repository": r, "pulp_labels": {} });
+        get(&server, &dists, page(json!([follow]))).await;
+        let mut now = follow.clone();
+        now["checkpoint"] = true.into();
+        get(&server, &d, now).await;
+        get(&server, &r, json!({ "manifest": "PULP_MANIFEST" })).await;
+        // No publication of version 1: the rollback would make one.
+        get(&server, &pubs, page(json!([]))).await;
+        answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}3/") })).await;
+        answer(&server, "PATCH", &d, 200, json!({ "pulp_href": d })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        rollback_preview(&mut app, RepoType::File, "docs".into(), format!("{r}versions/1/"));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no preview: {:?}", app.notices.back().map(|n| &n.text)) };
+        on_yes.unwrap()(&mut app);
+        settle(&mut app, &mut rx).await;
+        let e = app.notices.iter().rfind(|n| n.level == Level::Error).map(|n| n.text.clone()).unwrap_or_default();
+        assert_eq!(
+            e,
+            "rollback docs: conflict [409]: distribution docs is a checkpoint distribution and Pulp refuses to pin it; \
+             edit the distribution, clear Checkpoint, then pin it"
+        );
+        assert_eq!((bodies(&server, "POST", &pubs).await, bodies(&server, "PATCH", &d).await), (vec![], vec![]), "no write");
     }
 
     #[tokio::test]

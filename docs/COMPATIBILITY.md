@@ -247,6 +247,23 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   older servers. The Content View cleanup of unused snapshot versions applies
   `ops::protecting` before it deletes, so it sends no delete that Pulp refuses and its log
   names the distribution (`live_cv`, on 3.63.36, 3.95.3 and 3.123.1).
+* **Checkpoint distributions** (read in the source of 3.123.1, verified live on it in
+  `live_admin`). `DistributionSerializer.validate` (`serializers/publication.py:337-366`) keeps
+  the stored `checkpoint` on a PATCH and refuses it with a publication or version binding (HTTP
+  400, "The 'checkpoint' attribute may only be used with the 'repository' attribute"). Rollback,
+  pinned Distribute and `ops::ensure_distribution` (promote, replication) refuse such a
+  distribution before any write. The content app (`content/handler.py:392-434`) serves only
+  `<base path>/<timestamp>/`: the newest checkpoint publication of the repository created at or
+  before that second (any publication type), with `CHECKPOINT_TS_FORMAT` `%Y%m%dT%H%M%SZ`
+  (`constants.py:124`) of `pulp_created` in UTC (`TIME_ZONE = "UTC"`, `settings.py:215`).
+  Another timestamp redirects to the one of the served publication, and the bare base path is a
+  listing of the timestamps (`CheckpointListings`); a file directly under it gets HTTP 301.
+  Verify reads the newest checkpoint publication at its timestamp. The rollback confirm reads
+  the distribution again, so a Checkpoint set after the preview is refused too. The publication
+  delete impact names `<base path>/<timestamp>/` of a deleted checkpoint publication and the
+  older checkpoint publication that it then serves (or nothing); a deleted publication that is
+  not a checkpoint does not change what a checkpoint distribution serves. Servers without the
+  field never send it, and pulp-tui reads it as `false`.
 * **Publications and repositories are not protected** (read in the source of 3.123.1:
   `PublicationViewSet` is a plain `DestroyModelMixin`, `Distribution.publication` is
   `on_delete=SET_NULL`). A served publication is deleted without an error: a distribution

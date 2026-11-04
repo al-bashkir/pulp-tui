@@ -355,6 +355,7 @@ pub async fn ensure_distribution(
             });
         }
         let adopt = owner_check(&d, labels, db)?;
+        refuse_checkpoint(name, d.checkpoint)?;
         let repoint = d.publication.as_deref() != publication || d.repository.is_some() || d.repository_version.is_some();
         if repoint || adopt.is_some() {
             let mut body = json!({});
@@ -394,6 +395,18 @@ pub async fn ensure_distribution(
         on,
     )
     .await
+}
+
+/// Pulp refuses a publication or version binding on a checkpoint distribution (HTTP 400, "The 'checkpoint'
+/// attribute may only be used with the 'repository' attribute"): refuse it before any write, and say what to do.
+pub fn refuse_checkpoint(name: &str, checkpoint: bool) -> Result<()> {
+    if !checkpoint {
+        return Ok(());
+    }
+    let message = format!(
+        "distribution {name} is a checkpoint distribution and Pulp refuses to pin it; edit the distribution, clear Checkpoint, then pin it"
+    );
+    Err(PulpError::Api { status: 409, message })
 }
 
 /// Ownership of an existing distribution: it must carry `labels` and must not belong to another
@@ -550,7 +563,8 @@ pub fn not_compared(caps: &Capabilities, t: RepoType) -> Option<String> {
 
 /// The publication a distribution (JSON) serves, picked as pulpcore picks it: its own; else the newest
 /// one of its repository version; else the newest one of the newest published version of its repository.
-/// pulpcore picks among all publication types, so Deb verbatim publications count too.
+/// pulpcore picks among all publication types, so Deb verbatim publications count too. A checkpoint distribution
+/// serves the newest checkpoint publication of its repository (by creation), at `served_url` only.
 pub async fn served_publication(c: &PulpClient, caps: &Capabilities, t: RepoType, d: &Value) -> Result<Option<Value>> {
     if let Some(p) = d["publication"].as_str() {
         return Ok(Some(c.get(p, &[]).await?));
@@ -560,7 +574,23 @@ pub async fn served_publication(c: &PulpClient, caps: &Capabilities, t: RepoType
         (None, Some(r)) => ("repository", r),
         (None, None) => return Ok(None),
     };
-    Ok(newest(publications_where(c, caps, t, q).await?.iter()).cloned())
+    let pubs = publications_where(c, caps, t, q).await?;
+    if d["checkpoint"] == true {
+        return Ok(pubs.iter().filter(|p| p["checkpoint"] == true).max_by_key(|p| p["pulp_created"].as_str()).cloned());
+    }
+    Ok(newest(pubs.iter()).cloned())
+}
+
+/// The URL where a distribution at `base` serves publication `p`: `base`, or for a checkpoint distribution
+/// `<base>/<timestamp>/` (pulpcore `CHECKPOINT_TS_FORMAT` `%Y%m%dT%H%M%SZ` of `pulp_created`); its bare base path
+/// only lists the timestamps.
+/// shortcut: reads the UTC time off the API string (`Z`, pulpcore TIME_ZONE = "UTC"); parse the offset if a server sets another zone.
+pub fn served_url(base: &str, checkpoint: bool, p: &Value) -> String {
+    if !checkpoint {
+        return base.into();
+    }
+    let ts: String = p["pulp_created"].as_str().unwrap_or_default().chars().take(19).filter(|c| !matches!(c, '-' | ':')).collect();
+    format!("{}/{ts}Z/", base.trim_end_matches('/'))
 }
 
 /// The publications of `t` that match one filter (`repository` or `repository_version`), Deb verbatim ones included.
@@ -581,12 +611,21 @@ pub fn newest<'a>(pubs: impl Iterator<Item = &'a Value>) -> Option<&'a Value> {
 /// What `d` serves after publication `href` is deleted, when it serves `href` now: `Some(None)` nothing,
 /// `Some(Some(p))` publication `p`. `None`: `d` does not serve `href`. `pubs`: the publications of the
 /// repository of `href`. Pulp unbinds a pinned distribution (`on_delete=SET_NULL`); a repository or
-/// version binding moves to the next newest publication.
+/// version binding moves to the next newest publication. A checkpoint distribution serves a checkpoint
+/// `href` at its own timestamp (`served_url`), which then serves the newest checkpoint publication created before it.
 pub fn served_after_delete<'a>(d: &Distribution, href: &str, pubs: &'a [Value]) -> Option<Option<&'a Value>> {
     if let Some(p) = &d.publication {
         return (p == href).then_some(None);
     }
-    let repo = repo_of_version(pubs.iter().find(|p| p["pulp_href"] == href)?["repository_version"].as_str()?);
+    let deleted = pubs.iter().find(|p| p["pulp_href"] == href)?;
+    let repo = repo_of_version(deleted["repository_version"].as_str()?);
+    if d.checkpoint {
+        if d.repository.as_deref() != Some(repo.as_str()) || deleted["checkpoint"] != true {
+            return None;
+        }
+        let before = |p: &&Value| p["checkpoint"] == true && p["pulp_created"].as_str() < deleted["pulp_created"].as_str();
+        return Some(pubs.iter().filter(before).max_by_key(|p| p["pulp_created"].as_str()));
+    }
     let candidates: Vec<&Value> = match (&d.repository_version, &d.repository) {
         (Some(v), _) => pubs.iter().filter(|p| p["repository_version"] == v.as_str()).collect(),
         (None, Some(r)) if *r == repo => pubs.iter().collect(),

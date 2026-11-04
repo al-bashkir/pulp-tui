@@ -185,7 +185,8 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   Example: `tests/fixtures/advisory.json`.
 * **P** publishes the latest version. It always makes a new publication, with the repository
   settings of that moment.
-* **D** distributes: pin the latest version (publication), or follow the repository latest.
+* **D** distributes: pin the latest version (publication), or follow the repository latest. Pulp
+  cannot pin a checkpoint distribution: **D** refuses it before any change (see Distributions).
 * **P** and **D** on Deb ask for an optional signing service (empty = the keys of the repository).
   **D** reuses a publication only when its signing service is the same. On RPM, **D** never
   reuses a publication when the repository has a metadata signing service: Pulp signs a new one.
@@ -288,7 +289,8 @@ removed counts.
   Deb, the new publication keeps the signing service of the one the distribution serves now. The
   preview says if it reuses a publication of the version or makes a new one. On RPM, a repository
   with a metadata signing service always gets a new publication, signed with that service: an
-  older one can be unsigned.
+  older one can be unsigned. A checkpoint distribution is refused before any change (see
+  Distributions).
 * **m** compares with the marked version: mark one with `Space`, then press `m` on the other. It
   lists the added and removed units (older → newer) of each content type, for example
   `+ advisory RHSA-2024:0001`. A `warning:` line shows when Pulp counts other numbers. A
@@ -342,18 +344,23 @@ releases, components, indices and more). `/` searches package names or file path
 
 ### Distributions
 
-`t` toggles RPM/File/Deb. Details show **PINNED** (a publication or a version) or **FOLLOWS
-LATEST** (a repository). **i** full JSON.
+`t` toggles RPM/File/Deb. Details show **PINNED** (a publication or a version), **FOLLOWS
+LATEST** (a repository) or **CHECKPOINTS** (a checkpoint distribution of a repository). The
+*binding* column shows `pinned`, `latest` or `checkpoint`. **i** full JSON.
 
 * **y** copies the content URL (OSC 52 terminal clipboard). In tmux, set
   `set -g allow-passthrough on` or `set -s set-clipboard on`.
 * **V** verifies what the distribution serves. One that follows a repository serves its newest
-  publication, which is not the latest version when that version has no publication. Deb: it
+  publication, which is not the latest version when that version has no publication. A
+  checkpoint distribution serves the newest checkpoint publication of its repository only at
+  `<base path>/<timestamp>/` (for example `20260102T030405Z`); Verify reads it there. Deb: it
   fetches `Release`, a `Packages` index and the smallest `.deb`, and compares the digest. A
   difference reads `MISMATCH: served content differs: …`.
 * **b** re-points to a version, with a preview. On Deb, it keeps the signing service of the
   publication that it serves now. On RPM, it makes a new signed publication when the repository
-  has a metadata signing service.
+  has a metadata signing service. Pulp cannot pin a checkpoint distribution, so the preview
+  refuses it before any change and says what it serves now. To pin it, edit the distribution,
+  clear **Checkpoint**, then re-point it.
 * **c** / **e** / **d** create / edit / delete. Fields: name, base path, what it serves, content
   guard, labels (Deb: the signing service of a pinned publication). Flags:
   * **Hidden**: the content app does not list it. Its URL still serves.

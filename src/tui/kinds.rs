@@ -662,9 +662,10 @@ impl Kind {
             Kind::Distributions(_) => vec![
                 col("name", 26, |v| s(v, "name")),
                 col("base_path", 26, |v| s(v, "base_path")),
-                col("binding", 8, |v| {
+                col("binding", 10, |v| {
                     match (v["publication"].is_string(), v["repository_version"].is_string(), v["repository"].is_string()) {
                         (true, _, _) | (_, true, _) => "pinned".into(),
+                        (_, _, true) if v["checkpoint"] == true => "checkpoint".into(),
                         (_, _, true) => "latest".into(),
                         _ => "unbound".into(),
                     }
@@ -1088,6 +1089,24 @@ mod tests {
             }
             assert!(!k.columns().is_empty());
         }
+    }
+
+    #[test]
+    fn distribution_binding_column_names_checkpoint_distributions() {
+        let cols = Kind::Distributions(RepoType::File).columns();
+        let binding = cols.iter().find(|c| c.title == "binding").unwrap();
+        let cases = [
+            (json!({ "publication": "/p/" }), "pinned"),
+            (json!({ "repository_version": "/r/versions/1/" }), "pinned"),
+            (json!({ "repository": "/r/" }), "latest"),
+            (json!({ "repository": "/r/", "checkpoint": false }), "latest"),
+            (json!({ "repository": "/r/", "checkpoint": true }), "checkpoint"),
+            (json!({}), "unbound"),
+        ];
+        for (row, want) in cases {
+            assert_eq!((binding.get)(&row), want, "{row}");
+        }
+        assert!(usize::from(binding.width) >= "checkpoint".len());
     }
 
     #[test]

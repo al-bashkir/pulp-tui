@@ -212,6 +212,9 @@ fn detail_lines(kind: &Kind, v: &serde_json::Value) -> Vec<String> {
             out.push(match (v["publication"].as_str(), v["repository_version"].as_str(), v["repository"].as_str()) {
                 (Some(p), _, _) => format!("PINNED to publication {} (immutable)", kinds::short(p)),
                 (_, Some(rv), _) => format!("PINNED to repository version {}", kinds::short(rv)),
+                (_, _, Some(r)) if v["checkpoint"] == true => {
+                    format!("CHECKPOINTS of repository {} at <base path>/<timestamp>/", kinds::short(r))
+                }
                 (_, _, Some(r)) => format!("FOLLOWS LATEST of repository {}", kinds::short(r)),
                 _ => "UNBOUND: serves nothing".into(),
             });
@@ -637,6 +640,16 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw_form(f, form, f.area())).unwrap();
         t.backend().to_string()
+    }
+
+    #[test]
+    fn distribution_details_name_the_binding() {
+        let binding = |v: serde_json::Value| detail_lines(&Kind::Distributions(crate::pulp::RepoType::File), &v)[1].clone();
+        assert_eq!(binding(serde_json::json!({ "repository": "/r/" })), "FOLLOWS LATEST of repository r");
+        assert_eq!(
+            binding(serde_json::json!({ "repository": "/r/", "checkpoint": true })),
+            "CHECKPOINTS of repository r at <base path>/<timestamp>/"
+        );
     }
 
     #[test]
