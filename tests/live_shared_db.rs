@@ -158,6 +158,45 @@ async fn postgres_migration_3_keeps_served_paths() {
     s.drop_schema().await;
 }
 
+/// Migration 6 on a schema 5 database drops served rows of an environment that no longer exists. Then a
+/// served row needs its environment, and the database refuses to drop an environment that still has one.
+#[tokio::test]
+async fn postgres_served_rows_need_their_environment() {
+    if !live_enabled() {
+        return;
+    }
+    let s = Schema::new().await;
+    {
+        let mut c = sqlx::AnyConnection::connect(&s.connect()).await.unwrap();
+        for m in &PG_MIGRATIONS[..5] {
+            c.execute(sqlx::raw_sql(m)).await.unwrap();
+        }
+        c.execute(sqlx::raw_sql(
+            "INSERT INTO schema_version(version) VALUES (5);
+             INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'k', 'web', 't');
+             INSERT INTO environments(id, profile, name, prior_id, label) VALUES (1, 'k', 'Library', NULL, 'library'), (2, 'k', 'Dev', 1, 'dev');
+             INSERT INTO binding_repos VALUES (2, 1, '/r/1/', 'os', 'rpm', '/d/1/', 'k/dev/web/os', '/p/1/'),
+                                              (7, 1, '/r/1/', 'os', 'rpm', '/d/2/', 'k/gone/web/os', '/p/1/');",
+        ))
+        .await
+        .unwrap();
+    }
+    assert_eq!(s.migrate().await, (5, PG_MIGRATIONS.len() as i64));
+    let st = s.open().await;
+    let row = st.binding_repos(2, 1).await.unwrap().remove(0);
+    assert_eq!(row.base_path, "k/dev/web/os");
+    assert!(st.binding_repos(7, 1).await.unwrap().is_empty(), "environment 7 does not exist");
+
+    let e = st.save_binding_repo(&BindingRepo { env_id: 8, ..row }).await.unwrap_err().to_string();
+    assert!(e.contains("foreign key"), "{e}");
+    let mut c = sqlx::AnyConnection::connect(&s.connect()).await.unwrap();
+    let e = c.execute(sqlx::raw_sql("DELETE FROM environments WHERE id = 2")).await.unwrap_err().to_string();
+    assert!(e.contains("foreign key"), "{e}");
+    st.delete_env(2).await.unwrap(); // its served rows first, then the environment
+    assert!(st.binding_repos(2, 1).await.unwrap().is_empty());
+    s.drop_schema().await;
+}
+
 #[tokio::test]
 async fn two_operators_share_state_and_locks() {
     if !live_enabled() {

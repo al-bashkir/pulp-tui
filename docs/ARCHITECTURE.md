@@ -368,9 +368,12 @@ PostgreSQL, so SQL must be portable. Store calls are `async` and run in jobs.
 | 3      | `environments.label` (set to `lower(name)`, so no served path moves)  |
 | 4      | composites, `cv_components`, `cv_version_components`, `borrowed` rows |
 | 5      | `cv_version_repos.signing` (also stops an older pulp-tui on Deb rows) |
+| 6      | `binding_repos.env_id` foreign key (drops orphan rows)                |
 
 `cv_components` has no cascade, so the database refuses to delete a view or version that a
-composite uses.
+composite uses. `bindings.env_id` and `binding_repos.env_id` have no cascade either: the
+database refuses to delete an environment that still has them. SQLite cannot add a constraint,
+so migration 6 rebuilds `binding_repos`. Every SQLite connection sets `PRAGMA foreign_keys=ON`.
 
 ### Connection
 

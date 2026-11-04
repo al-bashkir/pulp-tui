@@ -96,6 +96,19 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY(version_id, component_version_id));",
     // 5: Deb signing choice of a Content View publish ('' = same as source, 'none', or a signing service href)
     "ALTER TABLE cv_version_repos ADD COLUMN signing TEXT NOT NULL DEFAULT '';",
+    // 6: served rows need their environment (no cascade: `delete_env` deletes them first). SQLite cannot add a
+    // constraint, so the table is rebuilt; rows of an environment or view that no longer exists are dropped.
+    "CREATE TABLE binding_repos_new(
+        env_id INTEGER NOT NULL REFERENCES environments(id),
+        cv_id INTEGER NOT NULL REFERENCES content_views(id) ON DELETE CASCADE,
+        repo_href TEXT NOT NULL, repo_name TEXT NOT NULL, repo_type TEXT NOT NULL,
+        distribution TEXT NOT NULL, base_path TEXT NOT NULL, publication TEXT,
+        PRIMARY KEY(env_id, cv_id, repo_href));
+     INSERT INTO binding_repos_new(env_id, cv_id, repo_href, repo_name, repo_type, distribution, base_path, publication)
+        SELECT env_id, cv_id, repo_href, repo_name, repo_type, distribution, base_path, publication FROM binding_repos
+        WHERE env_id IN (SELECT id FROM environments) AND cv_id IN (SELECT id FROM content_views);
+     DROP TABLE binding_repos;
+     ALTER TABLE binding_repos_new RENAME TO binding_repos;",
 ];
 
 /// `MIGRATIONS` for PostgreSQL: every integer is BIGINT (sqlx `Any` reads SQLite integers as
@@ -174,6 +187,9 @@ pub const PG_MIGRATIONS: &[&str] = &[
         PRIMARY KEY(version_id, component_version_id));",
     // 5: Deb signing choice of a Content View publish ('' = same as source, 'none', or a signing service href)
     "ALTER TABLE cv_version_repos ADD COLUMN signing TEXT NOT NULL DEFAULT '';",
+    // 6: served rows need their environment (see `MIGRATIONS`); rows of an environment that no longer exists are dropped.
+    "DELETE FROM binding_repos WHERE env_id NOT IN (SELECT id FROM environments);
+     ALTER TABLE binding_repos ADD FOREIGN KEY (env_id) REFERENCES environments(id);",
 ];
 
 /// A Content View lock not renewed for this long is expired; the next operator takes it over.
@@ -2168,6 +2184,54 @@ mod tests {
         assert_eq!((r.publication.as_deref(), r.pending_task.as_deref(), r.content_count), (Some("/p/1/"), None, Some(7)));
         assert!(!r.borrowed);
         assert_eq!(r.signing, "", "schema 5: a row written before it is same as source");
+    }
+
+    /// Schema 6: served rows of an environment that no longer exists are dropped; the others stay.
+    #[tokio::test]
+    async fn migration_6_drops_served_rows_without_their_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pulp-tui.db");
+        {
+            let s = Store::open_at_version(&path, 5).await.unwrap();
+            sqlx::raw_sql(
+                "INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'old', 'web', 't');
+                 INSERT INTO environments(id, profile, name, prior_id) VALUES (1, 'old', 'Library', NULL), (2, 'old', 'Dev', 1);
+                 INSERT INTO binding_repos VALUES (2, 1, '/r/1/', 'os', 'rpm', '/d/1/', 'old/dev/web/os', '/p/1/');
+                 INSERT INTO binding_repos VALUES (7, 1, '/r/1/', 'os', 'rpm', '/d/2/', 'old/gone/web/os', '/p/1/');",
+            )
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let s = Store::open(&path).await.unwrap();
+        assert_eq!(s.binding_repos(2, 1).await.unwrap()[0].base_path, "old/dev/web/os");
+        assert!(s.binding_repos(7, 1).await.unwrap().is_empty(), "environment 7 does not exist");
+    }
+
+    /// A served row needs its environment, and the database refuses to drop an environment that still has one.
+    #[tokio::test]
+    async fn served_rows_need_their_environment() {
+        let s = Store::open_in_memory().await.unwrap();
+        let cv = s.create_cv("lab", "web", "").await.unwrap();
+        let lib = s.ensure_library("lab").await.unwrap();
+        let dev = s.create_env("lab", "Dev", lib, false).await.unwrap();
+        let row = BindingRepo {
+            env_id: dev + 100,
+            cv_id: cv,
+            repo_href: "/r/1/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: "/d/1/".into(),
+            base_path: "dev/web/os".into(),
+            publication: None,
+        };
+        let e = s.save_binding_repo(&row).await.unwrap_err().to_string();
+        assert!(e.contains("FOREIGN KEY"), "{e}");
+        s.save_binding_repo(&BindingRepo { env_id: dev, ..row }).await.unwrap();
+        let e = sqlx::query("DELETE FROM environments WHERE id = $1").bind(dev).execute(&s.pool).await.unwrap_err().to_string();
+        assert!(e.contains("FOREIGN KEY"), "{e}");
+        s.delete_env(dev).await.unwrap(); // its served rows first, then the environment
+        assert!(s.binding_repos(dev, cv).await.unwrap().is_empty());
     }
 
     #[tokio::test]
