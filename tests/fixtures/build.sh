@@ -4,15 +4,16 @@
 #   target/fixtures/upstream/rpm/          yum repository (+ updateinfo advisory) for sync
 #   target/fixtures/upstream/rpm2/         same repository with one newer package
 #   target/fixtures/upstream/file/         File repository with PULP_MANIFEST
+#   target/fixtures/upstream/git/files.git  bare Git repository (dumb HTTP), tag v1 and branch main
 #   target/fixtures/upstream/deb/          APT repository (dist fixture, component main, amd64)
 #   target/fixtures/files/                 loose files for uploads
-# Requires rpmbuild, createrepo_c, modifyrepo_c, and GNU ar, tar, gzip (the .debs are built
+# Requires rpmbuild, createrepo_c, modifyrepo_c, git, and GNU ar, tar, gzip (the .debs are built
 # without dpkg-deb).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=${FIXTURES_DIR:-$ROOT/target/fixtures}
-STAMP=$OUT/.built-v3
+STAMP=$OUT/.built-v4
 [ -f "$STAMP" ] && { echo "fixtures up to date: $OUT"; exit 0; }
 rm -rf "$OUT"
 mkdir -p "$OUT"/{rpms,files,build,upstream/rpm,upstream/rpm2,upstream/file,upstream/deb}
@@ -86,6 +87,23 @@ head -c 4096 /dev/zero >"$OUT/upstream/file/isos/boot.iso"
 (cd "$OUT/upstream/file" && for f in docs/readme.txt docs/guide.txt isos/boot.iso; do
   echo "$f,$(sha256sum "$f" | cut -d' ' -f1),$(stat -c %s "$f")"
 done >PULP_MANIFEST)
+
+# Git repository for a pulp_file Git remote: bare, for the dumb HTTP protocol (update-server-info).
+# Tag v1: docs/readme.txt. Branch main (HEAD): also docs/guide.txt.
+GITW=$OUT/build/git
+git_fx() {
+  GIT_AUTHOR_DATE=2026-01-01T00:00:00Z GIT_COMMITTER_DATE=2026-01-01T00:00:00Z \
+    git -C "$GITW" -c user.name=pulp-tui -c user.email=pulp-tui@example.com -c commit.gpgsign=false -c tag.gpgsign=false "$@"
+}
+git init -q -b main "$GITW"
+mkdir -p "$GITW/docs"
+echo "readme v1" >"$GITW/docs/readme.txt"
+git_fx add docs && git_fx commit -q -m v1 && git_fx tag v1
+echo "guide v1" >"$GITW/docs/guide.txt"
+git_fx add docs && git_fx commit -q -m v2
+git clone -q --bare "$GITW" "$OUT/upstream/git/files.git"
+git -C "$OUT/upstream/git/files.git" update-server-info
+
 # Debian content: a .deb is an ar archive of debian-binary, control.tar.gz and data.tar.gz,
 # in that order. Fixed mtime, owner and gzip -n keep the archives reproducible.
 DEB=$OUT/upstream/deb

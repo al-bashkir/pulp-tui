@@ -62,6 +62,7 @@ General rules:
 | Fallback replication of a type            | `status/` component on source and destination                        | dry run stops (3)                         |
 | Alternate content sources                 | the plugin, `acs/rpm/rpm/`, `acs/file/file/`, `acs/deb/deb/`         | endpoint message on the screen            |
 | RPM ULN remotes                           | the plugin, `remotes/rpm/uln/`                                       | endpoint message on the screen (6)        |
+| File Git remotes                          | the plugin, `remotes/file/git/`                                      | endpoint message on the screen (7)        |
 | RPM comps, advisory upload (**U**, **A**) | `post` of `rpm/comps/`, `content/rpm/advisories/`                    | endpoint message                          |
 | Version repair (**F**)                    | `{rpm_rpm_repository_version_href}repair/` (4)                       | endpoint message                          |
 | Reclaim space (**R**)                     | `repositories/reclaim_space/`                                        | endpoint message                          |
@@ -87,6 +88,8 @@ General rules:
    delete confirm says that it cannot tell whether this is your own user.
 6. pulp_rpm 3.27.12, 3.34.0 and 3.39.5 have it. The Remote picker of a repository and a sync
    lists it only when the server has the endpoint.
+7. pulpcore 3.123.1 has it; 3.63.36 and 3.95.3 do not (read in their images). The picker is
+   the same as in (6).
 
 ### Form fields
 
@@ -102,7 +105,7 @@ General rules:
 
 * A hidden sync option uses the server default.
 * **Remote**: the form shows only the fields of the type's schema (`rpm.RpmRemote`,
-  `rpm.UlnRemote`, `file.FileRemote`, `deb.AptRemote`); Labels always.
+  `rpm.UlnRemote`, `file.FileRemote`, `file.FileGitRemote`, `deb.AptRemote`); Labels always.
 * **Replication filter**: the form shows `q_select`, else `pulp_label_select`.
 * **Deb Content View signing** (`signing_service`, `signing_service_release_overrides`):
   detected in the JSON of the derived repository. Without them, pulp-tui does not send them,
@@ -135,6 +138,10 @@ next section.
 * **RPM ULN remote** (`live_repos`, 3.123.1, through the TUI): create with `uln://`, an
   edit of `uln_server_base_url` keeps the account (`hidden_fields`), delete after the impact
   names the repository that uses it. A ULN sync needs a ULN account: mock tests only.
+* **File Git remote** (`live_repos`, 3.123.1, through the TUI): create with `git_ref` v1 of
+  the fixture `upstream/git/files.git`; a File repository with it as default remote (made
+  outside the TUI) syncs with the untouched, pre-filled sync form (one file); after an edit
+  of `git_ref` to `main`, the next sync adds the second file.
 * **Content Views**: multi-repository snapshot, RPM, File and advisory filters, numbered
   versions, Library auto-binding, promotion path rules, rollback, served-content check,
   retention protection, partial failure and retry, Resume that re-attaches to a submitted
@@ -441,6 +448,14 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   one (`REMOTE_TYPES = [RpmRemote]`). Remote names are unique across all remote types
   (`DomainUniqueValidator` on `Remote`), so pulp-tui finds a picked name in the first
   collection that has it.
+* **Git remotes** (pulpcore 3.123.1, `file.FileGitRemote`): `policy` is a hidden field
+  (always `immediate`, not in the schema); `git_ref` defaults to `HEAD` and is not nullable,
+  so a cleared Git ref is sent as `HEAD`. The sync runs `git clone --bare --depth 1 --branch
+  <ref>`, and after a failure a full bare clone (GitPython; the image has `git`). A shallow
+  clone fails on the dumb HTTP protocol, the full clone works: the fixture is a bare
+  repository with `git update-server-info` on the static fixture server. Username and
+  password go into the clone URL for `http` and `https` only. A File ACS does not take a Git
+  remote (`REMOTE_TYPES = [FileRemote]`).
 
 ### Replication
 
@@ -631,7 +646,7 @@ or IpAddress(127.0.0.1)`.
 * RPM layout `nested_by_digest`: served-content checks skip the package probe (metadata is
   still checked).
 * ULN: a sync from a ULN remote is tested with mock HTTP only (it needs a ULN account).
-  `export-repos` leaves out ULN remotes.
+  `export-repos` leaves out ULN and Git remotes.
 * Signing services can be set on repositories, not created (that needs server scripts).
 * Content guards are only shown and set by href, not created or replicated.
 * Reusable filter sets are not implemented; filters are per view repository, so a later

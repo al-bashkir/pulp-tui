@@ -14,7 +14,7 @@ pub enum Kind {
     Profiles,
     /// `true` also shows the snapshot repositories of Content Views (label `pulp_tui_cv`).
     Repos(RepoType, bool),
-    /// `true`: the plugin's second remote type (`RepoType::alt_remote`, pulp_rpm ULN).
+    /// `true`: the plugin's second remote type (`RepoType::alt_remote`: pulp_rpm ULN, pulp_file Git).
     Remotes(RepoType, bool),
     /// Alternate content sources.
     Acs(RepoType),
@@ -588,6 +588,10 @@ impl Kind {
                 col("retain", 6, |v| s(v, "retain_repo_versions")),
                 col("description", 30, |v| s(v, "description")),
             ],
+            // pulp_file Git remotes have no policy (always immediate).
+            Kind::Remotes(RepoType::File, true) => {
+                vec![col("name", 28, |v| s(v, "name")), col("git ref", 14, |v| s(v, "git_ref")), col("url", 50, |v| s(v, "url"))]
+            }
             Kind::Remotes(..) => {
                 vec![col("name", 28, |v| s(v, "name")), col("policy", 10, |v| s(v, "policy")), col("url", 50, |v| s(v, "url"))]
             }
@@ -1499,6 +1503,25 @@ mod tests {
         assert_eq!(uln.unsupported(&caps), None);
         caps.versions.clear();
         assert_eq!(uln.unsupported(&caps).as_deref(), Some("not supported by this server: pulp_rpm plugin"));
+    }
+
+    #[test]
+    fn file_git_remotes_follow_file_remotes_and_need_the_endpoint() {
+        let git = Kind::Remotes(RepoType::File, false).toggle().unwrap();
+        assert_eq!(git, Kind::Remotes(RepoType::File, true));
+        assert_eq!(git.title(), "File Git Remotes  [t: toggle type]");
+        assert_eq!(git.source().unwrap().0, "remotes/file/git/");
+        assert_eq!(git.toggle(), Some(Kind::Remotes(RepoType::Deb, false)));
+        let row = json!({ "name": "docs", "git_ref": "v1", "url": "https://git.example/docs.git", "policy": "immediate" });
+        let cells: Vec<(&str, String)> = git.columns().iter().map(|c| (c.title, (c.get)(&row))).collect();
+        assert_eq!(cells, [("name", "docs".into()), ("git ref", "v1".into()), ("url", "https://git.example/docs.git".into())]);
+        // pulp_file before pulpcore 3.123 (3.95.3 tested) has no Git remotes.
+        let mut caps = Capabilities::default();
+        caps.versions.insert("file".into(), "3.95.3".into());
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/remotes/file/file/": {} } }));
+        assert_eq!(git.unsupported(&caps).as_deref(), Some("not supported by this server: File Git remotes (remotes/file/git/)"));
+        caps.paths.insert("remotes/file/git/".into());
+        assert_eq!(git.unsupported(&caps), None);
     }
 
     #[test]

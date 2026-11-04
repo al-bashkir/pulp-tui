@@ -243,15 +243,15 @@ repository. A Deb distribution serves at `<content URL>/dists/<distribution>/...
 
 ### Remotes
 
-`t` toggles RPM, RPM ULN, File, Deb. **c** / **e** / **d** create / edit / delete, **i** full
-JSON. The form shows only the fields of the server's schema for the type. Delete lists the
-repositories that use the remote. Pulp does not delete a remote that an alternate content
-source (ACS) uses, so pulp-tui refuses it (also in a bulk delete) and names the ACS: delete
-them or change their remote first. An ACS takes only RPM, File and Deb remotes, never a ULN
-remote.
+`t` toggles RPM, RPM ULN, File, File Git, Deb. **c** / **e** / **d** create / edit / delete,
+**i** full JSON. The form shows only the fields of the server's schema for the type. Delete
+lists the repositories that use the remote. Pulp does not delete a remote that an alternate
+content source (ACS) uses, so pulp-tui refuses it (also in a bulk delete) and names the ACS:
+delete them or change their remote first. An ACS takes only RPM, File and Deb remotes, never a
+ULN or Git remote.
 
-The Remote field of a repository and of a sync lists the remotes of both RPM types; the note
-`ULN` marks a ULN remote.
+The Remote field of a repository and of a sync lists the remotes of both types of the plugin;
+the note `ULN` or `Git` marks the second type.
 
 * **URL**: `http://`, `https://`, or `file://` under the server's `ALLOWED_IMPORT_PATHS`. File: the
   URL of `PULP_MANIFEST`. Deb: the archive base URL (the directory with `dists/`).
@@ -270,6 +270,13 @@ RPM ULN fields (Oracle Unbreakable Linux Network; the screen says when the serve
 * **Username**, **Password** (required on create): the ULN account. Pulp never returns them;
   on edit, empty keeps them.
 * **ULN server base URL**: empty = the server setting `DEFAULT_ULN_SERVER_BASE_URL`.
+
+File Git fields (a File repository syncs the files of a Git commit; pulpcore 3.123 has it, 3.95
+not):
+
+* **URL**: the Git repository, `http://`, `https://`, `git://`, `ssh://` or `file://`. Pulp
+  uses **Username** and **Password** only with `http://` and `https://`.
+* **Git ref**: branch, tag or commit; empty = `HEAD`. No download policy (always immediate).
 
 Deb fields:
 

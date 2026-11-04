@@ -104,7 +104,8 @@ impl RepoType {
     pub fn alt_remote(self) -> Option<(&'static str, &'static str, &'static str)> {
         match self {
             RepoType::Rpm => Some(("ULN", "remotes/rpm/uln/", "rpm.UlnRemote")),
-            RepoType::File | RepoType::Deb => None,
+            RepoType::File => Some(("Git", "remotes/file/git/", "file.FileGitRemote")),
+            RepoType::Deb => None,
         }
     }
     pub fn publications(self) -> &'static str {

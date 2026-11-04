@@ -446,3 +446,54 @@ async fn uln_remote_create_edit_and_delete_through_the_tui() {
     assert!(c.get::<Value>(&href, &[]).await.is_err(), "deleted");
     cleanup(&c, &[&repo]).await;
 }
+
+/// A File Git remote through the TUI (Remotes, `t` to File Git), and a File repository whose default remote it is,
+/// made outside the TUI: the sync form shows the Git remote and, untouched, syncs from it (audit F09). The
+/// fixture is a bare repository for the dumb HTTP protocol: pulp_file's shallow clone fails there and its full
+/// clone works. `git_ref` v1 has one file; after an edit to `main`, the next sync adds the second.
+#[tokio::test]
+async fn file_git_remote_syncs_a_repository_with_the_prefilled_form() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::File, unique("it-git"));
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Remotes(t, true);
+    if let Some(e) = app.list.kind.unsupported(&app.conn.as_ref().unwrap().caps) {
+        assert_eq!(e, "not supported by this server: File Git remotes (remotes/file/git/)");
+        eprintln!("skipping: {e}");
+        return;
+    }
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("name", &name), ("url", &format!("{}/git/files.git", upstream())), ("git_ref", "v1")]);
+    settle(&mut app, &mut rx).await;
+    let found: Option<Value> = ops::find_by_name(&c, &c.api("remotes/file/git/"), &name).await.unwrap();
+    let remote = found.unwrap_or_else(|| panic!("not created: {:?}", texts(&app)));
+    let href = remote["pulp_href"].as_str().unwrap().to_string();
+    assert_eq!(remote["git_ref"], "v1");
+    let repo = create(&c, t.repositories(), json!({ "name": name, "remote": href }), "/repositories/").await;
+
+    let sync = async |app: &mut pulp_tui::tui::app::App, rx: &mut tokio::sync::mpsc::UnboundedReceiver<pulp_tui::tui::app::Msg>| {
+        app.list.kind = Kind::Repos(t, false);
+        run(app, Act::Sync, c.get::<Value>(&repo, &[]).await.unwrap());
+        settle(app, rx).await;
+        let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no sync form: {:?}", texts(app)) };
+        assert_eq!(form.get("remote"), name, "the default remote, by name");
+        fill(app, &[]);
+        settle(app, rx).await;
+        settle_submitted(&c, app).await;
+        let v = latest(&c, &repo).await;
+        file::files_in(&c, &v).await.unwrap().into_iter().map(|f| f.relative_path).collect::<Vec<_>>()
+    };
+    assert_eq!(sync(&mut app, &mut rx).await, ["docs/readme.txt"]);
+
+    app.list.kind = Kind::Remotes(t, true);
+    run(&mut app, Act::Edit, remote);
+    fill(&mut app, &[("git_ref", "main")]);
+    settle(&mut app, &mut rx).await;
+    settle_submitted(&c, &app).await;
+    let mut paths = sync(&mut app, &mut rx).await;
+    paths.sort();
+    assert_eq!(paths, ["docs/guide.txt", "docs/readme.txt"]);
+    cleanup(&c, &[&repo, &href]).await;
+}

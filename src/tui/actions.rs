@@ -1760,7 +1760,9 @@ fn remote_url(t: RepoType, alt: bool) -> (&'static str, &'static [&'static str])
         // pulp_rpm UlnRemoteSerializer.validate_url takes only `uln`.
         (RepoType::Rpm, true) => ("uln://<channel label>, e.g. uln://ol8_x86_64_baseos_latest", &["uln"]),
         (RepoType::Rpm, false) => ("yum repository base URL", WEB),
-        (RepoType::File, _) => ("URL of the PULP_MANIFEST", WEB),
+        // pulp_file clones with the git command; it puts Username and Password into an http(s) URL only.
+        (RepoType::File, true) => ("Git repository URL", &["http", "https", "file", "git", "ssh"]),
+        (RepoType::File, false) => ("URL of the PULP_MANIFEST", WEB),
         (RepoType::Deb, _) => ("Debian archive base URL (the directory that holds dists/)", WEB),
     }
 }
@@ -1797,7 +1799,11 @@ fn remote_extra_fields(t: RepoType, alt: bool, caps: Option<&Capabilities>, v: &
                 vec![]
             }
         }
-        (RepoType::File, _) => vec![],
+        (RepoType::File, true) => {
+            let f = Field::text("git_ref", "Git ref").value(s(v, "git_ref"));
+            vec![f.help("branch, tag or commit; empty = HEAD")].into_iter().filter(|f| has(&f.key)).collect()
+        }
+        (RepoType::File, false) => vec![],
         (RepoType::Deb, _) => {
             let text = |k: &str, label: &str| Field::text(k, label).value(s(v, k));
             let flag = |k: &str, label: &str| Field::new(k, label, FieldKind::Bool).value(if v[k] == true { "true" } else { "false" });
@@ -1860,6 +1866,8 @@ fn remote_body(f: &Form, edit: bool, schemes: &[&str]) -> Result<(Value, Vec<(St
             // pulpcore: `headers` is not nullable; an empty list removes them.
             ("headers", _) if val.trim() == "-" => b["headers"] = json!([]),
             ("headers", _) => b["headers"] = parse_headers(&val).map_err(|e| format!("{}: {e}", fld.label))?,
+            // pulp_file: not nullable, default HEAD.
+            ("git_ref", _) if val.is_empty() => b["git_ref"] = "HEAD".into(),
             ("excluded_package_metadata_fields", _) => {
                 b[fld.key.as_str()] = val.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>().into()
             }
@@ -5676,6 +5684,100 @@ mod tests {
         let Some(Modal::Confirm { typed, lines, .. }) = app.modal.take() else { panic!("no confirm") };
         assert_eq!(typed.as_deref(), Some("ol8"));
         assert!(lines.contains(&"1 repository(ies) use it as default remote: ol8-os".to_string()), "{lines:?}");
+    }
+
+    /// The Git form has the fields of `file.FileGitRemote` (no policy: pulp_file sets `immediate`) and a Git ref; the URL
+    /// takes the schemes that git clones from, and a cleared ref is HEAD (Pulp refuses null). A File sync picks a Git
+    /// remote from the Remote picker (note `Git`).
+    #[tokio::test]
+    async fn git_remote_form_follows_the_git_schema_and_a_file_sync_picks_it() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{body_json, method, path};
+        let server = wiremock::MockServer::start().await;
+        let (coll, href, repo) =
+            (format!("{API}remotes/file/git/"), format!("{API}remotes/file/git/1/"), format!("{API}repositories/file/file/r/"));
+        let url = "ssh://git@git.example/docs.git";
+        let created = json!({ "name": "docs", "url": url, "tls_validation": true, "git_ref": "v1" });
+        let task = json!({ "task": format!("{API}tasks/1/") });
+        for (m, p, body, status, answer) in [
+            ("POST", &coll, created, 201, json!({ "pulp_href": href })),
+            ("PATCH", &href, json!({ "git_ref": "HEAD" }), 200, json!({ "pulp_href": href })),
+            ("POST", &format!("{repo}sync/"), json!({ "remote": href, "mirror": false }), 202, task),
+        ] {
+            wiremock::Mock::given(method(m))
+                .and(path(p.as_str()))
+                .and(body_json(body))
+                .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(answer))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        get(&server, &format!("{API}remotes/file/file/"), page(json!([]))).await;
+        get(&server, &coll, page(json!([{ "pulp_href": href, "name": "docs" }]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let mut caps = plugins();
+        // The properties of file.FileGitRemote in pulpcore 3.123.1.
+        let props: serde_json::Map<String, Value> = [
+            "ca_cert",
+            "client_cert",
+            "client_key",
+            "connect_timeout",
+            "download_concurrency",
+            "git_ref",
+            "headers",
+            "max_retries",
+            "name",
+            "password",
+            "proxy_password",
+            "proxy_url",
+            "proxy_username",
+            "pulp_labels",
+            "rate_limit",
+            "sock_connect_timeout",
+            "sock_read_timeout",
+            "tls_validation",
+            "total_timeout",
+            "url",
+            "username",
+        ]
+        .map(|k| (k.to_string(), json!({})))
+        .into_iter()
+        .collect();
+        caps.load_openapi(&json!({ "components": { "schemas": { "file.FileGitRemote": { "properties": props } } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        app.list.kind = Kind::Remotes(RepoType::File, true);
+        let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+
+        run(&mut app, Act::Create, Value::Null);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.title, "New File Git remote");
+        let k = keys(&form);
+        assert!(!k.contains(&"policy".to_string()) && k.contains(&"git_ref".to_string()) && k.contains(&"password".to_string()), "{k:?}");
+        for (k, v) in [("name", "docs"), ("url", "host:8000/docs.git"), ("git_ref", "v1")] {
+            set(&mut form, k, v);
+        }
+        assert_eq!(submit(&mut app, &form), Err("invalid URL: use http://, https://, file://, git://, ssh:// (not host:)".into()));
+        set(&mut form, "url", url);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.notices.iter().any(|n| n.text == "create remote docs: done"), "{:?}", app.notices.back().map(|n| &n.text));
+
+        run(&mut app, Act::Edit, json!({ "pulp_href": href, "name": "docs", "url": url, "git_ref": "v1", "tls_validation": true }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(form.get("git_ref"), "v1");
+        set(&mut form, "git_ref", "");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.notices.iter().any(|n| n.text == "update remote docs: done"), "{:?}", app.notices.back().map(|n| &n.text));
+
+        let items = super::super::pick::load_options(&app.ctx().unwrap(), &Source::SyncRemotes(RepoType::File), "").await.unwrap();
+        assert_eq!(items.iter().map(|i| (i.label.as_str(), i.note.as_str())).collect::<Vec<_>>(), [("docs", "Git")]);
+        repo_action(&mut app, RepoType::File, Act::Sync, json!({ "pulp_href": repo, "name": "site", "remote": null }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        set(&mut form, "remote", "docs");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert!(app.notices.iter().any(|n| n.text.starts_with("submitted: sync site")), "{:?}", app.notices.back().map(|n| &n.text));
     }
 
     #[tokio::test]
