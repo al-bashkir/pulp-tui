@@ -83,6 +83,33 @@ pub(super) fn unmark_when_deleted(app: &mut App, href: String, m: Mutation, labe
     }
 }
 
+/// Send `steps` one after the other: each adds to the latest version, so each task ends before the next is sent.
+/// The Task Center tracks every task; the last mutation is returned for the caller to report or follow.
+async fn one_by_one<T, E, Fut>(ctx: &Ctx, steps: Vec<T>, mut send: impl FnMut(T) -> Fut) -> anyhow::Result<Mutation>
+where
+    Fut: Future<Output = std::result::Result<Mutation, E>>,
+    anyhow::Error: From<E>,
+{
+    let on = ctx.on_task();
+    let mut sent = None;
+    for step in steps {
+        if let Some(m) = sent.take() {
+            ops::settle(&ctx.client, m, &on).await?;
+        }
+        sent = Some(send(step).await?);
+    }
+    sent.ok_or_else(|| anyhow!("nothing to send"))
+}
+
+/// The units that Remove sends: Deb adds the release records of the packages in `latest` (`deb::with_release_records`).
+async fn remove_units(c: &PulpClient, t: RepoType, latest: &str, units: Vec<String>) -> anyhow::Result<Vec<String>> {
+    match t {
+        RepoType::Deb if latest.is_empty() => bail!("repository has no versions"),
+        RepoType::Deb => Ok(deb::with_release_records(c, latest, units).await?),
+        RepoType::Rpm | RepoType::File => Ok(units),
+    }
+}
+
 /// A Remove task ended: a Content screen that still shows the browsed version moves to the new one.
 fn content_removed(app: &mut App, old: &str, n: usize, t: &Task) {
     let Some(new) = t.created_matching("/versions/") else {
@@ -235,7 +262,7 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl 
         let mut goes = vec![];
         for href in repos {
             let r: Value = ctx.client.get(&href, &[]).await?;
-            if latest_goes(&ctx, &r).await? {
+            if latest_goes(&ctx, &r, 1).await? {
                 goes.push(s(&r, "name"));
             }
         }
@@ -247,7 +274,7 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl 
             if goes.is_empty() {
                 lines.push("Older versions are not changed and can still be published (rollback).".into());
             } else {
-                lines.extend(goes_lines(&goes.join(", "), "Content that is not upstream"));
+                lines.extend(goes_lines(&goes.join(", "), 1, "Content that is not upstream"));
             }
             if complete {
                 lines.push("mirror_complete also publishes the upstream metadata unchanged (a publication is created).".into());
@@ -262,21 +289,25 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl 
 }
 
 /// pulpcore `Repository.cleanup_old_versions`: after each new version, Pulp keeps the newest `retain_repo_versions`
-/// versions that no distribution serves (`protected_versions`) and deletes the others. True when the next version
-/// makes Pulp delete the current version of the repository `r`: retention 1 and no distribution serves it.
-async fn latest_goes(ctx: &Ctx, r: &Value) -> anyhow::Result<bool> {
+/// versions that no distribution serves (`protected_versions`) and deletes the others. True when the next `versions`
+/// new versions make Pulp delete the current version of the repository `r`: retention `versions` or less and no
+/// distribution serves it.
+async fn latest_goes(ctx: &Ctx, r: &Value, versions: usize) -> anyhow::Result<bool> {
     // Version 0 is empty: its delete loses no content.
     let latest = r["latest_version_href"].as_str().filter(|v| version_number(v) > 0);
-    let Some(v) = latest.filter(|_| r["retain_repo_versions"] == 1) else { return Ok(false) };
+    let Some(v) = latest.filter(|_| r["retain_repo_versions"].as_u64().is_some_and(|k| k as usize <= versions)) else {
+        return Ok(false);
+    };
     let t = RepoType::from_href(v).ok_or_else(|| anyhow!("unknown repository type: {v}"))?;
     Ok(ops::version_protection(&ctx.client, &ctx.caps, t, v).await?.1.is_empty())
 }
 
-/// The confirm lines when the next version makes Pulp delete the current version of `names` (`latest_goes`).
-fn goes_lines(names: &str, what: &str) -> Vec<String> {
+/// The confirm lines when the next `retain` new versions make Pulp delete the current version of `names` (`latest_goes`).
+fn goes_lines(names: &str, retain: u64, what: &str) -> Vec<String> {
+    let after = if retain == 1 { "the new version".to_string() } else { format!("{retain} new versions") };
     vec![
         format!(
-            "WARNING: retain_repo_versions = 1 and no distribution serves the current version of {names}: Pulp deletes it after the new version."
+            "WARNING: retain_repo_versions = {retain} and no distribution serves the current version of {names}: Pulp deletes it after {after}."
         ),
         format!("{what} then stays only in older versions that distributions serve; orphan cleanup deletes content that no version has."),
     ]
@@ -1513,7 +1544,8 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         lines.push(if deps { "RPM dependencies are copied too.".into() } else { String::new() });
                         ap(move |app| {
                             app.confirm("Confirm copy", lines, move |app| {
-                                submit(app, format!("copy {source} -> {name}"), move |c| async move {
+                                let label = format!("copy {source} -> {name}");
+                                app.job(label.clone(), move |ctx| async move {
                                     // (units, through modify/): the RPM metadata goes after the packages, through modify/.
                                     let mut batches: Vec<(Option<Vec<String>>, bool)> = match units {
                                         None => vec![(None, false)],
@@ -1522,21 +1554,16 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                                     if !meta.is_empty() {
                                         batches.extend(ops::batches(&meta).into_iter().map(|b| (Some(b.to_vec()), true)));
                                     }
-                                    // Each batch adds to the latest version: wait for one before the next; the last goes to Tasks.
-                                    let mut sent = None;
-                                    for (units, modify) in batches {
-                                        if let Some(m) = sent.take() {
-                                            ops::settle(&c, m, &ops::no_progress).await?;
+                                    let (c, sv, href) = (&ctx.client, &sv, &href);
+                                    let m = one_by_one(&ctx, batches, move |(units, modify)| async move {
+                                        match t {
+                                            RepoType::Rpm if !modify => rpm::copy(c, sv, href, None, units, deps).await,
+                                            RepoType::Rpm | RepoType::File => ops::add_content(c, href, units.unwrap_or_default()).await,
+                                            RepoType::Deb => deb::copy(c, sv, href, None, units).await,
                                         }
-                                        sent = Some(match t {
-                                            RepoType::Rpm if !modify => rpm::copy(&c, &sv, &href, None, units, deps).await?,
-                                            RepoType::Rpm | RepoType::File => {
-                                                ops::add_content(&c, &href, units.unwrap_or_default()).await?
-                                            }
-                                            RepoType::Deb => deb::copy(&c, &sv, &href, None, units).await?,
-                                        });
-                                    }
-                                    sent.ok_or_else(|| anyhow!("nothing to copy"))
+                                    })
+                                    .await?;
+                                    ap(move |app| submitted(app, m, &label))
                                 })
                             })
                         })
@@ -2696,10 +2723,20 @@ fn content_action(app: &mut App, version: String, act: Act) {
         Act::RemoveContent => app.job(format!("read repository {}", short(&repo)), move |ctx| async move {
             // The retention of the repository decides whether older versions keep the content.
             let r: Value = ctx.client.get(&repo, &[]).await?;
-            let (goes, name) = (latest_goes(&ctx, &r).await?, s(&r, "name"));
-            let mut lines = vec![format!("Create a new version of {name} without {} unit(s).", units.len())];
+            let latest = s(&r, "latest_version_href");
+            // What the run sends: one version per batch. The run reuses it while the latest version stays the same.
+            let sent = remove_units(&ctx.client, t, &latest, units.clone()).await?;
+            let k = ops::batches(&sent).len();
+            let (goes, name) = (latest_goes(&ctx, &r, k).await?, s(&r, "name"));
+            let mut lines = vec![match k {
+                1 => format!("Create a new version of {name} without {} unit(s).", units.len()),
+                k => format!(
+                    "Create {k} new versions of {name} without {} unit(s), one per batch (Pulp limits the size of a request).",
+                    units.len()
+                ),
+            }];
             if goes {
-                lines.extend(goes_lines(&name, "The removed content"));
+                lines.extend(goes_lines(&name, r["retain_repo_versions"].as_u64().unwrap_or(1), "The removed content"));
             } else {
                 lines.push("The current and older versions are immutable and keep the content.".into());
             }
@@ -2712,14 +2749,9 @@ fn content_action(app: &mut App, version: String, act: Act) {
                         if let Some(e) = snapshot_refusal(&r) {
                             bail!(e);
                         }
-                        let units = match t {
-                            RepoType::Deb => {
-                                let latest = r["latest_version_href"].as_str().ok_or_else(|| anyhow!("repository has no versions"))?;
-                                deb::with_release_records(c, latest, units).await?
-                            }
-                            RepoType::Rpm | RepoType::File => units,
-                        };
-                        let m = ops::remove_content(c, &repo, units).await?;
+                        let now = s(&r, "latest_version_href");
+                        let units = if now == latest { sent } else { remove_units(c, t, &now, units).await? };
+                        let m = one_by_one(&ctx, ops::batches(&units), |b| ops::remove_content(c, &repo, b.to_vec())).await?;
                         // Only a success shows the new version (without marks): on a failure the operator keeps them.
                         ap(move |app| follow(app, m, label, move |app, t| content_removed(app, &version, n, &t)))
                     });
@@ -2745,11 +2777,16 @@ fn content_action(app: &mut App, version: String, act: Act) {
                     if let Some(e) = snapshot_refusal(&r) {
                         bail!(e);
                     }
-                    let m = match t {
-                        RepoType::Rpm | RepoType::File => ops::add_content(c, &s(&r, "pulp_href"), units).await?,
-                        // modify/ adds no release component records, so apt would not see the packages.
-                        RepoType::Deb => deb::copy(c, &version, &s(&r, "pulp_href"), None, Some(units)).await?,
-                    };
+                    let dest = s(&r, "pulp_href");
+                    let (dest, version) = (&dest, &version);
+                    let m = one_by_one(&ctx, ops::batches(&units), move |b| async move {
+                        match t {
+                            RepoType::Rpm | RepoType::File => ops::add_content(c, dest, b.to_vec()).await,
+                            // modify/ adds no release component records, so apt would not see the packages.
+                            RepoType::Deb => deb::copy(c, version, dest, None, Some(b.to_vec())).await,
+                        }
+                    })
+                    .await?;
                     ap(move |app| {
                         follow(app, m, label, move |app, t| {
                             // Only after success: on a failure the operator keeps the marks.
@@ -4284,7 +4321,9 @@ mod tests {
         let added = json!({ "add_content_units": [h("advisories", "a1"), h("packagegroups", "g"), h("modulemds", "m")] });
         assert_eq!(posts_to(&server, &format!("{dst}modify/")).await, [added], "after the copy: the modify, once");
 
-        // Without rules: one copy of everything, nothing else.
+        // Without rules: one copy of everything, nothing else. The copy task that ended reloaded the Dashboard,
+        // which read the plugins from status/ (none here).
+        app.conn.as_mut().unwrap().caps = Arc::new(plugins());
         repo_action(&mut app, RepoType::Rpm, Act::CopyContent, json!({ "pulp_href": dst, "name": "dst" }));
         fill_and_submit(&mut app, &[("source", "src"), ("deps", "false")]);
         settle(&mut app, &mut rx).await;
@@ -4309,13 +4348,16 @@ mod tests {
         let pkgs: Vec<Value> =
             hrefs.iter().map(|h| json!({ "pulp_href": h, "package": "p", "version": "1.0-1", "architecture": "amd64" })).collect();
         get(&server, &format!("{API}content/deb/packages/"), page(json!(pkgs))).await;
-        get(&server, &format!("{API}tasks/1/"), json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "name": "copy" }))
-            .await;
-        wiremock::Mock::given(method("POST"))
-            .and(path(format!("{API}deb/copy/")))
-            .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
-            .mount(&server)
-            .await;
+        for i in [1, 2] {
+            let task = format!("{API}tasks/{i}/");
+            get(&server, &task, json!({ "pulp_href": task, "state": "completed", "name": "copy" })).await;
+            wiremock::Mock::given(method("POST"))
+                .and(path(format!("{API}deb/copy/")))
+                .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": task })))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+        }
         let (mut app, mut rx) = connected(&server).await;
         app.conn.as_mut().unwrap().caps = Arc::new(plugins());
         repo_action(&mut app, RepoType::Deb, Act::CopyContent, json!({ "pulp_href": dst, "name": "dst" }));
@@ -4340,6 +4382,129 @@ mod tests {
             .flat_map(|r| serde_json::from_value::<Vec<String>>(r.body_json::<Value>().unwrap()["config"][0]["content"].clone()).unwrap())
             .collect();
         assert_eq!(units, hrefs);
+        assert_eq!(
+            tracked(&app),
+            [(format!("{API}tasks/1/"), "copy src -> dst".into()), (format!("{API}tasks/2/"), "copy src -> dst".into())]
+        );
+    }
+
+    /// Href and label of each task in the Task Center, sorted by href.
+    fn tracked(app: &App) -> Vec<(String, String)> {
+        let mut v: Vec<_> = app.tasks.items.iter().map(|t| (t.href.clone(), t.label.clone())).collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn a_large_remove_or_add_is_sent_in_batches_and_each_task_is_tracked() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let units: Vec<String> = (0..30_000).map(|i| format!("{API}content/file/files/{i:036}/")).collect();
+        let (src, dst) = (format!("{API}repositories/file/file/src/"), format!("{API}repositories/file/file/dst/"));
+        for (act, repo, field, label) in [
+            (Act::RemoveContent, &src, "remove_content_units", "remove 30000 unit(s)"),
+            (Act::AddToRepo, &dst, "add_content_units", "add 30000 unit(s) to dst"),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            get(&server, &src, json!({ "pulp_href": src, "name": "src", "latest_version_href": format!("{src}versions/1/") })).await;
+            get(&server, &format!("{API}repositories/file/file/"), page(json!([{ "pulp_href": dst, "name": "dst" }]))).await;
+            for i in [1, 2] {
+                let task = format!("{API}tasks/{i}/");
+                let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": task }));
+                wiremock::Mock::given(method("POST"))
+                    .and(path(format!("{repo}modify/")))
+                    .respond_with(accepted)
+                    .up_to_n_times(1)
+                    .mount(&server)
+                    .await;
+                let created = [format!("{repo}versions/{}/", i + 1)];
+                get(&server, &task, json!({ "pulp_href": task, "state": "completed", "created_resources": created })).await;
+            }
+            let (mut app, mut rx) = connected(&server).await;
+            app.list.marked = units.iter().cloned().collect();
+            content_action(&mut app, format!("{src}versions/1/"), act);
+            if act == Act::AddToRepo {
+                let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+                form.fields[0].value = "dst".into();
+                submit(&mut app, &form).unwrap();
+            } else {
+                settle(&mut app, &mut rx).await; // the repository is read before the confirm
+                let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+                yes(&mut app);
+            }
+            settle(&mut app, &mut rx).await;
+            let sent = server.received_requests().await.unwrap();
+            let kinds: Vec<_> = sent
+                .iter()
+                .filter(|r| r.method.as_str() == "POST" || r.url.path().ends_with("/tasks/1/"))
+                .map(|r| r.method.to_string())
+                .collect();
+            assert_eq!(kinds, ["POST", "GET", "POST"], "{label}: the first batch is done before the second is sent");
+            let bodies = posts_to(&server, &format!("{repo}modify/")).await;
+            let sent: Vec<String> = bodies.iter().flat_map(|b| serde_json::from_value::<Vec<String>>(b[field].clone()).unwrap()).collect();
+            assert_eq!(sent, units, "{label}");
+            assert_eq!(tracked(&app), [(format!("{API}tasks/1/"), label.into()), (format!("{API}tasks/2/"), label.into())]);
+        }
+    }
+
+    /// A Remove of more units than one request takes makes one version per batch: the confirm says how many, and
+    /// retention deletes the current version when it keeps no more versions than that. Deb counts the release records.
+    #[tokio::test]
+    async fn a_remove_in_batches_confirms_the_number_of_versions() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let files: Vec<String> = (0..30_000).map(|i| format!("{API}content/file/files/{i:036}/")).collect();
+        let debs: Vec<String> = (0..15_000).map(|i| format!("{API}content/deb/packages/{i:036}/")).collect();
+        let prcs: Vec<Value> = (0..15_000)
+            .map(|i| json!({ "pulp_href": format!("{API}content/deb/package_release_components/{i:036}/"), "package": debs[i] }))
+            .collect();
+        let latest = |t: &str, n: &str| format!("{API}repositories/{t}/{t}/{n}/versions/1/");
+        let cases = [
+            (
+                "file",
+                "two",
+                json!(2),
+                &files,
+                "Create 2 new versions of two without 30000 unit(s), one per batch (Pulp limits the size of a request).",
+                true,
+            ),
+            (
+                "file",
+                "three",
+                json!(3),
+                &files,
+                "Create 2 new versions of three without 30000 unit(s), one per batch (Pulp limits the size of a request).",
+                false,
+            ),
+            (
+                "deb",
+                "apt",
+                Value::Null,
+                &debs,
+                "Create 2 new versions of apt without 15000 unit(s), one per batch (Pulp limits the size of a request).",
+                false,
+            ),
+        ];
+        for (t, n, retain, _, _, _) in &cases {
+            let r = json!({ "pulp_href": format!("{API}repositories/{t}/{t}/{n}/"), "name": n, "latest_version_href": latest(t, n), "retain_repo_versions": retain });
+            get(&server, &format!("{API}repositories/{t}/{t}/{n}/"), r).await;
+            get(&server, &format!("{API}publications/{t}/{t}/"), page(json!([]))).await;
+            get(&server, &format!("{API}distributions/{t}/{t}/"), page(json!([]))).await;
+        }
+        get(&server, &format!("{API}content/deb/package_release_components/"), page(json!(prcs))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let warn = "WARNING: retain_repo_versions = 2 and no distribution serves the current version of two: Pulp deletes it after 2 new versions.";
+        let keep = "The current and older versions are immutable and keep the content.";
+        for (t, n, _, units, first, goes) in cases {
+            app.list.marked = units.iter().cloned().collect();
+            content_action(&mut app, latest(t, n), Act::RemoveContent);
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, typed, .. }) = app.modal.take() else { panic!("no confirm for {n}") };
+            assert_eq!(lines[0], first, "{n}");
+            assert_eq!(typed.as_deref(), goes.then_some(n), "{n}: {lines:?}");
+            assert_eq!((lines.iter().any(|l| l == keep), lines.iter().any(|l| l == warn)), (!goes, goes), "{n}: {lines:?}");
+        }
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing sent before a yes");
     }
 
     #[tokio::test]
@@ -4432,29 +4597,38 @@ mod tests {
     async fn deb_remove_content_takes_the_release_records_along() {
         use crate::tui::app::Modal;
         use wiremock::matchers::{method, path, query_param};
-        let server = wiremock::MockServer::start().await;
         let repo = format!("{API}repositories/deb/apt/r/");
-        let latest = format!("{repo}versions/2/");
         let (p1, p2) = (format!("{API}content/deb/packages/1/"), format!("{API}content/deb/packages/2/"));
-        get(&server, &repo, json!({ "pulp_href": repo, "name": "r", "latest_version_href": latest })).await;
-        let prcs = page(json!([{ "pulp_href": "/prc/1/", "package": p1 }, { "pulp_href": "/prc/2/", "package": p2 }]));
-        wiremock::Mock::given(method("GET"))
-            .and(path(format!("{API}content/deb/package_release_components/")))
-            .and(query_param("repository_version", latest.as_str()))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(prcs))
-            .mount(&server)
-            .await;
-        let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") }));
-        wiremock::Mock::given(method("POST")).and(path(format!("{repo}modify/"))).respond_with(accepted).mount(&server).await;
-        let (mut app, mut rx) = connected(&server).await;
-        app.list.marked = [p1.clone()].into();
-        // The browsed version is older: the removal starts from the latest one.
-        content_action(&mut app, format!("{repo}versions/1/"), Act::RemoveContent);
-        settle(&mut app, &mut rx).await; // the repository is read before the confirm
-        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
-        on_yes.unwrap()(&mut app);
-        settle(&mut app, &mut rx).await;
-        assert_eq!(posts_to(&server, &format!("{repo}modify/")).await, [json!({ "remove_content_units": [p1, "/prc/1/"] })]);
+        // The confirm reads the records of the latest version; the run reads them again only when a new version came.
+        for (at_yes, record, reads) in [(2, "/prc/1/", 1), (3, "/prc/3/", 2)] {
+            let server = wiremock::MockServer::start().await;
+            for v in [2, at_yes] {
+                let r = json!({ "pulp_href": repo, "name": "r", "latest_version_href": format!("{repo}versions/{v}/") });
+                let ok = wiremock::ResponseTemplate::new(200).set_body_json(r);
+                wiremock::Mock::given(method("GET")).and(path(repo.as_str())).respond_with(ok).up_to_n_times(1).mount(&server).await;
+                let r = if v == 2 { "/prc/1/" } else { record };
+                let prcs = page(json!([{ "pulp_href": r, "package": p1 }, { "pulp_href": "/prc/2/", "package": p2 }]));
+                wiremock::Mock::given(method("GET"))
+                    .and(path(format!("{API}content/deb/package_release_components/")))
+                    .and(query_param("repository_version", format!("{repo}versions/{v}/")))
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(prcs))
+                    .mount(&server)
+                    .await;
+            }
+            let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") }));
+            wiremock::Mock::given(method("POST")).and(path(format!("{repo}modify/"))).respond_with(accepted).mount(&server).await;
+            let (mut app, mut rx) = connected(&server).await;
+            app.list.marked = [p1.clone()].into();
+            // The browsed version is older: the removal starts from the latest one.
+            content_action(&mut app, format!("{repo}versions/1/"), Act::RemoveContent);
+            settle(&mut app, &mut rx).await; // the repository is read before the confirm
+            let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirm") };
+            on_yes.unwrap()(&mut app);
+            settle(&mut app, &mut rx).await;
+            assert_eq!(posts_to(&server, &format!("{repo}modify/")).await, [json!({ "remove_content_units": [p1, record] })]);
+            let sent = server.received_requests().await.unwrap();
+            assert_eq!(sent.iter().filter(|r| r.url.path().ends_with("/package_release_components/")).count(), reads, "v{at_yes}");
+        }
     }
 
     /// Remove the marked unit from the browsed version 1 on a mock server whose task ends as `task`.

@@ -223,7 +223,8 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   takes: the chosen packages, each advisory whose packages are all chosen, and the comps, modules
   and other metadata as they are (added after the packages; the confirm counts them). Advisories
   of the dependencies are not added. A Deb copy is structured: it also copies the Release,
-  component and architecture records, and does not solve dependencies.
+  component and architecture records, and does not solve dependencies. A large selection goes in
+  batches, as for **x** and **a** on Content.
 * **R** reclaims disk space. Pulp deletes the stored files of synced content that no other
   repository has. The content stays in every version. Pulp downloads a file again from the remote
   when a client asks, so the upstream must still serve it. Uploaded content keeps its files. A
@@ -405,6 +406,11 @@ releases, components, indices and more). `/` searches package names or file path
   else orphan cleanup can delete them.
 * **a** adds them to another repository: a new version. On Deb, it is a structured copy, only on
   the packages list.
+* **x** and **a** send a large selection (above about 27,000 units) in batches, one task after
+  the other; each batch makes a new version. The Task Center shows the task of each batch. When
+  a batch fails, the batches after it are not sent. The confirm of **x** says how many versions
+  it makes (on Deb, the release records of the packages count too). With N versions, Pulp deletes
+  the current version when **Retain versions** is N or less, unless a distribution serves it.
 
 ### Publications
 
