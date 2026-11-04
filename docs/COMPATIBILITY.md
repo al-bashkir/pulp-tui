@@ -238,6 +238,8 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   or is the newest version with a complete publication (`checkpoint: false`). Every
   publication type counts. The delete preview applies the same rules (`ops::protecting`).
   `checkpoint` is new (migration 0131); pulp-tui reads it as `false` on older servers.
+  Older servers (3.63.36, 3.95.3) delete a served version, so the Content View cleanup of
+  unused snapshot versions applies `ops::protecting` itself and keeps those versions.
 * **Version repair** (`{version}repair/`, `verify_checksums` default true; progress reports
   `repair.missing`, `repair.corrupted`, `repair.repaired`). Pulp downloads each missing or
   corrupt file from the remote artifacts, else deletes the stored file. A version without
@@ -335,7 +337,15 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   filter, so before a delete pulp-tui matches the bindings in the client (pulp_rpm 3.39.3).
 * **RPM publish settings** (`metadata_signing_service`, `checksum_type`, `repo_config`,
   `compression_type`, `layout`) default to the repository values. A Content View publish
-  copies them to the snapshot repository first.
+  copies them to the snapshot repository first. `repodata/repomd.xml.asc` exists only in a
+  publication made while the repository had a `metadata_signing_service`; Verify requires
+  it when the repository has one.
+* **Publication mode.** A publication stores how it publishes (RPM `checksum_type`,
+  `compression_type`, `layout`, `repo_config`; File `manifest`; Deb `simple`,
+  `structured`, `layout`, `signing_service`, `publish_*`, `excluded_package_metadata_fields`).
+  Rollback and pinned Distribute copy these fields from the publication that the
+  distribution serves now (same repository only) and reuse only a publication with the same
+  values; otherwise clients can lose their paths or signatures.
 * **File publish ignores the repository** (pulp_file 3.123.1). Without `manifest` the
   publication gets `PULP_MANIFEST` (the repository value is for autopublish only);
   `manifest: null` gives none. pulp-tui sends the repository `manifest` (snapshot
@@ -473,7 +483,11 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
   signing runs on upload and `modify/`, not on sync or `deb/copy/`.
 * **`excluded_package_metadata_fields`** (3.11.1, migration `0042`, default `[]`, also for publications that
   do not set it). An edit clears it with `[]`.
-* **`AptPublication`** defaults: `structured=true`, `simple=false`.
+* **`AptPublication`** defaults: `structured=true`, `simple=false`. A structured
+  publication serves `dists/<release>/<component>/`; a simple one serves
+  `dists/default/Release` and `dists/default/all/binary-<arch>/Packages` (pulp_deb
+  `tasks/publishing.py`). Verify probes the paths of each mode that the publication has. A
+  Deb Content View snapshot takes the mode of the newest APT publication of its source.
 * **`signing-services/` has no type filter**, so Deb and RPM services look the same.
 * **No publication reuse for Deb Content Views.** A publication signed with the repository
   keys stores `signing_service: null`, as an unsigned one, and an unchanged copy makes no

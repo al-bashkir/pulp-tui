@@ -14,7 +14,7 @@
 //! Partial promotions are recorded as `partial` and can be retried or reverted.
 
 use crate::filters::Selector;
-use crate::pulp::models::{DebPackage, Distribution, Package, RepoVersion, Repository, Task};
+use crate::pulp::models::{DebPackage, Distribution, Package, Publication, RepoVersion, Repository, Task};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::{
@@ -810,7 +810,7 @@ impl CvService {
         vr.pending_task = None;
         self.alive()?;
         self.store.save_version_repo(vr).await?;
-        if let Err(e) = self.drop_unused_versions(derived, &version, log, on).await {
+        if let Err(e) = self.drop_unused_versions(t, derived, &version, log, on).await {
             log(format!("{}: cleanup of unused versions stopped: {e:#}", repo.repo_name));
         }
         Ok(())
@@ -918,11 +918,21 @@ impl CvService {
     /// of a copy, and those of a publish that stopped between steps. Pulp merges each one into the
     /// next version (the snapshot does not change) and refuses a version that a distribution serves.
     /// Best effort: the snapshot is already recorded, and the next publish tries again.
-    async fn drop_unused_versions(&self, derived: &str, latest: &str, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
+    async fn drop_unused_versions(&self, t: RepoType, derived: &str, latest: &str, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
+        let c = &self.client;
         let used: HashSet<String> = self.store.used_versions(derived).await?.into_iter().collect();
         let versions: Vec<RepoVersion> =
-            self.client.list_all(&format!("{derived}versions/"), &[("fields", "pulp_href,number".into())], 100_000).await?;
+            c.list_all(&format!("{derived}versions/"), &[("fields", "pulp_href,number".into())], 100_000).await?;
+        // pulpcore before 3.123 deletes a served version: check as newer servers do (a binding row can serve one
+        // that no live view version records, for example after a partial promote).
+        let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", derived.into())], 100_000).await?;
+        let ds = ops::distributions(c, t).await?;
         for v in versions.iter().filter(|v| v.number > 0 && v.pulp_href != latest && !used.contains(&v.pulp_href)) {
+            let by: Vec<String> = ops::protecting(&v.pulp_href, &pubs, &ds).iter().map(|(d, why)| format!("{} ({why})", d.name)).collect();
+            if !by.is_empty() {
+                log(format!("keeping {}: served by {}", v.pulp_href, by.join(", ")));
+                continue;
+            }
             self.alive()?;
             match self.client.delete(&v.pulp_href).await {
                 Ok(m) => {
@@ -1893,6 +1903,10 @@ mod tests {
         let versions: Vec<Value> = (0..3).map(|n| json!({ "pulp_href": v(n), "number": n })).collect();
         let page = json!({ "count": 3, "next": null, "results": versions });
         Mock::given(method("GET")).and(path(format!("{DERIVED}versions/"))).respond_with(ok(page)).mount(&server).await;
+        for coll in ["publications/rpm/rpm/", "distributions/rpm/rpm/"] {
+            let none = json!({ "count": 0, "next": null, "results": [] });
+            Mock::given(method("GET")).and(path(format!("/pulp/api/v3/{coll}"))).respond_with(ok(none)).mount(&server).await;
+        }
         Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(204)).mount(&server).await;
 
         svc.publish_repo("web", &mut new, &|_| {}, &ops::no_progress).await.unwrap_err(); // the publish step is not served
@@ -2271,10 +2285,22 @@ mod tests {
         let mut row = svc.store.version_repos(other.id).await.unwrap().remove(0);
         (row.derived_repo, row.derived_version) = (Some(FILE_DERIVED.into()), Some(v(1)));
         svc.store.save_version_repo(&row).await.unwrap();
-        let versions: Vec<Value> = (0..4).map(|n| json!({ "pulp_href": v(n), "number": n })).collect();
-        let page = json!({ "count": 4, "next": null, "results": versions });
+        let versions: Vec<Value> = (0..5).map(|n| json!({ "pulp_href": v(n), "number": n })).collect();
+        let page = json!({ "count": 5, "next": null, "results": versions });
         let list = format!("{FILE_DERIVED}versions/");
         Mock::given(method("GET")).and(path(list)).respond_with(ResponseTemplate::new(200).set_body_json(page)).mount(&server).await;
+        // Version 4 is in no view version, but a distribution serves its publication: older pulpcore deletes it.
+        let p4 = json!({ "pulp_href": "/pulp/api/v3/publications/file/file/4/", "repository_version": v(4) });
+        let d =
+            json!({ "pulp_href": "/d/1/", "name": "partial", "base_path": "p", "publication": "/pulp/api/v3/publications/file/file/4/" });
+        for (coll, results) in [("publications/file/file/", p4), ("distributions/file/file/", d)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pulp/api/v3/{coll}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [results] })))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
         let task = json!({ "task": "/pulp/api/v3/tasks/2/" });
         Mock::given(method("DELETE")).and(path(v(2))).respond_with(ResponseTemplate::new(202).set_body_json(task)).mount(&server).await;
         let done = json!({ "pulp_href": "/pulp/api/v3/tasks/2/", "state": "completed", "name": "delete" });
@@ -2287,8 +2313,10 @@ mod tests {
         svc.publish_repo("web", &mut vr, &|s| lines.lock().unwrap().push(s), &ops::no_progress).await.unwrap_err(); // publish not served
         let sent = server.received_requests().await.unwrap();
         let deleted: Vec<_> = sent.iter().filter(|r| r.method.as_str() == "DELETE").map(|r| r.url.path().to_string()).collect();
-        assert_eq!(deleted, [v(2)], "not version 0, the one another view version uses, or the new snapshot");
-        assert!(lines.lock().unwrap().contains(&format!("deleted unused version {}", v(2))));
+        assert_eq!(deleted, [v(2)], "not version 0, the one another view version uses, the new snapshot, or a served one");
+        let lines = lines.lock().unwrap();
+        assert!(lines.contains(&format!("deleted unused version {}", v(2))), "{lines:?}");
+        assert!(lines.contains(&format!("keeping {}: served by partial (pinned to a publication of this version)", v(4))), "{lines:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
