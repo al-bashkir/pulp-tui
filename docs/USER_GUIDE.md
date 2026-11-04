@@ -613,8 +613,9 @@ Disconnected import of a Pulp export. Copy the export files to a directory in th
   assignments; for a group, its members and its role assignments; for a role, the users and groups
   that have it (pulp-tui reads the roles of each user and group, because the lists have no role
   filter).
-* **Roles** of a user or group: **c** adds a role, an optional object, and an optional domain (when
-  the server has domains). **d** removes. Owner and admin roles ask to confirm.
+* **Roles** of a user or group: **c** adds a role, an optional object, or an optional domain (when
+  the server has domains; not both, Pulp refuses that). **d** removes. Owner and admin roles ask
+  to confirm.
 * **Roles** screen: system roles are read-only. **c** / **e** / **d** a custom role (permissions as
   a comma list).
 

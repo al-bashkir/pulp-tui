@@ -201,6 +201,9 @@ fn assign_role(app: &mut App, owner: String, who: String) {
     }
     let form = Form::new(format!("Assign role to {who}"), fields);
     app.form(form, move |app, f| {
+        if f.opt("content_object").is_some() && f.opt("domain").is_some() {
+            return Err("set Object or Domain, not both: Pulp refuses a role assignment with both".into());
+        }
         let role = f.get("role").to_string();
         let mut b = json!({ "role": role, "content_object": f.opt("content_object") });
         if let Some(d) = f.opt("domain") {
@@ -1595,6 +1598,27 @@ mod tests {
             lines,
             ["Delete role custom.viewer. All assignments of this role are removed.", "1 user(s) have it: ann", "1 group(s) have it: ops"]
         );
+    }
+
+    /// Pulp answers 400 to a role assignment with both `content_object` and `domain`.
+    #[tokio::test]
+    async fn assign_role_refuses_an_object_and_a_domain_together() {
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let mut caps = (*app.conn.as_ref().unwrap().caps).clone();
+        caps.status = Some(serde_json::from_value(json!({ "versions": [], "domain_enabled": true })).unwrap());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let user = "/pulp/api/v3/users/1/".to_string();
+        super::role_assignment(&mut app, crate::tui::kinds::Act::Create, Value::Null, user, "bob".into(), false);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        set(&mut form, "role", "file.filerepository_viewer");
+        set(&mut form, "content_object", "/pulp/api/v3/repositories/file/file/1/");
+        set(&mut form, "domain", "/pulp/api/v3/domains/1/");
+        assert_eq!(submit(&mut app, &form), Err("set Object or Domain, not both: Pulp refuses a role assignment with both".into()));
+        assert!(app.jobs.is_empty() && app.modal.is_none(), "nothing sent");
+        set(&mut form, "domain", "");
+        assert_eq!(submit(&mut app, &form), Ok(()));
+        assert_eq!(app.jobs.len(), 1, "an object alone is sent");
     }
 
     #[tokio::test]
