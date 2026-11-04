@@ -23,7 +23,8 @@ use crate::store::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -325,11 +326,11 @@ impl CvService {
         Ok(lacks.map(|(k, v)| format!("not labeled {k}={}", v.as_str().unwrap_or_default())))
     }
 
-    /// The derived repositories of the view's own (not borrowed) version rows. Refused while another view
-    /// serves one of their publications: deleting the repository deletes its publications.
-    async fn snapshot_repos(&self, cv: &ContentView) -> Result<BTreeSet<String>> {
+    /// The derived repositories of the view's own (not borrowed) version rows (href -> source repository). Refused
+    /// while another view serves one of their publications: deleting the repository deletes its publications.
+    async fn snapshot_repos(&self, cv: &ContentView) -> Result<BTreeMap<String, CvRepo>> {
         let served = self.store.served_publications(&self.scope).await?;
-        let mut repos: BTreeSet<String> = BTreeSet::new();
+        let mut repos = BTreeMap::new();
         for v in self.store.versions(cv.id).await? {
             for vr in self.store.version_repos(v.id).await?.into_iter().filter(|vr| !vr.borrowed) {
                 if let Some((_, other, env)) = served.iter().find(|(p, o, _)| *o != cv.name && vr.publication.as_ref() == Some(p)) {
@@ -340,10 +341,62 @@ impl CvService {
                         vr.repo().repo_name
                     );
                 }
-                repos.extend(vr.derived_repo);
+                if let (Some(r), Some(src)) = (vr.derived_repo, vr.repo) {
+                    repos.insert(r, src);
+                }
             }
         }
         Ok(repos)
+    }
+
+    /// Refused while a distribution that the view does not delete (not in `own`) serves one of its snapshot `repos`:
+    /// Pulp deletes a repository with its versions and publications, also served ones.
+    async fn refuse_served_snapshots(&self, cv: &ContentView, repos: &BTreeMap<String, CvRepo>, own: &[(String, Value)]) -> Result<()> {
+        let mut dists = HashMap::new();
+        for (r, src) in repos {
+            let (pubs, ds) = self.serving(r, src.repo_type, &mut dists).await?;
+            let serves = |d: &&Distribution| {
+                !own.iter().any(|(h, _)| *h == d.pulp_href)
+                    && (d.repository.as_ref() == Some(r)
+                        || d.repository_version.as_deref().is_some_and(|v| ops::repo_of_version(v) == *r)
+                        || pubs.iter().any(|p| d.publication.as_ref() == Some(&p.pulp_href)))
+            };
+            if let Some(d) = ds.iter().find(serves) {
+                bail!(
+                    "content view {}: distribution {} serves the snapshot repository of {} ({r}); \
+                     delete {} or point it to other content first",
+                    cv.name,
+                    d.name,
+                    src.repo_name,
+                    d.name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The publications of snapshot repository `repo` and the distributions of its type `t` (listed once per type in `dists`).
+    // shortcut: Deb verbatim publications are not listed; list them too if operators serve snapshots verbatim.
+    async fn serving<'a>(
+        &self,
+        repo: &str,
+        t: RepoType,
+        dists: &'a mut HashMap<RepoType, Vec<Distribution>>,
+    ) -> Result<(Vec<Publication>, &'a [Distribution])> {
+        let c = &self.client;
+        let pubs = match c.list_all(&c.api(t.publications()), &[("repository", repo.into())], 100_000).await {
+            Ok(p) => p,
+            // Pulp answers 400 to the href of a deleted repository in a filter; a deleted repository serves nothing.
+            Err(e) => match c.get::<Value>(repo, &[]).await {
+                Err(g) if g.is_not_found() => vec![],
+                _ => return Err(e.into()),
+            },
+        };
+        let ds = match dists.entry(t) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(ops::distributions(c, t).await?),
+        };
+        Ok((pubs, ds))
     }
 
     /// Delete `href` if it is ours (`not_ours` with `labels`); otherwise it is logged and kept. Already gone is fine.
@@ -936,9 +989,8 @@ impl CvService {
     /// `drop_unused_versions` for one version: kept when a distribution serves it (`pubs`: the publications of
     /// its repository).
     async fn drop_version(&self, v: &str, pubs: &[Publication], ds: &[Distribution], log: Log<'_>, on: OnTask<'_>) -> Result<()> {
-        let by: Vec<String> = ops::protecting(v, pubs, ds).iter().map(|(d, why)| format!("{} ({why})", d.name)).collect();
-        if !by.is_empty() {
-            log(format!("keeping {v}: served by {}", by.join(", ")));
+        if let Some(why) = served_by(&ops::protecting(v, pubs, ds)) {
+            log(format!("keeping {v}: {why}"));
             return Ok(());
         }
         self.alive()?;
@@ -1501,7 +1553,7 @@ impl CvService {
 
     /// The publication and snapshot version of each own (not borrowed) row of version `v`: (repository, href, why
     /// it is kept; `None` = deleted). Kept: shared with another live version, served by any binding row of the
-    /// scope, or not ours.
+    /// scope, served by a Pulp distribution, or not ours.
     async fn version_objects(&self, v: &CvVersion) -> Result<Vec<(String, String, Option<String>)>> {
         let mut shared = self.other_versions_objects(v).await?;
         // Any binding row of the scope, also a composite's, may still serve a publication of this version.
@@ -1509,14 +1561,27 @@ impl CvService {
         shared.extend(served.iter().map(|(p, _, _)| p.clone()));
         let aliases = self.store.aliases().await?;
         let name = self.store.content_view(v.cv_id).await?.name;
-        let mut objects = vec![];
+        let (mut objects, mut dists) = (vec![], HashMap::new());
         for vr in self.store.version_repos(v.id).await?.into_iter().filter(|vr| !vr.borrowed) {
             // Publications and versions belong to the derived repository.
             let not_ours =
                 if let Some(r) = &vr.derived_repo { self.not_ours(r, &json!({ LABEL_CV: slug(&name) }), &aliases).await? } else { None };
-            objects.extend(row_objects(&vr, not_ours, &mut shared, &served));
+            let pulp = if not_ours.is_none() { self.served_in_pulp(&vr, &mut dists).await? } else { [None, None] };
+            objects.extend(row_objects(&vr, not_ours, pulp, &mut shared, &served));
         }
         Ok(objects)
+    }
+
+    /// Why a distribution serves the publication and the snapshot version of `vr` (`None`: none does), from
+    /// `ops::protecting`. Pulp does not protect a served publication, so a distribution that no binding row records
+    /// would lose its content. One pinned to another publication of the version serves only that one.
+    async fn served_in_pulp(&self, vr: &CvVersionRepo, dists: &mut HashMap<RepoType, Vec<Distribution>>) -> Result<[Option<String>; 2]> {
+        let (Some(r), Some(dv)) = (&vr.derived_repo, &vr.derived_version) else { return Ok([None, None]) };
+        let (pubs, ds) = self.serving(r, vr.repo().repo_type, dists).await?;
+        let mut by = ops::protecting(dv, &pubs, ds);
+        let version = served_by(&by);
+        by.retain(|(d, _)| d.publication.is_none() || d.publication == vr.publication);
+        Ok([served_by(&by), version])
     }
 
     /// The publications and snapshot versions of the other live versions of `v`'s view.
@@ -1536,14 +1601,6 @@ impl CvService {
     /// its rows borrow the components' objects).
     pub async fn delete_view(&self, cv_id: i64, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
         let cv = self.store.content_view(cv_id).await?;
-        let refs = self.store.composite_refs(cv_id).await?;
-        if !refs.is_empty() {
-            bail!(
-                "content view {} is used by {}; remove it from the composite and delete those composite versions first",
-                cv.name,
-                refs.join(", ")
-            );
-        }
         let objects = self.view_objects(&cv).await?;
         self.delete_all_owned(objects, log, on).await?;
         self.alive()?;
@@ -1552,15 +1609,31 @@ impl CvService {
         Ok(())
     }
 
-    /// (href, its ownership labels) of each distribution and derived repository of view `cv`.
+    /// Why `delete_view` is refused, if it is. Reads only.
+    pub async fn delete_view_impact(&self, cv_id: i64) -> Result<()> {
+        self.view_objects(&self.store.content_view(cv_id).await?).await.map(drop)
+    }
+
+    /// (href, its ownership labels) of each distribution and derived repository of view `cv`. Refused while a
+    /// composite uses the view or something outside it serves one of its snapshots. Reads only.
     async fn view_objects(&self, cv: &ContentView) -> Result<Vec<(String, Value)>> {
+        let refs = self.store.composite_refs(cv.id).await?;
+        if !refs.is_empty() {
+            bail!(
+                "content view {} is used by {}; remove it from the composite and delete those composite versions first",
+                cv.name,
+                refs.join(", ")
+            );
+        }
         let envs = self.store.environments(&self.scope).await?;
         let mut objects = vec![];
         for b in self.store.all_binding_repos(cv.id).await? {
             let env = envs.iter().find(|e| e.id == b.env_id).ok_or_else(|| anyhow!("unknown environment"))?;
             objects.push((b.distribution, dist_labels(&cv.name, &env.name)));
         }
-        objects.extend(self.snapshot_repos(cv).await?.into_iter().map(|r| (r, json!({ LABEL_CV: slug(&cv.name) }))));
+        let repos = self.snapshot_repos(cv).await?;
+        self.refuse_served_snapshots(cv, &repos, &objects).await?;
+        objects.extend(repos.into_keys().map(|r| (r, json!({ LABEL_CV: slug(&cv.name) }))));
         Ok(objects)
     }
 
@@ -1574,11 +1647,13 @@ impl CvService {
     }
 }
 
-/// (repository, href, why it is kept) for the publication and snapshot version of `vr`: kept when not ours, or when
-/// `shared` has it (`served`: (publication, view, environment) of the binding rows).
+/// (repository, href, why it is kept) for the publication and snapshot version of `vr`: kept when not ours, when
+/// `shared` has it (`served`: (publication, view, environment) of the binding rows), or when a Pulp distribution
+/// serves it (`pulp`: why, for the publication and the version).
 fn row_objects(
     vr: &CvVersionRepo,
     not_ours: Option<String>,
+    pulp: [Option<String>; 2],
     shared: &mut HashSet<String>,
     served: &[(String, String, String)],
 ) -> Vec<(String, String, Option<String>)> {
@@ -1590,16 +1665,26 @@ fn row_objects(
         shared.insert(dv.clone());
     }
     let mut objects = vec![];
-    for href in [&vr.publication, &vr.derived_version].into_iter().flatten() {
-        let keep = not_ours.clone().or_else(|| {
-            shared.contains(href).then(|| match by {
-                Some((_, other, env)) => format!("still served by {other} in {env}"),
-                None => "shared with another version".into(),
+    for (href, pulp) in [&vr.publication, &vr.derived_version].into_iter().zip(pulp) {
+        let Some(href) = href else { continue };
+        let keep = not_ours
+            .clone()
+            .or_else(|| {
+                shared.contains(href).then(|| match by {
+                    Some((_, other, env)) => format!("still served by {other} in {env}"),
+                    None => "shared with another version".into(),
+                })
             })
-        });
+            .or(pulp);
         objects.push((vr.repo().repo_name.clone(), href.clone(), keep));
     }
     objects
+}
+
+/// "served by <distribution> (<why>), …" for the distributions that `ops::protecting` gives; `None` when there are none.
+fn served_by(by: &[(&Distribution, &str)]) -> Option<String> {
+    let names: Vec<String> = by.iter().map(|(d, why)| format!("{} ({why})", d.name)).collect();
+    (!names.is_empty()).then(|| format!("served by {}", names.join(", ")))
 }
 
 /// Whether environment `e` comes after environment `id` on its path.
@@ -2621,6 +2706,7 @@ mod tests {
         svc.store.save_version_repo(&vr).await.unwrap();
         svc.store.finish_version(vr.version_id, "published", None).await.unwrap();
         serve_owner(&server, DERIVED, svc.store.db_id()).await;
+        serve_snapshot(&server, json!([]), json!([])).await; // no distribution serves them
         // The publication is already gone; the first delete of the version is refused.
         Mock::given(method("DELETE")).and(path(p.as_str())).respond_with(ResponseTemplate::new(404)).mount(&server).await;
         Mock::given(method("DELETE")).and(path(dv.as_str())).respond_with(ResponseTemplate::new(403)).up_to_n_times(1).mount(&server).await;
@@ -2838,7 +2924,16 @@ mod tests {
         serve_labels(&server, DERIVED, json!({ LABEL_CV: "web", LABEL_DB: svc.store.db_id() })).await;
         Mock::given(method("DELETE")).and(path(ours)).respond_with(ResponseTemplate::new(204)).mount(&server).await;
         // A snapshot of web, and another view that serves a publication that is not web's: no refusal.
-        published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/9/").await;
+        let v = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/9/").await;
+        let row = svc.store.version_repos(v.id).await.unwrap().remove(0);
+        // In Pulp, web's own distribution serves the snapshot; another serves a version and a publication of another repository.
+        let pubs = json!([{ "pulp_href": row.publication, "repository_version": row.derived_version }]);
+        let dists = json!([
+            { "pulp_href": ours, "name": "pulp-tui-cv-web-Dev-r0", "base_path": "dev/web/r0", "publication": row.publication },
+            { "pulp_href": "/d/8/", "name": "other", "base_path": "o", "repository_version": "/pulp/api/v3/repositories/rpm/rpm/8/versions/1/" },
+            { "pulp_href": "/d/9/", "name": "other2", "base_path": "o2", "publication": "/pulp/api/v3/publications/rpm/rpm/99/" },
+        ]);
+        serve_snapshot(&server, pubs, dists).await;
         let api = svc.store.create_cv("k", "api", "").await.unwrap();
         let served = BindingRepo {
             env_id: dev,
@@ -3285,6 +3380,10 @@ mod tests {
         let svc = mock_service(&server).await;
         let (_, row) = served_by_composite(&svc).await;
         serve_labels(&server, DERIVED, json!({ LABEL_CV: "os", LABEL_DB: svc.store.db_id() })).await;
+        // Pulp shows the composite's distribution too: the reason of the binding row comes first.
+        let pubs = json!([{ "pulp_href": row.publication, "repository_version": row.derived_version }]);
+        let dists = json!([{ "pulp_href": DIST, "name": "pulp-tui-cv-rocky9-Dev-os", "base_path": "x", "publication": row.publication }]);
+        serve_snapshot(&server, pubs, dists).await;
         let logs = Mutex::new(vec![]);
         svc.delete_version(row.version_id, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
         assert_none(&server, "DELETE").await;
@@ -3311,6 +3410,136 @@ mod tests {
         assert_none(&server, "DELETE").await;
         assert_none(&server, "GET").await;
         assert_eq!(svc.store.content_view(os).await.unwrap().name, "os");
+    }
+
+    /// Pulp lists `pubs` as the publications of DERIVED and `dists` as the RPM distributions.
+    async fn serve_snapshot(server: &wiremock::MockServer, pubs: Value, dists: Value) {
+        for (p, results) in [("/pulp/api/v3/publications/rpm/rpm/", pubs), ("/pulp/api/v3/distributions/rpm/rpm/", dists)] {
+            let page = json!({ "count": results.as_array().unwrap().len(), "next": null, "results": results });
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(p))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page))
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// A distribution named "partial" that no binding row records, serving `href` through `field`.
+    fn plain_dist(field: &str, href: &str) -> Value {
+        json!({ "pulp_href": "/pulp/api/v3/distributions/rpm/rpm/7/", "name": "partial", "base_path": "partial", field: href })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_version_keeps_what_a_plain_distribution_serves() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let other = "/pulp/api/v3/publications/rpm/rpm/9/";
+        // (field of the distribution, what it serves: `None` = the row's publication, why, the publication is kept too)
+        let cases = [
+            ("publication", None, "pinned to a publication of this version", true),
+            ("repository", Some(DERIVED), "follows the repository; this is its newest published version", true),
+            // Pulp serves only the pinned publication: another publication of the version can go.
+            ("publication", Some(other), "pinned to a publication of this version", false),
+        ];
+        for (field, serves, why, keeps_pub) in cases {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+            let v = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
+            let row = svc.store.version_repos(v.id).await.unwrap().remove(0);
+            let (p, dv) = (row.publication.unwrap(), row.derived_version.unwrap());
+            serve_labels(&server, DERIVED, json!({ LABEL_CV: "web", LABEL_DB: svc.store.db_id() })).await;
+            let pubs = json!([{ "pulp_href": p, "repository_version": dv }, { "pulp_href": other, "repository_version": dv }]);
+            serve_snapshot(&server, pubs, json!([plain_dist(field, serves.unwrap_or(&p))])).await;
+            Mock::given(method("DELETE")).and(path(p.as_str())).respond_with(ResponseTemplate::new(204)).mount(&server).await;
+            let logs = Mutex::new(vec![]);
+            svc.delete_version(v.id, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+            let kept = |h: &str| format!("keeping {h}: served by partial ({why})");
+            let sent = server.received_requests().await.unwrap();
+            let deleted: Vec<&str> = sent.iter().filter(|r| r.method.as_str() == "DELETE").map(|r| r.url.path()).collect();
+            if keeps_pub {
+                assert_eq!(logs.into_inner().unwrap(), [kept(&p), kept(&dv)], "{field}");
+                assert!(deleted.is_empty(), "{deleted:?}");
+            } else {
+                assert_eq!(logs.into_inner().unwrap(), [kept(&dv)]);
+                assert_eq!(deleted, [p.as_str()]);
+            }
+            assert_eq!(svc.store.version(v.id).await.unwrap().state, "deleted");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_view_refuses_while_a_plain_distribution_serves_its_snapshot() {
+        for field in ["repository", "repository_version", "publication"] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+            let v = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
+            let row = svc.store.version_repos(v.id).await.unwrap().remove(0);
+            let (p, dv) = (row.publication.unwrap(), row.derived_version.unwrap());
+            let serves = match field {
+                "repository" => DERIVED,
+                "repository_version" => dv.as_str(),
+                _ => p.as_str(),
+            };
+            // web in Dev: its own distribution serves the snapshot too, and the view deletes it.
+            let lib = svc.store.ensure_library("k").await.unwrap();
+            let dev = svc.store.create_env("k", "Dev", lib, false).await.unwrap();
+            let b = BindingRepo {
+                env_id: dev,
+                cv_id: cv,
+                repo_href: "/pulp/api/v3/repositories/rpm/rpm/1/".into(),
+                repo_name: "os".into(),
+                repo_type: RepoType::Rpm,
+                distribution: DIST.into(),
+                base_path: "dev/web/os".into(),
+                publication: Some(p.clone()),
+            };
+            svc.store.save_binding_repo(&b).await.unwrap();
+            let own = json!({ "pulp_href": DIST, "name": "pulp-tui-cv-web-Dev-os", "base_path": "dev/web/os", "publication": p });
+            let pubs = json!([{ "pulp_href": p, "repository_version": dv }]);
+            serve_snapshot(&server, pubs, json!([own, plain_dist(field, serves)])).await;
+            let e = svc.delete_view(cv, &|_| {}, &ops::no_progress).await.unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "content view web: distribution partial serves the snapshot repository of os ({DERIVED}); \
+                     delete partial or point it to other content first"
+                ),
+                "{field}"
+            );
+            assert_none(&server, "DELETE").await;
+            assert_eq!(svc.store.content_view(cv).await.unwrap().name, "web");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deletes_go_on_when_the_snapshot_repository_is_gone() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        for exists in [false, true] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+            let v = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
+            // Pulp answers 400 to the href of a deleted repository in a filter; the repository answers 404 (not mounted).
+            let bad = ResponseTemplate::new(400).set_body_json(json!([format!("URI {DERIVED} not found for repository.")]));
+            Mock::given(method("GET")).and(path("/pulp/api/v3/publications/rpm/rpm/")).respond_with(bad).mount(&server).await;
+            let none = ResponseTemplate::new(200).set_body_json(json!({ "count": 0, "next": null, "results": [] }));
+            Mock::given(method("GET")).and(path("/pulp/api/v3/distributions/rpm/rpm/")).respond_with(none).mount(&server).await;
+            if exists {
+                // Another 400 while the repository is there: what serves it is unknown, so nothing is deleted.
+                serve_labels(&server, DERIVED, json!({ LABEL_CV: "web", LABEL_DB: svc.store.db_id() })).await;
+                assert!(svc.delete_view(cv, &|_| {}, &ops::no_progress).await.is_err());
+                assert_none(&server, "DELETE").await;
+                assert_eq!(svc.store.content_view(cv).await.unwrap().name, "web");
+            } else {
+                // A rerun after an interrupted delete: the repository is already gone.
+                svc.delete_version(v.id, &|_| {}, &ops::no_progress).await.unwrap();
+                svc.delete_view(cv, &|_| {}, &ops::no_progress).await.unwrap();
+                assert!(svc.store.content_views("k").await.unwrap().is_empty());
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

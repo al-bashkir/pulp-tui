@@ -630,6 +630,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                 ]
             };
             let svc = ctx.cv()?;
+            svc.delete_view_impact(id).await?; // a refusal shows before the typed confirmation
             let envs = svc.store.environments(&svc.scope).await?;
             let mut protected: Vec<String> = vec![];
             lines.push(String::new());
@@ -2130,6 +2131,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_view_is_refused_before_the_confirmation_while_a_distribution_serves_its_snapshot() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let derived = format!("{REPOS}rpm/rpm/2/");
+        let v = st.begin_version(web, "", &[cv_repo("os", "rpm", "1")]).await.unwrap();
+        let mut vr = st.version_repos(v.id).await.unwrap().remove(0);
+        vr.derived_repo = Some(derived.clone());
+        st.save_version_repo(&vr).await.unwrap();
+        serve(&server, "GET", "/pulp/api/v3/publications/rpm/rpm/".into(), 200, json!({ "count": 0, "next": null, "results": [] })).await;
+        let d = json!({ "pulp_href": "/d/7/", "name": "partial", "base_path": "partial", "repository": derived });
+        serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/".into(), 200, json!({ "count": 1, "next": null, "results": [d] })).await;
+        cv_action(&mut app, "lab", Act::Delete, json!({ "id": web, "name": "web", "composite": false }));
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "refused: no confirmation");
+        let (level, text) = last_notice(&app);
+        assert_eq!(level, Level::Error);
+        assert!(text.starts_with("read what deleting web removes: content view web: distribution partial serves "), "{text}");
+    }
+
+    #[tokio::test]
     async fn delete_version_shows_what_it_deletes_or_why_it_is_refused() {
         let server = MockServer::start().await;
         let (mut app, mut rx, st) = composite_app().await;
@@ -2151,6 +2174,12 @@ mod tests {
         let (v1, row) = versions.remove(0);
         let labels = json!({ "pulp_labels": { crate::cv::LABEL_CV: "web", crate::cv::LABEL_DB: st.db_id() } });
         serve(&server, "GET", derived.clone(), 200, labels).await;
+        // An operator's distribution serves the publication of v2 only: the publication of v1 can go.
+        let dv = format!("{derived}versions/1/");
+        let pubs_of = |n: u64| json!({ "pulp_href": format!("{pubs}{n}/"), "repository_version": dv });
+        serve(&server, "GET", pubs.into(), 200, json!({ "count": 2, "next": null, "results": [pubs_of(1), pubs_of(2)] })).await;
+        let d = json!({ "pulp_href": "/d/7/", "name": "partial", "base_path": "partial", "publication": format!("{pubs}2/") });
+        serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/".into(), 200, json!({ "count": 1, "next": null, "results": [d] })).await;
         let item = json!({ "id": v1.id, "number": v1.number, "state": "published", "components": [] });
         let lib = st.ensure_library("lab").await.unwrap();
         st.set_binding(lib, web, v1.id, "active").await.unwrap();

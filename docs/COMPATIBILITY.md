@@ -247,6 +247,20 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   older servers. The Content View cleanup of unused snapshot versions applies
   `ops::protecting` before it deletes, so it sends no delete that Pulp refuses and its log
   names the distribution (`live_cv`, on 3.63.36, 3.95.3 and 3.123.1).
+* **Publications and repositories are not protected** (read in the source of 3.123.1:
+  `PublicationViewSet` is a plain `DestroyModelMixin`, `Distribution.publication` is
+  `on_delete=SET_NULL`). A served publication is deleted without an error: a distribution
+  pinned to it then serves nothing, and one that follows the repository serves an older
+  publication. A repository delete takes all its versions and publications, also served
+  ones. So the Content View version delete keeps the publication and the snapshot version
+  that a distribution serves (`ops::protecting`; a distribution pinned to another
+  publication of the version keeps only the version), and the view delete is refused while
+  a distribution that the view does not delete serves its snapshot repository, one of its
+  versions or one of its publications (`live_cv`, on 3.123.1). Deb verbatim publications
+  of a snapshot repository are not checked. A list filter with the href of a deleted
+  repository gets HTTP 400 (`URI … not found for repository.`); these checks then read
+  the repository, and when it is gone (404), nothing serves it, so a rerun of an
+  interrupted delete continues.
 * **Version repair** (`{version}repair/`, `verify_checksums` default true; progress reports
   `repair.missing`, `repair.corrupted`, `repair.repaired`). Pulp downloads each missing or
   corrupt file from the remote artifacts, else deletes the stored file. A version without
@@ -324,7 +338,7 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   publications; a publication delete sets the distribution's `publication` to null, without
   an error. So pulp-tui never deletes a served object, and checks every binding of the
   server: a composite and its component can serve one publication. `delete_view` refuses to
-  delete a derived repository that another view serves.
+  delete a derived repository that another view or any other distribution serves.
 * **Only publications are served** (`SERVE_FROM_PUBLICATION` in all three plugins). A
   distribution on a version serves the newest complete publication of that version; with
   none, every path is 404, and Verify and the rollback preview say so.

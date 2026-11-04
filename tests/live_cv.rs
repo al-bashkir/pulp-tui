@@ -553,3 +553,56 @@ async fn publish_cleanup_keeps_a_served_version_that_no_view_version_records() {
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &[&repo, &remote]).await;
 }
+
+/// Pulp protects neither a served publication nor a served repository: a version delete keeps what a plain
+/// distribution serves, and the view delete is refused until that distribution is gone.
+#[tokio::test]
+async fn deletes_keep_what_a_plain_distribution_serves() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvplain");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
+    let cv = store.create_cv(&profile, &id, "").await.unwrap();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    store.set_cv_repo(cv, &docs).await.unwrap();
+    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let row = store.version_repos(v1.id).await.unwrap().remove(0);
+    let (p, dv, derived) = (row.publication.unwrap(), row.derived_version.unwrap(), row.derived_repo.unwrap());
+
+    // Outside the view: a plain distribution pinned to the snapshot publication of v1. Then v1 is no longer bound.
+    let name = format!("{id}-plain");
+    let dist = ops::ensure_distribution(&c, RepoType::File, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
+    let readme = format!("http://127.0.0.1:8080/pulp/content/{name}/docs/readme.txt");
+    assert_eq!(served(&c, &readme).await.0, 200);
+    let lib = store.ensure_library(&profile).await.unwrap();
+    svc.unpromote(cv, lib, &quiet, &no_progress).await.unwrap();
+
+    let why = format!("served by {name} (pinned to a publication of this version)");
+    let want = vec![("docs".to_string(), p.clone(), Some(why.clone())), ("docs".to_string(), dv.clone(), Some(why.clone()))];
+    assert_eq!(svc.delete_version_impact(v1.id).await.unwrap(), want);
+    let lines = Mutex::new(vec![]);
+    svc.delete_version(v1.id, &|s| lines.lock().unwrap().push(s), &no_progress).await.unwrap();
+    assert_eq!(*lines.lock().unwrap(), [format!("keeping {p}: {why}"), format!("keeping {dv}: {why}")]);
+    assert_eq!(store.version(v1.id).await.unwrap().state, "deleted");
+    assert!(c.get::<serde_json::Value>(&p, &[]).await.is_ok(), "the served publication was deleted");
+    assert_eq!(served(&c, &readme).await.0, 200, "the distribution still serves");
+
+    let refusal = format!(
+        "content view {id}: distribution {name} serves the snapshot repository of docs ({derived}); \
+         delete {name} or point it to other content first"
+    );
+    assert_eq!(svc.delete_view_impact(cv).await.unwrap_err().to_string(), refusal);
+    assert_eq!(svc.delete_view(cv, &quiet, &no_progress).await.unwrap_err().to_string(), refusal);
+    assert!(c.get::<serde_json::Value>(&derived, &[]).await.is_ok(), "refused before any delete");
+    assert_eq!(served(&c, &readme).await.0, 200);
+
+    cleanup(&c, &[&dist]).await;
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    assert!(c.get::<serde_json::Value>(&derived, &[]).await.unwrap_err().is_not_found());
+    cleanup(&c, &[&repo, &remote]).await;
+}
