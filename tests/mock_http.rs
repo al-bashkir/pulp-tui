@@ -5,7 +5,7 @@
 use pulp_tui::config::{AuthMethod, Profile, Settings};
 use pulp_tui::pulp::models::Task;
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, RepoType, deb};
+use pulp_tui::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, RepoType, deb, rpm};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -1226,4 +1226,76 @@ async fn a_deb_verbatim_publication_protects_its_version() {
     assert_eq!((pubs.len(), by.len()), (0, 0));
     let asked = server.received_requests().await.unwrap().iter().filter(|r| r.url.path().contains("/verbatim/")).count();
     assert_eq!(asked, 1, "only the first call lists verbatim publications");
+}
+
+/// A GET of `p` that answers `body`.
+async fn serve_json(server: &MockServer, p: &str, body: Value) {
+    Mock::given(method("GET")).and(path(p)).respond_with(ResponseTemplate::new(200).set_body_json(body)).mount(server).await;
+}
+
+/// A prune answers with a task group that never gets `all_tasks_dispatched` (pulp_rpm 3.39.5). Each repository
+/// task reports how many packages go (`total`) and names its new version; a failed one fails the prune.
+#[tokio::test]
+async fn rpm_prune_reports_each_repository_of_its_task_group() {
+    let server = MockServer::start().await;
+    let (os, extras) = (format!("{API}repositories/rpm/rpm/os/"), format!("{API}repositories/rpm/rpm/extras/"));
+    for (keep_days, g) in [(0, 1), (1, 2)] {
+        Mock::given(method("POST"))
+            .and(path(format!("{API}rpm/prune/")))
+            .and(body_json(json!({ "repo_hrefs": [os, extras], "keep_days": keep_days, "dry_run": keep_days == 1 })))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "task_group": format!("{API}task-groups/{g}/") })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let task = |n: u32, name: &str, state: &str| json!({ "pulp_href": format!("{API}tasks/{n}/"), "name": format!("pulp_rpm.app.tasks.prune.{name}"), "state": state });
+    let group = |g: u32, tasks: Vec<Value>, counts: Value| {
+        let mut v = json!({ "pulp_href": format!("{API}task-groups/{g}/"), "description": "Prune old Packages.", "all_tasks_dispatched": false, "tasks": tasks });
+        v.as_object_mut().unwrap().extend(counts.as_object().unwrap().clone());
+        v
+    };
+    let tasks = vec![
+        task(1, "prune_packages", "completed"),
+        task(2, "prune_repo_packages", "completed"),
+        task(3, "prune_repo_packages", "completed"),
+    ];
+    serve_json(&server, &format!("{API}task-groups/1/"), group(1, tasks, json!({ "completed": 3 }))).await;
+    let report = |name: &str, n: u64| json!([{ "code": "rpm.package.prune.repository", "message": format!("Pruning {name}"), "total": n, "done": n }]);
+    let new = format!("{os}versions/3/");
+    serve_json(&server, &format!("{API}tasks/2/"), json!({ "pulp_href": format!("{API}tasks/2/"), "state": "completed", "progress_reports": report("os", 2), "created_resources": [new] })).await;
+    serve_json(
+        &server,
+        &format!("{API}tasks/3/"),
+        // A report without `total`: no package goes.
+        json!({ "pulp_href": format!("{API}tasks/3/"), "state": "completed",
+            "progress_reports": [{ "code": "rpm.package.prune.repository", "message": "Pruning extras" }] }),
+    )
+    .await;
+    // The new version lists none of the packages that it has as removed.
+    Mock::given(method("GET"))
+        .and(path(format!("{API}content/rpm/packages/")))
+        .and(query_param("repository_version", &new))
+        .and(query_param("repository_version_removed", &new))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 0, "results": [] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+    let repos = [os.clone(), extras.clone()];
+    let got = rpm::prune(&c, &repos, 0, false, &|_| {}).await.unwrap();
+    let want = [
+        rpm::Pruned { repo: "extras".into(), packages: 0, version: None, not_removed: 0 },
+        rpm::Pruned { repo: "os".into(), packages: 2, version: Some(new), not_removed: 0 },
+    ];
+    assert_eq!(got, want, "by repository name");
+
+    let tasks = vec![task(4, "prune_packages", "completed"), task(5, "prune_repo_packages", "failed")];
+    serve_json(&server, &format!("{API}task-groups/2/"), group(2, tasks, json!({ "completed": 1, "failed": 1 }))).await;
+    let failed = json!({ "pulp_href": format!("{API}tasks/5/"), "state": "failed", "error": { "description": "repository is locked" } });
+    serve_json(&server, &format!("{API}tasks/5/"), failed).await;
+    let e = rpm::prune(&c, &repos, 1, true, &|_| {}).await.unwrap_err();
+    assert!(
+        matches!(&e, PulpError::TaskFailed { state, message, .. } if state == "failed" && message.contains("repository is locked")),
+        "{e}"
+    );
 }

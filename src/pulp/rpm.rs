@@ -1,4 +1,4 @@
-//! RPM plugin operations: package listing, serving checks, the copy API, comps and advisory uploads.
+//! RPM plugin operations: package listing, serving checks, the copy API, comps and advisory uploads, prune.
 
 use super::client::{Mutation, Page, PulpClient, PulpError, Result};
 use super::models::*;
@@ -26,6 +26,58 @@ pub async fn upload_comps(c: &PulpClient, path: &Path, repo: &str, replace: bool
 /// Add one advisory to `repo`: a JSON file with the fields of an updateinfo record (`id`, `issued`, `updated` required).
 pub async fn upload_advisory(c: &PulpClient, path: &Path, repo: &str) -> Result<Mutation> {
     upload_file(c, ADVISORIES, path, &[("repository", repo.into())]).await
+}
+
+/// Prune old packages (POST, pulp_rpm 3.27+): a task group with the `prune_packages` task and one task per repository.
+pub const PRUNE: &str = "rpm/prune/";
+
+/// What the prune task of one repository reports: the packages that go (dry run) or went, and the new version.
+/// `not_removed`: packages that the new version has as removed but still lists (pulp_rpm 3.34.0 on pulpcore 3.95.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pruned {
+    pub repo: String,
+    pub packages: u64,
+    pub version: Option<String>,
+    pub not_removed: u64,
+}
+
+/// Remove from the latest version of each of `repos` (a new version) the packages that have a newer one of the same
+/// name and arch and came in more than `keep_days` days ago (0 = keep only the newest). A dry run changes nothing and
+/// reports the counts; Pulp names the packages only in its debug log. Waits for the group: a failed task fails it.
+pub async fn prune(
+    c: &PulpClient,
+    repos: &[String],
+    keep_days: u64,
+    dry_run: bool,
+    on: &(dyn Fn(&TaskGroup) + Send + Sync),
+) -> Result<Vec<Pruned>> {
+    let body = json!({ "repo_hrefs": repos, "keep_days": keep_days, "dry_run": dry_run });
+    let Mutation::TaskGroup(g) = c.post(&c.api(PRUNE), &body).await? else {
+        return Err(PulpError::Decode(format!("{PRUNE} did not answer with a task group")));
+    };
+    let (group, lines) = super::ops::group_report(c, &g, on).await?;
+    if group.outcome() != "completed" {
+        return Err(PulpError::TaskFailed { href: g, state: group.outcome().into(), message: lines.join("\n") });
+    }
+    let repo_tasks = group.tasks.iter().filter(|t| t["name"].as_str().is_some_and(|n| n.ends_with(".prune_repo_packages")));
+    let mut out = vec![];
+    for h in repo_tasks.filter_map(|t| t["pulp_href"].as_str()) {
+        let t: Task = c.get(h, &[]).await?;
+        if let Some(r) = t.progress_reports.iter().find(|r| r.code == "rpm.package.prune.repository") {
+            let repo = r.message.trim_start_matches("Pruning ").to_string();
+            let version = t.created_matching("/versions/");
+            let mut not_removed = 0;
+            if let Some(v) = &version {
+                // A pulp_rpm without the fix (3.35.0; 3.32.15, 3.29.13, 3.27.14) on a pulpcore with version
+                // content_ids (seen: 3.34.0 on 3.95.3) marks the packages removed, but the version still lists them.
+                let q = [("repository_version", v.clone()), ("repository_version_removed", v.clone()), ("limit", "1".into())];
+                not_removed = c.list::<Value>(&c.api(RepoType::Rpm.content()), &q).await?.count;
+            }
+            out.push(Pruned { repo, packages: r.total.unwrap_or(0), version, not_removed });
+        }
+    }
+    out.sort_by(|a, b| a.repo.cmp(&b.repo));
+    Ok(out)
 }
 
 pub async fn packages_in(c: &PulpClient, version: &str) -> Result<Vec<Package>> {

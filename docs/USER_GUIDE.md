@@ -210,6 +210,16 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   when a client asks, so the upstream must still serve it. Uploaded content keeps its files. A
   form asks which versions keep their files (`3,4`; empty = none). The confirm shows the default
   remote and its download policy. Type the repository name to start.
+* **O** (RPM) prunes old packages of the marked repositories (else of the selected one). A package
+  goes when the repository has a newer version of it (same name and architecture) and it came into
+  the repository more than **Keep days** ago (default 14; 0 keeps only the newest). pulp-tui runs
+  Pulp's dry run first; the confirm shows how many packages each repository loses (Pulp names them
+  only in its debug log). Type the repository name (several: `prune 2 repositories`). Each
+  repository gets a new latest version without them; older versions keep them. A dry run that
+  finds nothing ends with a notice. Content View snapshot repositories are refused. Some pulp_rpm
+  versions (for example 3.34.0 with pulpcore 3.95.3; fixed in 3.35.0, 3.32.15, 3.29.13 and
+  3.27.14) make the new version but keep the packages in it; the result then says that the new
+  version still has them. Upgrade pulp_rpm to fix it.
 * **c** / **e** / **d** create / edit / delete. Delete names each distribution that serves the
   repository, a version or a publication of it.
 

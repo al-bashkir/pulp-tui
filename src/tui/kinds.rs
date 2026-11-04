@@ -163,6 +163,8 @@ pub enum Act {
     CopyContent,
     /// Delete the stored files of a repository's synced content (`repositories/reclaim_space/`).
     Reclaim,
+    /// RPM: remove older versions of packages from the latest version (`rpm/prune/`), after a dry run.
+    PrunePackages,
     RemoveContent,
     AddToRepo,
     Compare,
@@ -263,7 +265,7 @@ impl Act {
             ToggleProtected => 'L',
             ToggleActive | UploadAdvisory => 'A',
             BreakLock | UploadComps => 'U',
-            PruneOrphans => 'O',
+            PruneOrphans | PrunePackages => 'O',
         }
     }
 
@@ -285,6 +287,7 @@ impl Act {
             Distribute => "Distribute (create/re-point distribution)",
             CopyContent => "Copy content from another repository",
             Reclaim => "Reclaim disk space (files of synced content)",
+            PrunePackages => "Prune old package versions (new version)",
             RemoveContent => "Remove from repository (new version)",
             AddToRepo => "Add to another repository",
             Compare => "Compare with marked version",
@@ -820,7 +823,10 @@ impl Kind {
                     Inspect,
                 ];
                 match t {
-                    RepoType::Rpm => drop(actions.splice(5..5, [UploadComps, UploadAdvisory])),
+                    RepoType::Rpm => {
+                        actions.insert(9, PrunePackages); // after Reclaim
+                        actions.splice(5..5, [UploadComps, UploadAdvisory]);
+                    }
                     RepoType::File | RepoType::Deb => {}
                 }
                 actions

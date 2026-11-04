@@ -1,6 +1,6 @@
 //! Users, groups, roles (Pulp RBAC), replication, and export and import actions.
 
-use super::actions::{ap, caps, submit, url_with_scheme};
+use super::actions::{ap, caps, group_progress, submit, url_with_scheme};
 use super::app::{App, Level};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, s, short};
@@ -558,16 +558,7 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
             ];
             let go = move |app: &mut App| {
                 app.job(format!("replicate {name}"), move |ctx| async move {
-                    let (p, task) = (ctx.clone(), ctx.on_task());
-                    let on = move |g: &crate::pulp::models::TaskGroup| {
-                        // The Task Center shows, stores and re-attaches the group, and reports how it ended.
-                        task(&g.as_task());
-                        p.progress(format!(
-                            "tasks: {} done, {} running, {} waiting, {} failed",
-                            g.completed, g.running, g.waiting, g.failed
-                        ))
-                    };
-                    let res = replication::replicate_native(&ctx.client, &href, &on).await;
+                    let res = replication::replicate_native(&ctx.client, &href, &group_progress(&ctx)).await;
                     ap(move |app| match res {
                         Ok(lines) => app.text(format!("Replication of {name}"), lines),
                         Err(e) => app.text(format!("Replication of {name} FAILED"), format!("{e:#}").lines().map(str::to_string).collect()),
@@ -1060,13 +1051,7 @@ fn confirm_import(app: &mut App, href: String, name: String, toc: String, mappin
     lines.push("The new version holds exactly the exported content; older versions stay.".into());
     app.confirm_prod(format!("Import {toc}?"), lines, &name.clone(), move |app| {
         app.job(format!("import {name}"), move |ctx| async move {
-            let (p, task) = (ctx.clone(), ctx.on_task());
-            let on = move |g: &crate::pulp::models::TaskGroup| {
-                // The Task Center shows, stores and re-attaches the group, and reports how it ended.
-                task(&g.as_task());
-                p.progress(format!("tasks: {} done, {} running, {} waiting, {} failed", g.completed, g.running, g.waiting, g.failed))
-            };
-            let (group, mut lines) = ops::pulp_import(&ctx.client, &href, &toc, &on).await?;
+            let (group, mut lines) = ops::pulp_import(&ctx.client, &href, &toc, &group_progress(&ctx)).await?;
             let repos = group.tasks.iter().filter(|t| t["name"].as_str().is_some_and(|n| n.ends_with("import_repository_version"))).count();
             ap(move |app| {
                 let done = group.outcome() == "completed";

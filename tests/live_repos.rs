@@ -497,3 +497,51 @@ async fn file_git_remote_syncs_a_repository_with_the_prefilled_form() {
     assert_eq!(paths, ["docs/guide.txt", "docs/readme.txt"]);
     cleanup(&c, &[&repo, &href]).await;
 }
+
+/// Prune through the TUI on a repository synced from `rpm2` (fixture-alpha 1.0 and 1.1): with keep_days 0 the
+/// dry run reports the older alpha and changes nothing; after the typed name, the new version lacks it (on a server
+/// whose new version still lists it, the result says so).
+#[tokio::test]
+async fn rpm_prune_dry_run_then_prune_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("it-prune"));
+    let (repo, remote) = synced_repo(&c, RepoType::Rpm, &name, "rpm2/", "additive").await;
+    let v1 = latest(&c, &repo).await;
+    let nevras = async |v: &str| -> Vec<String> {
+        let mut n: Vec<String> = rpm::packages_in(&c, v).await.unwrap().iter().map(Package::nevra).collect();
+        n.sort();
+        n
+    };
+    assert!(nevras(&v1).await.contains(&"fixture-alpha-1.0-1.noarch".to_string()));
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(RepoType::Rpm, false);
+    run(&mut app, Act::PrunePackages, json!({ "pulp_href": repo, "name": name }));
+    fill(&mut app, &[("keep_days", "0")]);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(&app)) };
+    assert_eq!(typed.as_deref(), Some(name.as_str()));
+    assert!(lines.contains(&format!("  {name}: 1 package(s)")), "{lines:?}");
+    assert_eq!(latest(&c, &repo).await, v1, "the dry run made no version");
+    yes(&mut app);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no result: {:?}", texts(&app)) };
+    let v2 = latest(&c, &repo).await;
+    assert!(v2.ends_with("/versions/2/"), "{v2}");
+    let left = nevras(&v2).await;
+    if left.contains(&"fixture-alpha-1.0-1.noarch".to_string()) {
+        // pulp_rpm 3.34.0 (pulpcore 3.95.3): the task marks the package removed, but version 2 still lists it.
+        let bug = "new version 2 still has 1 of the 1 package(s) that Pulp marked removed \
+            (pulp_rpm bug, fixed in 3.35.0 and in 3.32.15, 3.29.13, 3.27.14): upgrade pulp_rpm";
+        assert_eq!(lines, [format!("{name}: {bug}")]);
+        return cleanup(&c, &[&repo, &remote]).await;
+    }
+    assert_eq!(lines, [format!("{name}: removed 1 package(s): new version 2")]);
+    assert!(
+        left.contains(&"fixture-alpha-1.1-1.noarch".to_string()) && !left.iter().any(|n| n.starts_with("fixture-alpha-1.0")),
+        "{left:?}"
+    );
+    assert_eq!(nevras(&v1).await.len(), left.len() + 1, "version 1 keeps it");
+    cleanup(&c, &[&repo, &remote]).await;
+}

@@ -1368,6 +1368,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             );
         }
         Act::Reclaim => reclaim(app, href),
+        Act::PrunePackages => prune_packages(app, href),
         Act::UploadComps | Act::UploadAdvisory => {
             let comps = act == Act::UploadComps;
             let (what, ep) = if comps { ("comps.xml", rpm::COMPS) } else { ("advisory", rpm::ADVISORIES) };
@@ -1558,6 +1559,80 @@ fn reclaim(app: &mut App, repo: String) {
 fn reclaimed(app: &mut App, label: &str, t: &Task) {
     let done = t.progress_reports.iter().find(|r| r.code == "reclaim-space.artifact").and_then(|r| r.done).unwrap_or(0);
     app.ok(format!("{label}: deleted {done} file(s)"));
+}
+
+/// Report each snapshot of a task group to the Task Center (it shows, stores and re-attaches the group) and the job line.
+pub(super) fn group_progress(ctx: &Ctx) -> impl Fn(&TaskGroup) + Send + Sync + use<> {
+    let (p, task) = (ctx.clone(), ctx.on_task());
+    move |g: &TaskGroup| {
+        task(&g.as_task());
+        p.progress(format!("tasks: {} done, {} running, {} waiting, {} failed", g.completed, g.running, g.waiting, g.failed))
+    }
+}
+
+/// Prune old packages of the marked RPM repositories, else of `repo`: the dry run shows how many each would lose,
+/// and the run starts after the typed confirmation.
+fn prune_packages(app: &mut App, repo: String) {
+    if caps(app).is_some_and(|c| !c.has_operation(rpm::PRUNE, "post")) {
+        return app.error(format!("not supported by this server: prune old packages ({})", rpm::PRUNE));
+    }
+    let repos: Vec<String> = if app.list.marked.is_empty() { vec![repo] } else { app.list.marked.iter().cloned().collect() };
+    let help = "a package goes when a newer one of the same name and arch is there and it came in more than this many days ago; 0 = keep only the newest";
+    let days = Field::new("keep_days", "Keep days", FieldKind::Number).value("14").help(help);
+    app.form(Form::new("Prune old packages", vec![days]), move |app, f| {
+        let keep_days: u64 = f.get("keep_days").trim().parse().map_err(|_| "Keep days must be a whole number from 0".to_string())?;
+        let repos = repos.clone();
+        app.job("prune dry run", move |ctx| async move {
+            let c = &ctx.client;
+            let mut names = vec![];
+            for h in &repos {
+                // Marks can be on other pages: read each repository.
+                let r: Value = c.get(h, &[("fields", "name,pulp_labels".into())]).await?;
+                if let Some(e) = snapshot_refusal(&r) {
+                    bail!(e);
+                }
+                names.push(s(&r, "name"));
+            }
+            let dry = rpm::prune(c, &repos, keep_days, true, &group_progress(&ctx)).await?;
+            if dry.iter().all(|p| p.packages == 0) {
+                let text = format!("prune dry run: no package of {} is old enough to go (keep {keep_days} days)", names.join(", "));
+                return ap(move |app| app.ok(text));
+            }
+            let mut lines = vec![format!("Pulp removes these packages from the latest version (keep {keep_days} days):")];
+            lines.extend(dry.iter().map(|p| format!("  {}: {} package(s)", p.repo, p.packages)));
+            lines.push("Each is an older version (same name and arch) of a package that the repository has. The new".into());
+            lines.push("latest version lacks them; older versions keep them. Pulp names them only in its debug log.".into());
+            let (title, typed) = match names.as_slice() {
+                [one] => (format!("Prune old packages of {one}"), one.clone()),
+                _ => (format!("Prune old packages of {} repositories", names.len()), format!("prune {} repositories", names.len())),
+            };
+            ap(move |app| {
+                app.confirm_danger(title, lines, &typed, move |app| {
+                    app.job("prune old packages", move |ctx| async move {
+                        let done = rpm::prune(&ctx.client, &repos, keep_days, false, &group_progress(&ctx)).await?;
+                        let lines = done.iter().map(|p| match &p.version {
+                            Some(v) if p.not_removed > 0 => format!(
+                                "{}: new version {} still has {} of the {} package(s) that Pulp marked removed \
+                                 (pulp_rpm bug, fixed in 3.35.0 and in 3.32.15, 3.29.13, 3.27.14): upgrade pulp_rpm",
+                                p.repo,
+                                version_number(v),
+                                p.not_removed,
+                                p.packages
+                            ),
+                            Some(v) => format!("{}: removed {} package(s): new version {}", p.repo, p.packages, version_number(v)),
+                            None => format!("{}: nothing removed (no new version)", p.repo),
+                        });
+                        let lines = lines.collect();
+                        ap(move |app| {
+                            app.text(format!("Prune old packages (keep {keep_days} days)"), lines);
+                            app.reload();
+                        })
+                    })
+                })
+            })
+        });
+        Ok(())
+    });
 }
 
 /// The optional signing service of a Deb publication; `None` for other types and when the server's Deb
@@ -6732,6 +6807,13 @@ mod tests {
         f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
     }
 
+    /// Set `values` in the open form and submit it; the form must take them.
+    fn fill_and_submit(app: &mut App, values: &[(&str, &str)]) {
+        let Some(crate::tui::app::Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        values.iter().for_each(|(k, v)| set(&mut form, k, v));
+        submit(app, &form).unwrap();
+    }
+
     #[tokio::test]
     async fn acs_create_sends_the_remote_and_paths_and_a_refresh_ends_with_its_tasks() {
         use crate::tui::app::Modal;
@@ -7195,6 +7277,158 @@ mod tests {
         run(&mut app, Act::Repair, json!({ "pulp_href": full, "number": 2 }));
         assert!(app.modal.is_none());
         assert_eq!(last(&app).1, "not supported by this server: repository version repair ({rpm_rpm_repository_version_href}repair/)");
+    }
+
+    /// A prune server: `rpm/prune/` answers the dry run with group 1 and the run with group 2; each group has the
+    /// `prune_packages` task and one task per repository in `repos` (name, packages that go, new version number,
+    /// packages that the new version lists and has as removed).
+    async fn prune_server(repos: &[(&str, u64, Option<u64>, u64)]) -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        for (g, dry) in [(1, true), (2, false)] {
+            wiremock::Mock::given(method("POST"))
+                .and(path(format!("{API}rpm/prune/")))
+                .and(body_partial_json(json!({ "dry_run": dry })))
+                .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task_group": format!("{API}task-groups/{g}/") })))
+                .mount(&server)
+                .await;
+            let task = |n: usize, name: &str| {
+                let href = format!("{API}tasks/{g}{n}/");
+                json!({ "pulp_href": href, "name": format!("pulp_rpm.app.tasks.prune.{name}"), "state": "completed" })
+            };
+            let tasks: Vec<Value> =
+                std::iter::once(task(0, "prune_packages")).chain((1..=repos.len()).map(|n| task(n, "prune_repo_packages"))).collect();
+            let group = json!({ "pulp_href": format!("{API}task-groups/{g}/"), "description": "Prune old Packages.",
+                "all_tasks_dispatched": false, "completed": tasks.len(), "tasks": tasks });
+            get(&server, &format!("{API}task-groups/{g}/"), group).await;
+            for (n, (name, packages, version, _)) in repos.iter().enumerate() {
+                let created: Vec<String> =
+                    version.filter(|_| !dry).map(|v| format!("{API}repositories/rpm/rpm/{name}/versions/{v}/")).into_iter().collect();
+                let done = if dry { 0 } else { *packages };
+                let reports = json!([{ "code": "rpm.package.prune.repository", "message": format!("Pruning {name}"), "total": packages, "done": done }]);
+                let href = format!("{API}tasks/{g}{}/", n + 1);
+                get(
+                    &server,
+                    &href,
+                    json!({ "pulp_href": href, "state": "completed", "progress_reports": reports, "created_resources": created }),
+                )
+                .await;
+            }
+        }
+        for (name, _, version, listed) in repos {
+            let href = format!("{API}repositories/rpm/rpm/{name}/");
+            get(&server, &href, json!({ "pulp_href": href, "name": name, "pulp_labels": {} })).await;
+            if let Some(v) = version {
+                let v = format!("{href}versions/{v}/");
+                wiremock::Mock::given(method("GET"))
+                    .and(path(format!("{API}content/rpm/packages/")))
+                    .and(query_param("repository_version", &v))
+                    .and(query_param("repository_version_removed", &v))
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": listed, "results": [] })))
+                    .mount(&server)
+                    .await;
+            }
+        }
+        server
+    }
+
+    /// Prune runs the dry run first and shows what each repository would lose; only the typed confirmation sends the run.
+    /// A new version that still lists packages that Pulp marked removed in it (pulp_rpm 3.34.0) is named as such.
+    #[tokio::test]
+    async fn prune_shows_the_dry_run_and_prunes_the_marked_repositories_after_the_typed_confirmation() {
+        use crate::tui::app::Modal;
+        let server = prune_server(&[("extras", 0, None, 0), ("old", 1, Some(2), 1), ("os", 2, Some(3), 0)]).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let k = Kind::Repos(RepoType::Rpm, false);
+        app.list.kind = k.clone();
+        assert!(k.actions().contains(&Act::PrunePackages) && Act::PrunePackages.mutates(&k, false));
+        for t in [RepoType::File, RepoType::Deb] {
+            assert!(!Kind::Repos(t, false).actions().contains(&Act::PrunePackages), "{t:?}");
+        }
+        let href = |n: &str| format!("{API}repositories/rpm/rpm/{n}/");
+        let (extras, old, os) = (href("extras"), href("old"), href("os"));
+        app.list.marked = [extras.clone(), old.clone(), os.clone()].into();
+        run(&mut app, Act::PrunePackages, json!({ "pulp_href": os, "name": "os" }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!((keys(&form), form.get("keep_days")), (vec!["keep_days".to_string()], "14"), "Pulp's default");
+        set(&mut form, "keep_days", "-1");
+        assert_eq!(submit(&mut app, &form), Err("Keep days must be a whole number from 0".into()));
+        set(&mut form, "keep_days", "0");
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let prune = format!("{API}rpm/prune/");
+        let dry = json!({ "repo_hrefs": [extras, old, os], "keep_days": 0, "dry_run": true });
+        assert_eq!(posts_to(&server, &prune).await, std::slice::from_ref(&dry), "only the dry run before the confirm");
+        let Some(Modal::Confirm { title, typed, lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!((title.as_str(), typed.as_deref()), ("Prune old packages of 3 repositories", Some("prune 3 repositories")));
+        for want in ["  extras: 0 package(s)", "  old: 1 package(s)", "  os: 2 package(s)"] {
+            assert!(lines.iter().any(|l| l == want), "{want}: {lines:?}");
+        }
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let run = json!({ "repo_hrefs": [extras, old, os], "keep_days": 0, "dry_run": false });
+        assert_eq!(posts_to(&server, &prune).await, [dry, run]);
+        let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no result") };
+        let bug = "old: new version 2 still has 1 of the 1 package(s) that Pulp marked removed \
+            (pulp_rpm bug, fixed in 3.35.0 and in 3.32.15, 3.29.13, 3.27.14): upgrade pulp_rpm";
+        assert_eq!(
+            (title.as_str(), lines),
+            (
+                "Prune old packages (keep 0 days)",
+                vec!["extras: nothing removed (no new version)".to_string(), bug.into(), "os: removed 2 package(s): new version 3".into()]
+            )
+        );
+        let groups: Vec<_> = app.tasks.items.iter().map(|t| (t.href.clone(), t.state.clone())).collect();
+        assert_eq!(groups, [(format!("{API}task-groups/2/"), "completed".into()), (format!("{API}task-groups/1/"), "completed".into())]);
+    }
+
+    /// A dry run that finds nothing ends there; snapshot repositories, servers without `rpm/prune/` and read-only
+    /// profiles are refused before any request.
+    #[tokio::test]
+    async fn prune_stops_at_an_empty_dry_run_and_refuses_snapshots_old_servers_and_read_only_profiles() {
+        let server = prune_server(&[("extras", 0, None, 0)]).await;
+        let snap = format!("{API}repositories/rpm/rpm/snap/");
+        get(&server, &snap, json!({ "pulp_href": snap, "name": "snap", "pulp_labels": { "pulp_tui_cv": "web" } })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Repos(RepoType::Rpm, false);
+        let last = |app: &App| app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        let prune = async |app: &mut App, rx: &mut tokio::sync::mpsc::UnboundedReceiver<super::super::app::Msg>, item: Value| {
+            run(app, Act::PrunePackages, item);
+            fill_and_submit(app, &[]);
+            settle(app, rx).await;
+        };
+        let extras = format!("{API}repositories/rpm/rpm/extras/");
+        prune(&mut app, &mut rx, json!({ "pulp_href": extras, "name": "extras" })).await;
+        assert!(app.modal.is_none());
+        assert_eq!(last(&app), "prune dry run: no package of extras is old enough to go (keep 14 days)");
+        let posts = async || posts_to(&server, &format!("{API}rpm/prune/")).await;
+        assert_eq!(posts().await, [json!({ "repo_hrefs": [extras], "keep_days": 14, "dry_run": true })]);
+
+        prune(&mut app, &mut rx, json!({ "pulp_href": snap, "name": "snap" })).await;
+        assert!(
+            last(&app).ends_with(
+                "refused: snap is a snapshot repository of Content View web; change its source repositories and publish a new version"
+            ),
+            "{}",
+            last(&app)
+        );
+        assert_eq!(posts().await.len(), 1);
+
+        let item = json!({ "pulp_href": extras, "name": "extras" });
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/rpm/copy/": { "post": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, Act::PrunePackages, item.clone());
+        assert!(app.modal.is_none());
+        assert_eq!(last(&app), "not supported by this server: prune old packages (rpm/prune/)");
+
+        let p = Profile { url: server.uri(), auth: AuthMethod::None, read_only: true, ..Default::default() };
+        app.conn.as_mut().unwrap().client = PulpClient::new("lab", &p, &app.cfg.settings).unwrap();
+        assert!(!app.available_actions(&item).contains(&Act::PrunePackages));
+        run(&mut app, Act::PrunePackages, item);
+        assert!(app.modal.is_none());
+        assert_eq!(last(&app), "read-only mode: this action changes the server");
+        assert_eq!(posts().await.len(), 1);
     }
 
     /// pulpcore 3.123 deletes a path that an edit removes from every ACS that has the same path.

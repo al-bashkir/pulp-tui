@@ -436,11 +436,11 @@ impl TaskGroup {
         format!("completed {}  failed {}  canceled {}  skipped {}", self.completed, self.failed, self.canceled, self.skipped)
     }
     /// `all_tasks_dispatched` is not reliable (pulpcore 3.123 leaves it false after a
-    /// replication or an import), so a failure, the replication finalizer or the completed
-    /// `pulp_import` (it dispatches every repository task of the import) also ends the group. An
+    /// replication, an import or an RPM prune), so a failure, the replication finalizer or the completed
+    /// `pulp_import` or `prune_packages` (each dispatches every repository task) also ends the group. An
     /// ACS refresh dispatches all its tasks before it answers and never sets the flag.
     pub fn is_final(&self) -> bool {
-        let last = |n: &str| n.ends_with("finalize_replication") || n.ends_with("importer.pulp_import");
+        let last = |n: &str| ["finalize_replication", "importer.pulp_import", "prune.prune_packages"].iter().any(|s| n.ends_with(s));
         let finalized = self.tasks.iter().any(|t| t["name"].as_str().is_some_and(last) && t["state"] == "completed");
         let refresh = self.description.starts_with("Refreshing ") && self.description.to_lowercase().contains("alternate content source");
         self.active() == 0 && self.done() > 0 && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh)
@@ -818,6 +818,27 @@ mod tests {
         assert_eq!(state(group("completed", Some("completed"), json!({ "completed": 2 }))), (true, "completed".into()));
         assert_eq!(state(group("completed", None, json!({ "completed": 1 }))), (true, "completed".into()), "no destination found");
         assert_eq!(state(group("failed", None, json!({ "failed": 1 }))), (true, "failed".into()));
+    }
+
+    /// pulp_rpm 3.39.5 never sets `all_tasks_dispatched` on a prune group; `prune_packages` dispatches every repository task.
+    #[test]
+    fn a_prune_group_ends_when_prune_packages_completed_and_nothing_runs() {
+        use serde_json::json;
+        let group = |tasks: &[(&str, &str)], counts: Value| -> TaskGroup {
+            let tasks: Vec<Value> =
+                tasks.iter().map(|(n, s)| json!({ "name": format!("pulp_rpm.app.tasks.prune.{n}"), "state": s })).collect();
+            let mut g =
+                json!({ "pulp_href": "/g/3/", "description": "Prune old Packages.", "all_tasks_dispatched": false, "tasks": tasks });
+            g.as_object_mut().unwrap().extend(counts.as_object().unwrap().clone());
+            serde_json::from_value(g).unwrap()
+        };
+        let state = |g: TaskGroup| (g.is_final(), g.as_task().state);
+        let (main, repo) = ("prune_packages", "prune_repo_packages");
+        assert_eq!(state(group(&[(main, "running")], json!({ "running": 1 }))), (false, "running".into()));
+        let waiting = group(&[(main, "completed"), (repo, "waiting")], json!({ "completed": 1, "waiting": 1 }));
+        assert_eq!(state(waiting), (false, "waiting".into()));
+        assert_eq!(state(group(&[(main, "completed"), (repo, "completed")], json!({ "completed": 2 }))), (true, "completed".into()));
+        assert_eq!(state(group(&[(repo, "completed")], json!({ "completed": 1 }))), (false, "waiting".into()), "a repository task alone");
     }
 
     /// The refresh of an alternate content source dispatches all its tasks before it answers and never sets

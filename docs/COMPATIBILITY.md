@@ -67,6 +67,7 @@ General rules:
 | RPM comps, advisory upload (**U**, **A**) | `post` of `rpm/comps/`, `content/rpm/advisories/`                    | endpoint message                          |
 | Version repair (**F**)                    | `{rpm_rpm_repository_version_href}repair/` (4)                       | endpoint message                          |
 | Reclaim space (**R**)                     | `repositories/reclaim_space/`                                        | endpoint message                          |
+| RPM prune old packages (**O**)            | `post` of `rpm/prune/` (8)                                           | endpoint message                          |
 | Current user                              | `login/`, else `users/?username=<Basic-auth name>`                   | header shows "anonymous" (5)              |
 | Users, groups, roles                      | `users/`, `roles/`                                                   | screen not supported                      |
 | Domain scope of a role assignment         | `status/` `domain_enabled: true`                                     | Assign role has no Domain field           |
@@ -91,6 +92,7 @@ General rules:
    lists it only when the server has the endpoint.
 7. pulpcore 3.123.1 has it; 3.63.36 and 3.95.3 do not (read in their images). The picker is
    the same as in (6).
+8. pulp_rpm 3.27.12, 3.34.0 and 3.39.5 have it (read in their images).
 
 ### Form fields
 
@@ -238,7 +240,7 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
 * **Task groups.** Counters, `all_tasks_dispatched` and `tasks` exist from 3.63.
   `task-groups/` (3.123) has no filters, only `limit`, `offset`, `fields`,
   `exclude_fields`, and lists the newest first. `TaskGroup::is_final` has a rule per kind
-  (replication, import, ACS refresh; see below), never only the three-poll rule.
+  (replication, import, ACS refresh, RPM prune; see below), never only the three-poll rule.
 * **Group cancel** (`PATCH {task_group_href}`) exists from 3.95, not on 3.63. It cancels
   every waiting or running task and sets `all_tasks_dispatched` (pulpcore
   `tasking/tasks.py`). The confirmation first reads the group (description, unfinished
@@ -321,6 +323,28 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   counts what the same N deletes. Protection counts from `timestamp_of_interest`, not from
   the orphan time: on pulp1, 142,224 units were orphans at 0 minutes and none at 1440,
   because all were created that day. The old `DELETE orphans/` is not used.
+* **Prune old packages** (`rpm/prune/`: `repo_hrefs`, `keep_days` default 14, `dry_run`; read
+  in pulp_rpm 3.39.5 `tasks/prune.py`). The answer is a task group: the `prune_packages` task
+  dispatches one `prune_repo_packages` task per repository and ends. It calls
+  `TaskGroup.finish()` in 3.27.12 but not in 3.34.0 and 3.39.5, so `all_tasks_dispatched` stays
+  false; `TaskGroup::is_final` ends the group when `prune_packages` completed and nothing runs.
+  A package goes when the latest version has a newer one of the same name and arch and its
+  `RepositoryContent` was created more than `keep_days` ago. Each repository task has the
+  progress report `rpm.package.prune.repository` (`message` `Pruning <name>`, `total` = packages
+  that go, `done` = 0 on a dry run) and, unless dry, makes a new version (none when nothing
+  goes). A dry run logs the packages at debug level only; the API gives the counts.
+  pulp_rpm 3.34.0 on pulpcore 3.95.3 (seen on a fresh container) does not remove them: the new
+  version has the package as removed (`content_summary.removed` 1,
+  `repository_version_removed=<v>` lists it), but `repository_version=<v>` still lists it and
+  `present` keeps the old count. `prune.py` gives `remove_content` a `RepositoryContent`
+  queryset, and pulpcore 3.95.3 takes its ids away from the version's `content_ids`, which hold
+  content ids. pulp_rpm fixed it in 3.35.0 (commit 4860ebf397) and in 3.32.15, 3.29.13 and
+  3.27.14; 3.33.x and 3.34.0 have no fix. pulpcore 3.63.36 has no `content_ids`, so pulp_rpm
+  3.27.12 there removes the packages. After a run pulp-tui counts the packages that the new
+  version lists and has as removed (`repository_version=<v>&repository_version_removed=<v>`, 0
+  on a correct server) and, when there are any, says "new version N still has K of the M
+  package(s) that Pulp marked removed (pulp_rpm bug, ...)" instead of "removed M package(s)"
+  (`rpm_prune_dry_run_then_prune_through_the_tui`).
 
 ### Content and digests
 
