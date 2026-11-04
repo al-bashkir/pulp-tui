@@ -928,19 +928,26 @@ impl CvService {
         let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", derived.into())], 100_000).await?;
         let ds = ops::distributions(c, t).await?;
         for v in versions.iter().filter(|v| v.number > 0 && v.pulp_href != latest && !used.contains(&v.pulp_href)) {
-            let by: Vec<String> = ops::protecting(&v.pulp_href, &pubs, &ds).iter().map(|(d, why)| format!("{} ({why})", d.name)).collect();
-            if !by.is_empty() {
-                log(format!("keeping {}: served by {}", v.pulp_href, by.join(", ")));
-                continue;
+            self.drop_version(&v.pulp_href, &pubs, &ds, log, on).await?;
+        }
+        Ok(())
+    }
+
+    /// `drop_unused_versions` for one version: kept when a distribution serves it (`pubs`: the publications of
+    /// its repository).
+    async fn drop_version(&self, v: &str, pubs: &[Publication], ds: &[Distribution], log: Log<'_>, on: OnTask<'_>) -> Result<()> {
+        let by: Vec<String> = ops::protecting(v, pubs, ds).iter().map(|(d, why)| format!("{} ({why})", d.name)).collect();
+        if !by.is_empty() {
+            log(format!("keeping {v}: served by {}", by.join(", ")));
+            return Ok(());
+        }
+        self.alive()?;
+        match self.client.delete(v).await {
+            Ok(m) => {
+                ops::settle(&self.client, m, on).await?;
+                log(format!("deleted unused version {v}"));
             }
-            self.alive()?;
-            match self.client.delete(&v.pulp_href).await {
-                Ok(m) => {
-                    ops::settle(&self.client, m, on).await?;
-                    log(format!("deleted unused version {}", v.pulp_href));
-                }
-                Err(e) => log(format!("keeping {}: {e}", v.pulp_href)),
-            }
+            Err(e) => log(format!("keeping {v}: {e}")),
         }
         Ok(())
     }

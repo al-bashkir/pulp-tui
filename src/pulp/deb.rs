@@ -38,27 +38,9 @@ fn served_entry(index: &str, p: &DebPackage) -> Option<(String, Option<String>)>
 /// listed in a `Packages` index and downloadable with the expected digest. `base` ends with `/`.
 /// A structured publication (the default) serves `dists/<release>/`; a simple one `dists/default/all/`.
 pub async fn verify(c: &PulpClient, base: &str, version: &str, publication: &Value) -> Result<String> {
-    let fail = |m: String| Err(PulpError::Mismatch(m));
-    let (simple, structured) = (publication["simple"] == true, publication["structured"] != false);
-    let mut dirs = vec![];
-    if structured {
-        let q = [("repository_version", version.to_string()), ("fields", "distribution".into()), ("limit", "1".into())];
-        let releases: Page<Value> = c.list(&c.api("content/deb/releases/"), &q).await?;
-        let Some(dist) = releases.results.first().and_then(|r| r["distribution"].as_str()) else {
-            return fail("the version has no Release".into());
-        };
-        // pulp_deb publishes under `dists/<distribution without slashes>/<last part of the component>/`.
-        dirs.push(dist.trim_matches('/').to_string());
-    }
-    if simple {
-        dirs.push("default".into());
-    }
-    for dir in dirs {
-        let probe = format!("dists/{dir}/Release");
-        let (status, _) = c.fetch_content(&format!("{base}{probe}"), 64 << 20).await?;
-        if status != 200 {
-            return fail(format!("{probe} returned HTTP {status}"));
-        }
+    let (releases, indices) = layout(c, version, publication).await?;
+    for dir in releases {
+        served(c, base, &format!("dists/{dir}/Release")).await?;
     }
     let q = [
         ("repository_version", version.to_string()),
@@ -68,39 +50,69 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str, publication: &Val
     ];
     let pkgs: Page<DebPackage> = c.list(&c.api("content/deb/packages/"), &q).await?;
     let Some(p) = pkgs.results.first() else { return Ok("Release served (no packages)".into()) };
-    let comps: Vec<Value> = if structured {
-        c.list_all(
-            &c.api("content/deb/release_components/"),
-            &[("repository_version", version.into()), ("fields", "plain_component,distribution".into())],
-            10_000,
-        )
-        .await?
-    } else {
-        vec![]
-    };
     let mut tried = vec![];
     // The smallest package of the version can be in any of its distributions.
-    let comps = comps.iter().filter_map(|r| Some((r["distribution"].as_str()?.trim_matches('/'), r["plain_component"].as_str()?)));
-    for (d, comp) in comps.chain(simple.then_some(("default", "all"))) {
+    for (d, comp) in indices {
         let index = format!("dists/{d}/{comp}/binary-{}/Packages", p.architecture);
-        let (status, body) = c.fetch_content(&format!("{base}{index}"), 64 << 20).await?;
-        let entry = if status == 200 { served_entry(&String::from_utf8_lossy(&body), p) } else { None };
-        let Some((path, listed)) = entry else {
-            tried.push(index);
-            continue;
-        };
-        // The API has no sha256 for an on_demand package until its file is downloaded; the index has the one apt checks.
-        let Some(want) = listed.or_else(|| p.sha256.clone()) else { return fail(format!("package {path} has no SHA256 in {index}")) };
-        if p.sha256.as_ref().is_some_and(|s| *s != want) {
-            return fail(format!("package {path}: {index} lists another SHA256 than Pulp has"));
+        match served_package(c, base, p, &index).await? {
+            Some(path) => return Ok(format!("Release and {path} served with matching digest ({} packages)", pkgs.count)),
+            None => tried.push(index),
         }
-        let (status, body) = c.fetch_content(&format!("{base}{path}"), 64 << 20).await?;
-        if status == 200 && hex::encode(Sha256::digest(&body)) == want {
-            return Ok(format!("Release and {path} served with matching digest ({} packages)", pkgs.count));
-        }
-        return fail(format!("package {path} not served with the expected digest"));
     }
-    fail(format!("package {} not listed in any Packages index (tried {})", p.key(), tried.join(", ")))
+    Err(PulpError::Mismatch(format!("package {} not listed in any Packages index (tried {})", p.key(), tried.join(", "))))
+}
+
+/// An error unless `base` serves `path` (HTTP 200).
+async fn served(c: &PulpClient, base: &str, path: &str) -> Result<()> {
+    let (status, _) = c.fetch_content(&format!("{base}{path}"), 64 << 20).await?;
+    if status != 200 {
+        return Err(PulpError::Mismatch(format!("{path} returned HTTP {status}")));
+    }
+    Ok(())
+}
+
+/// What a publication of `version` serves: the `dists/` directories with a Release file, and each
+/// (directory, component) with package indices. Structured (the default): the releases and components of
+/// the version, under `dists/<distribution without slashes>/<last part of the component>/`; simple:
+/// `default` with component `all`.
+async fn layout(c: &PulpClient, version: &str, publication: &Value) -> Result<(Vec<String>, Vec<(String, String)>)> {
+    let (mut releases, mut indices) = (vec![], vec![]);
+    if publication["structured"] != false {
+        let q = [("repository_version", version.to_string()), ("fields", "distribution".into()), ("limit", "1".into())];
+        let page: Page<Value> = c.list(&c.api("content/deb/releases/"), &q).await?;
+        let Some(dist) = page.results.first().and_then(|r| r["distribution"].as_str()) else {
+            return Err(PulpError::Mismatch("the version has no Release".into()));
+        };
+        releases.push(dist.trim_matches('/').to_string());
+        let q = [("repository_version", version.to_string()), ("fields", "plain_component,distribution".into())];
+        let comps: Vec<Value> = c.list_all(&c.api("content/deb/release_components/"), &q, 10_000).await?;
+        let dir = |r: &Value| Some((r["distribution"].as_str()?.trim_matches('/').to_string(), r["plain_component"].as_str()?.to_string()));
+        indices.extend(comps.iter().filter_map(dir));
+    }
+    if publication["simple"] == true {
+        releases.push("default".into());
+        indices.push(("default".into(), "all".into()));
+    }
+    Ok((releases, indices))
+}
+
+/// The path of package `p` when `index` lists it and the server serves it with the digest that apt checks;
+/// `None` when `index` is not served or does not list it.
+async fn served_package(c: &PulpClient, base: &str, p: &DebPackage, index: &str) -> Result<Option<String>> {
+    let fail = |m: String| Err(PulpError::Mismatch(m));
+    let (status, body) = c.fetch_content(&format!("{base}{index}"), 64 << 20).await?;
+    let entry = if status == 200 { served_entry(&String::from_utf8_lossy(&body), p) } else { None };
+    let Some((path, listed)) = entry else { return Ok(None) };
+    // The API has no sha256 for an on_demand package until its file is downloaded; the index has the one apt checks.
+    let Some(want) = listed.or_else(|| p.sha256.clone()) else { return fail(format!("package {path} has no SHA256 in {index}")) };
+    if p.sha256.as_ref().is_some_and(|s| *s != want) {
+        return fail(format!("package {path}: {index} lists another SHA256 than Pulp has"));
+    }
+    let (status, body) = c.fetch_content(&format!("{base}{path}"), 64 << 20).await?;
+    if status == 200 && hex::encode(Sha256::digest(&body)) == want {
+        return Ok(Some(path));
+    }
+    fail(format!("package {path} not served with the expected digest"))
 }
 
 /// Hrefs of the release records (`PackageReleaseComponent`) in `version` whose package is in `packages`.

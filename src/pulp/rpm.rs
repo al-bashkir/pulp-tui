@@ -45,25 +45,28 @@ pub fn package_path(layout: &str, location_href: &str) -> Option<String> {
     }
 }
 
+/// The metadata files that `base` serves (`repomd.xml`, and `repomd.xml.asc` when the repository of
+/// `version` has a metadata signing service); an error when one is missing. A publication made before the
+/// repository got its signing service has no signature.
+async fn served_metadata(c: &PulpClient, base: &str, version: &str) -> Result<&'static str> {
+    let repo: Value = c.get(&super::ops::repo_of_version(version), &[("fields", "metadata_signing_service".into())]).await?;
+    let signed = repo["metadata_signing_service"].is_string();
+    let files: &[&str] = if signed { &["repomd.xml", "repomd.xml.asc"] } else { &["repomd.xml"] };
+    for f in files {
+        let (status, _) = c.fetch_content(&format!("{base}repodata/{f}"), 64 << 20).await?;
+        if status != 200 {
+            let why = if f.ends_with(".asc") { " (the repository signs its metadata)" } else { "" };
+            return Err(PulpError::Mismatch(format!("repodata/{f} returned HTTP {status}{why}")));
+        }
+    }
+    Ok(if signed { "repomd.xml, repomd.xml.asc" } else { "repomd.xml" })
+}
+
 /// RPM metadata must be served (and signed, when the repository has a metadata signing service) and
 /// the smallest package must be downloadable with the expected digest. `base` ends with `/`.
 pub async fn verify(c: &PulpClient, base: &str, version: &str, layout: &str) -> Result<String> {
     let fail = |m: String| Err(PulpError::Mismatch(m));
-    let probe = "repodata/repomd.xml";
-    let (status, _) = c.fetch_content(&format!("{base}{probe}"), 64 << 20).await?;
-    if status != 200 {
-        return fail(format!("{probe} returned HTTP {status}"));
-    }
-    // A publication made before the repository got its signing service has no signature.
-    let repo: Value = c.get(&super::ops::repo_of_version(version), &[("fields", "metadata_signing_service".into())]).await?;
-    let signed = repo["metadata_signing_service"].is_string();
-    if signed {
-        let (status, _) = c.fetch_content(&format!("{base}{probe}.asc"), 1 << 20).await?;
-        if status != 200 {
-            return fail(format!("{probe}.asc returned HTTP {status} (the repository signs its metadata)"));
-        }
-    }
-    let metadata = if signed { "repomd.xml, repomd.xml.asc" } else { "repomd.xml" };
+    let metadata = served_metadata(c, base, version).await?;
     let q = [
         ("repository_version", version.to_string()),
         ("fields", "location_href,sha256,pkgId,checksum_type".into()),
