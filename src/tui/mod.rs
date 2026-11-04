@@ -68,6 +68,10 @@ pub async fn run(mut app: App, profile: Option<String>) -> anyhow::Result<()> {
                 break;
             }
         }
+        // A dismiss or a task end just before the exit is still stored.
+        if let Some(w) = app.last_task_store.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), w).await;
+        }
         Ok(())
     }
     .await;

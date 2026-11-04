@@ -599,7 +599,11 @@ server tasks → task groups → workers.
 * **W** live view of the task. **i** details with all progress reports.
 * **X** cancels on the server. On a task group, it cancels the whole group; the confirm counts its
   unfinished tasks.
-* **z** dismisses finished tasks. Above 500 tracked tasks, the oldest finished one goes by itself.
+* **z** dismisses finished tasks, also from the local file: they do not come back after a restart
+  or a Connect. Pulp keeps its task records. Above 500 tracked tasks, the oldest finished one goes
+  by itself.
+* At start and at Connect, the Task Center attaches every unfinished task again, and shows the 50
+  newest finished ones.
 * A canceled or skipped task gives a warning; a failed task gives an error.
 
 Server tasks:

@@ -301,6 +301,10 @@ async fn store_methods_on_postgres() {
     st.finish_task(k, "/t/1/", "completed").await.unwrap();
     st.track_task(k, "/t/1/", "sync os", "waiting").await.unwrap(); // a finished row stays finished
     assert_eq!(st.tasks(k, 5).await.unwrap()[0].state, "completed");
+    st.track_task(k, "/t/2/", "sync os", "running").await.unwrap();
+    assert_eq!(st.tasks(k, 0).await.unwrap().iter().map(|t| t.href.as_str()).collect::<Vec<_>>(), ["/t/2/"], "no finished one");
+    st.forget_finished_tasks(k).await.unwrap(); // dismiss
+    assert_eq!(st.tasks(k, 5).await.unwrap().iter().map(|t| t.href.as_str()).collect::<Vec<_>>(), ["/t/2/"]);
 
     // Export and import between two servers' scopes of the same database.
     let ex = st.export(k).await.unwrap();

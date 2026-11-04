@@ -2675,7 +2675,7 @@ fn task_action(app: &mut App, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     match act {
         Act::DismissTasks => {
-            let n = app.tasks.dismiss_finished();
+            let n = app.dismiss_finished_tasks();
             app.ok(format!("dismissed {n} finished task(s) from the list (Pulp keeps its records)"));
             app.reload();
         }

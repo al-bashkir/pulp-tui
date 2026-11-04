@@ -587,11 +587,18 @@ impl Store {
         Ok(())
     }
 
-    /// Recent task references (unfinished first) to reattach after a restart.
+    /// Dismiss: the finished task references go (Pulp keeps its task records).
+    pub async fn forget_finished_tasks(&self, profile: &str) -> Result<()> {
+        sqlx::query("DELETE FROM tasks WHERE profile = $1 AND finished_at IS NOT NULL").bind(profile).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// The task references to reattach after a restart: every unfinished one (first), and the `limit` newest finished ones.
     pub async fn tasks(&self, profile: &str, limit: usize) -> Result<Vec<TaskRef>> {
         let rows = sqlx::query(
-            "SELECT href, label, state, created_at FROM tasks WHERE profile = $1
-             ORDER BY finished_at IS NOT NULL, created_at DESC LIMIT $2",
+            "SELECT href, label, state, created_at FROM tasks WHERE profile = $1 AND (finished_at IS NULL OR href IN
+                (SELECT href FROM tasks WHERE profile = $1 AND finished_at IS NOT NULL ORDER BY created_at DESC LIMIT $2))
+             ORDER BY finished_at IS NOT NULL, created_at DESC",
         )
         .bind(profile)
         .bind(limit as i64)

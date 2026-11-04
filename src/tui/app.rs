@@ -245,6 +245,8 @@ pub struct App {
     pub notices: VecDeque<Notice>,
     pub jobs: Vec<Job>,
     pub tasks: TaskCenter,
+    /// The last work queued on the stored task references (`task_store`).
+    pub(super) last_task_store: Option<tokio::task::JoinHandle<()>>,
     pub dashboard: Vec<String>,
     /// Dashboard values that came in for this connection; shown until a refresh brings new ones.
     pub dashboard_stats: HashMap<super::actions::Stat, String>,
@@ -284,6 +286,7 @@ impl App {
             notices: VecDeque::new(),
             jobs: vec![],
             tasks,
+            last_task_store: None,
             dashboard: vec![],
             dashboard_stats: HashMap::new(),
             last_repo: None,
@@ -579,6 +582,31 @@ impl App {
 
     // ---- tasks ---------------------------------------------------------------------
 
+    /// Run `work` on the stored task references after all work queued before it, so the writes of a task apply
+    /// in the order they were made. It is not a job: a Connect stops only the job that waits for its result.
+    fn task_store<T: Send + 'static>(
+        &mut self,
+        work: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+    ) -> impl Future<Output = anyhow::Result<T>> + Send + 'static {
+        let (prev, (done, result)) = (self.last_task_store.take(), tokio::sync::oneshot::channel());
+        self.last_task_store = Some(tokio::spawn(async move {
+            if let Some(p) = prev {
+                let _ = p.await;
+            }
+            let _ = done.send(work.await);
+        }));
+        async move { result.await? }
+    }
+
+    /// Queue a write of task references (`task_store`); the job `label` shows it and its error.
+    fn persist_task(&mut self, label: &str, write: impl Future<Output = anyhow::Result<()>> + Send + 'static) {
+        let written = self.task_store(write);
+        self.spawn(label.into(), true, async move {
+            written.await?;
+            ap(|_| {})
+        });
+    }
+
     /// Remember a Pulp task (persisted so it is re-attached after a restart). `known`: the task as the
     /// server listed it; one that ended before keeps its state and is not reported as just ended.
     pub fn track_task(&mut self, href: &str, label: &str, known: Option<Task>) {
@@ -589,11 +617,18 @@ impl App {
         }
         if let Some(p) = self.profile.clone() {
             let (st, href, label) = (self.store.clone(), href.to_string(), label.to_string());
-            self.spawn("persist task reference".into(), true, async move {
-                st.track_task(&p, &href, &label, &state).await?;
-                ap(|_| {})
-            });
+            self.persist_task("persist task reference", async move { st.track_task(&p, &href, &label, &state).await });
         }
+    }
+
+    /// Remove the finished tasks from the Task Center and from the store, so a restart does not bring them back.
+    pub fn dismiss_finished_tasks(&mut self) -> usize {
+        let n = self.tasks.dismiss_finished();
+        if let Some(p) = self.profile.clone() {
+            let st = self.store.clone();
+            self.persist_task("forget finished tasks", async move { st.forget_finished_tasks(&p).await });
+        }
+        n
     }
 
     /// Track the task if needed (`known` as in `track_task`) and open a text view that follows its state until it ends.
@@ -616,10 +651,7 @@ impl App {
         self.notify(Level::Warn, format!("task not found on the server (purged?): {label}"));
         if let Some(p) = self.profile.clone() {
             let (st, href) = (self.store.clone(), href.to_string());
-            self.spawn("persist task state".into(), true, async move {
-                st.finish_task(&p, &href, super::tasks::GONE).await?;
-                ap(|_| {})
-            });
+            self.persist_task("persist task state", async move { st.finish_task(&p, &href, super::tasks::GONE).await });
         }
     }
 
@@ -639,14 +671,14 @@ impl App {
             && (new || finished)
         {
             let (st, href, state, label) = (self.store.clone(), href.clone(), state.clone(), label.clone());
-            self.spawn("persist task state".into(), true, async move {
+            self.persist_task("persist task state", async move {
                 if new {
                     st.track_task(&p, &href, &label, &state).await?;
                 }
                 if finished {
                     st.finish_task(&p, &href, &state).await?;
                 }
-                ap(|_| {})
+                Ok(())
             });
         }
         if finished {
@@ -783,9 +815,11 @@ impl App {
     fn reattach_tasks(&mut self) {
         let Some(p) = self.profile.clone() else { return };
         let st = self.store.clone();
+        // After the writes queued before it: a task that ended is read as ended.
+        let refs = self.task_store(async move { st.tasks(&p, 50).await });
         // Not named "load ...": list reloads cancel those.
         self.spawn("reattach tasks".into(), true, async move {
-            let refs = st.tasks(&p, 50).await?;
+            let refs = refs.await?;
             ap(move |app| {
                 let mut n = 0;
                 for r in refs.iter().rev() {
@@ -2126,7 +2160,7 @@ mod tests {
     async fn an_ended_task_tracked_again_is_not_re_attached_as_unfinished() {
         let mut app = app_on(Kind::ServerTasks(vec![])).await;
         let mut rx = app.rx.take().unwrap();
-        // Tracked and ended in an earlier session; dismissed from the Task Center since.
+        // Tracked and ended in an earlier session; no longer in the Task Center (it re-attaches the newest only).
         app.store.track_task("lab", "/t/1/", "export", "running").await.unwrap();
         app.store.finish_task("lab", "/t/1/", "failed").await.unwrap();
         for (h, state) in [("/t/1/", "failed"), ("/t/2/", "completed")] {
@@ -2142,6 +2176,61 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.contains(&("/t/1/", "failed")) && rows.contains(&("/t/2/", "completed")), "{rows:?}");
         assert!(app.tasks.due().is_empty(), "not polled again");
+    }
+
+    fn polled(h: &str, state: &str) -> Msg {
+        let t = serde_json::json!({ "pulp_href": h, "name": "x", "state": state });
+        Msg::TaskPolled { href: h.into(), result: Ok(serde_json::from_value(t).unwrap()) }
+    }
+
+    /// A restart or a Connect: a new Task Center that re-attaches the stored references.
+    async fn restart(app: &mut App, rx: &mut UnboundedReceiver<Msg>) {
+        (app.tasks, app.notices) = (TaskCenter::new(app.cfg.settings.poll_bounds()), VecDeque::new());
+        app.reattach_tasks();
+        settle(app, rx).await;
+    }
+
+    #[tokio::test]
+    async fn dismissed_tasks_stay_dismissed_after_a_restart() {
+        let mut app = app_on(Kind::Tasks).await;
+        let mut rx = app.rx.take().unwrap();
+        app.track_task("/t/1/", "sync", None);
+        let failed = serde_json::from_value(serde_json::json!({ "pulp_href": "/t/2/", "name": "x", "state": "failed" })).unwrap();
+        app.track_task("/t/2/", "export", Some(failed));
+        app.track_task("/t/3/", "publish", None);
+        app.handle_msg(polled("/t/1/", "completed"));
+        super::super::actions::run(&mut app, Act::DismissTasks, Value::Null);
+        settle(&mut app, &mut rx).await;
+        restart(&mut app, &mut rx).await;
+        let rows: Vec<_> = app.tasks.items.iter().map(|t| t.href.as_str()).collect();
+        assert_eq!(rows, ["/t/3/"], "the dismissed tasks do not come back");
+    }
+
+    #[tokio::test]
+    async fn a_connect_between_the_track_and_the_end_of_a_task_keeps_both_writes_in_order() {
+        let mut app = app_on(Kind::Tasks).await;
+        let mut rx = app.rx.take().unwrap();
+        app.track_task("/t/1/", "sync", None);
+        app.abort_all(); // a Connect stops the jobs
+        app.handle_msg(polled("/t/1/", "completed"));
+        app.abort_all();
+        assert_eq!(texts(&app), ["task completed: sync"], "a store write is no operation: Connect does not warn");
+        restart(&mut app, &mut rx).await;
+        let refs = app.store.tasks("lab", 10).await.unwrap();
+        assert_eq!(refs.iter().map(|r| (r.href.as_str(), r.state.as_str())).collect::<Vec<_>>(), [("/t/1/", "completed")]);
+        assert!(app.notices.is_empty(), "not re-attached as unfinished: {:?}", texts(&app));
+    }
+
+    #[tokio::test]
+    async fn every_unfinished_task_is_re_attached() {
+        let mut app = app_on(Kind::Tasks).await;
+        let mut rx = app.rx.take().unwrap();
+        for i in 0..120 {
+            app.store.track_task("lab", &format!("/t/{i}/"), "sync", if i < 60 { "running" } else { "completed" }).await.unwrap();
+        }
+        restart(&mut app, &mut rx).await;
+        assert_eq!(texts(&app), ["re-attached to 60 unfinished task(s) from a previous session"]);
+        assert_eq!((app.tasks.active(), app.tasks.items.len()), (60, 110), "and the 50 newest finished tasks");
     }
 
     #[tokio::test]

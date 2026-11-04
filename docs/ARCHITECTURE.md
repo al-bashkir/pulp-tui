@@ -60,15 +60,19 @@ it.
 
 Pulp tasks are the source of truth.
 
-* The Task Center stores task references in the local file. It polls each unfinished task:
-  the interval starts at `poll_min_ms`, grows 1.5x while nothing changes, resets on a
-  change, has ±20 % jitter. At most three polls run at a time. A task that a workflow waits
-  on is not polled twice.
+* The Task Center stores task references in the local file only (never in a shared
+  `[database]`). The store work goes through one queue (`App::task_store`): the writes of a
+  task apply in the order they were made, and the re-attach reads after them. The queue is
+  not a job, so Connect (`abort_all`) does not stop a write; quit waits up to 2 s for it.
+* It polls each unfinished task: the interval starts at `poll_min_ms`, grows 1.5x while
+  nothing changes, resets on a change, has ±20 % jitter. At most three polls run at a time.
+  A task that a workflow waits on is not polled twice.
 * A workflow takes only `completed` as done (`ops::wait_task`). `failed`, `canceled` and
   `skipped` stop the step with the state as the error.
-* After a restart, unfinished references are polled again (re-attached). A task that
-  answers 404 (purged) gets the final state `gone`. An answer for a task that is not
-  tracked (previous server) is dropped.
+* After a restart or a Connect, every unfinished reference is polled again (re-attached);
+  the 50 newest finished ones show, not polled. Dismiss deletes the finished references
+  from the file. A task that answers 404 (purged) gets the final state `gone`. An answer
+  for a task that is not tracked (previous server) is dropped.
 
 Task groups (native replication, import, ACS refresh) are one Task Center row each. The
 href goes into the task references; `ops::get_task` reads a group as one task
