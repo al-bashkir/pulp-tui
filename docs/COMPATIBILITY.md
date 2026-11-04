@@ -60,6 +60,7 @@ General rules:
 | Deb verbatim publications (kind, list)    | `publications/deb/verbatim/`                                         | APT publications only                     |
 | Chunked upload                            | `uploads/` and `{upload_href}`                                       | message for files above `upload_chunk_mb` |
 | Uploads screen                            | `uploads/` and `{upload_href}`                                       | screen not supported                      |
+| Task Schedules screen                     | `task-schedules/`                                                    | screen not supported                      |
 | Native replication                        | pulpcore ≥ 3.23, `upstream-pulps/`, `{upstream_pulp_href}replicate/` | screen points to the fallback             |
 | Fallback replication of a type            | `status/` component on source and destination                        | dry run stops (3)                         |
 | Alternate content sources                 | the plugin, `acs/rpm/rpm/`, `acs/file/file/`, `acs/deb/deb/`         | endpoint message on the screen            |
@@ -252,6 +253,9 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   every waiting or running task and sets `all_tasks_dispatched` (pulpcore
   `tasking/tasks.py`). The confirmation first reads the group (description, unfinished
   tasks); the row keeps the state that Pulp reports.
+* **Task schedules** (3.123.1): `task-schedules/` has GET only (no create, edit or
+  delete). `dispatch_interval` is a Django duration (`1 00:00:00` is one day); `last_task`
+  is a task href or null. pulp1 has two: orphan cleanup and analytics, each once a day.
 
 ### Repository versions
 

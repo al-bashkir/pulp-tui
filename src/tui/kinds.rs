@@ -71,6 +71,8 @@ pub enum Kind {
     Workers,
     /// Chunked uploads that are not committed (a commit deletes the upload), oldest first.
     Uploads,
+    /// Tasks that Pulp dispatches by itself (read-only in the API).
+    TaskSchedules,
     /// This session's requests, actions and notices; `polls` also shows task polling.
     Logs {
         polls: bool,
@@ -97,6 +99,7 @@ pub const NAV: &[(&str, Kind)] = &[
     ("Groups", Kind::Groups),
     ("Roles", Kind::Roles),
     ("Tasks", Kind::Tasks),
+    ("Task Schedules", Kind::TaskSchedules),
     ("Uploads", Kind::Uploads),
     ("Logs", Kind::Logs { polls: false }),
 ];
@@ -455,6 +458,7 @@ impl Kind {
             Kind::TaskGroups => "Task groups (newest first)  [t: workers]".into(),
             Kind::Workers => "Workers  [t: tracked tasks]".into(),
             Kind::Uploads => "Uploads (chunked uploads not committed, oldest first)".into(),
+            Kind::TaskSchedules => "Task Schedules (read-only)".into(),
             Kind::Logs { polls } => {
                 format!("Logs (this session, UTC)  [t: show/hide task polling]{}", if *polls { " — polling shown" } else { "" })
             }
@@ -489,6 +493,7 @@ impl Kind {
             Kind::TaskGroups => Feature::TaskGroups,
             Kind::ContentGuards => Feature::ContentGuards,
             Kind::Uploads => Feature::ChunkedUpload,
+            Kind::TaskSchedules => Feature::TaskSchedules,
             _ => return None,
         };
         caps.require(f).err().map(|e| {
@@ -585,6 +590,7 @@ impl Kind {
             Kind::Workers => ("workers/".into(), vec![("ordering", "name".into())], name),
             // The stale ones first; the API filters only on size.
             Kind::Uploads => ("uploads/".into(), vec![("ordering", "pulp_created".into())], None),
+            Kind::TaskSchedules => ("task-schedules/".into(), vec![("ordering", "name".into())], Some("name__contains")),
             // No filters and no ordering in the API; the task list of a group comes with Inspect.
             Kind::TaskGroups => ("task-groups/".into(), vec![("exclude_fields", "tasks".into())], None),
             Kind::ServerTasks(f) => {
@@ -828,6 +834,13 @@ impl Kind {
                 col("size", 12, |v| s(v, "size")),
                 col("completed", 19, |v| ts(v, "completed")),
             ],
+            Kind::TaskSchedules => vec![
+                col("name", 36, |v| s(v, "name")),
+                col("task", 24, |v| s(v, "task_name").trim_start_matches("pulpcore.app.tasks.").to_string()),
+                col("interval", 12, |v| s(v, "dispatch_interval")),
+                col("next dispatch", 19, |v| ts(v, "next_dispatch")),
+                col("last task", 13, |v| short(&s(v, "last_task"))),
+            ],
             Kind::Logs { .. } => vec![
                 col("time", 8, |v| s(v, "at")),
                 col("kind", 7, |v| s(v, "kind")),
@@ -913,6 +926,7 @@ impl Kind {
             Kind::ServerTasks(_) => vec![WatchTask, Inspect, TrackTask, CancelTask, Filter, Delete, PurgeTasks],
             Kind::TaskGroups => vec![CancelTask, Inspect],
             Kind::Uploads => vec![Delete, Inspect],
+            Kind::TaskSchedules => vec![WatchTask, Inspect],
             Kind::Workers | Kind::Logs { .. } => vec![Inspect],
         }
     }
@@ -1650,6 +1664,27 @@ mod tests {
         caps.paths.insert("uploads/".into());
         assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: chunked uploads API (uploads/)"));
         caps.paths.insert("{upload_href}".into());
+        assert_eq!(k.unsupported(&caps), None);
+    }
+
+    #[test]
+    fn task_schedules_screen_is_read_only_and_opens_the_last_task() {
+        let k = Kind::TaskSchedules;
+        assert!(NAV.iter().any(|(l, n)| *l == "Task Schedules" && *n == k));
+        assert_eq!(k.source().unwrap(), ("task-schedules/".into(), vec![("ordering", "name".into())], Some("name__contains")));
+        let row = json!({ "name": "Clean up stale content periodically", "task_name": "pulpcore.app.tasks.orphan.orphan_cleanup",
+            "dispatch_interval": "1 00:00:00", "next_dispatch": "2026-11-05T21:19:15.559891Z", "last_task": "/pulp/api/v3/tasks/01a1a86e-55a7-75e4/" });
+        let cells: Vec<String> = k.columns().iter().map(|c| (c.get)(&row)).collect();
+        assert_eq!(
+            cells,
+            ["Clean up stale content periodically", "orphan.orphan_cleanup", "1 00:00:00", "2026-11-05 21:19:15", "01a1a86e-55a7"]
+        );
+        assert_eq!(k.actions(), [Act::WatchTask, Act::Inspect]);
+        assert!(k.actions().iter().all(|a| !a.mutates(&k, false)), "Pulp has no write API for schedules");
+        let mut caps = Capabilities::default();
+        caps.paths.insert("tasks/".into());
+        assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: task schedules API (task-schedules/)"));
+        caps.paths.insert("task-schedules/".into());
         assert_eq!(k.unsupported(&caps), None);
     }
 

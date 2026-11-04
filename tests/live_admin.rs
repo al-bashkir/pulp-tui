@@ -459,3 +459,26 @@ async fn an_unfinished_upload_is_listed_and_deleted() {
     settle(&mut app, &mut rx).await;
     assert_eq!(c.get::<Value>(&href, &[]).await.unwrap_err().status(), Some(404), "{:?}", texts(&app));
 }
+
+/// The Task Schedules screen lists the schedules (pulp1 has two; a server may have none); W opens the
+/// last task of a schedule in the Task Center.
+#[tokio::test]
+async fn task_schedules_screen() {
+    if !live_enabled() {
+        return;
+    }
+    let (mut app, mut rx) = app().await;
+    app.open(Screen::List(Kind::TaskSchedules));
+    settle(&mut app, &mut rx).await;
+    assert_eq!(app.list.error, None);
+    let cols = Kind::TaskSchedules.columns();
+    for r in &app.list.items {
+        let cells: Vec<String> = cols.iter().map(|col| (col.get)(r)).collect();
+        assert!(!cells[0].is_empty() && !cells[1].is_empty() && !cells[2].is_empty(), "{r}");
+    }
+    let Some(r) = app.list.items.iter().find(|r| r["last_task"].is_string()).cloned() else { return };
+    run(&mut app, Act::WatchTask, r.clone());
+    let Some(Modal::Text { title, .. }) = &app.modal else { panic!("no live view: {:?}", texts(&app)) };
+    assert_eq!(title, &format!("Watch task {}", r["name"].as_str().unwrap()));
+    assert!(app.tasks.items.iter().any(|t| r["last_task"] == t.href.as_str()), "the last task is in the Task Center");
+}

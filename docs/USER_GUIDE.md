@@ -761,6 +761,12 @@ Server tasks:
 **Task groups** (newest first, no search): counts of tasks by state. **i** shows the tasks, **X**
 cancels the group. **Workers** (read-only): name, last heartbeat, current task.
 
+### Task Schedules
+
+The tasks that Pulp starts by itself, read-only: name, task, interval (`1 00:00:00` is one
+day), next dispatch and last task. `/` searches the name. **W** tracks the last task in the
+Task Center and opens its live view. **i** full JSON.
+
 ### Uploads
 
 Chunked uploads that are not committed, oldest first: id, created, size (in bytes, as the

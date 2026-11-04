@@ -21,6 +21,11 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         Kind::Roles => role_action(app, act, item),
         Kind::ContentGuards => guard_action(app, act, item),
         Kind::Uploads if act == Act::Delete => delete_uploads(app, item),
+        // W: the last task of the schedule, not the schedule.
+        Kind::TaskSchedules if act == Act::WatchTask => match s(&item, "last_task") {
+            t if t.is_empty() => app.error(format!("schedule {} has not run a task yet", s(&item, "name"))),
+            t => app.watch_task(&t, &s(&item, "name"), None),
+        },
         Kind::UpstreamPulps => upstream_action(app, act, item),
         Kind::PulpExporters | Kind::FsExporters => exporter_action(app, act, item),
         Kind::Exports { .. } => export_action(app, act, item),
@@ -2622,6 +2627,7 @@ mod tests {
         for (k, item, offered, refused) in [
             (Kind::ContentGuards, rbac, vec![Inspect], vec![GuardAccess, Create, Edit, Delete]),
             (Kind::Uploads, json!({ "pulp_href": U1 }), vec![Inspect], vec![Delete]),
+            (Kind::TaskSchedules, json!({ "pulp_href": "/s/1/", "last_task": "/t/1/" }), vec![WatchTask, Inspect], vec![]),
         ] {
             app.list.kind = k.clone();
             assert_eq!(app.available_actions(&item), offered, "{k:?}");
@@ -2670,5 +2676,25 @@ mod tests {
         assert_eq!(deleted, [U1, U2, U3].map(|u| format!("DELETE {u}")));
         assert!(app.list.marked.is_empty());
         assert!(notices(&app).iter().any(|(l, t)| *l == Level::Ok && t == "delete upload 0190aaaa-0003: done"), "{:?}", notices(&app));
+    }
+
+    #[tokio::test]
+    async fn watch_task_on_a_schedule_opens_its_last_task() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::TaskSchedules;
+        super::run(&mut app, Act::WatchTask, json!({ "pulp_href": "/pulp/api/v3/task-schedules/2/", "name": "new", "last_task": null }));
+        assert!(app.modal.is_none());
+        assert_eq!(notices(&app).last().unwrap(), &(Level::Error, "schedule new has not run a task yet".into()));
+        let task = "/pulp/api/v3/tasks/7/";
+        super::run(
+            &mut app,
+            Act::WatchTask,
+            json!({ "pulp_href": "/pulp/api/v3/task-schedules/1/", "name": "orphans", "last_task": task }),
+        );
+        let Some(Modal::Text { title, .. }) = &app.modal else { panic!("no live view: {:?}", notices(&app)) };
+        assert_eq!(title, "Watch task orphans");
+        assert!(app.tasks.items.iter().any(|t| t.href == task && t.label == "orphans"), "the last task, not the schedule");
     }
 }

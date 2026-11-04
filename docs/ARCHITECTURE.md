@@ -103,7 +103,7 @@ snapshot to the Task Center (`actions::group_progress`), so a restart re-attache
 | Owner    | Objects                                                                       |
 | -------- | ----------------------------------------------------------------------------- |
 | Pulp     | Repository, Remote, Repository Version, Publication, Distribution             |
-|          | Content Guard, Upload                                                         |
+|          | Content Guard, Upload, Task Schedule                                          |
 |          | Task, Task Group, User, Group, Role, Upstream Pulp                            |
 |          | Exporter, Export, Importer, Import                                            |
 | pulp-tui | Content View, Content View Version, Lifecycle Environment, Promotion, Binding |
