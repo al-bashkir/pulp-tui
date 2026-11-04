@@ -361,6 +361,13 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   copies them to the snapshot repository first. `repodata/repomd.xml.asc` exists only in a
   publication made while the repository had a `metadata_signing_service`; Verify requires
   it when the repository has one.
+* **RPM publications store no signing service** (pulp_rpm 3.39.5: no such field in
+  `RpmPublication` or its serializer). A publication made before the repository got its
+  `metadata_signing_service`, or with another service, looks the same as a signed one. So
+  rollback and pinned Distribute never reuse a publication when the repository has a
+  `metadata_signing_service`: they make a new one, which Pulp signs with the service of
+  now. A server without the field counts as unsigned. Fallback replication still reuses
+  (it runs often); its verify fails when the reused publication has no `repomd.xml.asc`.
 * **Publication mode.** A publication stores how it publishes (RPM `checksum_type`,
   `compression_type`, `layout`, `repo_config`; File `manifest`; Deb `simple`,
   `structured`, `layout`, `signing_service`, `publish_*`, `excluded_package_metadata_fields`).

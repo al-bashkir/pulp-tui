@@ -187,7 +187,8 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   settings of that moment.
 * **D** distributes: pin the latest version (publication), or follow the repository latest.
 * **P** and **D** on Deb ask for an optional signing service (empty = the keys of the repository).
-  **D** reuses a publication only when its signing service is the same.
+  **D** reuses a publication only when its signing service is the same. On RPM, **D** never
+  reuses a publication when the repository has a metadata signing service: Pulp signs a new one.
 * **C** copies content from another repository, with the filter rules of Content Views (see
   "Filters"). RPM can copy dependencies. A Deb copy is structured: it also copies the Release,
   component and architecture records, and does not solve dependencies.
@@ -284,7 +285,10 @@ removed counts.
   for the optional signing service.
 * **b** points a distribution to this version (rollback, with a preview). It makes no version, so
   the distributions that follow the repository and the next sync still use the newest version. On
-  Deb, the new publication keeps the signing service of the one the distribution serves now.
+  Deb, the new publication keeps the signing service of the one the distribution serves now. The
+  preview says if it reuses a publication of the version or makes a new one. On RPM, a repository
+  with a metadata signing service always gets a new publication, signed with that service: an
+  older one can be unsigned.
 * **m** compares with the marked version: mark one with `Space`, then press `m` on the other. It
   lists the added and removed units (older → newer) of each content type, for example
   `+ advisory RHSA-2024:0001`. A `warning:` line shows when Pulp counts other numbers. A
@@ -348,7 +352,8 @@ LATEST** (a repository). **i** full JSON.
   fetches `Release`, a `Packages` index and the smallest `.deb`, and compares the digest. A
   difference reads `MISMATCH: served content differs: …`.
 * **b** re-points to a version, with a preview. On Deb, it keeps the signing service of the
-  publication that it serves now.
+  publication that it serves now. On RPM, it makes a new signed publication when the repository
+  has a metadata signing service.
 * **c** / **e** / **d** create / edit / delete. Fields: name, base path, what it serves, content
   guard, labels (Deb: the signing service of a pinned publication). Flags:
   * **Hidden**: the content app does not list it. Its URL still serves.

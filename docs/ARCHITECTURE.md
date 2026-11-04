@@ -156,7 +156,9 @@ a signing service href). Then for each repository (`publish_repo`):
    (Deb). PATCH only fields that differ and that the server has.
 5. Publication: RPM and File reuse one of that version, except after a PATCH in step 4 or
    on Resume of a recorded version (a publication keeps the old settings). Deb always
-   creates one (a signed and an unsigned one cannot be told apart).
+   creates one (a signed and an unsigned one cannot be told apart). RPM keeps the reuse
+   also with a metadata signing service: each change of the service is a PATCH in step 4,
+   so a new publication follows it, and Pulp lists the newest publication first.
 
 Then the version is stored `published` and the Library step runs.
 
@@ -288,6 +290,9 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
   * Objects without the label are conflicts and are skipped.
   * A File item without a readable served manifest is skipped (no URL guess).
   * It never deletes and does not copy content guards, labels or metadata.
+  * It reuses a publication of the synced version (`ops::find_publication`), also for an
+    RPM repository with a metadata signing service (a new one on every run would pile up).
+    If the reused one is unsigned, the verify after it fails on `repomd.xml.asc`.
 * Guards: source and destination differ; a distribution served from the destination's
   content origin is a loop and is skipped.
 

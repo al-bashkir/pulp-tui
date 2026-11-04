@@ -274,19 +274,28 @@ pub fn publication_mode(t: RepoType, p: &Value) -> Value {
     mode_fields(t).iter().filter_map(|&k| p.get(k).map(|v| (k.to_string(), v.clone()))).collect()
 }
 
-/// Reuse a publication of the version that has `mode`, else create one with it.
+/// Reuse a publication of the version that has `mode` (`reusable_publication`), else create one with it.
 /// `mode`: publication fields that must match (`null`: must be unset); other fields may be anything.
 /// A reused publication keeps the repository settings of the time it was made; the operator's
 /// Publish uses `create_publication` instead.
 pub async fn ensure_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value, on: OnTask<'_>) -> Result<String> {
-    if let Some(p) = find_publication(c, t, version, mode).await? {
+    if let Some(p) = reusable_publication(c, t, version, mode).await? {
         return Ok(p);
     }
     create_publication(c, t, version, mode, on).await
 }
 
-/// A publication of the version that has `mode` and, for File, the manifest name that a new one would get
-/// (the reuse of `ensure_publication`).
+/// The publication that `ensure_publication` reuses: `find_publication`, but none when the RPM repository signs
+/// its metadata. pulp_rpm stores no signing service in a publication, so one made before the repository got its
+/// service (or with another key) cannot be told apart; Pulp signs a new one with the service of now.
+pub async fn reusable_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> Result<Option<String>> {
+    if t == RepoType::Rpm && rpm::signs_metadata(c, version).await? {
+        return Ok(None);
+    }
+    find_publication(c, t, version, mode).await
+}
+
+/// A publication of the version that has `mode` and, for File, the manifest name that a new one would get.
 pub async fn find_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> Result<Option<String>> {
     let all: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository_version", version.into())], 1_000).await?;
     let mut want = mode.as_object().cloned().unwrap_or_default();

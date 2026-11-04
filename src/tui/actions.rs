@@ -2006,7 +2006,7 @@ fn version_action(app: &mut App, act: Act, item: Value) {
                 format!("Point a distribution to version {number}"),
                 vec![Field::pick("dist", "Distribution", Source::Distributions(t)).required()],
             )
-            .note("The distribution will serve this version's publication (created if missing). No version is deleted.");
+            .note("The distribution will serve a publication of this version, an existing or a new one (the preview says which). No version is deleted.");
             app.form(form, move |app, f| {
                 rollback_preview(app, t, f.get("dist").to_string(), href.clone());
                 Ok(())
@@ -2157,11 +2157,17 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
             Some((v, p, how)) => (format!("{} ({how})", short(&v)), pinned_mode(t, Some(&p), &version, None)),
             None => ("nothing".into(), pinned_mode(t, None, &version, None)),
         };
+        let signs = t == RepoType::Rpm && rpm::signs_metadata(c, &version).await?;
+        let publication = match ops::reusable_publication(c, t, &version, &mode).await? {
+            Some(p) => format!("existing {}", short(&p)),
+            None if signs => "new, signed with the repository's metadata signing service".into(),
+            None => "new".into(),
+        };
         let lines = vec![
             format!("Distribution {dist} ({})", s(&d, "base_url")),
             format!("  now serves:  {current}"),
             format!("  will serve:  {} (pinned)", short(&version)),
-            format!("  publication: {}", mode_line(&mode)),
+            format!("  publication: {publication} ({})", mode_line(&mode)),
             String::new(),
             "Newer versions and publications are kept.".into(),
             "Repository metadata switches immediately. Pulp may keep serving files of the previous".into(),
@@ -4236,7 +4242,7 @@ mod tests {
         settle(&mut app, &mut rx).await;
         let Some(Modal::Confirm { on_yes, lines, .. }) = app.modal.take() else { panic!("no confirm") };
         assert!(
-            lines.contains(&"  publication: layout=flat, signing_service=/ss/1/, simple=true, structured=false".to_string()),
+            lines.contains(&"  publication: new (layout=flat, signing_service=/ss/1/, simple=true, structured=false)".to_string()),
             "{lines:?}"
         );
         on_yes.unwrap()(&mut app);
@@ -4248,6 +4254,55 @@ mod tests {
         let sent = server.received_requests().await.unwrap();
         let patch: Value = sent.iter().find(|r| r.method.as_str() == "PATCH").unwrap().body_json().unwrap();
         assert_eq!(patch["publication"], json!(format!("{pubs}9/")));
+    }
+
+    /// When the repository signs its metadata, the publication of the old version in the served mode may be unsigned
+    /// (pulp_rpm cannot tell): the preview says a new signed one is made, and the confirm makes it. Else it is reused.
+    #[tokio::test]
+    async fn rpm_rollback_of_a_signing_repository_makes_a_new_publication() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let (r, pubs, dists) =
+            (format!("{API}repositories/rpm/rpm/r/"), format!("{API}publications/rpm/rpm/"), format!("{API}distributions/rpm/rpm/"));
+        let (old, now, d) = (format!("{r}versions/1/"), format!("{pubs}5/"), format!("{dists}1/"));
+        let mode = json!({ "repository_version": old, "checksum_type": "sha256" });
+        let new = "new, signed with the repository's metadata signing service";
+        for (service, what, posts, served) in [(json!("/ss/1/"), new, vec![mode.clone()], "9/"), (json!(null), "existing 1", vec![], "1/")]
+        {
+            let server = wiremock::MockServer::start().await;
+            let dist = json!({ "pulp_href": d, "name": "prod", "base_path": "prod", "base_url": "http://h/prod/", "publication": now });
+            get(&server, &dists, page(json!([dist]))).await;
+            get(&server, &format!("{API}distributions/"), page(json!([]))).await;
+            get(&server, &r, json!({ "metadata_signing_service": service })).await;
+            get(&server, &now, json!({ "pulp_href": now, "repository_version": format!("{r}versions/2/"), "checksum_type": "sha256" }))
+                .await;
+            get(&server, &pubs, page(json!([{ "pulp_href": format!("{pubs}1/"), "repository_version": old, "checksum_type": "sha256" }])))
+                .await;
+            for p in ["1/", "9/"] {
+                get(&server, &format!("{pubs}{p}"), json!({ "pulp_href": format!("{pubs}{p}"), "repository_version": old })).await;
+            }
+            wiremock::Mock::given(method("POST"))
+                .and(path(pubs.clone()))
+                .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{pubs}9/") })))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(method("PATCH"))
+                .and(path(d.clone()))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": d })))
+                .mount(&server)
+                .await;
+            let (mut app, mut rx) = connected(&server).await;
+            rollback_preview(&mut app, RepoType::Rpm, "prod".into(), old.clone());
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { on_yes, lines, .. }) = app.modal.take() else { panic!("no confirm") };
+            assert!(lines.contains(&format!("  publication: {what} (checksum_type=sha256)")), "{lines:?}");
+            on_yes.unwrap()(&mut app);
+            settle(&mut app, &mut rx).await;
+            assert_eq!(posts_to(&server, &pubs).await, posts, "{service}");
+            let sent = server.received_requests().await.unwrap();
+            let patch: Value = sent.iter().find(|r| r.method.as_str() == "PATCH").unwrap().body_json().unwrap();
+            assert_eq!(patch["publication"], json!(format!("{pubs}{served}")));
+        }
     }
 
     #[test]
@@ -5787,6 +5842,7 @@ mod tests {
         )
         .await;
         get(&server, &pubs, page(json!([]))).await;
+        get(&server, &r, json!({ "metadata_signing_service": null })).await;
         answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}2/") })).await;
         let pinned = json!({ "pulp_href": d, "name": "r", "base_path": "r", "publication": p1, "pulp_labels": {} });
         assert_eq!(run(&server, json!([pinned]), "pin this version").await, "distribution r serves http://h/r/");
@@ -5863,6 +5919,7 @@ mod tests {
         .await;
         get(&server, &dists, page(json!([item]))).await;
         get(&server, &pubs, page(json!([]))).await;
+        get(&server, &r, json!({ "metadata_signing_service": null })).await;
         answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}2/") })).await;
         answer(&server, "PATCH", &d, 200, json!({ "pulp_href": d })).await;
         answer(&server, "DELETE", &d, 204, json!({})).await;

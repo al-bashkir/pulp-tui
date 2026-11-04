@@ -111,6 +111,46 @@ async fn rpm_lifecycle() {
     cleanup(&c, &[&dist, &repo, &local, &remote]).await;
 }
 
+/// v1 is published unsigned, then the repository gets a metadata signing service. A rollback to v1 (the TUI
+/// path: the mode of the served publication, `ensure_publication`, re-point, verify) makes a new, signed
+/// publication: pulp_rpm stores no signing service in a publication, so the unsigned one cannot be told apart.
+/// Needs `tests/env/pulp-env.sh rpm-signing-up`.
+#[tokio::test]
+async fn rpm_rollback_of_a_signing_repository_serves_signed_metadata() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Rpm;
+    let name = unique("it-rpm-signed");
+    let (repo, remote) = synced_repo(&c, t, &name, "rpm/", "additive").await;
+    let v1 = latest(&c, &repo).await;
+    let unsigned = ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
+    ops::settle(&c, c.patch(&remote, &json!({ "url": format!("{}/rpm2/", upstream()) })).await.unwrap(), &no_progress).await.unwrap();
+    ops::settle(&c, ops::sync(&c, t, &repo, None, "additive").await.unwrap(), &no_progress).await.unwrap();
+    let v2 = latest(&c, &repo).await;
+    let pub2 = ops::create_publication(&c, t, &v2, &json!({}), &no_progress).await.unwrap();
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), None, &no_progress).await.unwrap();
+
+    let svc: Value = ops::find_by_name(&c, &c.api("signing-services/"), "pulp-tui-rpm-test")
+        .await
+        .unwrap()
+        .expect("RPM test signing service (tests/env/pulp-env.sh rpm-signing-up)");
+    ops::settle(&c, c.patch(&repo, &json!({ "metadata_signing_service": svc["pulp_href"] })).await.unwrap(), &no_progress).await.unwrap();
+
+    let d: Value = c.get(&dist, &[]).await.unwrap();
+    let now = ops::served_publication(&c, &Capabilities::default(), t, &d).await.unwrap().unwrap();
+    let p = ops::ensure_publication(&c, t, &v1, &ops::publication_mode(t, &now), &no_progress).await.unwrap();
+    assert_ne!(p, unsigned, "the unsigned publication of v1 is not reused");
+    ops::ensure_distribution(&c, t, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
+    let base = dist_url(&c, &dist).await;
+    assert_eq!(served(&c, &format!("{base}repodata/repomd.xml.asc")).await.0, 200);
+    let pv: Value = c.get(&p, &[]).await.unwrap();
+    let msg = ops::verify_served(&c, t, &base, &v1, &pv).await.unwrap();
+    assert!(msg.starts_with("repomd.xml, repomd.xml.asc and ") && msg.contains("matching digest"), "{msg}");
+    cleanup(&c, &[&dist, &repo, &remote]).await;
+}
+
 /// A comps-only change (`rpm/comps/` upload) shows in the version compare, and Pulp counts the units it lists.
 #[tokio::test]
 async fn rpm_compare_lists_comps_units() {

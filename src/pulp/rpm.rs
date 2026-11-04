@@ -45,12 +45,17 @@ pub fn package_path(layout: &str, location_href: &str) -> Option<String> {
     }
 }
 
+/// Whether the repository of `version` has a metadata signing service (a server without the field: no).
+pub async fn signs_metadata(c: &PulpClient, version: &str) -> Result<bool> {
+    let repo: Value = c.get(&super::ops::repo_of_version(version), &[("fields", "metadata_signing_service".into())]).await?;
+    Ok(repo["metadata_signing_service"].is_string())
+}
+
 /// The metadata files that `base` serves (`repomd.xml`, and `repomd.xml.asc` when the repository of
 /// `version` has a metadata signing service); an error when one is missing. A publication made before the
 /// repository got its signing service has no signature.
 async fn served_metadata(c: &PulpClient, base: &str, version: &str) -> Result<&'static str> {
-    let repo: Value = c.get(&super::ops::repo_of_version(version), &[("fields", "metadata_signing_service".into())]).await?;
-    let signed = repo["metadata_signing_service"].is_string();
+    let signed = signs_metadata(c, version).await?;
     let files: &[&str] = if signed { &["repomd.xml", "repomd.xml.asc"] } else { &["repomd.xml"] };
     for f in files {
         let (status, _) = c.fetch_content(&format!("{base}repodata/{f}"), 64 << 20).await?;

@@ -902,6 +902,45 @@ async fn rpm_verify_needs_the_signature_when_the_repository_signs_its_metadata()
     assert_eq!(asc[1], Ok("repomd.xml, repomd.xml.asc and Packages/a/a.rpm served with matching digest (1 packages)".into()));
 }
 
+/// pulp_rpm stores no signing service in a publication, so one of a repository that signs its metadata may be
+/// unsigned (made before the service was set): it is never reused. Unset or absent (an older server): reused.
+#[tokio::test]
+async fn rpm_publication_is_new_when_the_repository_signs_its_metadata() {
+    let coll = format!("{API}publications/rpm/rpm/");
+    let mode = json!({ "checksum_type": "sha256" });
+    for (repo, want) in
+        [(json!({ "metadata_signing_service": null }), "1/"), (json!({}), "1/"), (json!({ "metadata_signing_service": "/ss/1/" }), "2/")]
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{API}repositories/rpm/rpm/r/")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&repo))
+            .mount(&server)
+            .await;
+        let listed = json!({ "pulp_href": format!("{coll}1/"), "repository_version": RPM_V, "checksum_type": "sha256" });
+        Mock::given(method("GET"))
+            .and(path(&coll))
+            .and(query_param("repository_version", RPM_V))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [listed] })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(&coll))
+            .and(body_json(json!({ "repository_version": RPM_V, "checksum_type": "sha256" })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{coll}2/") })))
+            .expect(u64::from(want == "2/"))
+            .mount(&server)
+            .await;
+        let c = client(&server, |_, _| {});
+        assert_eq!(
+            ops::ensure_publication(&c, RepoType::Rpm, RPM_V, &mode, &no_progress).await.unwrap(),
+            format!("{coll}{want}"),
+            "{repo}"
+        );
+        server.verify().await;
+    }
+}
+
 #[tokio::test]
 async fn rpm_and_file_verify_units_not_downloaded_yet() {
     // An on_demand unit has no sha256 in the API until its file is downloaded.
