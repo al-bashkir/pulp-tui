@@ -1,6 +1,6 @@
 //! Users, groups, roles (Pulp RBAC), replication, and export and import actions.
 
-use super::actions::{ap, caps, group_progress, submit, url_with_scheme};
+use super::actions::{ap, caps, group_progress, submit, unmark_when_deleted, url_with_scheme};
 use super::app::{App, Level};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, guard_type, s, short};
@@ -646,9 +646,12 @@ fn delete_uploads(app: &mut App, item: Value) {
     let hrefs = if marked.is_empty() { vec![s(&item, "pulp_href")] } else { marked };
     app.confirm("Delete uploads", lines, move |app| {
         for href in hrefs {
-            // shortcut: a failed delete loses its mark (its error names the upload); keep it as delete_marked does if needed.
-            app.list.marked.remove(&href);
-            submit(app, format!("delete upload {}", short(&href)), move |c| async move { Ok(c.delete(&href).await?) });
+            // A failed delete keeps its mark; its error names the upload.
+            let label = format!("delete upload {}", short(&href));
+            app.job(label.clone(), move |ctx| async move {
+                let m = ctx.client.delete(&href).await?;
+                ap(move |app| unmark_when_deleted(app, href, m, label))
+            });
         }
     });
 }
@@ -2926,6 +2929,22 @@ mod tests {
         assert_eq!(deleted, [U1, U2, U3].map(|u| format!("DELETE {u}")));
         assert!(app.list.marked.is_empty());
         assert!(notices(&app).iter().any(|(l, t)| *l == Level::Ok && t == "delete upload 0190aaaa-0003: done"), "{:?}", notices(&app));
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_delete_keeps_its_mark() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        serve(&server, "DELETE", U1, 204, Value::Null).await;
+        serve(&server, "DELETE", U2, 403, json!({ "detail": "You do not have permission to perform this action." })).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Uploads;
+        app.list.marked.extend([U1.to_string(), U2.to_string()]);
+        super::run(&mut app, Act::Delete, json!({ "pulp_href": U1 }));
+        let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.list.marked, [U2.to_string()].into(), "only the deleted upload is unmarked");
     }
 
     #[tokio::test]

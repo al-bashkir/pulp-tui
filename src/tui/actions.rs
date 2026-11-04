@@ -66,6 +66,23 @@ fn follow(app: &mut App, m: Mutation, label: String, done: impl FnOnce(&mut App,
     });
 }
 
+/// Report the delete of the marked `href`. Unmark it only when the delete completed: a failed or canceled task keeps
+/// the mark. Also on a list in the history (the operator opened a sub-list while the task ran).
+pub(super) fn unmark_when_deleted(app: &mut App, href: String, m: Mutation, label: String) {
+    let unmark = move |app: &mut App| {
+        for l in std::iter::once(&mut app.list).chain(app.history.iter_mut().map(|(_, l)| l)) {
+            l.marked.remove(&href);
+        }
+    };
+    match m {
+        Mutation::Task(_) => follow(app, m, label, move |app, _| unmark(app)),
+        _ => {
+            unmark(app);
+            submitted(app, m, &label);
+        }
+    }
+}
+
 /// A Remove task ended: a Content screen that still shows the browsed version moves to the new one.
 fn content_removed(app: &mut App, old: &str, n: usize, t: &Task) {
     let Some(new) = t.created_matching("/versions/") else {
@@ -1257,8 +1274,7 @@ fn delete_marked(app: &mut App, kind: Kind) {
                     }
                     ap(move |app| {
                         for (href, m, label) in done {
-                            app.list.marked.remove(&href);
-                            submitted(app, m, &label);
+                            unmark_when_deleted(app, href, m, label);
                         }
                         if !failed.is_empty() {
                             app.error(format!("delete failed (still marked): {}", failed.join("; ")));
@@ -5641,6 +5657,36 @@ mod tests {
         settle(&mut app, &mut rx).await;
         assert_eq!(app.list.marked, [d2].into(), "only the failed one stays marked");
         assert!(app.notices.iter().any(|n| n.level == Level::Error && n.text.starts_with("delete failed (still marked): two:")));
+    }
+
+    #[tokio::test]
+    async fn a_marked_delete_unmarks_only_when_its_task_completed() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let d = |i: u32| format!("{API}distributions/file/file/{i}/");
+        for (i, state) in [(1, "completed"), (2, "failed"), (3, "canceled")] {
+            get(&server, &d(i), json!({ "pulp_href": d(i), "name": format!("d{i}"), "base_url": "http://x/" })).await;
+            let task = format!("{API}tasks/{i}/");
+            let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": task }));
+            wiremock::Mock::given(method("DELETE")).and(path(d(i).as_str())).respond_with(accepted).mount(&server).await;
+            get(&server, &task, json!({ "pulp_href": task, "state": state, "error": { "description": "boom" } })).await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Distributions(RepoType::File);
+        app.list.marked = [d(1), d(2), d(3)].into();
+        run(&mut app, Act::Delete, json!({ "pulp_href": d(1), "name": "d1" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        yes(&mut app);
+        while app.jobs.iter().any(|j| j.label == "delete 3 distributions") {
+            app.handle_msg(rx.recv().await.unwrap());
+        }
+        // The deletes got 202. The operator opens a sub-list while the tasks run; Esc brings the marked list back.
+        let list = std::mem::replace(&mut app.list, super::super::app::ListState::new(Kind::Tasks));
+        app.history.push((Screen::Dashboard, list));
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.history[0].1.marked, [d(2), d(3)].into(), "a failed or canceled delete keeps its mark");
     }
 
     #[tokio::test]

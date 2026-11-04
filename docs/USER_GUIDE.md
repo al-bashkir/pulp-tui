@@ -87,7 +87,8 @@ These rules apply to all screens. The screen sections do not repeat them.
   (`j k g G`), `/` filters again, a second `Esc` closes.
 * **Bulk delete:** on Repositories, Remotes and Distributions, **d** with marked items deletes all
   the marked items. One confirm lists the impact of each item. Type `delete N <what>`, for example
-  `delete 3 repositories`. An item that fails to delete stays marked.
+  `delete 3 repositories`. A mark goes away only when the delete task of its item completed. An
+  item whose delete fails, or whose task fails or is canceled, stays marked.
 * **Object roles (B):** on repositories, remotes, alternate sources, publications,
   distributions, content guards, groups, server tasks, task schedules, uploads and upstream
   Pulps. The form shows who holds which role on the object, and your permissions on it. Then
@@ -824,7 +825,7 @@ stay until you delete them. **i** shows the chunks.
 * **d** deletes the selected upload, or the marked ones (`Space` marks). It asks for a plain
   confirmation, not a typed name: an upload holds only the chunks that a client sent, and no
   content, artifact or repository changes. A client that still sends that upload fails and
-  must start again.
+  must start again. An upload whose delete fails stays marked.
 
 ### Artifacts
 
