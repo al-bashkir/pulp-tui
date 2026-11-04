@@ -1045,6 +1045,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
     let note = if default.is_some() { "repository has a default remote" } else { "repository has NO default remote: pick one" };
     let label = format!("remote of {name}");
     let (autopublish, retain) = (item["autopublish"] == true, item["retain_package_versions"].as_u64().unwrap_or(0));
+    let own = default.clone();
     let open = move |app: &mut App, current: String| {
         let mut fields = vec![
             Field::pick("remote", "Remote", Source::Remotes(t)).help("empty = the repository's default remote").value(current),
@@ -1052,7 +1053,9 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
         ];
         fields.extend(sync_fields(t, caps.as_deref()));
         app.form(Form::new(format!("Sync {name}"), fields).note(note), move |app, f| {
-            let (remote, policy) = (f.opt("remote").map(str::to_string), f.get("policy").to_string());
+            // An untouched (or empty) Remote is the repository's own remote, by href: it can be of a type the picker lacks.
+            let remote = f.opt("remote").filter(|_| f.changed("remote")).map(str::to_string);
+            let (policy, own) = (f.get("policy").to_string(), own.clone());
             let (href, name, options) = (href.clone(), name.clone(), sync_options(f));
             let repos = vec![href.clone()];
             // pulp_rpm sync() answers HTTP 400 to these pairs; say it before any request.
@@ -1073,7 +1076,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
                 submit(app, format!("sync {name} ({policy})"), move |c| async move {
                     let r = match remote {
                         Some(r) => Some(href_by_name(&c, t.remotes(), &r).await?),
-                        None => None,
+                        None => own,
                     };
                     Ok(ops::sync_with(&c, t, &href, r.as_deref(), &policy, options).await?)
                 })
@@ -5473,6 +5476,45 @@ mod tests {
         repo_action(&mut app, RepoType::Rpm, Act::Sync, json!({ "pulp_href": "/r/", "name": "x", "remote": null }));
         let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
         assert_eq!(form.get("remote"), "");
+    }
+
+    /// A default remote of another type (pulp_rpm ULN, pulp_file Git; made outside pulp-tui): an untouched Remote syncs
+    /// from its href, and an Edit that does not touch the Remote does not send it.
+    #[tokio::test]
+    async fn sync_and_edit_keep_a_default_remote_of_another_type() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        for m in ["POST", "PATCH"] {
+            wiremock::Mock::given(wiremock::matchers::method(m))
+                .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") })))
+                .mount(&server)
+                .await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        for (t, remote) in [(RepoType::Rpm, format!("{API}remotes/rpm/uln/1/")), (RepoType::File, format!("{API}remotes/file/git/1/"))] {
+            get(&server, &remote, json!({ "name": "up" })).await;
+            let repo = format!("{API}{}r/", t.repositories());
+            let item = json!({ "pulp_href": repo, "name": "os", "remote": remote });
+            repo_action(&mut app, t, Act::Sync, item.clone());
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no form") };
+            assert_eq!(form.get("remote"), "up");
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+            let sent = posts_to(&server, &format!("{repo}sync/")).await;
+            assert_eq!(sent.last().map(|b| &b["remote"]), Some(&json!(remote)), "{t:?}: {:?}", app.notices.back().map(|n| &n.text));
+
+            repo_action(&mut app, t, Act::Edit, item);
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            assert_eq!(form.get("remote"), "up");
+            form.fields.iter_mut().find(|f| f.key == "description").unwrap().value = "new".into();
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+            let sent = server.received_requests().await.unwrap();
+            let patch = sent.iter().rev().find(|r| r.method.as_str() == "PATCH" && r.url.path() == repo).expect("a PATCH");
+            assert_eq!(patch.body_json::<Value>().unwrap(), json!({ "description": "new" }), "{t:?}: the remote is not sent");
+        }
     }
 
     #[tokio::test]

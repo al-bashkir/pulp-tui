@@ -171,8 +171,10 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
 
 * **v** versions. **o** content of the latest version. **H** sync history (tasks that touched the
   repository). **i** full JSON.
-* **f** sync. Choose the remote (empty = the default remote) and the policy: RPM `additive`,
-  `mirror_complete`, `mirror_content_only`; File and Deb `additive`, `mirror`. A mirror policy
+* **f** sync. Choose the remote and the policy: RPM `additive`, `mirror_complete`,
+  `mirror_content_only`; File and Deb `additive`, `mirror`. The Remote field shows the default
+  remote; untouched or empty, the sync uses the default remote by its href, of any type (also a
+  ULN or Git remote). Edit sends the remote only when you change it. A mirror policy
   shows a warning first. With **Retain versions** 1, Pulp deletes the current version after the
   sync, unless a distribution serves it: then the warning says so and you type the repository
   name (on a Content View sync, the names of those repositories). Options:
