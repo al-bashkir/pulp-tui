@@ -153,6 +153,14 @@ impl TaskCenter {
         out
     }
 
+    /// Poll the task at the next tick, also when a workflow polls it itself (after a cancel request).
+    pub fn poll_now(&mut self, href: &str) {
+        if let Some(t) = self.items.iter_mut().find(|t| t.href == href) {
+            t.driven_until = None;
+            t.next_poll = Instant::now();
+        }
+    }
+
     pub fn dismiss_finished(&mut self) -> usize {
         let before = self.items.len();
         self.items.retain(|t| !t.is_final());

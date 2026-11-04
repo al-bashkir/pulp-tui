@@ -43,7 +43,9 @@ it.
   a tracked task ends, and when an operation job fails (to show the state it left).
 * Esc aborts only list loads (`App::abort_loads`). An operation job waits until it ends;
   Connect (`App::abort_all`) or quit stops the wait. Pulp tasks always continue: only
-  *Cancel task* asks Pulp to cancel one.
+  *Cancel task* asks Pulp to cancel one. After that request, the Task Center polls the task
+  at the next tick, also when a workflow polls it. A failed read after an accepted cancel is
+  a warning, not a failed cancel.
 
 ### Requests and retries
 

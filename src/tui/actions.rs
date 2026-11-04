@@ -2796,17 +2796,24 @@ fn purge_tasks(app: &mut App, before: String, states: Vec<String>) {
     });
 }
 
-/// PATCH `state: canceled` on a task or a task group, then report the state that Pulp gives.
+/// PATCH `state: canceled` on a task or a task group, then report the state that Pulp gives. A failed read of
+/// that state does not make an accepted cancel fail; the Task Center reads the task again at once.
 fn cancel_task(app: &mut App, href: String) {
     app.job("cancel task", move |ctx| async move {
         let res = ctx.client.patch(&href, &json!({ "state": "canceled" })).await;
-        let t = ops::get_task(&ctx.client, &href).await?;
+        let t = ops::get_task(&ctx.client, &href).await;
         ap(move |app| {
-            match res {
-                Ok(_) => app.notify(Level::Info, format!("cancel requested; Pulp reports state {}", t.state)),
-                Err(e) => app.error(format!("Pulp refused cancellation ({e}); task state is {}", t.state)),
+            match (res, &t) {
+                (Ok(_), Ok(t)) => app.notify(Level::Info, format!("cancel requested; Pulp reports state {}", t.state)),
+                (Ok(_), Err(_)) => app.notify(Level::Info, "cancel requested"),
+                (Err(e), Ok(t)) => app.error(format!("Pulp refused cancellation ({e}); task state is {}", t.state)),
+                (Err(e), Err(_)) => app.error(format!("Pulp refused cancellation ({e})")),
             }
-            app.handle_msg(super::app::Msg::Task(t, None));
+            match t {
+                Ok(t) => app.handle_msg(super::app::Msg::Task(t, None)),
+                Err(e) => app.notify(Level::Warn, format!("task state not read after the cancel request: {e}")),
+            }
+            app.tasks.poll_now(&href);
             app.reload();
         })
     });
@@ -5094,6 +5101,64 @@ mod tests {
         let e = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
         assert!(e.starts_with("not supported by this server: "), "{e}");
         assert_eq!(server.received_requests().await.unwrap().len(), asked);
+    }
+
+    /// Track `hrefs` as a workflow does (the Task Center skips them while it polls), then cancel each one.
+    async fn cancel_driven(server: &wiremock::MockServer, hrefs: &[&String]) -> (App, Vec<(Level, String)>) {
+        use crate::tui::app::{Modal, Msg};
+        for h in hrefs {
+            let ok = wiremock::ResponseTemplate::new(200).set_body_json(json!({}));
+            wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                .and(wiremock::matchers::path(h.as_str()))
+                .respond_with(ok)
+                .mount(server)
+                .await;
+        }
+        let (mut app, mut rx) = connected(server).await;
+        let minute = std::time::Duration::from_secs(60);
+        app.tasks = crate::tui::tasks::TaskCenter::new((minute, minute)); // the next poll is a minute away
+        for h in hrefs {
+            app.handle_msg(Msg::Task(serde_json::from_value(json!({ "pulp_href": h, "name": "x", "state": "running" })).unwrap(), None));
+        }
+        assert!(app.tasks.due().is_empty());
+        for h in hrefs {
+            task_action(&mut app, Act::CancelTask, json!({ "pulp_href": h }));
+            settle(&mut app, &mut rx).await; // a group is read before its confirmation
+            let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirmation") };
+            yes(&mut app);
+            settle(&mut app, &mut rx).await;
+        }
+        let n = app.notices.iter().map(|n| (n.level, n.text.clone())).collect();
+        (app, n)
+    }
+
+    #[tokio::test]
+    async fn a_canceled_task_or_group_is_polled_soon_after_the_cancel() {
+        let server = wiremock::MockServer::start().await;
+        let (task, group) = (format!("{API}tasks/1/"), format!("{API}task-groups/1/"));
+        get(&server, &task, json!({ "pulp_href": task, "name": "sync", "state": "canceling" })).await;
+        let g = json!({ "pulp_href": group, "description": "up", "all_tasks_dispatched": true, "canceling": 1, "tasks": [{ "state": "canceling" }] });
+        get(&server, &group, g).await;
+        let (mut app, n) = cancel_driven(&server, &[&task, &group]).await;
+        assert_eq!(n.iter().filter(|(_, t)| t.starts_with("cancel requested; Pulp reports state ")).count(), 2, "{n:?}");
+        assert_eq!(app.tasks.due(), [group, task], "the Task Center polls both at once");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_cancel_is_reported_when_the_task_is_not_read_after_it() {
+        let server = wiremock::MockServer::start().await;
+        let task = format!("{API}tasks/1/");
+        let boom = wiremock::ResponseTemplate::new(500).set_body_json(json!({ "detail": "boom" }));
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(task.as_str()))
+            .respond_with(boom)
+            .mount(&server)
+            .await;
+        let (mut app, n) = cancel_driven(&server, &[&task]).await;
+        assert!(n.contains(&(Level::Info, "cancel requested".into())), "{n:?}");
+        assert!(n.iter().any(|(l, t)| *l == Level::Warn && t.starts_with("task state not read after the cancel request: ")), "{n:?}");
+        assert!(!n.iter().any(|(l, _)| *l == Level::Error), "the cancel did not fail: {n:?}");
+        assert_eq!(app.tasks.due(), [task], "the Task Center reads it");
     }
 
     #[tokio::test]

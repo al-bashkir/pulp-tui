@@ -57,7 +57,8 @@ These rules apply to all screens. The screen sections do not repeat them.
    for about two minutes, the operation ends with `could not read task …, it may still be running`.
    This is not a failure.
 3. **X on Tasks** asks Pulp to cancel a task or a task group. The Task Center then shows the state
-   that Pulp reports.
+   that Pulp reports, and reads the task again at once. When pulp-tui cannot read the state after
+   the request, the cancel is still requested; a warning tells you that the state was not read.
 
 ## Keys
 
