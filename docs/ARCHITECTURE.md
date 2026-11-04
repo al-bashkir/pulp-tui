@@ -20,7 +20,7 @@ for normal operation.
   response size limit, error mapping. It keeps every href below the API root and records
   each attempt in the session log.
 * **Capabilities**: `status/` (versions, health, content origin), the current user, and
-  the live OpenAPI schema (endpoints, methods, fields, enums).
+  the live OpenAPI schema (endpoints, methods, operation ids, fields, enums).
 * **Typed adapters**: plugin endpoints, task and task-group waits, find-or-create,
   publications, distributions, uploads, content lists, diffs, served-content checks.
 * **Services** use only the layers above: Content Views, replication, filter rules
@@ -460,8 +460,8 @@ client clock).
   at 64 KiB, secret keys redacted (any case), upload bodies replaced by their size. It is
   never written to disk.
 * Read-only profiles block mutating requests in the client; the UI hides the actions.
-* Pulp enforces RBAC. pulp-tui warns on owner/admin grants, `is_staff` and changes to
-  one's own access, refuses to delete the logged-in account, and never works around a 403.
+* Pulp enforces RBAC. pulp-tui warns on owner/admin grants (also object roles), `is_staff`
+  and changes to one's own access, refuses to delete the logged-in account, and never works around a 403.
 * Destructive operations show the impact first. Deletes of repositories, distributions,
   users, roles, content guards, domains, Content Views, ACSs and protected promotions, reclaim
   space and a domain storage migration need the typed name. Production profiles show a red

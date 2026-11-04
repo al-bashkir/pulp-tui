@@ -85,6 +85,7 @@ General rules:
 | Content guards screen                     | `contentguards/` and `distributions/`                                | screen not supported                      |
 | Content guard types (**c**)               | `contentguards/<type>/`, for example `contentguards/core/rbac/`      | type not offered                          |
 | RBAC guard download access (**a**)        | `{r_b_a_c_content_guard_href}add_role/`                              | endpoint message                          |
+| Object roles (**B**)                      | operation `<collection>_list_roles`, e.g. `repositories_rpm_rpm_…`   | endpoint message                          |
 | Task group cancel                         | `patch` on `{task_group_href}`                                       | endpoint message                          |
 
 1. For the copy action. A Content View publish gets the server's error.
@@ -516,6 +517,22 @@ Read in pulpcore 3.123.1 (models and serializers in `pulpcore/app/`) and live on
   href. `distributions/` has no `content_guard` filter, so the screen reads `name` and
   `content_guard` of all distributions.
 
+### Object roles
+
+Read in pulpcore 3.123.1 (`RolesMixin` in `app/viewsets/base.py`, `NestedRoleSerializer`).
+
+* `list_roles/`, `add_role/`, `remove_role/` and `my_permissions/` come together. The detail
+  path in the OpenAPI is a template (`{rpm_rpm_repository_href}list_roles/`), so pulp-tui finds
+  the type by the operation id: the collection path with `_` for `/` and `-`
+  (`task_schedules_list_roles`). The test server has them on repositories, remotes, ACSs,
+  publications, distributions, content guards (not x509 or RHSM), groups, tasks, task
+  schedules, uploads and upstream Pulps; not on domains, exporters or importers.
+* `list_roles/` answers `{roles: [{role, users, groups}]}` with user and group names.
+  `my_permissions/` answers `{permissions}` (`get_all_permissions` of the object).
+* `add_role/` and `remove_role/` take `{role, users, groups}` and answer 201. They refuse
+  (400) a role without a permission for the object type, an assignment that exists, and the
+  removal of one that does not.
+
 ### Domains
 
 Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
@@ -798,8 +815,8 @@ or IpAddress(127.0.0.1)`.
 * RPM `osv_config` (the ecosystems of a version scan) is not in the repository form; set it with
   the API. An edit that changes the Labels of a repository that has it gets HTTP 400 from
   pulp_rpm; with the `osv.rpm.config` label taken out of the field, the edit removes the config.
-* Content guards are not replicated (fallback replication), and object roles other than the
-  RBAC guard's download role are not managed.
+* Content guards are not replicated (fallback replication). The object role form lists all
+  roles, not only the ones for the object type (Pulp refuses the others).
 * Reusable filter sets are not implemented; filters are per view repository, so a later
   table can be added without a change to published versions. A composite has no filters
   and cannot be a component of another composite.

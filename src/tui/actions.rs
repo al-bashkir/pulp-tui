@@ -303,6 +303,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         }
         (Kind::Logs { .. }, Act::Inspect) => app.text(s(&item, "summary"), log_lines(&item)),
         (_, Act::Inspect) => inspect(app, &kind, item),
+        (_, Act::ObjectRoles) => super::actions_admin::object_roles(app, item),
         (Kind::Profiles, _) => profile_action(app, act, item),
         (Kind::Repos(t, _), _) => repo_action(app, *t, act, item),
         (Kind::Remotes(t, alt), _) => remote_action(app, *t, *alt, act, item),

@@ -241,6 +241,8 @@ pub enum Act {
     GuardAccess,
     /// Domain: copy its artifacts to another storage backend (`domains/migrate/`).
     MigrateStorage,
+    /// Who holds which role on the object, my permissions on it; add or remove a role (`{href}list_roles/`, ...).
+    ObjectRoles,
     /// In no `actions()` list: offered on Connect and save; here so that `mutates` classifies them.
     MigrateDb,
     CopyDb,
@@ -286,6 +288,7 @@ impl Act {
             ToggleActive | UploadAdvisory => 'A',
             BreakLock | UploadComps => 'U',
             PruneOrphans | PrunePackages => 'O',
+            ObjectRoles => 'B',
         }
     }
 
@@ -361,6 +364,7 @@ impl Act {
             PurgeTasks => "Purge finished tasks (whole server)",
             GuardAccess => "Download access (users, groups)",
             MigrateStorage => "Migrate the storage backend (copies all artifacts)",
+            ObjectRoles => "Object roles (who may do what; my permissions)",
             MigrateDb => "Migrate database",
             CopyDb => "Copy Content View data",
         }
@@ -400,6 +404,8 @@ impl Act {
                     | Exports
                     | Imports
                     | Filter
+                    // A view; its add/remove form is offered only outside read-only mode (and the client refuses the POST there).
+                    | ObjectRoles
             ),
         }
     }
@@ -882,6 +888,7 @@ impl Kind {
                     Create,
                     Edit,
                     Delete,
+                    ObjectRoles,
                     Inspect,
                 ];
                 match t {
@@ -893,8 +900,9 @@ impl Kind {
                 }
                 actions
             }
-            Kind::Remotes(..) | Kind::Roles => vec![Create, Edit, Delete, Inspect],
-            Kind::Acs(_) => vec![Refresh, Create, Edit, Delete, Inspect],
+            Kind::Remotes(..) => vec![Create, Edit, Delete, ObjectRoles, Inspect],
+            Kind::Roles => vec![Create, Edit, Delete, Inspect],
+            Kind::Acs(_) => vec![Refresh, Create, Edit, Delete, ObjectRoles, Inspect],
             Kind::Versions(_) => {
                 vec![Content, Publish, Distribute, Rollback, Restore, Compare, Repair, Scan, Delete, PruneOrphans, Inspect]
             }
@@ -903,9 +911,9 @@ impl Kind {
                 vec![Inspect, RemoveContent]
             }
             Kind::Content { .. } => vec![Inspect, RemoveContent, AddToRepo],
-            Kind::Publications(_) => vec![Create, Distribute, Delete, Inspect],
-            Kind::Distributions(_) => vec![CopyUrl, Verify, Rollback, Create, Edit, Delete, Inspect],
-            Kind::ContentGuards => vec![GuardAccess, Create, Edit, Delete, Inspect],
+            Kind::Publications(_) => vec![Create, Distribute, Delete, ObjectRoles, Inspect],
+            Kind::Distributions(_) => vec![CopyUrl, Verify, Rollback, Create, Edit, Delete, ObjectRoles, Inspect],
+            Kind::ContentGuards => vec![GuardAccess, Create, Edit, Delete, ObjectRoles, Inspect],
             Kind::ContentViews => vec![
                 CvVersions,
                 CvSyncRepos,
@@ -928,20 +936,20 @@ impl Kind {
             ],
             Kind::CvVersions { .. } => vec![Promote, Rollback, Compare, Resume, WatchTask, Delete, Inspect],
             Kind::Environments => vec![Create, Edit, ToggleProtected, Delete],
-            Kind::UpstreamPulps => vec![Replicate, ReplicationHistory, FallbackReplicate, Create, Edit, Delete, Inspect],
+            Kind::UpstreamPulps => vec![Replicate, ReplicationHistory, FallbackReplicate, Create, Edit, Delete, ObjectRoles, Inspect],
             Kind::PulpExporters | Kind::FsExporters => vec![Export, Exports, Create, Edit, Delete, Inspect],
             Kind::Exports { .. } => vec![Delete, Inspect],
             Kind::Importers => vec![Import, Imports, Create, Edit, Delete, Inspect],
             Kind::Imports { .. } => vec![Inspect],
             Kind::Users => vec![Roles, Create, Edit, Password, ToggleActive, Delete, Inspect],
             Kind::UserRoles { .. } | Kind::GroupRoles { .. } | Kind::GroupUsers { .. } => vec![Create, Delete],
-            Kind::Groups => vec![Members, Roles, Create, Edit, Delete, Inspect],
+            Kind::Groups => vec![Members, Roles, Create, Edit, Delete, ObjectRoles, Inspect],
             Kind::Domains => vec![MigrateStorage, Create, Edit, Delete, Inspect],
             Kind::Tasks => vec![WatchTask, Inspect, CancelTask, DismissTasks],
-            Kind::ServerTasks(_) => vec![WatchTask, Inspect, TrackTask, CancelTask, Filter, Delete, PurgeTasks],
+            Kind::ServerTasks(_) => vec![WatchTask, ObjectRoles, Inspect, TrackTask, CancelTask, Filter, Delete, PurgeTasks],
             Kind::TaskGroups => vec![CancelTask, Inspect],
-            Kind::Uploads => vec![Delete, Inspect],
-            Kind::TaskSchedules => vec![WatchTask, Inspect],
+            Kind::Uploads => vec![Delete, ObjectRoles, Inspect],
+            Kind::TaskSchedules => vec![WatchTask, ObjectRoles, Inspect],
             Kind::Workers | Kind::Logs { .. } => vec![Inspect],
         }
     }
@@ -1573,7 +1581,7 @@ mod tests {
         assert_eq!(k.toggle(), Some(Kind::Acs(RepoType::File)));
         let paths: Vec<String> = RepoType::ALL.iter().map(|t| Kind::Acs(*t).source().unwrap().0).collect();
         assert_eq!(paths, ["acs/rpm/rpm/", "acs/file/file/", "acs/deb/deb/"]);
-        assert_eq!(k.actions(), [Act::Refresh, Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
+        assert_eq!(k.actions(), [Act::Refresh, Act::Create, Act::Edit, Act::Delete, Act::ObjectRoles, Act::Inspect]);
         assert!(Act::Refresh.mutates(&k, false), "a refresh runs sync tasks");
         let mut caps = Capabilities::default();
         caps.versions.insert("rpm".into(), "3.39.5".into());
@@ -1606,7 +1614,7 @@ mod tests {
         assert_eq!((k.source().unwrap().0, uln.source().unwrap().0), ("remotes/rpm/rpm/".into(), "remotes/rpm/uln/".into()));
         assert_eq!(uln.toggle(), Some(Kind::Remotes(RepoType::File, false)));
         assert_eq!(Kind::Remotes(RepoType::Deb, false).toggle(), Some(k.clone()), "Deb has one remote type");
-        assert_eq!(uln.actions(), [Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
+        assert_eq!(uln.actions(), [Act::Create, Act::Edit, Act::Delete, Act::ObjectRoles, Act::Inspect]);
         assert!(Act::Create.mutates(&uln, false));
         let mut caps = Capabilities::default();
         caps.versions.insert("rpm".into(), "3.39.5".into());
@@ -1647,9 +1655,13 @@ mod tests {
         let row =
             json!({ "name": "certs", "pulp_href": "/pulp/api/v3/contentguards/certguard/x509/0190abcd/", "distributions": ["a", "b"] });
         assert_eq!(k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["certs", "certguard/x509", "a, b"]);
-        assert_eq!(k.item_actions(&row), [Act::Create, Act::Edit, Act::Delete, Act::Inspect], "access is for RBAC guards only");
+        assert_eq!(
+            k.item_actions(&row),
+            [Act::Create, Act::Edit, Act::Delete, Act::ObjectRoles, Act::Inspect],
+            "access is for RBAC guards only"
+        );
         let rbac = json!({ "pulp_href": "/pulp/api/v3/contentguards/core/rbac/1/" });
-        assert_eq!(k.item_actions(&rbac), [Act::GuardAccess, Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
+        assert_eq!(k.item_actions(&rbac), [Act::GuardAccess, Act::Create, Act::Edit, Act::Delete, Act::ObjectRoles, Act::Inspect]);
         assert_eq!(Act::GuardAccess.key(), 'a');
         for a in [Act::GuardAccess, Act::Create, Act::Edit, Act::Delete] {
             assert!(a.mutates(&k, false), "{a:?}");
@@ -1673,7 +1685,7 @@ mod tests {
         assert_eq!((path.as_str(), q, search), ("uploads/", vec![("ordering", "pulp_created".to_string())], None), "no name to search");
         let row = json!({ "pulp_href": "/pulp/api/v3/uploads/0190abcd-1234-5678/", "pulp_created": "2026-11-02T10:00:00.123Z", "size": 2048, "completed": null });
         assert_eq!(k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["0190abcd-1234", "2026-11-02 10:00:00", "2048", ""]);
-        assert_eq!(k.actions(), [Act::Delete, Act::Inspect]);
+        assert_eq!(k.actions(), [Act::Delete, Act::ObjectRoles, Act::Inspect]);
         assert!(Act::Delete.mutates(&k, false) && !Act::Inspect.mutates(&k, false));
         let mut caps = Capabilities::default();
         caps.paths.insert("uploads/".into());
@@ -1694,13 +1706,41 @@ mod tests {
             cells,
             ["Clean up stale content periodically", "orphan.orphan_cleanup", "1 00:00:00", "2026-11-05 21:19:15", "01a1a86e-55a7"]
         );
-        assert_eq!(k.actions(), [Act::WatchTask, Act::Inspect]);
-        assert!(k.actions().iter().all(|a| !a.mutates(&k, false)), "Pulp has no write API for schedules");
+        assert_eq!(k.actions(), [Act::WatchTask, Act::ObjectRoles, Act::Inspect]);
+        assert!(k.actions().iter().all(|a| !a.mutates(&k, false)), "Pulp has no write API for schedules; B is a view");
         let mut caps = Capabilities::default();
         caps.paths.insert("tasks/".into());
         assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: task schedules API (task-schedules/)"));
         caps.paths.insert("task-schedules/".into());
         assert_eq!(k.unsupported(&caps), None);
+    }
+
+    #[test]
+    fn object_roles_are_offered_on_the_objects_that_have_them() {
+        let with = [
+            Kind::Repos(RepoType::Deb, false),
+            Kind::Remotes(RepoType::Rpm, true),
+            Kind::Acs(RepoType::File),
+            Kind::Publications(RepoType::Deb),
+            Kind::Distributions(RepoType::Rpm),
+            Kind::ContentGuards,
+            Kind::Groups,
+            Kind::ServerTasks(vec![]),
+            Kind::TaskSchedules,
+            Kind::Uploads,
+            Kind::UpstreamPulps,
+        ];
+        for k in with {
+            let acts = k.actions();
+            let at = acts.iter().position(|a| *a == Act::ObjectRoles).unwrap_or_else(|| panic!("{k:?}"));
+            assert_eq!(acts[at + 1], Act::Inspect, "{k:?}: just before Inspect");
+            assert!(!Act::ObjectRoles.mutates(&k, false), "{k:?}: a view; read-only mode gets no add/remove form");
+        }
+        for k in [Kind::Roles, Kind::Users, Kind::Versions(None), Kind::Domains, Kind::Exports { exporter: "/e/".into(), name: "e".into() }]
+        {
+            assert!(!k.actions().contains(&Act::ObjectRoles), "{k:?}: Pulp has no list_roles/ there");
+        }
+        assert_eq!(Act::ObjectRoles.key(), 'B');
     }
 
     #[test]

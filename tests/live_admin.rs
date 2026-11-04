@@ -502,3 +502,35 @@ async fn domains_screen_follows_domain_enabled() {
         assert_eq!(app.list.error.as_deref(), Some(off));
     }
 }
+
+/// Object roles of a File repository: admin, its creator, holds the owner role; the form adds the viewer role
+/// for a new user, Pulp then lists it, and the form removes it again.
+#[tokio::test]
+async fn object_roles_add_and_remove_a_viewer_on_a_repository() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = unique("admin-objroles");
+    let user = create(&c, "users/", json!({ "username": name }), "/users/").await;
+    let repo = create(&c, RepoType::File.repositories(), json!({ "name": name }), "/repositories/").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(RepoType::File, false);
+    let item = json!({ "pulp_href": repo, "name": name });
+    let viewers = async || {
+        let v: Value = c.get(&format!("{repo}list_roles/"), &[]).await.unwrap();
+        let roles = v["roles"].as_array().unwrap().iter().filter(|r| r["role"] == "file.filerepository_viewer");
+        roles.flat_map(|r| r["users"].as_array().unwrap().iter().filter_map(|u| u.as_str().map(String::from))).collect::<Vec<_>>()
+    };
+    for change in ["add", "remove"] {
+        run(&mut app, Act::ObjectRoles, item.clone());
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no form: {:?}", texts(&app)) };
+        let owner = form.notes.iter().any(|n| n.starts_with("file.filerepository_owner: users ") && n.contains("admin"));
+        assert!(owner && form.notes.last().unwrap().starts_with("My permissions: "), "{:?}", form.notes);
+        fill(&mut app, &[("change", change), ("role", "file.filerepository_viewer"), ("users", &name)]);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(viewers().await.contains(&name), change == "add", "{change}: {:?}", texts(&app));
+    }
+    cleanup(&c, &[&repo, &user]).await;
+}

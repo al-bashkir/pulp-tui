@@ -397,6 +397,73 @@ fn role_action(app: &mut App, act: Act, item: Value) {
     }
 }
 
+/// Who holds which role on one object (`{href}list_roles/`) and what the current user may do with it
+/// (`my_permissions/`); then add or remove a role for users and groups (`add_role/`, `remove_role/`).
+pub fn object_roles(app: &mut App, item: Value) {
+    let href = s(&item, "pulp_href");
+    let name = Some(s(&item, "name")).filter(|n| !n.is_empty()).unwrap_or_else(|| short(&href));
+    if caps(app).is_some_and(|c| !c.has_object_roles(&href)) {
+        return app.error(format!("not supported by this server: object roles of {}/", crate::pulp::caps::collection(&href)));
+    }
+    let me = me(app);
+    app.job(format!("read roles of {name}"), move |ctx| async move {
+        let c = &ctx.client;
+        let (roles, mine): (Value, Value) =
+            (c.get(&format!("{href}list_roles/"), &[]).await?, c.get(&format!("{href}my_permissions/"), &[]).await?);
+        let names = |v: &Value| {
+            let n: Vec<&str> = v.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            if n.is_empty() { "none".to_string() } else { n.join(", ") }
+        };
+        let rows = roles["roles"].as_array().into_iter().flatten();
+        let mut notes: Vec<String> =
+            rows.map(|r| format!("{}: users {}; groups {}", s(r, "role"), names(&r["users"]), names(&r["groups"]))).collect();
+        if notes.is_empty() {
+            notes.push("No role on this object.".into());
+        }
+        notes.push(format!("My permissions: {}", names(&mine["permissions"])));
+        ap(move |app| {
+            // Viewing is read-only; adding and removing is not.
+            if app.read_only() {
+                return app
+                    .text(format!("Roles on {name}"), [notes, vec!["Read-only mode: no role is added or removed here.".into()]].concat());
+            }
+            let fields = vec![
+                Field::new("change", "Change", FieldKind::Choice(vec!["add".into(), "remove".into()])),
+                Field::pick("role", "Role", Source::Roles).required().help("Pulp refuses a role without a permission for this object"),
+                Field::pick("users", "Users", Source::Users).multi(),
+                Field::pick("groups", "Groups", Source::Groups).multi(),
+            ];
+            let mut form = Form::new(format!("Roles on {name}"), fields);
+            form.notes = notes;
+            app.form(form, move |app, f| {
+                let list = |k: &str| f.get(k).split('\n').filter(|x| !x.is_empty()).map(String::from).collect::<Vec<_>>();
+                let (role, users, groups) = (f.get("role").to_string(), list("users"), list("groups"));
+                if users.is_empty() && groups.is_empty() {
+                    return Err("pick a user or a group".into());
+                }
+                let add = f.get("change") == "add";
+                let mut warn = vec![];
+                if add && is_powerful(&role) {
+                    warn.push(format!("{role} grants owner/admin level permissions on {name}."));
+                }
+                if let Some(m) = me.as_ref().filter(|m| !add && users.contains(m)) {
+                    warn.push(format!("You remove a role from YOUR OWN account ({m}): you may lose access to {name}."));
+                }
+                let url = format!("{href}{}", if add { "add_role/" } else { "remove_role/" });
+                let (label, b) =
+                    (format!("{} role {role} on {name}", f.get("change")), json!({ "role": role, "users": users, "groups": groups }));
+                let go = move |app: &mut App| submit(app, label, move |c| async move { Ok(c.post(&url, &b).await?) });
+                if warn.is_empty() {
+                    go(app)
+                } else {
+                    app.confirm("Confirm role change", warn, go)
+                }
+                Ok(())
+            });
+        })
+    });
+}
+
 // ---- content guards ---------------------------------------------------------------------
 
 /// Content guard types: the collection below `contentguards/`, the request schema, the fields beyond name and description.
@@ -2772,9 +2839,9 @@ mod tests {
         let rbac = json!({ "pulp_href": RBAC, "name": "staff" });
         app.list.marked.insert(U2.into());
         for (k, item, offered, refused) in [
-            (Kind::ContentGuards, rbac, vec![Inspect], vec![GuardAccess, Create, Edit, Delete]),
-            (Kind::Uploads, json!({ "pulp_href": U1 }), vec![Inspect], vec![Delete]),
-            (Kind::TaskSchedules, json!({ "pulp_href": "/s/1/", "last_task": "/t/1/" }), vec![WatchTask, Inspect], vec![]),
+            (Kind::ContentGuards, rbac, vec![ObjectRoles, Inspect], vec![GuardAccess, Create, Edit, Delete]),
+            (Kind::Uploads, json!({ "pulp_href": U1 }), vec![ObjectRoles, Inspect], vec![Delete]),
+            (Kind::TaskSchedules, json!({ "pulp_href": "/s/1/", "last_task": "/t/1/" }), vec![WatchTask, ObjectRoles, Inspect], vec![]),
             (Kind::Domains, json!({ "pulp_href": "/d/1/", "name": "edge" }), vec![Inspect], vec![MigrateStorage, Create, Edit, Delete]),
         ] {
             app.list.kind = k.clone();
@@ -3001,5 +3068,139 @@ mod tests {
         super::run(&mut app, Act::MigrateStorage, row);
         assert!(app.modal.is_none() && app.jobs.is_empty());
         assert_eq!(notices(&app).last().unwrap().1, "not supported by this server: domain storage migration (domains/migrate/)");
+    }
+
+    /// The form that the shared action `ObjectRoles` opens for `item` on the current screen.
+    async fn roles_form(app: &mut App, rx: &mut UnboundedReceiver<Msg>, item: Value) -> super::Form {
+        crate::tui::actions::run(app, crate::tui::kinds::Act::ObjectRoles, item);
+        settle(app, rx).await;
+        open_now(app)
+    }
+
+    #[tokio::test]
+    async fn object_roles_show_who_holds_what_and_add_or_remove_a_role() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        let repo = "/pulp/api/v3/repositories/rpm/rpm/0190abcd/";
+        let roles = json!({ "roles": [
+            { "role": "rpm.rpmrepository_owner", "users": ["admin"], "groups": [] },
+            { "role": "rpm.rpmrepository_viewer", "users": ["bob", "carol"], "groups": ["ops"] }] });
+        serve(&server, "GET", &format!("{repo}list_roles/"), 200, roles).await;
+        let mine = json!({ "permissions": ["rpm.view_rpmrepository", "rpm.sync_rpmrepository"] });
+        serve(&server, "GET", &format!("{repo}my_permissions/"), 200, mine).await;
+        for p in ["add_role/", "remove_role/"] {
+            serve(&server, "POST", &format!("{repo}{p}"), 201, json!({})).await;
+        }
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Repos(RepoType::Rpm, false);
+        let item = json!({ "pulp_href": repo, "name": "os" });
+
+        let mut f = roles_form(&mut app, &mut rx, item.clone()).await;
+        assert_eq!(f.title, "Roles on os");
+        assert_eq!(
+            f.notes,
+            [
+                "rpm.rpmrepository_owner: users admin; groups none",
+                "rpm.rpmrepository_viewer: users bob, carol; groups ops",
+                "My permissions: rpm.view_rpmrepository, rpm.sync_rpmrepository",
+            ]
+        );
+        assert_eq!(f.fields.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(), ["change", "role", "users", "groups"]);
+        set(&mut f, "role", "rpm.rpmrepository_viewer");
+        assert_eq!(submit_open(&mut app, &f), Err("pick a user or a group".into()));
+        let mut f = roles_form(&mut app, &mut rx, item.clone()).await;
+        set(&mut f, "role", "rpm.rpmrepository_viewer");
+        set(&mut f, "users", "dave");
+        submit_open(&mut app, &f).unwrap();
+        assert!(app.modal.is_none(), "an ordinary role goes at once");
+        settle(&mut app, &mut rx).await;
+
+        // An owner role asks first.
+        let mut f = roles_form(&mut app, &mut rx, item.clone()).await;
+        set(&mut f, "role", "rpm.rpmrepository_owner");
+        set(&mut f, "groups", "ops");
+        submit_open(&mut app, &f).unwrap();
+        let Some(Modal::Confirm { title, lines, typed: None, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(title, "Confirm role change");
+        assert_eq!(lines, ["rpm.rpmrepository_owner grants owner/admin level permissions on os."]);
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+
+        // So does a removal from one's own account.
+        let conn = app.conn.as_mut().unwrap();
+        let mut caps = (*conn.caps).clone();
+        caps.user = Some(crate::pulp::caps::CurrentUser { href: "/u/".into(), username: "bob".into(), is_staff: None });
+        conn.caps = Arc::new(caps);
+        let mut f = roles_form(&mut app, &mut rx, item.clone()).await;
+        set(&mut f, "role", "rpm.rpmrepository_viewer");
+        set(&mut f, "users", "bob");
+        submit_open(&mut app, &f).unwrap();
+        assert!(app.modal.is_none(), "a role added to one's own account needs no warning");
+        settle(&mut app, &mut rx).await;
+        let mut f = roles_form(&mut app, &mut rx, item.clone()).await;
+        set(&mut f, "change", "remove");
+        set(&mut f, "role", "rpm.rpmrepository_viewer");
+        set(&mut f, "users", "bob\ncarol");
+        submit_open(&mut app, &f).unwrap();
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(lines, ["You remove a role from YOUR OWN account (bob): you may lose access to os."]);
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let (add, remove) = (format!("{repo}add_role/"), format!("{repo}remove_role/"));
+        assert_eq!(
+            sent(&server).await,
+            [
+                ("POST".into(), add.clone(), json!({ "role": "rpm.rpmrepository_viewer", "users": ["dave"], "groups": [] })),
+                ("POST".into(), add.clone(), json!({ "role": "rpm.rpmrepository_owner", "users": [], "groups": ["ops"] })),
+                ("POST".into(), add, json!({ "role": "rpm.rpmrepository_viewer", "users": ["bob"], "groups": [] })),
+                ("POST".into(), remove, json!({ "role": "rpm.rpmrepository_viewer", "users": ["bob", "carol"], "groups": [] })),
+            ]
+        );
+        assert!(notices(&app).contains(&(Level::Ok, "remove role rpm.rpmrepository_viewer on os: done".into())), "{:?}", notices(&app));
+
+        // Per object type: the server's operation ids.
+        let mut caps = crate::pulp::Capabilities::default();
+        caps.paths.insert("repositories/rpm/rpm/".into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        crate::tui::actions::run(&mut app, Act::ObjectRoles, item);
+        assert!(app.modal.is_none() && app.jobs.is_empty());
+        assert_eq!(notices(&app).last().unwrap().1, "not supported by this server: object roles of repositories/rpm/rpm/");
+    }
+
+    #[tokio::test]
+    async fn read_only_mode_shows_object_roles_and_my_permissions_without_the_change_form() {
+        use crate::config::{AuthMethod, Config, Profile};
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        serve(&server, "GET", "/pulp/api/v3/status/", 200, json!({ "versions": [] })).await;
+        let up = "/pulp/api/v3/uploads/0190aaaa/";
+        let roles = json!({ "roles": [{ "role": "core.upload_owner", "users": ["admin"], "groups": [] }] });
+        serve(&server, "GET", &format!("{up}list_roles/"), 200, roles).await;
+        serve(&server, "GET", &format!("{up}my_permissions/"), 200, json!({ "permissions": ["core.view_upload"] })).await;
+        let mut cfg = Config::default();
+        let p = Profile { url: server.uri(), auth: AuthMethod::None, read_only: true, ..Default::default() };
+        cfg.profiles.insert("lab".into(), p);
+        let store = Arc::new(crate::store::Store::open_in_memory().await.unwrap());
+        let mut app = App::new(cfg, "/dev/null".into(), store.clone(), Ok(store));
+        let mut rx = app.rx.take().unwrap();
+        app.connect("lab");
+        settle(&mut app, &mut rx).await;
+        assert!(app.read_only());
+        app.list.kind = Kind::Uploads;
+        let item = json!({ "pulp_href": up });
+        assert!(app.available_actions(&item).contains(&Act::ObjectRoles), "the view is read-only");
+        crate::tui::actions::run(&mut app, Act::ObjectRoles, item);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { title, lines, .. }) = &app.modal else { panic!("no view: {:?}", notices(&app)) };
+        assert_eq!(title, "Roles on 0190aaaa");
+        assert_eq!(
+            lines,
+            &[
+                "core.upload_owner: users admin; groups none",
+                "My permissions: core.view_upload",
+                "Read-only mode: no role is added or removed here.",
+            ]
+        );
+        assert!(sent(&server).await.is_empty());
     }
 }

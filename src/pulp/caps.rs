@@ -22,6 +22,8 @@ pub struct Capabilities {
     pub paths: BTreeSet<String>,
     /// (path, method) of each operation, the path as in `paths`: `("{task_group_href}", "patch")`.
     pub operations: BTreeSet<(String, String)>,
+    /// `operationId`s: `repositories_rpm_rpm_list_roles` is `{rpm_rpm_repository_href}list_roles/`.
+    pub operation_ids: BTreeSet<String>,
     /// Schema name -> property names (request and response schemas).
     pub schemas: BTreeMap<String, BTreeSet<String>>,
     pub enums: BTreeMap<String, Vec<String>>,
@@ -84,6 +86,12 @@ impl Feature {
     }
 }
 
+/// `repositories/rpm/rpm` of `/pulp/<domain>/api/v3/repositories/rpm/rpm/<id>/`.
+pub fn collection(href: &str) -> &str {
+    let rel = href.split_once("api/v3/").map_or(href, |(_, r)| r);
+    rel.trim_end_matches('/').rsplit_once('/').map_or("", |(c, _)| c)
+}
+
 pub fn parse_version(v: &str) -> (u64, u64, u64) {
     let mut it = v.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).map(|s| s.parse().unwrap_or(0));
     (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
@@ -137,6 +145,8 @@ impl Capabilities {
             for (p, item) in paths {
                 let rel = p.rsplit_once("api/v3/").map(|(_, r)| r.to_string()).unwrap_or_else(|| p.clone());
                 self.operations.extend(item.as_object().into_iter().flat_map(|o| o.keys()).map(|m| (rel.clone(), m.clone())));
+                let ids = item.as_object().into_iter().flat_map(|o| o.values()).filter_map(|op| op["operationId"].as_str());
+                self.operation_ids.extend(ids.map(String::from));
                 self.paths.insert(rel);
             }
         }
@@ -171,6 +181,12 @@ impl Capabilities {
     /// `has_endpoint` for one method of the path (`patch`); unknown is "present" too.
     pub fn has_operation(&self, rel: &str, method: &str) -> bool {
         self.paths.is_empty() || self.operations.contains(&(rel.to_string(), method.to_string()))
+    }
+    /// Whether the object at `href` has `list_roles/`, `add_role/`, `remove_role/` and `my_permissions/` (pulpcore
+    /// `RolesMixin`): the detail path is a template (`{rpm_rpm_repository_href}`), so look up the operation id that
+    /// its collection gives. Unknown is "present".
+    pub fn has_object_roles(&self, href: &str) -> bool {
+        self.paths.is_empty() || self.operation_ids.contains(&format!("{}_list_roles", collection(href).replace(['/', '-'], "_")))
     }
     pub fn has_field(&self, schema: &str, field: &str) -> bool {
         self.schemas.is_empty() || self.schemas.get(schema).is_some_and(|s| s.contains(field))
@@ -275,6 +291,22 @@ mod tests {
         assert!(!c.supports(Feature::DebCopy), "the plugin too");
         assert!(!c.supports(Feature::Users));
         assert_eq!(c.enum_values("SyncPolicyEnum").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn object_roles_follow_the_operation_ids_of_the_collection() {
+        let mut c = Capabilities::default();
+        assert!(c.has_object_roles("/pulp/api/v3/contentguards/certguard/x509/1/"), "no OpenAPI: optimistic");
+        c.load_openapi(&json!({ "paths": {
+            "{rpm_rpm_repository_href}list_roles/": { "get": { "operationId": "repositories_rpm_rpm_list_roles" } },
+            "{task_schedule_href}list_roles/": { "get": { "operationId": "task_schedules_list_roles" } },
+            "/pulp/api/v3/contentguards/certguard/x509/": { "get": { "operationId": "contentguards_certguard_x509_list" } } } }));
+        assert!(c.has_object_roles("/pulp/api/v3/repositories/rpm/rpm/0190abcd/"));
+        assert!(c.has_object_roles("/pulp/edge/api/v3/repositories/rpm/rpm/0190abcd/"), "in a domain");
+        assert!(c.has_object_roles("/pulp/api/v3/task-schedules/0190abcd/"), "- is _ in an operation id");
+        assert!(!c.has_object_roles("/pulp/api/v3/contentguards/certguard/x509/1/"), "x509 guards have no roles");
+        assert!(!c.has_object_roles("/pulp/api/v3/repositories/rpm/rpm/0190abcd/versions/1/"));
+        assert_eq!(collection("/pulp/api/v3/contentguards/certguard/x509/1/"), "contentguards/certguard/x509");
     }
 
     #[test]

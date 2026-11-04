@@ -88,6 +88,15 @@ These rules apply to all screens. The screen sections do not repeat them.
 * **Bulk delete:** on Repositories, Remotes and Distributions, **d** with marked items deletes all
   the marked items. One confirm lists the impact of each item. Type `delete N <what>`, for example
   `delete 3 repositories`. An item that fails to delete stays marked.
+* **Object roles (B):** on repositories, remotes, alternate sources, publications,
+  distributions, content guards, groups, server tasks, task schedules, uploads and upstream
+  Pulps. The form shows who holds which role on the object, and your permissions on it. Then
+  **add** or **remove** one role (from the role list) for the users and groups that you pick.
+  An owner or admin role, and a removal from your own account, ask first. Pulp refuses a role
+  without a permission for the object, a role that a user already has, and the removal of a
+  role that a user does not have. On a type without object roles (an x509 or RHSM content
+  guard), pulp-tui says that the server does not support it. In read-only mode **B** shows the
+  roles and your permissions only, with no add or remove.
 * Lists keep 5 rows of margin above and below the selected row.
 
 **Forms** open in move mode:
