@@ -57,6 +57,33 @@ async fn rpm_comps_and_advisory_uploads_make_new_versions() {
     cleanup(&c, &[&repo]).await;
 }
 
+/// The same advisory with a newer `updated` replaces the older one (pulp_rpm `resolve_advisory_conflict`): another
+/// unit under the same id, which the Versions compare shows as changed.
+#[tokio::test]
+async fn compare_shows_an_updated_advisory_as_changed() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name, dir) = (client(), unique("it-advcmp"), tempfile::tempdir().unwrap());
+    let repo = create(&c, RepoType::Rpm.repositories(), json!({ "name": name }), "/repositories/").await;
+    let id = format!("{name}:0001");
+    let first = fixture_as(&dir, "advisory.json", "PULP-TUI-2026:0002", &id);
+    let v1 = settled_version(&c, rpm::upload_advisory(&c, &first, &repo).await.unwrap()).await.expect("a new version");
+    let newer = dir.path().join("newer.json");
+    let text = std::fs::read_to_string(&first).unwrap().replace("\"updated\": \"2026-01-02", "\"updated\": \"2026-01-03");
+    std::fs::write(&newer, text).unwrap();
+    let v2 = settled_version(&c, rpm::upload_advisory(&c, &newer, &repo).await.unwrap()).await.expect("a new version");
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Versions(Some((repo.clone(), name.clone())));
+    app.list.marked = [v1].into();
+    run(&mut app, Act::Compare, json!({ "pulp_href": v2, "number": 2 }));
+    settle(&mut app, &mut rx).await;
+    let Some(pulp_tui::tui::app::Modal::Text { lines, .. }) = &app.modal else { panic!("no comparison: {:?}", texts(&app)) };
+    assert!(lines[0].ends_with(": +0 added, -0 removed, ~1 changed"), "{lines:?}");
+    assert!(lines.contains(&format!("~ advisory {id}")), "{lines:?}");
+    cleanup(&c, &[&repo]).await;
+}
+
 /// Pulp takes only an on_demand remote for an ACS. A refresh answers with a task group that never gets
 /// `all_tasks_dispatched`; it ends with its tasks, also as the one Task Center task (`ops::get_task`).
 #[tokio::test]

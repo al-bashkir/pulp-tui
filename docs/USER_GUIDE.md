@@ -348,10 +348,13 @@ removed counts.
   Distributions).
 * **m** compares with the marked version: mark one with `Space`, then press `m` on the other. It
   lists the added and removed units (older → newer) of each content type, for example
-  `+ advisory RHSA-2024:0001`. A `warning:` line shows when Pulp counts other numbers. A
+  `+ advisory RHSA-2024:0001`. A unit with the same key but other content (a rebuilt package
+  with the same NEVRA, an updated advisory) is a `~` line, counted as changed. A `warning:` line
+  shows when Pulp counts other numbers. A
   `not compared (not on this server):` line names the content types that the server cannot list.
 * **R** restores as latest: a new latest version with the content of this version. The preview
-  shows what changes, and what serves the new version (with autopublish, Pulp publishes it; else
+  shows what changes, as compare does (also `~` lines for the same key with other content), and
+  what serves the new version (with autopublish, Pulp publishes it; else
   use **P**). Retention can then delete the oldest versions. On Deb, pulp_deb removes the Release
   files and indices from the new version; the next publish writes new ones. Refused for the latest
   version. When the content is the same, Pulp makes no version.

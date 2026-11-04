@@ -2246,11 +2246,13 @@ fn acs_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
 
 // ---- versions and content ------------------------------------------------------------------
 
-/// The units added and removed from version `a` to `b`, with a warning for a version of which Pulp
-/// counts other units than the compare lists (a content type it does not know, or two units with one key).
+/// The units added, removed and changed (same key, other unit) from version `a` to `b`, with a warning for a
+/// version of which Pulp counts other units than the compare lists (a content type it does not know, or two units
+/// with one key).
 async fn compare_versions(c: &PulpClient, caps: &Capabilities, t: RepoType, a: &str, b: &str) -> anyhow::Result<Vec<String>> {
-    let (ka, kb) = (ops::all_content_keys(c, caps, t, a).await?, ops::all_content_keys(c, caps, t, b).await?);
-    let mut lines = ops::diff(&ka, &kb).lines(&short(a), &short(b));
+    let units = async |v: &str| ops::content_units_except(c, caps, t, v, &[]).await;
+    let (ka, kb) = (units(a).await?, units(b).await?);
+    let mut lines = ops::diff_units(&ka, &kb).lines(&short(a), &short(b));
     let mut warnings: Vec<String> = ops::not_compared(caps, t).into_iter().collect();
     for (v, keys) in [(a, &ka), (b, &kb)] {
         let n = c.get::<RepoVersion>(v, &[]).await?.content_summary.present_count();
@@ -2511,8 +2513,9 @@ fn restore_preview(app: &mut App, t: RepoType, version: String, number: String) 
             bail!("version {number} is already the latest version of {name}");
         }
         let drops: &[&str] = if t == RepoType::Deb { &deb::NEW_VERSION_DROPS } else { &[] };
-        let new = ops::content_keys_except(c, &ctx.caps, t, &version, drops).await?;
-        let d = ops::diff(&ops::all_content_keys(c, &ctx.caps, t, &latest).await?, &new);
+        // Href-aware, as Compare: the same key with another unit is other content.
+        let new = ops::content_units_except(c, &ctx.caps, t, &version, drops).await?;
+        let d = ops::diff_units(&ops::content_units_except(c, &ctx.caps, t, &latest, &[]).await?, &new);
         let mut diff = d.lines(&format!("latest {}", short(&latest)), &format!("new (= v{number})"));
         diff.splice(1..1, ops::not_compared(&ctx.caps, t));
         let lines = restore_lines(t, &r, &number, diff);
@@ -5193,6 +5196,38 @@ mod tests {
         assert_eq!(last(&app), "restore docs v2 as latest: no new version (the latest version already has this content)");
     }
 
+    /// A package with the same NEVRA but another unit in the restored version is other content: the preview shows
+    /// it as changed, as Compare does.
+    #[tokio::test]
+    async fn the_restore_preview_shows_another_unit_under_the_same_key_as_changed() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        let server = wiremock::MockServer::start().await;
+        let r = format!("{API}repositories/rpm/rpm/r/");
+        let v = |n: u32| format!("{r}versions/{n}/");
+        get(&server, &r, json!({ "pulp_href": r, "name": "r", "latest_version_href": v(2), "autopublish": false })).await;
+        for n in [1, 2] {
+            let pkg = json!({ "pulp_href": format!("/p/{n}/"), "name": "bash", "epoch": "0", "version": "5.2", "release": "1", "arch": "x86_64" });
+            wiremock::Mock::given(method("GET"))
+                .and(path(format!("{API}content/rpm/packages/")))
+                .and(query_param("repository_version", v(n)))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([pkg]))))
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(method("GET"))
+            .and(path_regex("/content/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([]))))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        version_action(&mut app, Act::Restore, json!({ "pulp_href": v(1), "number": 1 }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm") };
+        let diff = &lines[lines.iter().position(String::is_empty).unwrap() + 1..];
+        assert_eq!(diff, ["latest r@v2 -> new (= v1): +0 added, -0 removed, ~1 changed", "", "~ package bash-5.2-1.x86_64"]);
+    }
+
     /// pulp_deb removes its Release files and indices from every new version: the preview does not promise them.
     #[tokio::test]
     async fn a_deb_restore_preview_leaves_out_the_units_pulp_deb_drops() {
@@ -6694,6 +6729,43 @@ mod tests {
                 "+ package bash-5.2-1.x86_64"
             ]
         );
+    }
+
+    /// A rebuilt package (same NEVRA) and an updated advisory (same id) are other units (content never changes in
+    /// Pulp): compare shows them as changed.
+    #[tokio::test]
+    async fn compare_shows_another_unit_under_the_same_key_as_changed() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        let server = wiremock::MockServer::start().await;
+        let r = format!("{API}repositories/rpm/rpm/r/");
+        let count = json!({ "count": 1, "href": "/c/" });
+        for n in [1, 2] {
+            let v = format!("{r}versions/{n}/");
+            let pkg = json!({ "pulp_href": format!("/p/{n}/"), "name": "bash", "epoch": "0", "version": "5.2", "release": "1", "arch": "x86_64" });
+            let units = [("packages", pkg), ("advisories", json!({ "pulp_href": format!("/a/{n}/"), "id": "FIX-1" }))];
+            for (p, unit) in units {
+                wiremock::Mock::given(method("GET"))
+                    .and(path(format!("{API}content/rpm/{p}/")))
+                    .and(query_param("repository_version", v.as_str()))
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([unit]))))
+                    .mount(&server)
+                    .await;
+            }
+            let present = json!({ "rpm.package": count, "rpm.advisory": count });
+            get(&server, &v, json!({ "pulp_href": v, "number": n, "content_summary": { "present": present } })).await;
+        }
+        wiremock::Mock::given(method("GET"))
+            .and(path_regex("/content/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(json!([]))))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.marked = [format!("{r}versions/1/")].into();
+        version_action(&mut app, Act::Compare, json!({ "pulp_href": format!("{r}versions/2/"), "number": 2 }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no comparison: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert_eq!(lines[..], ["r@v1 -> r@v2: +0 added, -0 removed, ~2 changed", "", "~ advisory FIX-1", "~ package bash-5.2-1.x86_64"]);
     }
 
     /// An older plugin can lack a content endpoint: compare the other types and name the skipped one.

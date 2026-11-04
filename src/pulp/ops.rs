@@ -555,11 +555,23 @@ pub async fn content_keys_except(
     version: &str,
     skip: &[&str],
 ) -> Result<BTreeSet<String>> {
-    let mut out = BTreeSet::new();
+    Ok(content_units_except(c, caps, t, version, skip).await?.into_keys().collect())
+}
+
+/// `content_keys_except`, each key with the `pulp_href` of its unit (`diff_units`).
+pub async fn content_units_except(
+    c: &PulpClient,
+    caps: &Capabilities,
+    t: RepoType,
+    version: &str,
+    skip: &[&str],
+) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
     for ct in t.content_types().iter().filter(|ct| !skip.contains(&ct.path) && caps.has_endpoint(ct.path)) {
-        let q = [("repository_version", version.to_string()), ("fields", ct.fields.into()), ("limit", CONTENT_PAGE.into())];
+        let fields = if ct.fields.contains("pulp_href") { ct.fields.to_string() } else { format!("pulp_href,{}", ct.fields) };
+        let q = [("repository_version", version.to_string()), ("fields", fields), ("limit", CONTENT_PAGE.into())];
         let units: Vec<Value> = c.list_all(&c.api(ct.path), &q, 2_000_000).await?;
-        out.extend(units.iter().map(ct.key));
+        out.extend(units.iter().map(|u| ((ct.key)(u), u["pulp_href"].as_str().unwrap_or_default().to_string())));
     }
     Ok(out)
 }
@@ -660,17 +672,31 @@ pub async fn verify_served(c: &PulpClient, t: RepoType, base_url: &str, version:
 pub struct Diff {
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    /// Keys in both with another unit: content in Pulp never changes, so another unit is other content.
+    pub changed: Vec<String>,
 }
 
 pub fn diff(old: &BTreeSet<String>, new: &BTreeSet<String>) -> Diff {
-    Diff { added: new.difference(old).cloned().collect(), removed: old.difference(new).cloned().collect() }
+    Diff { added: new.difference(old).cloned().collect(), removed: old.difference(new).cloned().collect(), changed: vec![] }
+}
+
+/// `diff` of two `content_units_except` maps, with the keys whose unit href differs as `changed`.
+pub fn diff_units(old: &BTreeMap<String, String>, new: &BTreeMap<String, String>) -> Diff {
+    let keys = |m: &BTreeMap<String, String>| m.keys().cloned().collect();
+    let changed = new.iter().filter(|(k, h)| old.get(*k).is_some_and(|o| o != *h)).map(|(k, _)| k.clone()).collect();
+    Diff { changed, ..diff(&keys(old), &keys(new)) }
 }
 
 impl Diff {
     pub fn lines(&self, old: &str, new: &str) -> Vec<String> {
-        let mut out = vec![format!("{old} -> {new}: +{} added, -{} removed", self.added.len(), self.removed.len()), String::new()];
+        let mut head = format!("{old} -> {new}: +{} added, -{} removed", self.added.len(), self.removed.len());
+        if !self.changed.is_empty() {
+            head += &format!(", ~{} changed", self.changed.len());
+        }
+        let mut out = vec![head, String::new()];
         out.extend(self.added.iter().map(|k| format!("+ {k}")));
         out.extend(self.removed.iter().map(|k| format!("- {k}")));
+        out.extend(self.changed.iter().map(|k| format!("~ {k}")));
         out
     }
 }
