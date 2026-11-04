@@ -245,6 +245,45 @@ async fn task_polling_until_completion_or_failure() {
 }
 
 #[tokio::test]
+async fn settled_task_group_is_done_only_when_every_task_completed() {
+    let server = MockServer::start().await;
+    let task =
+        |n: u32, state: &str| json!({ "pulp_href": format!("{API}tasks/{n}/"), "state": state, "name": "pulp_rpm.app.tasks.synchronize" });
+    let groups = [
+        (json!({ "completed": 2 }), [task(1, "completed"), task(2, "completed")]),
+        (json!({ "completed": 1, "failed": 1 }), [task(3, "completed"), task(4, "failed")]),
+        (json!({ "completed": 1, "canceled": 1 }), [task(5, "completed"), task(6, "canceled")]),
+    ];
+    for (n, (counts, tasks)) in groups.into_iter().enumerate() {
+        let href = format!("{API}task-groups/{n}/");
+        let mut g = json!({ "pulp_href": href, "description": "g", "all_tasks_dispatched": true, "tasks": tasks });
+        g.as_object_mut().unwrap().extend(counts.as_object().unwrap().clone());
+        Mock::given(method("GET")).and(path(&href)).respond_with(ResponseTemplate::new(200).set_body_json(g)).mount(&server).await;
+    }
+    let failed = json!({ "pulp_href": format!("{API}tasks/4/"), "state": "failed", "error": {"description": "404 upstream"} });
+    Mock::given(method("GET"))
+        .and(path(format!("{API}tasks/4/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(failed))
+        .mount(&server)
+        .await;
+    let c = client(&server, |_, _| {});
+    let mut ends = vec![];
+    for n in 0..3 {
+        ends.push(match ops::settle(&c, Mutation::TaskGroup(format!("{API}task-groups/{n}/")), &no_progress).await {
+            Ok(t) => (format!("ok {t:?}"), String::new()),
+            Err(PulpError::TaskFailed { state, message, .. }) => (state, message),
+            Err(e) => panic!("{e:?}"),
+        });
+    }
+    assert_eq!(ends.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), ["ok None", "failed", "canceled"]);
+    // The error names the task that did not complete, with the error text `wait_task` gives.
+    let named =
+        |msg: &str, state: &str, n: u32| msg.lines().any(|l| l.trim_start().starts_with(state) && l.ends_with(&format!("{API}tasks/{n}/")));
+    assert!(named(&ends[1].1, "failed", 4) && ends[1].1.contains("error: 404 upstream"), "{}", ends[1].1);
+    assert!(named(&ends[2].1, "canceled", 6), "{}", ends[2].1);
+}
+
+#[tokio::test]
 async fn capability_negotiation_tolerates_old_or_restricted_servers() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

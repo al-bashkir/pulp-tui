@@ -70,7 +70,8 @@ Pulp tasks are the source of truth.
   nothing changes, resets on a change, has ±20 % jitter. At most three polls run at a time.
   A task that a workflow waits on is not polled twice.
 * A workflow takes only `completed` as done (`ops::wait_task`). `failed`, `canceled` and
-  `skipped` stop the step with the state as the error.
+  `skipped` stop the step with the state as the error. `ops::settle` does the same for a
+  task group: it is done only when every task completed.
 * After a restart or a Connect, every unfinished reference is polled again (re-attached);
   the 50 newest finished ones show, not polled. Dismiss deletes the finished references
   from the file. A task that answers 404 (purged) gets the final state `gone`. An answer

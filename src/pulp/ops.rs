@@ -66,13 +66,14 @@ pub async fn get_task(c: &PulpClient, href: &str) -> Result<Task> {
 }
 
 /// Await whatever a mutation returned. Returns the finished task when there was one.
+/// A task group is done only when every task completed; else the error is its `group_report`.
 pub async fn settle(c: &PulpClient, m: Mutation, on: OnTask<'_>) -> Result<Option<Task>> {
     match m {
         Mutation::Task(h) => wait_task(c, &h, on).await.map(Some),
-        Mutation::TaskGroup(g) => {
-            wait_task_group(c, &g, &|_| {}).await?;
-            Ok(None)
-        }
+        Mutation::TaskGroup(g) => match group_report(c, &g, &|_| {}).await? {
+            (group, _) if group.outcome() == "completed" => Ok(None),
+            (group, lines) => Err(PulpError::TaskFailed { href: g, state: group.outcome().into(), message: lines.join("\n") }),
+        },
         _ => Ok(None),
     }
 }
