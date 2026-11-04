@@ -759,6 +759,19 @@ migrate the `default` domain; pulp-tui says so before it sends anything.
   every artifact to the new storage and then uses it. Until the task ends, the other tasks of the
   domain wait. Pulp does not delete the files in the old storage.
 
+### Access Policies
+
+The access policy of each API viewset: viewset name (`repositories/rpm/rpm`, `tasks`, …),
+customized (an operator changed it) and the number of statements. `/` searches the viewset name.
+**i** shows the statements, creation hooks and queryset scoping.
+
+pulp-tui does not edit a policy: a wrong statement can lock users out, and a form line is no
+place for a JSON policy. Use the Pulp CLI or the API for that.
+
+* **R** resets a customized policy to the default of its plugin. The confirmation shows the
+  statements that are lost; you type the viewset name. Users may get or lose access at once.
+  On a policy that is not customized, pulp-tui says so and sends nothing.
+
 ### Tasks
 
 The Task Center shows tracked tasks: label (the operation that started it), state, progress (only

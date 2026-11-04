@@ -577,3 +577,33 @@ async fn server_repair_checks_that_the_files_exist() {
     let t = texts(&app);
     assert!(t.iter().any(|x| x.starts_with("repair all files on pulp1: ") && x.contains(" missing, ")), "{t:?}");
 }
+
+/// Access policies: a policy that an operator changed (here a PATCH with its own statements, so no access
+/// changes) is reset through the confirmation with the typed viewset name; Pulp then marks it as not customized.
+#[tokio::test]
+async fn access_policy_reset_restores_the_default() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let (mut app, mut rx) = app().await;
+    app.open(Screen::List(Kind::AccessPolicies));
+    app.list.filter = "task-schedules".into();
+    app.reload();
+    settle(&mut app, &mut rx).await;
+    assert_eq!(app.list.error, None);
+    let row =
+        app.list.items.iter().find(|r| r["viewset_name"] == "task-schedules").cloned().unwrap_or_else(|| panic!("{:?}", app.list.items));
+    let href = row["pulp_href"].as_str().unwrap().to_string();
+    let before = row["statements"].clone();
+    c.patch(&href, &json!({ "statements": before })).await.unwrap();
+    let row: Value = c.get(&href, &[]).await.unwrap();
+    assert_eq!(row["customized"], true, "an update marks the policy as customized");
+    run(&mut app, Act::ResetPolicy, row);
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some("task-schedules"));
+    assert!(lines[1].starts_with("Pulp replaces its "), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    let after: Value = c.get(&href, &[]).await.unwrap();
+    assert_eq!((after["customized"].clone(), after["statements"].clone()), (json!(false), before), "{:?}", texts(&app));
+}

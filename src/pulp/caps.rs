@@ -57,6 +57,7 @@ pub enum Feature {
     TaskSchedules,
     Domains,
     Artifacts,
+    AccessPolicies,
 }
 
 impl Feature {
@@ -84,6 +85,7 @@ impl Feature {
             Feature::TaskSchedules => "task schedules API (task-schedules/)",
             Feature::Domains => "domains (domains/, with DOMAIN_ENABLED on the server)",
             Feature::Artifacts => "artifacts API (artifacts/)",
+            Feature::AccessPolicies => "access policies API (access_policies/)",
         }
     }
 }
@@ -232,6 +234,7 @@ impl Capabilities {
             // Without DOMAIN_ENABLED, `domains/` lists only the default domain and no URL serves another one.
             Feature::Domains => self.status.as_ref().and_then(|s| s.domain_enabled) == Some(true) && self.has_endpoint("domains/"),
             Feature::Artifacts => self.has_endpoint("artifacts/"),
+            Feature::AccessPolicies => self.has_endpoint("access_policies/"),
         }
     }
 

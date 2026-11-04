@@ -22,6 +22,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         Kind::ContentGuards => guard_action(app, act, item),
         Kind::Uploads if act == Act::Delete => delete_uploads(app, item),
         Kind::Domains => domain_action(app, act, item),
+        Kind::AccessPolicies if act == Act::ResetPolicy => reset_policy(app, item),
         // W: the last task of the schedule, not the schedule.
         Kind::TaskSchedules if act == Act::WatchTask => match s(&item, "last_task") {
             t if t.is_empty() => app.error(format!("schedule {} has not run a task yet", s(&item, "name"))),
@@ -649,6 +650,33 @@ fn delete_uploads(app: &mut App, item: Value) {
             app.list.marked.remove(&href);
             submit(app, format!("delete upload {}", short(&href)), move |c| async move { Ok(c.delete(&href).await?) });
         }
+    });
+}
+
+/// Reset a customized access policy to the default of its plugin (`{access_policy_href}reset/`). The statements are
+/// not edited here: a wrong one can lock users out, and a one-line field is no place for a JSON policy.
+fn reset_policy(app: &mut App, item: Value) {
+    let endpoint = "{access_policy_href}reset/";
+    if caps(app).is_some_and(|c| !c.has_endpoint(endpoint)) {
+        return app.error(format!("not supported by this server: access policy reset ({endpoint})"));
+    }
+    let (href, viewset) = (s(&item, "pulp_href"), s(&item, "viewset_name"));
+    if item["customized"] != true {
+        return app.error(format!("access policy {viewset} is not customized: it is the default already"));
+    }
+    let mut lines = vec![
+        format!("Reset the access policy of {viewset} to the default of its plugin."),
+        "Pulp replaces its statements, creation hooks and queryset scoping; the changes are lost.".into(),
+        "Users may get or lose access to these objects at once.".into(),
+        "Statements now:".into(),
+    ];
+    lines.extend(super::actions::pretty(&item["statements"]));
+    app.confirm_danger(format!("Reset access policy {viewset}"), lines, &viewset.clone(), move |app| {
+        submit(
+            app,
+            format!("reset access policy {viewset}"),
+            move |c| async move { Ok(c.post(&format!("{href}reset/"), &json!({})).await?) },
+        )
     });
 }
 
@@ -2844,6 +2872,12 @@ mod tests {
             (Kind::TaskSchedules, json!({ "pulp_href": "/s/1/", "last_task": "/t/1/" }), vec![WatchTask, ObjectRoles, Inspect], vec![]),
             (Kind::Domains, json!({ "pulp_href": "/d/1/", "name": "edge" }), vec![Inspect], vec![MigrateStorage, Create, Edit, Delete]),
             (Kind::Artifacts, json!({ "pulp_href": "/a/1/", "sha256": "ab" }), vec![Inspect], vec![RepairServer]),
+            (
+                Kind::AccessPolicies,
+                json!({ "pulp_href": "/p/1/", "viewset_name": "tasks", "customized": true }),
+                vec![Inspect],
+                vec![ResetPolicy],
+            ),
         ] {
             app.list.kind = k.clone();
             assert_eq!(app.available_actions(&item), offered, "{k:?}");
@@ -3166,6 +3200,46 @@ mod tests {
         crate::tui::actions::run(&mut app, Act::ObjectRoles, item);
         assert!(app.modal.is_none() && app.jobs.is_empty());
         assert_eq!(notices(&app).last().unwrap().1, "not supported by this server: object roles of repositories/rpm/rpm/");
+    }
+
+    #[tokio::test]
+    async fn resetting_an_access_policy_shows_its_statements_and_needs_the_viewset_name() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        let ap = "/pulp/api/v3/access_policies/0190eeee/";
+        serve(&server, "POST", &format!("{ap}reset/"), 200, json!({ "pulp_href": ap, "customized": false })).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::AccessPolicies;
+        super::run(&mut app, Act::ResetPolicy, json!({ "pulp_href": ap, "viewset_name": "tasks", "customized": false }));
+        assert!(app.modal.is_none() && app.jobs.is_empty());
+        assert_eq!(notices(&app).last().unwrap().1, "access policy tasks is not customized: it is the default already");
+
+        let statements = json!([{ "action": ["list"], "principal": "authenticated", "effect": "allow" }]);
+        let item = json!({ "pulp_href": ap, "viewset_name": "tasks", "customized": true, "statements": statements });
+        super::run(&mut app, Act::ResetPolicy, item.clone());
+        let Some(Modal::Confirm { title, lines, typed: Some(typed), on_yes: Some(yes), .. }) = app.modal.take() else {
+            panic!("no typed confirm: {:?}", notices(&app))
+        };
+        assert_eq!((title.as_str(), typed.as_str()), ("Reset access policy tasks", "tasks"));
+        let head = [
+            "Reset the access policy of tasks to the default of its plugin.",
+            "Pulp replaces its statements, creation hooks and queryset scoping; the changes are lost.",
+            "Users may get or lose access to these objects at once.",
+            "Statements now:",
+        ];
+        assert_eq!(lines, [head.map(String::from).to_vec(), crate::tui::actions::pretty(&statements)].concat());
+        assert!(sent(&server).await.is_empty(), "nothing sent before the confirmation");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(sent(&server).await, [("POST".into(), format!("{ap}reset/"), json!({}))]);
+        assert!(notices(&app).contains(&(Level::Ok, "reset access policy tasks: done".into())), "{:?}", notices(&app));
+
+        let mut caps = crate::pulp::Capabilities::default();
+        caps.paths.insert("access_policies/".into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        super::run(&mut app, Act::ResetPolicy, item);
+        assert!(app.modal.is_none() && app.jobs.is_empty());
+        assert_eq!(notices(&app).last().unwrap().1, "not supported by this server: access policy reset ({access_policy_href}reset/)");
     }
 
     #[tokio::test]

@@ -62,6 +62,8 @@ General rules:
 | Uploads screen                            | `uploads/` and `{upload_href}`                                       | screen not supported                      |
 | Task Schedules screen                     | `task-schedules/`                                                    | screen not supported                      |
 | Artifacts screen                          | `artifacts/`                                                         | screen not supported                      |
+| Access Policies screen                    | `access_policies/`                                                   | screen not supported                      |
+| Access policy reset (**R**)               | `{access_policy_href}reset/`                                         | endpoint message                          |
 | Native replication                        | pulpcore ≥ 3.23, `upstream-pulps/`, `{upstream_pulp_href}replicate/` | screen points to the fallback             |
 | Fallback replication of a type            | `status/` component on source and destination                        | dry run stops (3)                         |
 | Alternate content sources                 | the plugin, `acs/rpm/rpm/`, `acs/file/file/`, `acs/deb/deb/`         | endpoint message on the screen            |
@@ -533,6 +535,18 @@ Read in pulpcore 3.123.1 (`ArtifactViewSet`, `ArtifactFilter`) and live on pulp1
   content uses. pulp-tui offers no delete.
 * `artifacts/` filters on the exact digests (`md5` … `sha512`), `repository_version` and
   `orphaned_for`; no partial match. `md5` and `sha1` are null unless the server allows them.
+
+### Access policies
+
+Read in pulpcore 3.123.1 (`AccessPolicyViewSet`, `AccessPolicySerializer`) and live on pulp1
+(127 policies, none customized).
+
+* `access_policies/` lists every viewset with its `statements`, `creation_hooks` and
+  `queryset_scoping`; it filters on `viewset_name` and `customized`. There is no create or
+  delete.
+* Any PUT or PATCH sets `customized: true`, also when the statements do not change.
+* `reset/` (POST, no body, 200) writes the plugin's `DEFAULT_ACCESS_POLICY` again and sets
+  `customized: false`.
 
 ### Object roles
 

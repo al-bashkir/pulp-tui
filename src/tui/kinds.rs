@@ -77,6 +77,8 @@ pub enum Kind {
     Domains,
     /// Stored files, newest first (read-only: Pulp's default policy refuses a delete).
     Artifacts,
+    /// The access policy of each viewset; read-only but for a reset to the plugin default.
+    AccessPolicies,
     /// This session's requests, actions and notices; `polls` also shows task polling.
     Logs {
         polls: bool,
@@ -103,6 +105,7 @@ pub const NAV: &[(&str, Kind)] = &[
     ("Groups", Kind::Groups),
     ("Roles", Kind::Roles),
     ("Domains", Kind::Domains),
+    ("Access Policies", Kind::AccessPolicies),
     ("Tasks", Kind::Tasks),
     ("Task Schedules", Kind::TaskSchedules),
     ("Uploads", Kind::Uploads),
@@ -194,6 +197,8 @@ pub enum Act {
     RepairServer,
     /// RPM: scan a repository version for known vulnerabilities (`{version}scan/`, osv.dev).
     Scan,
+    /// Access policy: back to the default of its plugin (`{access_policy_href}reset/`).
+    ResetPolicy,
     CopyUrl,
     Verify,
     CancelTask,
@@ -288,7 +293,7 @@ impl Act {
             CvPreview | Password => 'w',
             Promote | MigrateDb | CreateModule | MigrateStorage => 'M',
             CopyDb => 'Y',
-            Resume | Replicate | Roles | Restore | Refresh | Reclaim => 'R',
+            Resume | Replicate | Roles | Restore | Refresh | Reclaim | ResetPolicy => 'R',
             ToggleProtected => 'L',
             ToggleActive | UploadAdvisory => 'A',
             BreakLock | UploadComps => 'U',
@@ -324,6 +329,7 @@ impl Act {
             Restore => "Restore as latest version (new version)",
             Repair => "Repair (download missing or corrupt files again)",
             RepairServer => "Repair all files (whole server)",
+            ResetPolicy => "Reset to the plugin default",
             CopyUrl => "Copy content URL",
             Verify => "Verify served content",
             Scan => "Scan for vulnerabilities (osv.dev)",
@@ -480,6 +486,7 @@ impl Kind {
             Kind::TaskSchedules => "Task Schedules (read-only)".into(),
             Kind::Domains => "Domains (each has its own objects, content and storage)".into(),
             Kind::Artifacts => "Artifacts (stored files, newest first; / finds one sha256)".into(),
+            Kind::AccessPolicies => "Access Policies (who may call which API; read-only, R resets one)".into(),
             Kind::Logs { polls } => {
                 format!("Logs (this session, UTC)  [t: show/hide task polling]{}", if *polls { " — polling shown" } else { "" })
             }
@@ -517,6 +524,7 @@ impl Kind {
             Kind::TaskSchedules => Feature::TaskSchedules,
             Kind::Domains => Feature::Domains,
             Kind::Artifacts => Feature::Artifacts,
+            Kind::AccessPolicies => Feature::AccessPolicies,
             _ => return None,
         };
         caps.require(f).err().map(|e| {
@@ -613,6 +621,7 @@ impl Kind {
             Kind::Domains => ("domains/".into(), vec![("ordering", "name".into())], name),
             // The API filters on the exact digest only.
             Kind::Artifacts => ("artifacts/".into(), vec![("ordering", "-pulp_created".into())], Some("sha256")),
+            Kind::AccessPolicies => ("access_policies/".into(), vec![("ordering", "viewset_name".into())], Some("viewset_name__icontains")),
             Kind::Workers => ("workers/".into(), vec![("ordering", "name".into())], name),
             // The stale ones first; the API filters only on size.
             Kind::Uploads => ("uploads/".into(), vec![("ordering", "pulp_created".into())], None),
@@ -832,6 +841,11 @@ impl Kind {
                 col("size", 12, |v| s(v, "size")),
                 col("sha256", 64, |v| s(v, "sha256")),
             ],
+            Kind::AccessPolicies => vec![
+                col("viewset", 40, |v| s(v, "viewset_name")),
+                col("customized", 10, |v| s(v, "customized")),
+                col("statements", 10, |v| v["statements"].as_array().map(|a| a.len().to_string()).unwrap_or_default()),
+            ],
             Kind::GroupUsers { .. } => vec![col("username", 30, |v| s(v, "username"))],
             Kind::Roles => vec![
                 col("name", 40, |v| s(v, "name")),
@@ -967,6 +981,7 @@ impl Kind {
             Kind::Uploads => vec![Delete, ObjectRoles, Inspect],
             Kind::TaskSchedules => vec![WatchTask, ObjectRoles, Inspect],
             Kind::Artifacts => vec![RepairServer, Inspect],
+            Kind::AccessPolicies => vec![ResetPolicy, Inspect],
             Kind::Workers | Kind::Logs { .. } => vec![Inspect],
         }
     }
@@ -1778,6 +1793,23 @@ mod tests {
         caps.paths.insert("status/".into());
         assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: artifacts API (artifacts/)"));
         caps.paths.insert("artifacts/".into());
+        assert_eq!(k.unsupported(&caps), None);
+    }
+
+    #[test]
+    fn access_policies_screen_lists_the_viewsets_and_resets_one() {
+        let k = Kind::AccessPolicies;
+        assert!(NAV.iter().any(|(l, n)| *l == "Access Policies" && *n == k));
+        let src = ("access_policies/".into(), vec![("ordering", "viewset_name".into())], Some("viewset_name__icontains"));
+        assert_eq!(k.source().unwrap(), src);
+        let row = json!({ "viewset_name": "repositories/rpm/rpm", "customized": true, "statements": [{}, {}, {}] });
+        assert_eq!(k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["repositories/rpm/rpm", "yes", "3"]);
+        assert_eq!(k.actions(), [Act::ResetPolicy, Act::Inspect], "statements are read-only here");
+        assert!(Act::ResetPolicy.key() == 'R' && Act::ResetPolicy.mutates(&k, false));
+        let mut caps = Capabilities::default();
+        caps.paths.insert("status/".into());
+        assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: access policies API (access_policies/)"));
+        caps.paths.insert("access_policies/".into());
         assert_eq!(k.unsupported(&caps), None);
     }
 
