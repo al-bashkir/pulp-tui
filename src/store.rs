@@ -557,16 +557,20 @@ impl Store {
 
     // ---- tasks -------------------------------------------------------------------
 
+    /// Store a task reference; a final `state` is stored as finished. A finished row stays as it is.
     pub async fn track_task(&self, profile: &str, href: &str, label: &str, state: &str) -> Result<()> {
+        let finished = crate::pulp::models::TASK_FINAL_STATES.contains(&state).then(now);
         sqlx::query(
-            "INSERT INTO tasks(profile, href, label, state, created_at) VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(profile, href) DO UPDATE SET state = excluded.state",
+            "INSERT INTO tasks(profile, href, label, state, created_at, finished_at) VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT(profile, href) DO UPDATE SET state = excluded.state, finished_at = excluded.finished_at
+             WHERE tasks.finished_at IS NULL",
         )
         .bind(profile)
         .bind(href)
         .bind(label)
         .bind(state)
         .bind(now())
+        .bind(finished)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2514,6 +2518,29 @@ mod tests {
         let t = s.tasks("lab", 10).await.unwrap();
         assert_eq!(t[0].href, "/t/2/"); // unfinished first
         assert_eq!(t[1].state, "completed");
+    }
+
+    #[tokio::test]
+    async fn tracking_an_ended_task_again_keeps_it_ended() {
+        let s = Store::open_in_memory().await.unwrap();
+        s.track_task("lab", "/t/1/", "export", "running").await.unwrap();
+        s.finish_task("lab", "/t/1/", "failed").await.unwrap();
+        sqlx::query("UPDATE tasks SET finished_at = '2026-01-02T03:04:05Z'").execute(&s.pool).await.unwrap();
+        s.track_task("lab", "/t/1/", "export", "waiting").await.unwrap(); // a track that does not know the state
+        assert_eq!(s.tasks("lab", 10).await.unwrap()[0].state, "failed", "never back to an unfinished state");
+        s.track_task("lab", "/t/1/", "export", "failed").await.unwrap();
+        s.track_task("lab", "/t/2/", "old sync", "completed").await.unwrap(); // known to be ended
+        s.track_task("lab", "/t/3/", "sync", "running").await.unwrap();
+        s.track_task("lab", "/t/3/", "sync", "failed").await.unwrap();
+        s.track_task("lab", "/t/4/", "sync", "running").await.unwrap();
+        let t = s.tasks("lab", 10).await.unwrap();
+        let state = |h: &str| t.iter().find(|r| r.href == h).unwrap().state.as_str();
+        assert_eq!([state("/t/1/"), state("/t/2/"), state("/t/3/"), state("/t/4/")], ["failed", "completed", "failed", "running"]);
+        let unfinished: Vec<String> =
+            sqlx::query_scalar("SELECT href FROM tasks WHERE finished_at IS NULL").fetch_all(&s.pool).await.unwrap();
+        assert_eq!(unfinished, ["/t/4/"], "only the running task is re-attached as unfinished");
+        let kept: String = sqlx::query_scalar("SELECT finished_at FROM tasks WHERE href = '/t/1/'").fetch_one(&s.pool).await.unwrap();
+        assert_eq!(kept, "2026-01-02T03:04:05Z");
     }
 
     #[tokio::test]

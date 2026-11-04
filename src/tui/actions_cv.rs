@@ -278,7 +278,7 @@ fn wait_syncs(app: &mut App, cv: String, policy: String, rows: Vec<(String, Repo
     let mut sent = 0;
     for (name, r) in &rows {
         if let RepoSync::Submitted(h) = r {
-            app.track_task(h, &format!("sync {name} ({policy})"));
+            app.track_task(h, &format!("sync {name} ({policy})"), None);
             sent += 1;
         }
     }
@@ -975,7 +975,7 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                     Some((step, r.repo().repo_name.clone(), r.pending_task?))
                 });
                 ap(move |app| match pending {
-                    Some((step, repo, h)) => app.watch_task(&h, &format!("{name} v{number}: {step} {repo}")),
+                    Some((step, repo, h)) => app.watch_task(&h, &format!("{name} v{number}: {step} {repo}"), None),
                     None => app.notify(
                         Level::Info,
                         format!(

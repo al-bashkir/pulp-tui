@@ -40,7 +40,7 @@ where
 fn submitted(app: &mut App, m: Mutation, label: &str) {
     match m {
         Mutation::Task(h) | Mutation::TaskGroup(h) => {
-            app.track_task(&h, label);
+            app.track_task(&h, label, None);
             app.notify(Level::Info, format!("submitted: {label} (see Tasks)"));
         }
         _ => {
@@ -2675,14 +2675,15 @@ fn task_action(app: &mut App, act: Act, item: Value) {
             app.ok(format!("dismissed {n} finished task(s) from the list (Pulp keeps its records)"));
             app.reload();
         }
+        // A server task row is Pulp's task: one that ended before is tracked as ended, with no "task ended" notice.
         Act::TrackTask => {
-            app.track_task(&href, &s(&item, "name"));
+            app.track_task(&href, &s(&item, "name"), serde_json::from_value(item.clone()).ok());
             app.ok("tracking task");
         }
         Act::WatchTask => {
             // Task Center rows have a label, server tasks a name.
             let label = Some(s(&item, "label")).filter(|l| !l.is_empty()).unwrap_or_else(|| s(&item, "name"));
-            app.watch_task(&href, &label);
+            app.watch_task(&href, &label, serde_json::from_value(item).ok());
         }
         Act::Filter => {
             let Kind::ServerTasks(q) = app.list.kind.clone() else { return };

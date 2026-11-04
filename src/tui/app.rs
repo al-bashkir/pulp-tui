@@ -579,22 +579,27 @@ impl App {
 
     // ---- tasks ---------------------------------------------------------------------
 
-    /// Remember a submitted Pulp task (persisted so it is re-attached after a restart).
-    pub fn track_task(&mut self, href: &str, label: &str) {
-        self.tasks.track(href, label, "waiting");
+    /// Remember a Pulp task (persisted so it is re-attached after a restart). `known`: the task as the
+    /// server listed it; one that ended before keeps its state and is not reported as just ended.
+    pub fn track_task(&mut self, href: &str, label: &str, known: Option<Task>) {
+        let state = known.as_ref().map_or("waiting", |t| t.state.as_str()).to_string();
+        self.tasks.track(href, label, &state);
+        if let Some(t) = known {
+            self.task_update(t, false, None);
+        }
         if let Some(p) = self.profile.clone() {
             let (st, href, label) = (self.store.clone(), href.to_string(), label.to_string());
             self.spawn("persist task reference".into(), true, async move {
-                st.track_task(&p, &href, &label, "waiting").await?;
+                st.track_task(&p, &href, &label, &state).await?;
                 ap(|_| {})
             });
         }
     }
 
-    /// Track the task if needed and open a text view that follows its state until it ends.
-    pub fn watch_task(&mut self, href: &str, label: &str) {
+    /// Track the task if needed (`known` as in `track_task`) and open a text view that follows its state until it ends.
+    pub fn watch_task(&mut self, href: &str, label: &str, known: Option<Task>) {
         if !self.tasks.items.iter().any(|t| t.href == href) {
-            self.track_task(href, label);
+            self.track_task(href, label, known);
         }
         let lines = self.watch_lines(href);
         self.show(Modal::Text { title: format!("Watch task {label}"), lines, scroll: 0, watch: Some(href.into()) });
@@ -1987,7 +1992,7 @@ mod tests {
         let mut app = app_on(Kind::Tasks).await;
         app.input("Search", "half typ", |_, _| {});
         app.applying = true; // the result of a job (CvVersions W) runs
-        app.watch_task("/t/1/", "copy");
+        app.watch_task("/t/1/", "copy", None);
         app.applying = false;
         assert!(matches!(&app.modal, Some(Modal::Input { .. })), "the open dialog keeps its text");
         assert_eq!(app.queued.len(), 1);
@@ -1996,8 +2001,8 @@ mod tests {
     #[tokio::test]
     async fn watch_follows_task_updates() {
         let mut app = app_on(Kind::Tasks).await;
-        app.watch_task("/t/1/", "copy");
-        app.watch_task("/t/1/", "copy");
+        app.watch_task("/t/1/", "copy", None);
+        app.watch_task("/t/1/", "copy", None);
         assert_eq!(app.tasks.items.len(), 1);
         assert!(matches!(&app.modal, Some(Modal::Text { watch: Some(h), .. }) if h == "/t/1/"));
         let task = |state: &str| {
@@ -2016,7 +2021,7 @@ mod tests {
         let mut app = app_on(Kind::Tasks).await;
         let task =
             |h: &str| serde_json::from_value::<Task>(serde_json::json!({ "pulp_href": h, "state": "running", "name": "t" })).unwrap();
-        app.track_task("/t/1/", "a");
+        app.track_task("/t/1/", "a", None);
         app.reload();
         assert_eq!(app.list.current().unwrap()["pulp_href"], "/t/1/");
         // A workflow reports a new task: it goes on top, and the cursor stays on /t/1/ (Cancel keeps its target).
@@ -2091,6 +2096,75 @@ mod tests {
         app.screen = Screen::Dashboard;
         app.handle_msg(task(6, "completed"));
         assert_eq!(app.list.generation, 4, "the Dashboard reloads itself, not the list");
+    }
+
+    fn texts(app: &App) -> Vec<String> {
+        app.notices.iter().map(|n| n.text.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn tracking_an_ended_server_task_neither_notifies_nor_reloads() {
+        let mut app = app_on(Kind::ServerTasks(vec![])).await;
+        let row = |n: u32, state: &str| serde_json::json!({ "pulp_href": format!("/t/{n}/"), "name": "export", "state": state, "error": { "description": "disk full" } });
+        super::super::actions::run(&mut app, Act::TrackTask, row(1, "failed"));
+        super::super::actions::run(&mut app, Act::WatchTask, row(2, "canceled"));
+        // Pulp's answer to each poll that is sent.
+        for href in app.tasks.due() {
+            let t = [row(1, "failed"), row(2, "canceled")].into_iter().find(|r| r["pulp_href"] == href.as_str()).unwrap();
+            app.handle_msg(Msg::TaskPolled { href, result: Ok(serde_json::from_value(t).unwrap()) });
+        }
+        assert_eq!(texts(&app), ["tracking task"], "the tasks ended before: they did not just end");
+        assert_eq!(app.list.generation, 0, "no reload");
+        let rows: Vec<_> = app.tasks.items.iter().map(|t| (t.href.as_str(), t.state.as_str())).collect();
+        assert_eq!(rows, [("/t/2/", "canceled"), ("/t/1/", "failed")]);
+        assert!(app.tasks.due().is_empty(), "an ended task is never polled");
+        assert!(text_lines(&app).contains(&"state: canceled".to_string()), "{:?}", text_lines(&app));
+        assert!(text_lines(&app).iter().any(|l| l.contains("disk full")), "Pulp's error: {:?}", text_lines(&app));
+    }
+
+    #[tokio::test]
+    async fn an_ended_task_tracked_again_is_not_re_attached_as_unfinished() {
+        let mut app = app_on(Kind::ServerTasks(vec![])).await;
+        let mut rx = app.rx.take().unwrap();
+        // Tracked and ended in an earlier session; dismissed from the Task Center since.
+        app.store.track_task("lab", "/t/1/", "export", "running").await.unwrap();
+        app.store.finish_task("lab", "/t/1/", "failed").await.unwrap();
+        for (h, state) in [("/t/1/", "failed"), ("/t/2/", "completed")] {
+            super::super::actions::run(&mut app, Act::TrackTask, serde_json::json!({ "pulp_href": h, "name": "x", "state": state }));
+        }
+        settle(&mut app, &mut rx).await;
+        // A restart or a Connect re-attaches the stored references.
+        (app.tasks, app.notices) = (TaskCenter::new(app.cfg.settings.poll_bounds()), VecDeque::new());
+        app.reattach_tasks();
+        settle(&mut app, &mut rx).await;
+        assert!(app.notices.is_empty(), "no unfinished task to re-attach: {:?}", texts(&app));
+        let rows: Vec<_> = app.tasks.items.iter().map(|t| (t.href.as_str(), t.state.as_str())).collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&("/t/1/", "failed")) && rows.contains(&("/t/2/", "completed")), "{rows:?}");
+        assert!(app.tasks.due().is_empty(), "not polled again");
+    }
+
+    #[tokio::test]
+    async fn a_tracked_running_task_and_a_submitted_task_notify_when_they_end() {
+        let mut app = app_on(Kind::ServerTasks(vec![])).await;
+        app.tasks = TaskCenter::new((Duration::ZERO, Duration::from_secs(60)));
+        let poll = |h: &str, state: &str| {
+            let t = serde_json::json!({ "pulp_href": h, "name": "pulpcore.app.tasks.base.general_delete", "state": state });
+            Msg::TaskPolled { href: h.into(), result: Ok(serde_json::from_value(t).unwrap()) }
+        };
+        super::super::actions::run(
+            &mut app,
+            Act::TrackTask,
+            serde_json::json!({ "pulp_href": "/t/1/", "name": "sync", "state": "running" }),
+        );
+        app.track_task("/t/2/", "delete x", None); // as `submit` tracks the task of an answer 202
+        assert_eq!(app.tasks.due(), ["/t/2/", "/t/1/"], "the Task Center polls both");
+        app.handle_msg(poll("/t/1/", "running"));
+        assert_eq!((texts(&app).len(), app.list.generation), (1, 0), "still running: no notice, no reload");
+        app.handle_msg(poll("/t/1/", "completed"));
+        app.handle_msg(poll("/t/2/", "completed")); // final at its first poll
+        assert_eq!(texts(&app), ["tracking task", "task completed: sync", "task completed: delete x"]);
+        assert_eq!(app.list.generation, 2, "a reload per task that ended");
     }
 
     #[tokio::test]
@@ -2210,7 +2284,7 @@ mod tests {
                 "name": "pulp_file.app.tasks.publishing.publish" }))
             .unwrap()
         };
-        app.track_task("/t/1/", "sync web");
+        app.track_task("/t/1/", "sync web", None);
         app.job("publish web", move |ctx| async move {
             let on = ctx.on_task();
             on(&task("/t/1/"));

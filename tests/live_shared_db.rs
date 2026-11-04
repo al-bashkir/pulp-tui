@@ -299,6 +299,7 @@ async fn store_methods_on_postgres() {
     assert_eq!(st.last_replications(k, "src").await.unwrap().len(), 1);
     st.track_task(k, "/t/1/", "sync os", "running").await.unwrap();
     st.finish_task(k, "/t/1/", "completed").await.unwrap();
+    st.track_task(k, "/t/1/", "sync os", "waiting").await.unwrap(); // a finished row stays finished
     assert_eq!(st.tasks(k, 5).await.unwrap()[0].state, "completed");
 
     // Export and import between two servers' scopes of the same database.
