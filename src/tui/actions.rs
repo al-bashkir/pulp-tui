@@ -2327,11 +2327,25 @@ fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 if st.protected_versions(&ctx.scope).await?.contains(&version) {
                     bail!("refused: publication {id} is of a Content View snapshot (delete the Content View version instead)");
                 }
-                // Pulp unbinds the distributions that serve it without an error (`on_delete=SET_NULL`).
-                let users = served_by(&ops::distributions(&ctx.client, t).await?, |d| d.publication.as_ref() == Some(&href));
+                let pubs = ops::publications_where(&ctx.client, &ctx.caps, t, ("repository", &ops::repo_of_version(&version))).await?;
+                let users: Vec<String> = ops::distributions(&ctx.client, t)
+                    .await?
+                    .iter()
+                    .filter_map(|d| {
+                        let after = match ops::served_after_delete(d, &href, &pubs)? {
+                            Some(p) => format!(
+                                "publication {} (version {})",
+                                short(&s(p, "pulp_href")),
+                                ops::version_number(&s(p, "repository_version"))
+                            ),
+                            None => "nothing".into(),
+                        };
+                        Some(format!("  {} ({}): then serves {after}", d.name, d.base_url.as_deref().unwrap_or(&d.base_path)))
+                    })
+                    .collect();
                 let mut lines = vec![format!("Delete publication {id} of {}. The repository version is not affected.", short(&version))];
                 if !users.is_empty() {
-                    lines.push(format!("WARNING: {} distribution(s) serve this publication and stop serving:", users.len()));
+                    lines.push(format!("WARNING: {} distribution(s) serve this publication now:", users.len()));
                     lines.extend(users);
                 }
                 ap(move |app| {
@@ -4227,13 +4241,14 @@ mod tests {
             { "pulp_href": format!("{API}distributions/rpm/rpm/2/"), "name": "dev-os", "base_path": "dev/os", "publication": null },
         ]));
         get(&server, &format!("{API}distributions/rpm/rpm/"), dists).await;
+        get(&server, &format!("{API}publications/rpm/rpm/"), page(json!([]))).await;
         let (mut app, mut rx) = connected(&server).await;
         let item = json!({ "pulp_href": pubn, "repository_version": version });
         publication_action(&mut app, RepoType::Rpm, Act::Delete, item.clone());
         settle(&mut app, &mut rx).await;
         let Some(Modal::Confirm { lines, typed, .. }) = &app.modal else { panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text)) };
         assert_eq!(typed.as_deref(), Some("0190aaaa-bbbb"), "the operator types the publication id");
-        assert!(lines.contains(&"  prod-os (https://h/pulp/content/prod/os/)".to_string()), "{lines:?}");
+        assert!(lines.contains(&"  prod-os (https://h/pulp/content/prod/os/): then serves nothing".to_string()), "{lines:?}");
         assert!(!lines.iter().any(|l| l.contains("dev-os")), "{lines:?}");
 
         // A publication that a Content View serves is refused before any dialog.
@@ -4256,6 +4271,39 @@ mod tests {
         assert!(app.modal.is_none());
         let e = &app.notices.back().unwrap().text;
         assert!(e.contains("refused: Content View web serves publication 0190aaaa-bbbb in Library"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn publication_delete_names_the_followers_that_serve_it_and_what_they_serve_after() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/file/file/r/");
+        let (old, new) = (format!("{API}publications/file/file/0190aaaa-0001/"), format!("{API}publications/file/file/0190aaaa-0002/"));
+        let pubs = page(json!([
+            { "pulp_href": old, "repository_version": format!("{repo}versions/1/"), "pulp_created": "2026-01-01T00:00:00Z" },
+            { "pulp_href": new, "repository_version": format!("{repo}versions/2/"), "pulp_created": "2026-01-02T00:00:00Z" },
+        ]));
+        let dists = page(json!([
+            { "pulp_href": "/d/1/", "name": "follower", "base_path": "f", "repository": repo },
+            { "pulp_href": "/d/2/", "name": "on-v2", "base_path": "v2", "repository_version": format!("{repo}versions/2/") },
+            { "pulp_href": "/d/3/", "name": "on-v1", "base_path": "v1", "repository_version": format!("{repo}versions/1/") },
+            { "pulp_href": "/d/4/", "name": "other-repo", "base_path": "o", "repository": format!("{API}repositories/file/file/x/") },
+        ]));
+        get(&server, &format!("{API}distributions/file/file/"), dists).await;
+        get(&server, &format!("{API}publications/file/file/"), pubs).await;
+        let (mut app, mut rx) = connected(&server).await;
+        publication_action(
+            &mut app,
+            RepoType::File,
+            Act::Delete,
+            json!({ "pulp_href": new, "repository_version": format!("{repo}versions/2/") }),
+        );
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = &app.modal else { panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert!(lines.iter().any(|l| l.starts_with("WARNING: 2 distribution(s)")), "{lines:?}");
+        assert!(lines.contains(&"  follower (f): then serves publication 0190aaaa-0001 (version 1)".to_string()), "{lines:?}");
+        assert!(lines.contains(&"  on-v2 (v2): then serves nothing".to_string()), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("on-v1") || l.contains("other-repo")), "{lines:?}");
     }
 
     #[tokio::test]

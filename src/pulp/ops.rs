@@ -535,17 +535,43 @@ pub async fn served_publication(c: &PulpClient, caps: &Capabilities, t: RepoType
         return Ok(Some(c.get(p, &[]).await?));
     }
     let q = match (d["repository_version"].as_str(), d["repository"].as_str()) {
-        (Some(v), _) => [("repository_version", v.to_string())],
-        (None, Some(r)) => [("repository", r.to_string())],
+        (Some(v), _) => ("repository_version", v),
+        (None, Some(r)) => ("repository", r),
         (None, None) => return Ok(None),
     };
+    Ok(newest(publications_where(c, caps, t, q).await?.iter()).cloned())
+}
+
+/// The publications of `t` that match one filter (`repository` or `repository_version`), Deb verbatim ones included.
+pub async fn publications_where(c: &PulpClient, caps: &Capabilities, t: RepoType, (k, v): (&str, &str)) -> Result<Vec<Value>> {
+    let q = [(k, v.to_string())];
     let mut pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &q, 100_000).await?;
     if t == RepoType::Deb && caps.has_endpoint(deb::VERBATIM_PUBLICATIONS) {
         pubs.extend(c.list_all::<Value>(&c.api(deb::VERBATIM_PUBLICATIONS), &q, 100_000).await?);
     }
-    let key =
-        |p: &Value| (version_number(p["repository_version"].as_str().unwrap_or_default()), p["pulp_created"].as_str().map(str::to_string));
-    Ok(pubs.into_iter().max_by_key(key))
+    Ok(pubs)
+}
+
+/// pulpcore's pick: the publication of the highest repository version, then the newest one.
+fn newest<'a>(pubs: impl Iterator<Item = &'a Value>) -> Option<&'a Value> {
+    pubs.max_by_key(|p| (version_number(p["repository_version"].as_str().unwrap_or_default()), p["pulp_created"].as_str()))
+}
+
+/// What `d` serves after publication `href` is deleted, when it serves `href` now: `Some(None)` nothing,
+/// `Some(Some(p))` publication `p`. `None`: `d` does not serve `href`. `pubs`: the publications of the
+/// repository of `href`. Pulp unbinds a pinned distribution (`on_delete=SET_NULL`); a repository or
+/// version binding moves to the next newest publication.
+pub fn served_after_delete<'a>(d: &Distribution, href: &str, pubs: &'a [Value]) -> Option<Option<&'a Value>> {
+    if let Some(p) = &d.publication {
+        return (p == href).then_some(None);
+    }
+    let repo = repo_of_version(pubs.iter().find(|p| p["pulp_href"] == href)?["repository_version"].as_str()?);
+    let candidates: Vec<&Value> = match (&d.repository_version, &d.repository) {
+        (Some(v), _) => pubs.iter().filter(|p| p["repository_version"] == v.as_str()).collect(),
+        (None, Some(r)) if *r == repo => pubs.iter().collect(),
+        _ => return None,
+    };
+    (newest(candidates.iter().copied())?["pulp_href"] == href).then(|| newest(candidates.into_iter().filter(|p| p["pulp_href"] != href)))
 }
 
 /// Fetch what a distribution actually serves and compare it with a repository version:
