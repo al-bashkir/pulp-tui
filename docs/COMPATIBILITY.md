@@ -75,6 +75,8 @@ General rules:
 | Current user                              | `login/`, else `users/?username=<Basic-auth name>`                   | header shows "anonymous" (5)              |
 | Users, groups, roles                      | `users/`, `roles/`                                                   | screen not supported                      |
 | Domain scope of a role assignment         | `status/` `domain_enabled: true`                                     | Assign role has no Domain field           |
+| Domains screen                            | `status/` `domain_enabled: true` and `domains/`                      | screen not supported                      |
+| Domain storage migration (**M**)          | `domains/migrate/`                                                   | endpoint message                          |
 | Pulp exporters                            | `exporters/core/pulp/`                                               | screen not supported                      |
 | Filesystem exporters                      | `exporters/core/filesystem/`                                         | screen not supported                      |
 | Pulp importers, import check              | `importers/core/pulp/`, `importers/core/pulp/import-check/`          | screen not supported                      |
@@ -514,6 +516,29 @@ Read in pulpcore 3.123.1 (models and serializers in `pulpcore/app/`) and live on
   href. `distributions/` has no `content_guard` filter, so the screen reads `name` and
   `content_guard` of all distributions.
 
+### Domains
+
+Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
+`app/serializers/domain.py`). Not live: pulp1 has `DOMAIN_ENABLED` off.
+
+* **Without `DOMAIN_ENABLED`** `domains/` still answers, with the `default` domain only, and
+  no URL serves another domain. pulp-tui shows the screen only with `domain_enabled: true`.
+* **The `default` domain** is refused for update, delete and `migrate/` (400).
+* **Update and delete are tasks** (202). The delete raises PLP0007 ("You cannot delete a
+  domain that still contains repositories with content") while a repository version holds
+  content. Else the `BEFORE_DELETE` hook deletes the orphan content and the artifacts, and
+  Django refuses while a repository, remote, distribution, publication, exporter, importer,
+  ACS, upload or upstream Pulp of the domain exists (`on_delete=PROTECT`). The delete is one
+  transaction (django-lifecycle 1.3.0 `delete` is `atomic`) and artifact files go on commit,
+  so a refused delete changes nothing. Tasks of the domain are deleted with it (`CASCADE`).
+* **`domains/migrate/`** acts on the domain of the URL (`/pulp/<name>/api/v3/domains/migrate/`)
+  and takes `{storage_class, storage_settings}`. It copies the artifacts, then switches the
+  domain; the old files stay. The task locks the domain.
+* **Storage secrets are write-only**: `access_key`, `secret_key`, `security_token`,
+  `cloudfront_key` (S3), `account_name`, `account_key` (Azure). GET shows only their names in
+  `hidden_fields`.
+* `default_content_guard` must be a guard of the same domain, and only on update.
+
 ### Sync and remotes
 
 * **Refused sync pairs** (pulp_rpm 3.39.5, HTTP 400): `mirror_complete` with `skip_types`
@@ -781,6 +806,7 @@ or IpAddress(127.0.0.1)`.
 * Fallback replication does not delete destination objects or copy Pulp metadata; use
   native replication for that.
 * Pulp domains: the profile `domain` prefixes all API paths; not tested on a
-  domain-enabled server.
+  domain-enabled server. The Domains screen does not rename a domain, set its labels or its
+  default content guard (the guard picker lists the guards of the profile's domain only).
 * Bearer tokens are sent as given; no token refresh (OIDC).
 * Windows builds are not tested.

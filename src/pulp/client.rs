@@ -225,6 +225,11 @@ impl PulpClient {
         format!("{}{}", self.inner.api_prefix, path.trim_start_matches('/'))
     }
 
+    /// `api` in another Pulp domain (DOMAIN_ENABLED): `/pulp/<domain>/api/v3/<path>`.
+    pub fn domain_api(&self, domain: &str, path: &str) -> String {
+        format!("{}{domain}/api/v3/{}", self.inner.api_root, path.trim_start_matches('/'))
+    }
+
     /// The OpenAPI document is served below the API root, not the domain.
     pub fn docs_href(&self) -> String {
         format!("{}api/v3/docs/api.json", self.inner.api_root)

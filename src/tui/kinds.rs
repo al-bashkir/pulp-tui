@@ -73,6 +73,8 @@ pub enum Kind {
     Uploads,
     /// Tasks that Pulp dispatches by itself (read-only in the API).
     TaskSchedules,
+    /// Pulp domains (DOMAIN_ENABLED): name, storage backend.
+    Domains,
     /// This session's requests, actions and notices; `polls` also shows task polling.
     Logs {
         polls: bool,
@@ -98,6 +100,7 @@ pub const NAV: &[(&str, Kind)] = &[
     ("Users", Kind::Users),
     ("Groups", Kind::Groups),
     ("Roles", Kind::Roles),
+    ("Domains", Kind::Domains),
     ("Tasks", Kind::Tasks),
     ("Task Schedules", Kind::TaskSchedules),
     ("Uploads", Kind::Uploads),
@@ -236,6 +239,8 @@ pub enum Act {
     PurgeTasks,
     /// RBAC content guard: give or take the download role of users and groups.
     GuardAccess,
+    /// Domain: copy its artifacts to another storage backend (`domains/migrate/`).
+    MigrateStorage,
     /// In no `actions()` list: offered on Connect and save; here so that `mutates` classifies them.
     MigrateDb,
     CopyDb,
@@ -274,7 +279,7 @@ impl Act {
             ImportRepos => 'J',
             CvFilters | FallbackReplicate | Repair | Filter => 'F',
             CvPreview | Password => 'w',
-            Promote | MigrateDb | CreateModule => 'M',
+            Promote | MigrateDb | CreateModule | MigrateStorage => 'M',
             CopyDb => 'Y',
             Resume | Replicate | Roles | Restore | Refresh | Reclaim => 'R',
             ToggleProtected => 'L',
@@ -355,6 +360,7 @@ impl Act {
             Filter => "Filter (state, name, resource, start time)",
             PurgeTasks => "Purge finished tasks (whole server)",
             GuardAccess => "Download access (users, groups)",
+            MigrateStorage => "Migrate the storage backend (copies all artifacts)",
             MigrateDb => "Migrate database",
             CopyDb => "Copy Content View data",
         }
@@ -459,6 +465,7 @@ impl Kind {
             Kind::Workers => "Workers  [t: tracked tasks]".into(),
             Kind::Uploads => "Uploads (chunked uploads not committed, oldest first)".into(),
             Kind::TaskSchedules => "Task Schedules (read-only)".into(),
+            Kind::Domains => "Domains (each has its own objects, content and storage)".into(),
             Kind::Logs { polls } => {
                 format!("Logs (this session, UTC)  [t: show/hide task polling]{}", if *polls { " — polling shown" } else { "" })
             }
@@ -494,6 +501,7 @@ impl Kind {
             Kind::ContentGuards => Feature::ContentGuards,
             Kind::Uploads => Feature::ChunkedUpload,
             Kind::TaskSchedules => Feature::TaskSchedules,
+            Kind::Domains => Feature::Domains,
             _ => return None,
         };
         caps.require(f).err().map(|e| {
@@ -587,6 +595,7 @@ impl Kind {
             Kind::GroupUsers { group, .. } => (format!("{group}users/"), vec![], None),
             Kind::GroupRoles { group, .. } => (format!("{group}roles/"), vec![], None),
             Kind::Roles => ("roles/".into(), vec![("ordering", "name".into())], name),
+            Kind::Domains => ("domains/".into(), vec![("ordering", "name".into())], name),
             Kind::Workers => ("workers/".into(), vec![("ordering", "name".into())], name),
             // The stale ones first; the API filters only on size.
             Kind::Uploads => ("uploads/".into(), vec![("ordering", "pulp_created".into())], None),
@@ -796,6 +805,11 @@ impl Kind {
                 }),
             ],
             Kind::Groups => vec![col("name", 30, |v| s(v, "name")), col("id", 8, |v| s(v, "id"))],
+            Kind::Domains => vec![
+                col("name", 24, |v| s(v, "name")),
+                col("storage", 16, |v| s(v, "storage_class").rsplit('.').next().unwrap_or_default().into()),
+                col("description", 40, |v| s(v, "description")),
+            ],
             Kind::GroupUsers { .. } => vec![col("username", 30, |v| s(v, "username"))],
             Kind::Roles => vec![
                 col("name", 40, |v| s(v, "name")),
@@ -922,6 +936,7 @@ impl Kind {
             Kind::Users => vec![Roles, Create, Edit, Password, ToggleActive, Delete, Inspect],
             Kind::UserRoles { .. } | Kind::GroupRoles { .. } | Kind::GroupUsers { .. } => vec![Create, Delete],
             Kind::Groups => vec![Members, Roles, Create, Edit, Delete, Inspect],
+            Kind::Domains => vec![MigrateStorage, Create, Edit, Delete, Inspect],
             Kind::Tasks => vec![WatchTask, Inspect, CancelTask, DismissTasks],
             Kind::ServerTasks(_) => vec![WatchTask, Inspect, TrackTask, CancelTask, Filter, Delete, PurgeTasks],
             Kind::TaskGroups => vec![CancelTask, Inspect],
@@ -1686,6 +1701,31 @@ mod tests {
         assert_eq!(k.unsupported(&caps).as_deref(), Some("not supported by this server: task schedules API (task-schedules/)"));
         caps.paths.insert("task-schedules/".into());
         assert_eq!(k.unsupported(&caps), None);
+    }
+
+    #[test]
+    fn domains_screen_needs_domains_enabled_and_shows_the_storage() {
+        let k = Kind::Domains;
+        assert!(NAV.iter().any(|(l, n)| *l == "Domains" && *n == k));
+        assert_eq!(k.source().unwrap(), ("domains/".into(), vec![("ordering", "name".into())], Some("name__icontains")));
+        let row = json!({ "name": "edge", "storage_class": "storages.backends.s3.S3Storage", "description": "EU mirror" });
+        assert_eq!(k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["edge", "S3Storage", "EU mirror"]);
+        assert_eq!(k.actions(), [Act::MigrateStorage, Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
+        assert_eq!(Act::MigrateStorage.key(), 'M');
+        for a in [Act::MigrateStorage, Act::Create, Act::Edit, Act::Delete] {
+            assert!(a.mutates(&k, false), "{a:?}");
+        }
+        let mut caps = Capabilities::default();
+        caps.paths.insert("domains/".into());
+        let off = Some("not supported by this server: domains (domains/, with DOMAIN_ENABLED on the server)");
+        assert_eq!(k.unsupported(&caps).as_deref(), off, "no status");
+        let status = |on: bool| Some(serde_json::from_value(json!({ "versions": [], "domain_enabled": on })).unwrap());
+        caps.status = status(false);
+        assert_eq!(k.unsupported(&caps).as_deref(), off, "DOMAIN_ENABLED is off: Pulp lists only the default domain");
+        caps.status = status(true);
+        assert_eq!(k.unsupported(&caps), None);
+        caps.paths = ["status/".to_string()].into();
+        assert_eq!(k.unsupported(&caps).as_deref(), off, "no endpoint");
     }
 
     #[test]

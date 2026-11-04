@@ -53,6 +53,7 @@ pub enum Feature {
     TaskGroups,
     ContentGuards,
     TaskSchedules,
+    Domains,
 }
 
 impl Feature {
@@ -78,6 +79,7 @@ impl Feature {
             Feature::TaskGroups => "task groups API (task-groups/)",
             Feature::ContentGuards => "content guards API (contentguards/, distributions/)",
             Feature::TaskSchedules => "task schedules API (task-schedules/)",
+            Feature::Domains => "domains (domains/, with DOMAIN_ENABLED on the server)",
         }
     }
 }
@@ -209,6 +211,8 @@ impl Capabilities {
             // The screen lists the distributions that use each guard: `distributions/` has no guard filter.
             Feature::ContentGuards => self.has_endpoint("contentguards/") && self.has_endpoint("distributions/"),
             Feature::TaskSchedules => self.has_endpoint("task-schedules/"),
+            // Without DOMAIN_ENABLED, `domains/` lists only the default domain and no URL serves another one.
+            Feature::Domains => self.status.as_ref().and_then(|s| s.domain_enabled) == Some(true) && self.has_endpoint("domains/"),
         }
     }
 

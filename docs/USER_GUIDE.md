@@ -725,6 +725,31 @@ Disconnected import of a Pulp export. Copy the export files to a directory in th
 * **Roles** screen: system roles are read-only. **c** / **e** / **d** a custom role (permissions as
   a comma list).
 
+### Domains
+
+Only on a server with `DOMAIN_ENABLED` (status `domain_enabled: true`); else the screen says
+that the server does not support it. Each domain has its own repositories, content, artifacts
+and storage. The list shows name, storage class and description. Pulp does not edit, delete or
+migrate the `default` domain; pulp-tui says so before it sends anything.
+
+* **c** creates a domain: name (it becomes part of the URLs: `/pulp/<name>/api/v3/`),
+  description, storage class (the classes of the server) and storage settings, a JSON object
+  such as `{"location": "/var/lib/pulp/media"}` (FileSystem) or
+  `{"bucket_name": "b", "access_key": "…", "secret_key": "…"}` (S3). The settings field is
+  never shown, because it can hold keys. Two switches: redirect downloads to the object storage,
+  and hide the distributions that have a content guard.
+* **e** changes the description and the two switches. The storage changes only with **M**; a
+  domain is not renamed (every URL of the domain would move).
+* **d** counts what you may see in the domain (repositories, remotes, distributions, content
+  units, artifacts; `?` when you may not list them), then you type the name. Pulp refuses while a
+  repository version holds content, or while a repository, remote, distribution or other object
+  is in the domain; the task then fails with Pulp's reason, and nothing is deleted. Else Pulp
+  deletes the orphan content and the artifacts of the domain (with their files) and its task
+  records.
+* **M** migrates the storage: the new class and its settings, then you type the name. Pulp copies
+  every artifact to the new storage and then uses it. Until the task ends, the other tasks of the
+  domain wait. Pulp does not delete the files in the old storage.
+
 ### Tasks
 
 The Task Center shows tracked tasks: label (the operation that started it), state, progress (only
@@ -791,8 +816,9 @@ All events of this session, newest first, with UTC times. It works without a con
 (hidden by default).
 
 The log never records the `Authorization` header. It shows as `•••` the JSON values of
-`password`, `token`, `secret`, `client_key`, `authorization`, `headers`, `header_value`, and of keys that end in
-`_password`, `_token` or `_secret`, in any letter case. An upload shows only its size. A body is
+`password`, `token`, `secret`, `client_key`, `authorization`, `headers`, `header_value`, `access_key`,
+`secret_key`, `account_key`, `cloudfront_key`, and of keys that end in `_password`, `_token` or `_secret`,
+in any letter case. An upload shows only its size. A body is
 cut at 64 KiB. The log keeps 1000 rows in memory only and is gone when you quit.
 
 ## Server profiles

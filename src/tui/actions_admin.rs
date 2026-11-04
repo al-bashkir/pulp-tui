@@ -21,6 +21,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         Kind::Roles => role_action(app, act, item),
         Kind::ContentGuards => guard_action(app, act, item),
         Kind::Uploads if act == Act::Delete => delete_uploads(app, item),
+        Kind::Domains => domain_action(app, act, item),
         // W: the last task of the schedule, not the schedule.
         Kind::TaskSchedules if act == Act::WatchTask => match s(&item, "last_task") {
             t if t.is_empty() => app.error(format!("schedule {} has not run a task yet", s(&item, "name"))),
@@ -582,6 +583,152 @@ fn delete_uploads(app: &mut App, item: Value) {
             submit(app, format!("delete upload {}", short(&href)), move |c| async move { Ok(c.delete(&href).await?) });
         }
     });
+}
+
+// ---- domains ----------------------------------------------------------------------------
+
+/// Storage classes when the OpenAPI has no enum: pulpcore's `BACKEND_CHOICES` without the deprecated S3Boto3Storage.
+const STORAGE_CLASSES: [&str; 3] =
+    ["pulpcore.app.models.storage.FileSystem", "storages.backends.s3.S3Storage", "storages.backends.azure_storage.AzureStorage"];
+
+/// `S3Storage` of `storages.backends.s3.S3Storage`.
+fn storage_name(class: &str) -> &str {
+    class.rsplit('.').next().unwrap_or_default()
+}
+
+/// Storage class and settings of a domain create or migration. The settings can hold S3 or Azure keys: never shown.
+fn storage_fields(app: &App) -> Vec<Field> {
+    let classes = caps(app).and_then(|c| c.field_enum("Domain", "storage_class").map(<[String]>::to_vec));
+    let example = r#"never shown; e.g. {"location": "/var/lib/pulp/media"} or {"bucket_name": "b", "access_key": "…", "secret_key": "…"}"#;
+    vec![
+        Field::new(
+            "storage_class",
+            "Storage class",
+            FieldKind::Choice(classes.unwrap_or_else(|| STORAGE_CLASSES.map(String::from).to_vec())),
+        ),
+        Field::new("storage_settings", "Storage settings (JSON)", FieldKind::Secret).required().help(example),
+    ]
+}
+
+fn storage_body(f: &Form) -> Result<Value, String> {
+    let settings = serde_json::from_str::<Value>(f.get("storage_settings")).ok().filter(Value::is_object);
+    Ok(json!({ "storage_class": f.get("storage_class"), "storage_settings": settings.ok_or("Storage settings must be a JSON object")? }))
+}
+
+/// What the content app does for the domain; `v` holds the current values.
+fn domain_flags(v: &Value) -> Vec<Field> {
+    let flag = |k: &str, label: &str, help: &str| {
+        Field::new(k, label, FieldKind::Bool).value(if v[k] == true { "true" } else { "false" }).help(help)
+    };
+    vec![
+        flag("redirect_to_object_storage", "Redirect to object storage", "downloads go to the storage, not through Pulp"),
+        flag("hide_guarded_distributions", "Hide guarded distributions", "the content app does not list them"),
+    ]
+}
+
+fn domain_action(app: &mut App, act: Act, item: Value) {
+    let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
+    if act != Act::Create && name == "default" {
+        return app.error("Pulp does not edit, delete or migrate the default domain");
+    }
+    match act {
+        Act::Create => {
+            let name = Field::text("name", "Name").required().help("letters, digits, - and _; it becomes part of the URLs");
+            let mut fields = vec![name, Field::text("description", "Description")];
+            fields.extend(storage_fields(app));
+            fields.extend(domain_flags(&json!({ "redirect_to_object_storage": true })));
+            app.form(Form::new("New domain", fields), |app, f| {
+                let mut b = storage_body(f)?;
+                b["name"] = f.get("name").into();
+                if let Some(d) = f.opt("description") {
+                    b["description"] = d.into();
+                }
+                for k in ["redirect_to_object_storage", "hide_guarded_distributions"] {
+                    b[k] = f.bool(k).into();
+                }
+                submit(app, format!("create domain {}", f.get("name")), move |c| async move { Ok(c.post(&c.api("domains/"), &b).await?) });
+                Ok(())
+            });
+        }
+        // The storage changes only with a migration; a rename would move every URL of the domain.
+        Act::Edit => {
+            let mut fields = vec![Field::text("description", "Description").value(s(&item, "description"))];
+            fields.extend(domain_flags(&item));
+            app.form(Form::new(format!("Edit domain {name}"), fields), move |app, f| {
+                let mut b = json!({});
+                for fld in f.fields.iter().filter(|x| x.changed()) {
+                    b[&fld.key] = match (fld.kind == FieldKind::Bool, f.get(&fld.key)) {
+                        (true, v) => (v == "true").into(),
+                        (false, "") => Value::Null,
+                        (false, v) => v.into(),
+                    };
+                }
+                if b.as_object().is_some_and(|m| m.is_empty()) {
+                    return Err("nothing changed".into());
+                }
+                let href = href.clone();
+                submit(app, format!("update domain {name}"), move |c| async move { Ok(c.patch(&href, &b).await?) });
+                Ok(())
+            });
+        }
+        Act::Delete => {
+            let storage = storage_name(&s(&item, "storage_class")).to_string();
+            app.job(format!("impact of deleting domain {name}"), move |ctx| async move {
+                let c = &ctx.client;
+                let mut counts = vec![];
+                let kinds = [("repositories/", "repositories"), ("remotes/", "remotes"), ("distributions/", "distributions")];
+                for (path, what) in kinds.into_iter().chain([("content/", "content units"), ("artifacts/", "artifacts")]) {
+                    counts.push(match c.list::<Value>(&c.domain_api(&name, path), &[("limit", "1".into())]).await {
+                        Ok(p) => format!("{} {what}", p.count),
+                        Err(e) if e.status() == Some(403) => format!("? {what} (you may not list them)"),
+                        Err(e) => return Err(e.into()),
+                    });
+                }
+                // pulpcore: `Domain._cleanup_orphans_pre_delete` and the delete are one transaction; artifact files go on commit.
+                let lines = vec![
+                    format!("Delete domain {name} (storage {storage})."),
+                    format!("In it, as far as you may see: {}.", counts.join(", ")),
+                    "Pulp refuses while a repository version holds content (PLP0007), or while a repository, remote,".into(),
+                    "distribution or other object is in the domain: delete them first. The task then fails with Pulp's reason.".into(),
+                    "Else Pulp deletes the orphan content and the artifacts of the domain with their files, and its task records.".into(),
+                ];
+                ap(move |app| {
+                    app.confirm_danger(format!("Delete domain {name}"), lines, &name.clone(), move |app| {
+                        submit(app, format!("delete domain {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+                    })
+                })
+            });
+        }
+        Act::MigrateStorage => {
+            let endpoint = "domains/migrate/";
+            if caps(app).is_some_and(|c| !c.has_endpoint(endpoint)) {
+                return app.error(format!("not supported by this server: domain storage migration ({endpoint})"));
+            }
+            let (from, title, fields) = (
+                storage_name(&s(&item, "storage_class")).to_string(),
+                format!("Migrate the storage of domain {name}"),
+                storage_fields(app),
+            );
+            app.form(Form::new(title.clone(), fields), move |app, f| {
+                let b = storage_body(f)?;
+                let lines = vec![
+                    format!("Migrate the storage of domain {name} from {from} to {}.", storage_name(f.get("storage_class"))),
+                    "Pulp copies every artifact of the domain to the new storage, then the domain uses it.".into(),
+                    "Until the task ends, the other tasks of the domain wait; content is served from the old storage.".into(),
+                    "Pulp does not delete the files in the old storage: remove them after the task.".into(),
+                ];
+                let name = name.clone();
+                app.confirm_danger(title.clone(), lines, &name.clone(), move |app| {
+                    // `migrate/` acts on the domain of the URL.
+                    submit(app, format!("migrate the storage of domain {name}"), move |c| async move {
+                        Ok(c.post(&c.domain_api(&name, endpoint), &b).await?)
+                    })
+                });
+                Ok(())
+            });
+        }
+        _ => {}
+    }
 }
 
 // ---- replication ------------------------------------------------------------------------
@@ -2628,6 +2775,7 @@ mod tests {
             (Kind::ContentGuards, rbac, vec![Inspect], vec![GuardAccess, Create, Edit, Delete]),
             (Kind::Uploads, json!({ "pulp_href": U1 }), vec![Inspect], vec![Delete]),
             (Kind::TaskSchedules, json!({ "pulp_href": "/s/1/", "last_task": "/t/1/" }), vec![WatchTask, Inspect], vec![]),
+            (Kind::Domains, json!({ "pulp_href": "/d/1/", "name": "edge" }), vec![Inspect], vec![MigrateStorage, Create, Edit, Delete]),
         ] {
             app.list.kind = k.clone();
             assert_eq!(app.available_actions(&item), offered, "{k:?}");
@@ -2696,5 +2844,162 @@ mod tests {
         let Some(Modal::Text { title, .. }) = &app.modal else { panic!("no live view: {:?}", notices(&app)) };
         assert_eq!(title, "Watch task orphans");
         assert!(app.tasks.items.iter().any(|t| t.href == task && t.label == "orphans"), "the last task, not the schedule");
+    }
+
+    const DOM: &str = "/pulp/api/v3/domains/0190dddd/";
+    const FS_CLASS: &str = "pulpcore.app.models.storage.FileSystem";
+    const S3_CLASS: &str = "storages.backends.s3.S3Storage";
+
+    async fn on_domains(server: &MockServer) -> (App, UnboundedReceiver<Msg>) {
+        let (mut app, rx) = connected(server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Domains;
+        (app, rx)
+    }
+
+    #[tokio::test]
+    async fn a_domain_is_created_with_its_storage_and_edited_without_it() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        serve(&server, "POST", "/pulp/api/v3/domains/", 201, json!({ "pulp_href": DOM })).await;
+        serve(&server, "PATCH", DOM, 202, json!({ "task": "/pulp/api/v3/tasks/1/" })).await;
+        let (mut app, mut rx) = on_domains(&server).await;
+        let (mut f, mut submit) = open_form(&mut app, Act::Create, Value::Null);
+        assert_eq!(f.title, "New domain");
+        let keys: Vec<&str> = f.fields.iter().map(|x| x.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["name", "description", "storage_class", "storage_settings", "redirect_to_object_storage", "hide_guarded_distributions"]
+        );
+        let classes = [FS_CLASS, S3_CLASS, "storages.backends.azure_storage.AzureStorage"].map(String::from).to_vec();
+        assert_eq!(f.fields[2].kind, super::FieldKind::Choice(classes), "no OpenAPI: the classes that pulpcore offers");
+        assert_eq!(f.fields[3].kind, super::FieldKind::Secret, "S3 and Azure settings hold keys");
+        assert_eq!((f.get("redirect_to_object_storage"), f.get("hide_guarded_distributions")), ("true", "false"), "Pulp's defaults");
+        set(&mut f, "name", "edge");
+        set(&mut f, "storage_settings", "[1]");
+        assert_eq!(submit(&mut app, &f), Err("Storage settings must be a JSON object".into()));
+        set(&mut f, "storage_settings", r#"{"location": "/var/lib/pulp/edge"}"#);
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        // Edit takes the row; the storage changes only with a migration (M).
+        let row = json!({ "pulp_href": DOM, "name": "edge", "description": "old", "storage_class": FS_CLASS,
+            "redirect_to_object_storage": true, "hide_guarded_distributions": false });
+        let (mut f, mut submit) = open_form(&mut app, Act::Edit, row);
+        assert_eq!(f.title, "Edit domain edge");
+        let shown: Vec<(&str, &str)> = f.fields.iter().map(|x| (x.key.as_str(), x.value.as_str())).collect();
+        assert_eq!(shown, [("description", "old"), ("redirect_to_object_storage", "true"), ("hide_guarded_distributions", "false")]);
+        assert_eq!(submit(&mut app, &f), Err("nothing changed".into()));
+        set(&mut f, "description", "");
+        set(&mut f, "hide_guarded_distributions", "true");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let created = json!({ "name": "edge", "storage_class": FS_CLASS, "storage_settings": { "location": "/var/lib/pulp/edge" },
+            "redirect_to_object_storage": true, "hide_guarded_distributions": false });
+        assert_eq!(
+            sent(&server).await,
+            [
+                ("POST".into(), "/pulp/api/v3/domains/".into(), created),
+                ("PATCH".into(), DOM.into(), json!({ "description": null, "hide_guarded_distributions": true })),
+            ]
+        );
+        assert!(app.tasks.items.iter().any(|t| t.href == "/pulp/api/v3/tasks/1/" && t.label == "update domain edge"));
+
+        // Pulp refuses to change the default domain: say so before any request.
+        for a in [Act::Edit, Act::Delete, Act::MigrateStorage] {
+            super::run(&mut app, a, json!({ "pulp_href": "/pulp/api/v3/domains/0/", "name": "default" }));
+            assert!(app.modal.is_none() && app.jobs.is_empty(), "{a:?}");
+            assert_eq!(notices(&app).last().unwrap().1, "Pulp does not edit, delete or migrate the default domain", "{a:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_domain_counts_what_is_in_it_before_the_typed_name() {
+        use crate::tui::kinds::Act;
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        for (p, n) in [("repositories/", 2), ("remotes/", 1), ("distributions/", 0), ("content/", 5)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pulp/edge/api/v3/{p}")))
+                .and(query_param("limit", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": n, "next": null, "results": [] })))
+                .mount(&server)
+                .await;
+        }
+        // Pulp's default policy lets only an administrator list artifacts.
+        serve(&server, "GET", "/pulp/edge/api/v3/artifacts/", 403, json!({ "detail": "denied" })).await;
+        serve(&server, "DELETE", DOM, 202, json!({ "task": "/pulp/api/v3/tasks/2/" })).await;
+        let (mut app, mut rx) = on_domains(&server).await;
+        super::run(&mut app, Act::Delete, json!({ "pulp_href": DOM, "name": "edge", "storage_class": S3_CLASS }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, typed: Some(typed), on_yes: Some(yes), .. }) = app.modal.take() else {
+            panic!("no typed confirm: {:?}", notices(&app))
+        };
+        assert_eq!((title.as_str(), typed.as_str()), ("Delete domain edge", "edge"));
+        assert_eq!(
+            lines,
+            [
+                "Delete domain edge (storage S3Storage).",
+                "In it, as far as you may see: 2 repositories, 1 remotes, 0 distributions, 5 content units, ? artifacts (you may not list them).",
+                "Pulp refuses while a repository version holds content (PLP0007), or while a repository, remote,",
+                "distribution or other object is in the domain: delete them first. The task then fails with Pulp's reason.",
+                "Else Pulp deletes the orphan content and the artifacts of the domain with their files, and its task records.",
+            ]
+        );
+        assert!(sent(&server).await.is_empty(), "nothing deleted before the confirmation");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(sent(&server).await, [("DELETE".into(), DOM.into(), Value::Null)]);
+        assert!(app.tasks.items.iter().any(|t| t.href == "/pulp/api/v3/tasks/2/" && t.label == "delete domain edge"));
+    }
+
+    #[tokio::test]
+    async fn a_storage_migration_posts_to_its_domain_after_the_typed_name() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        serve(&server, "POST", "/pulp/edge/api/v3/domains/migrate/", 202, json!({ "task": "/pulp/api/v3/tasks/3/" })).await;
+        let (mut app, mut rx) = on_domains(&server).await;
+        let mut caps = crate::pulp::Capabilities::default();
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/domains/": {}, "/pulp/api/v3/domains/migrate/": {} },
+            "components": { "schemas": {
+                "Domain": { "properties": { "storage_class": { "allOf": [{ "$ref": "#/components/schemas/StorageClassEnum" }] } } },
+                "StorageClassEnum": { "enum": [FS_CLASS, S3_CLASS] } } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps.clone());
+        let row = json!({ "pulp_href": DOM, "name": "edge", "storage_class": FS_CLASS });
+        let (mut f, mut submit) = open_form(&mut app, Act::MigrateStorage, row.clone());
+        assert_eq!(f.title, "Migrate the storage of domain edge");
+        assert_eq!(f.fields.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(), ["storage_class", "storage_settings"]);
+        assert_eq!(f.fields[0].kind, super::FieldKind::Choice(vec![FS_CLASS.into(), S3_CLASS.into()]), "the classes of the server");
+        assert_eq!(f.fields[1].kind, super::FieldKind::Secret);
+        set(&mut f, "storage_class", S3_CLASS);
+        set(&mut f, "storage_settings", "x");
+        assert_eq!(submit(&mut app, &f), Err("Storage settings must be a JSON object".into()));
+        let settings = json!({ "bucket_name": "b", "access_key": "a", "secret_key": "s" });
+        set(&mut f, "storage_settings", &settings.to_string());
+        submit(&mut app, &f).unwrap();
+        let Some(Modal::Confirm { title, lines, typed: Some(typed), on_yes: Some(yes), .. }) = app.modal.take() else {
+            panic!("no typed confirm: {:?}", notices(&app))
+        };
+        assert_eq!((title.as_str(), typed.as_str()), ("Migrate the storage of domain edge", "edge"));
+        assert_eq!(
+            lines,
+            [
+                "Migrate the storage of domain edge from FileSystem to S3Storage.",
+                "Pulp copies every artifact of the domain to the new storage, then the domain uses it.",
+                "Until the task ends, the other tasks of the domain wait; content is served from the old storage.",
+                "Pulp does not delete the files in the old storage: remove them after the task.",
+            ]
+        );
+        assert!(sent(&server).await.is_empty(), "nothing sent before the confirmation");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let want = json!({ "storage_class": S3_CLASS, "storage_settings": settings });
+        assert_eq!(sent(&server).await, [("POST".into(), "/pulp/edge/api/v3/domains/migrate/".into(), want)]);
+        assert!(app.tasks.items.iter().any(|t| t.href == "/pulp/api/v3/tasks/3/" && t.label == "migrate the storage of domain edge"));
+
+        caps.paths.remove("domains/migrate/");
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        super::run(&mut app, Act::MigrateStorage, row);
+        assert!(app.modal.is_none() && app.jobs.is_empty());
+        assert_eq!(notices(&app).last().unwrap().1, "not supported by this server: domain storage migration (domains/migrate/)");
     }
 }

@@ -482,3 +482,23 @@ async fn task_schedules_screen() {
     assert_eq!(title, &format!("Watch task {}", r["name"].as_str().unwrap()));
     assert!(app.tasks.items.iter().any(|t| r["last_task"] == t.href.as_str()), "the last task is in the Task Center");
 }
+
+/// The Domains screen follows DOMAIN_ENABLED: pulp1 has it off (Pulp then lists only the default domain), so
+/// the screen says that the server does not support it; a server with domains lists the default domain.
+#[tokio::test]
+async fn domains_screen_follows_domain_enabled() {
+    if !live_enabled() {
+        return;
+    }
+    let (mut app, mut rx) = app().await;
+    let enabled = app.conn.as_ref().unwrap().caps.status.as_ref().and_then(|s| s.domain_enabled) == Some(true);
+    app.open(Screen::List(Kind::Domains));
+    settle(&mut app, &mut rx).await;
+    if enabled {
+        assert_eq!(app.list.error, None);
+        assert!(app.list.items.iter().any(|r| r["name"] == "default"), "{:?}", app.list.items);
+    } else {
+        let off = "not supported by this server: domains (domains/, with DOMAIN_ENABLED on the server)";
+        assert_eq!(app.list.error.as_deref(), Some(off));
+    }
+}

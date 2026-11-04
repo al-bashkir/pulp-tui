@@ -117,11 +117,23 @@ pub fn redact(v: &mut Value) {
     match v {
         Value::Object(m) => {
             for (k, v) in m.iter_mut() {
-                // `headers` of a remote can carry an Authorization value; `header_value` is a header guard's shared secret.
+                // `headers` of a remote can carry an Authorization value; `header_value` is a header guard's shared secret;
+                // the `*_key`s are the S3 and Azure credentials in a domain's `storage_settings`.
                 let k = k.to_ascii_lowercase();
-                let secret =
-                    matches!(k.as_str(), "password" | "token" | "secret" | "client_key" | "authorization" | "headers" | "header_value")
-                        || ["_password", "_token", "_secret"].iter().any(|s| k.ends_with(s));
+                let secret = matches!(
+                    k.as_str(),
+                    "password"
+                        | "token"
+                        | "secret"
+                        | "client_key"
+                        | "authorization"
+                        | "headers"
+                        | "header_value"
+                        | "access_key"
+                        | "secret_key"
+                        | "account_key"
+                        | "cloudfront_key"
+                ) || ["_password", "_token", "_secret"].iter().any(|s| k.ends_with(s));
                 if secret {
                     *v = Value::String("•••".into());
                 } else {
@@ -220,6 +232,12 @@ mod tests {
         let mut v = json!({"Password": "p", "X_Token": "t", "headers": [{"Authorization": "Bearer b"}], "header_value": "hv"});
         redact(&mut v);
         assert_eq!(v, json!({"Password": "•••", "X_Token": "•••", "headers": "•••", "header_value": "•••"}));
+
+        // The storage settings of a domain (S3, Azure) that a create or a migration sends.
+        let mut v = json!({"storage_settings": {"bucket_name": "b", "access_key": "a", "secret_key": "s", "account_key": "k", "cloudfront_key": "c"}});
+        redact(&mut v);
+        let hidden = json!({"bucket_name": "b", "access_key": "•••", "secret_key": "•••", "account_key": "•••", "cloudfront_key": "•••"});
+        assert_eq!(v["storage_settings"], hidden);
     }
 
     #[test]
