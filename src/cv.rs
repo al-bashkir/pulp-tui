@@ -837,7 +837,15 @@ impl CvService {
                     }
                     r.pulp_href
                 }
-                Some(_) => bail!("repository {name} exists but is not labeled {LABEL_CV}={}; refusing to modify it", slug(cv)),
+                // The `-` join of view and repository names can collide (`a-b` + `c`, `a` + `b-c`); the format stays.
+                Some(r) => match r.pulp_labels.get(LABEL_CV) {
+                    Some(other) => bail!(
+                        "repository {name} belongs to content view {other} (label {LABEL_CV}={other}): view {cv} with repository {} \
+                         derives the same name; refusing to modify it",
+                        repo.repo_name
+                    ),
+                    None => bail!("repository {name} exists but is not labeled {LABEL_CV}={}; refusing to modify it", slug(cv)),
+                },
                 None => {
                     log(format!("creating derived repository {name}"));
                     let body = json!({
@@ -1232,11 +1240,27 @@ impl CvService {
 
     /// Where `repo` of view `cv` is served in `env`: an existing distribution keeps its path (older
     /// servers use a `cv/` prefix, and an operator may move a distribution), a new one gets `base_path`.
+    /// Refuses the distribution of another view or environment that has the same derived name.
     pub async fn served_path(&self, cv: &str, env: &Environment, repo: &CvRepo) -> Result<String> {
         let coll = self.client.api(repo.repo_type.distributions());
         let name = distribution_name(cv, &env.name, &repo.repo_name);
         Ok(match ops::find_by_name::<Distribution>(&self.client, &coll, &name).await? {
-            Some(d) => d.base_path,
+            Some(d) => {
+                // The `-` join of view, environment and repository names can collide (`web`+`Library`+`b-c`,
+                // `web-Library`+`b`+`c`); the format stays. An unlabeled one is refused by `ops::ensure_distribution`.
+                let (lv, le) = (d.pulp_labels.get(LABEL_CV), d.pulp_labels.get(LABEL_ENV));
+                if let (Some(v), Some(e)) = (lv, le)
+                    && (v, e) != (&slug(cv), &slug(&env.name))
+                {
+                    bail!(
+                        "distribution {name} belongs to content view {v} in environment {e} (labels {LABEL_CV}={v}, {LABEL_ENV}={e}): \
+                         view {cv} in environment {} with repository {} derives the same name; refusing to modify it",
+                        env.name,
+                        repo.repo_name
+                    );
+                }
+                d.base_path
+            }
             None => base_path(cv, &env.label, &repo.repo_name),
         })
     }
@@ -2711,6 +2735,43 @@ mod tests {
         }
     }
 
+    /// View `a` with repository `b-c` derives the name of view `a-b` with repository `c` (the format stays: existing
+    /// objects keep their names). The refusal names the other view; an unlabeled repository is refused as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_derived_name_of_another_view_is_refused_with_that_view() {
+        use wiremock::matchers::{method, path, query_param};
+        let other = "repository pulp-tui-cv-a-b-c belongs to content view a-b (label pulp_tui_cv=a-b): \
+                     view a with repository b-c derives the same name; refusing to modify it";
+        for (labels, want) in [
+            (json!({ LABEL_CV: "a-b" }), other),
+            (json!({}), "repository pulp-tui-cv-a-b-c exists but is not labeled pulp_tui_cv=a; refusing to modify it"),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let cv = svc.store.create_cv("k", "a", "").await.unwrap();
+            let src = CvRepo {
+                repo_href: "/pulp/api/v3/repositories/rpm/rpm/1/".into(),
+                repo_name: "b-c".into(),
+                repo_type: RepoType::Rpm,
+                filters: vec![],
+            };
+            let v = svc.store.begin_version(cv, "", &[src]).await.unwrap();
+            let mut vr = svc.store.version_repos(v.id).await.unwrap().remove(0);
+            let found = json!({ "pulp_href": DERIVED, "name": "pulp-tui-cv-a-b-c", "latest_version_href": null, "pulp_labels": labels });
+            wiremock::Mock::given(method("GET"))
+                .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
+                .and(query_param("name", "pulp-tui-cv-a-b-c"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [found] })))
+                .mount(&server)
+                .await;
+            let e = svc.derived_repo("a", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err();
+            assert_eq!(e.to_string(), want);
+            assert_eq!(vr.derived_repo, None, "nothing recorded");
+            assert_none(&server, "PATCH").await;
+            assert_none(&server, "POST").await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn publish_refuses_a_snapshot_repository_as_source() {
         let server = wiremock::MockServer::start().await;
@@ -3323,6 +3384,36 @@ mod tests {
         assert_none(&server, "PATCH").await;
         assert_none(&server, "POST").await;
         assert_eq!(svc.store.binding_repos(lib, cv).await.unwrap()[0].base_path, "custom/os");
+    }
+
+    /// View `web` in Library with repository `b-c` derives the distribution name of view `web-Library` in environment
+    /// `b` with repository `c` (the format stays). The refusal names the other view; an unlabeled one is refused as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_derived_distribution_name_of_another_view_is_refused_with_that_view() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let other = "web in Library: failed: b-c: distribution pulp-tui-cv-web-Library-b-c belongs to content view web-Library in \
+                     environment b (labels pulp_tui_cv=web-Library, pulp_tui_env=b): view web in environment Library with \
+                     repository b-c derives the same name; refusing to modify it";
+        let unlabeled = r#"web in Library: failed: b-c: conflict [409]: distribution pulp-tui-cv-web-Library-b-c exists but lacks ownership labels {"pulp_tui_cv":"web","pulp_tui_env":"Library"}"#;
+        for (labels, want) in [(json!({ LABEL_CV: "web-Library", LABEL_ENV: "b" }), other), (json!({}), unlabeled)] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+            let v = published(&svc, cv, "b-c", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
+            let lib = svc.store.ensure_library("k").await.unwrap();
+            let d =
+                json!({ "pulp_href": DIST, "name": "pulp-tui-cv-web-Library-b-c", "base_path": "b/web-library/c", "pulp_labels": labels });
+            Mock::given(method("GET"))
+                .and(path("/pulp/api/v3/distributions/rpm/rpm/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [d] })))
+                .mount(&server)
+                .await;
+            let e = svc.promote(cv, v.id, lib, Mode::Promote, &|_| {}, &ops::no_progress).await.unwrap_err();
+            assert_eq!(e.to_string(), want);
+            assert_none(&server, "PATCH").await;
+            assert_none(&server, "POST").await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

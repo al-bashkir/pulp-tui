@@ -1056,6 +1056,15 @@ carry it as the label `pulp_tui_db=<id>`.
   `... is owned by another pulp-tui database (<id>)`.
 * It also refuses an object without the labels of its view and environment:
   `... is not labeled pulp_tui_env=Dev`. Delete and unpromote keep such an object.
+* Two views can derive the same snapshot repository name: view `a-b` with repository `c` and view
+  `a` with repository `b-c` both give `pulp-tui-cv-a-b-c`. The second view is refused with
+  `... belongs to content view a-b (label pulp_tui_cv=a-b): view a with repository b-c derives
+  the same name`. Create the second view under another name.
+* Distribution names can collide in the same way: view `web` in `Library` with repository `b-c`
+  and view `web-Library` in environment `b` with repository `c` both give
+  `pulp-tui-cv-web-Library-b-c`. Promote (and its preview) refuses with `... belongs to content
+  view web-Library in environment b (labels ...): view web in environment Library with
+  repository b-c derives the same name`. Rename the view, the environment or the repository.
 * An object without the ID label gets it at its next change.
 
 ### SQLite as the shared database
