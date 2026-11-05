@@ -284,6 +284,61 @@ async fn checkpoint_fallback_replication() {
     assert_eq!(served(&dst, &format!("{}docs/readme.txt", d.base_url.unwrap())).await.0, 200);
 }
 
+/// A flat Deb repository (Release and Packages at its root; a File distribution on pulp2 serves it), synced on pulp2
+/// with distributions "/" and served by a verbatim publication. The replica on pulp1 syncs "/" from that publication,
+/// publishes it verbatim and serves the flat Release and the packages.
+#[tokio::test]
+async fn deb_flat_verbatim_fallback_replication() {
+    use sha2::Digest;
+    if !live_enabled() {
+        return;
+    }
+    let (dst, up) = (client(), upstream_client());
+    let prefix = unique("fbflat");
+    let (deb, dir) = (fixtures().join("upstream/deb"), tempfile::tempdir().unwrap());
+    let packages = std::fs::read(deb.join("dists/fixture/main/binary-amd64/Packages")).unwrap();
+    // Unique per run, so the File repository gets a Release file of its own.
+    let release = format!(
+        "Origin: pulp-tui\nLabel: pulp-tui\nSuite: flat\nCodename: flat\nArchitectures: amd64\nDescription: {prefix}\nSHA256:\n {} {} Packages\n",
+        hex::encode(sha2::Sha256::digest(&packages)),
+        packages.len()
+    );
+    std::fs::write(dir.path().join("Release"), release.as_bytes()).unwrap();
+    let files = RepoType::File;
+    let repo = create(&up, files.repositories(), json!({ "name": format!("{prefix}-files") }), "/repositories/").await;
+    let mut uploads = vec![(dir.path().join("Release"), "Release".to_string())];
+    uploads.push((deb.join("dists/fixture/main/binary-amd64/Packages"), "Packages".into()));
+    for p in String::from_utf8(packages).unwrap().lines().filter_map(|l| l.strip_prefix("Filename: ")) {
+        uploads.push((deb.join(p), p.to_string()));
+    }
+    for (file, path) in &uploads {
+        ops::upload(&up, files, file, Some(path), Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
+    }
+    let p = ops::ensure_publication(&up, files, &latest(&up, &repo).await, &json!({}), &no_progress).await.unwrap();
+    let (name, base_path) = (format!("{prefix}-files"), format!("{prefix}/files"));
+    let d = ops::ensure_distribution(&up, files, &name, &base_path, Some(&p), &json!({}), None, &no_progress).await.unwrap();
+    let flat_url = up.get::<Distribution>(&d, &[]).await.unwrap().base_url.unwrap();
+
+    let t = RepoType::Deb;
+    let body = json!({ "name": prefix, "url": flat_url, "policy": "immediate", "distributions": "/" });
+    let remote = create(&up, t.remotes(), body, "/remotes/").await;
+    let deb_repo = create(&up, t.repositories(), json!({ "name": prefix, "remote": remote }), "/repositories/").await;
+    ops::settle(&up, ops::sync(&up, t, &deb_repo, None, "mirror").await.unwrap(), &no_progress).await.unwrap();
+    let verbatim = json!({ "verbatim": true });
+    let p = ops::create_publication(&up, t, &latest(&up, &deb_repo).await, &verbatim, &no_progress).await.unwrap();
+    let flat = format!("{prefix}-flat");
+    ops::ensure_distribution(&up, t, &flat, &format!("{prefix}/flat"), Some(&p), &json!({}), None, &no_progress).await.unwrap();
+
+    let plan = replication::plan(&up, &dst, &[t], &prefix, None).await.unwrap();
+    let rows: Vec<_> = plan.iter().map(|p| (p.name.clone(), p.action.clone(), p.distributions.clone(), p.mode.clone())).collect();
+    assert_eq!(rows, [(flat.clone(), PlanAction::Create, Some("/".to_string()), verbatim)], "{plan:?}");
+    let store = Store::open_in_memory().await.unwrap();
+    let res = replication::run(&dst, &store, up.profile(), &plan, true, &|_| {}, &no_progress).await.unwrap();
+    assert!(res.iter().all(|l| l.starts_with("completed") && l.contains("matching digest (4 packages)")), "{res:?}");
+    let d: Distribution = ops::find_by_name(&dst, &dst.api(t.distributions()), &flat).await.unwrap().unwrap();
+    assert_eq!(served(&dst, &format!("{}Release", d.base_url.unwrap())).await, (200, release.into_bytes()), "the flat Release as it is");
+}
+
 /// `export-repos` on pulp2 and `import-repos` on pulp1: a repository gets the remote of the same name on pulp1,
 /// no secret is in the file, and a rerun keeps everything.
 #[tokio::test]

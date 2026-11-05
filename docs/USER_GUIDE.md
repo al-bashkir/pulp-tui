@@ -684,7 +684,9 @@ Native Upstream Pulp objects (tech preview).
   * A File or Deb distribution without a readable publication is a `SKIP` row with the reason;
     so is a File one without a manifest.
   * A Deb replica syncs the releases (`dists/`) that the upstream publication serves and publishes
-    them in the same mode: structured, simple or verbatim. It is signed only when its repository
+    them in the same mode: structured, simple or verbatim. A verbatim publication of a flat
+    repository serves it at the root, and the replica syncs it from there. A verbatim publication
+    of a version that no sync made has no Release file: its row is `SKIP`. It is signed only when its repository
     has a signing service; the dry run row says when the upstream is signed and the replica will
     not be. Set the service before the first run: a rerun reuses the publication of an unchanged
     version.

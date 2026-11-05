@@ -667,7 +667,14 @@ Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
   publication without its own `signing_service` is signed with the repository's
   (`release_signing_service`, structured releases only; a simple release uses the
   repository's `signing_service`). A verbatim one serves the synced Release files and
-  signatures as they are.
+  signatures as they are, at their upstream paths. Each `ReleaseFile` of the version has the
+  path of its Release file (seen live): `dists/<d>/Release`, or `Release` for a flat repository
+  at the root. pulp_deb 3.11.1 (`_handle_distribution`) syncs a remote distribution that ends in
+  `/` as a flat repository in that directory (`/`: the root), stored as distribution `flat-repo`
+  with component `flat-repo-component` and one `Packages` index. So the replica remote of a
+  verbatim publication syncs `<d>`, or `/` for a flat one, and verify probes `Release` and
+  `Packages` there (`live_replication`, flat). A verbatim publication of a version that no
+  sync made serves no Release file: its row is `SKIP`.
 * **Upstream `base_url`** is the upstream's content origin: in the test containers
   `http://host.containers.internal:8081`, which pulp1 reaches and the host does not resolve
   (seen live). So the fallback reads the upstream through its API only; the replica
@@ -869,8 +876,7 @@ or IpAddress(127.0.0.1)`.
 
 * Plugins other than pulp_rpm, pulp_file and pulp_deb (container, python, …).
 * pulp_deb: no dependency solving. Fallback replication copies binary packages only (no
-  source packages, udebs or installer files), and not a verbatim publication of a flat
-  repository (it is served at the root, not under `dists/`).
+  source packages, udebs or installer files).
 * RPM layout `nested_by_digest`: served-content checks skip the package probe (metadata is
   still checked).
 * ULN: a sync from a ULN remote is tested with mock HTTP only (it needs a ULN account).

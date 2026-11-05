@@ -583,6 +583,44 @@ async fn deb_verbatim_mode_reuses_or_makes_a_verbatim_publication() {
     server.verify().await;
 }
 
+/// A verbatim publication serves the synced files at their upstream paths: verify reads the Release file where the
+/// version's ReleaseFile has it, `dists/<release>/` or, for a flat repository, the root with one `Packages` index.
+#[tokio::test]
+async fn deb_verify_of_a_verbatim_publication_reads_the_synced_paths() {
+    let deb = b"deb bytes";
+    let index = "Package: hello\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/hello.deb\n";
+    let flat =
+        (json!({ "distribution": "flat-repo", "relative_path": "Release" }), "flat-repo", "flat-repo-component", ["Release", "Packages"]);
+    let dists = (
+        json!({ "distribution": "fixture", "relative_path": "dists/fixture/Release" }),
+        "fixture",
+        "main",
+        ["dists/fixture/Release", "dists/fixture/main/binary-amd64/Packages"],
+    );
+    for (release_file, d, comp, [release, packages]) in [flat, dists] {
+        let server = MockServer::start().await;
+        let ok = |b: Value| ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [b] }));
+        Mock::given(method("GET"))
+            .and(path(format!("{API}content/deb/release_files/")))
+            .respond_with(ok(release_file))
+            .mount(&server)
+            .await;
+        let c = json!({ "distribution": d, "plain_component": comp });
+        Mock::given(method("GET")).and(path(format!("{API}content/deb/release_components/"))).respond_with(ok(c)).mount(&server).await;
+        let p = json!({ "pulp_href": "/p/1/", "package": "hello", "version": "1.0", "architecture": "amd64",
+            "relative_path": "pool/hello.deb", "sha256": hex::encode(Sha256::digest(deb)) });
+        Mock::given(method("GET")).and(path(format!("{API}content/deb/packages/"))).respond_with(ok(p)).mount(&server).await;
+        for (f, body) in [(release, &b"Suite: x\n"[..]), (packages, index.as_bytes()), ("pool/hello.deb", deb)] {
+            let served = ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+            Mock::given(method("GET")).and(path(format!("/pulp/content/r/{f}"))).respond_with(served).mount(&server).await;
+        }
+        let base = format!("{}/pulp/content/r/", server.uri());
+        let verbatim = json!({ "pulp_href": format!("{API}publications/deb/verbatim/1/") });
+        let msg = deb::verify(&client(&server, |_, _| {}), &base, "/v1/", &verbatim).await.unwrap();
+        assert_eq!(msg, "Release and pool/hello.deb served with matching digest (1 packages)", "{d}");
+    }
+}
+
 /// A `.deb` goes to `content/deb/packages/` with the release that lists it, in one request or (above one chunk)
 /// through `uploads/`. The task names the new release records before the package: the digest is checked on the package.
 #[tokio::test]

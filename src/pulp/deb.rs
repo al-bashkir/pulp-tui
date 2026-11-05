@@ -43,11 +43,12 @@ fn served_entry(index: &str, p: &DebPackage) -> Option<(String, Option<String>)>
 
 /// The Release files of the modes of `publication` must be served and the smallest package must be
 /// listed in a `Packages` index and downloadable with the expected digest. `base` ends with `/`.
-/// A structured publication (the default) serves `dists/<release>/`; a simple one `dists/default/all/`.
+/// A structured publication (the default) serves `dists/<release>/`; a simple one `dists/default/all/`; a verbatim
+/// one of a flat repository `Release` and `Packages` in its directory.
 pub async fn verify(c: &PulpClient, base: &str, version: &str, publication: &Value) -> Result<String> {
     let (releases, indices) = layout(c, version, publication).await?;
-    for dir in releases {
-        served(c, base, &format!("dists/{dir}/Release")).await?;
+    for d in releases {
+        served(c, base, &format!("{}Release", release_dir(&d))).await?;
     }
     let q = [
         ("repository_version", version.to_string()),
@@ -60,7 +61,11 @@ pub async fn verify(c: &PulpClient, base: &str, version: &str, publication: &Val
     let mut tried = vec![];
     // The smallest package of the version can be in any of its distributions.
     for (d, comp) in indices {
-        let index = format!("dists/{d}/{comp}/binary-{}/Packages", p.architecture);
+        let index = if d.ends_with('/') {
+            format!("{}Packages", release_dir(&d))
+        } else {
+            format!("dists/{d}/{comp}/binary-{}/Packages", p.architecture)
+        };
         match served_package(c, base, p, &index).await? {
             Some(path) => return Ok(format!("Release and {path} served with matching digest ({} packages)", pkgs.count)),
             None => tried.push(index),
@@ -84,8 +89,12 @@ async fn served(c: &PulpClient, base: &str, path: &str) -> Result<()> {
 /// (pulp_deb then makes the Release file), under `dists/<distribution without outer slashes, "/" is
 /// flat-repo>/<last part of the component>/`; without release components, `default` with component `empty`
 /// (pulp_deb 3.11.1; 3.5.4 and 3.8.1 publish no structured release then). Simple: `default` with component
-/// `all`, which replaces a structured `default`.
+/// `all`, which replaces a structured `default`. Verbatim: `verbatim_layout`. A release is named as a pulp_deb remote
+/// names it: `<d>` is `dists/<d>/`, `<dir>/` a flat repository there (`/`: the root, `release_dir`).
 pub async fn layout(c: &PulpClient, version: &str, publication: &Value) -> Result<(Vec<String>, Vec<(String, String)>)> {
+    if is_verbatim(publication["pulp_href"].as_str().unwrap_or_default()) {
+        return verbatim_layout(c, version).await;
+    }
     let simple = publication["simple"] == true;
     let (mut releases, mut indices) = (vec![], vec![]);
     if publication["structured"] != false {
@@ -109,6 +118,36 @@ pub async fn layout(c: &PulpClient, version: &str, publication: &Value) -> Resul
         indices.push(("default".into(), "all".into()));
     }
     Ok((releases, indices))
+}
+
+/// What a verbatim publication of `version` serves: the synced files at their upstream paths, one release per
+/// ReleaseFile (pulp_deb 3.11.1 `_handle_distribution`): `dists/<d>` with the components of its release, or the
+/// directory of a flat repository (synced as `<dir>/`, stored as `flat-repo`) with its one `Packages` index. A
+/// version that no sync made has no ReleaseFile, so no release.
+async fn verbatim_layout(c: &PulpClient, version: &str) -> Result<(Vec<String>, Vec<(String, String)>)> {
+    let q = |f: &str| [("repository_version", version.to_string()), ("fields", f.to_string())];
+    let files: Vec<Value> = c.list_all(&c.api("content/deb/release_files/"), &q("distribution,relative_path"), 10_000).await?;
+    let comps: Vec<Value> = c.list_all(&c.api("content/deb/release_components/"), &q("plain_component,distribution"), 10_000).await?;
+    let (mut releases, mut indices) = (vec![], vec![]);
+    for f in &files {
+        // The path of its Release file (seen live): `dists/<d>/Release`, or `Release` of a flat repository at the root.
+        let dir = f["relative_path"].as_str().unwrap_or_default().rsplit_once('/').map_or("", |(dir, _)| dir);
+        let Some(d) = dir.strip_prefix("dists/") else {
+            let d = format!("{dir}/");
+            indices.push((d.clone(), String::new()));
+            releases.push(d);
+            continue;
+        };
+        let comps = comps.iter().filter(|r| r["distribution"] == f["distribution"]).filter_map(|r| r["plain_component"].as_str());
+        indices.extend(comps.map(|comp| (d.to_string(), comp.to_string())));
+        releases.push(d.to_string());
+    }
+    Ok((releases, indices))
+}
+
+/// The served directory of release `d` of `layout`: `dists/<d>/`, or the directory of a flat repository (`""` at the root).
+fn release_dir(d: &str) -> String {
+    if d.ends_with('/') { d.trim_start_matches('/').to_string() } else { format!("dists/{d}/") }
 }
 
 /// The path of package `p` when `index` lists it and the server serves it with the digest that apt checks;

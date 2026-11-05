@@ -238,11 +238,11 @@ rerun of the relabel moves its row.
 Verify checks for every binding that the distribution serves the expected publication, the
 publication belongs to the snapshot, the snapshot exists, and served content matches:
 
-| Type | Served check                                                       |
-| ---- | ------------------------------------------------------------------ |
-| File | the manifest that the publication names (default `PULP_MANIFEST`)  |
-| RPM  | `repomd.xml`, the smallest package with digest                     |
-| Deb  | `dists/<dist>/Release`, the smallest package of `Packages`, digest |
+| Type | Served check                                                                                  |
+| ---- | --------------------------------------------------------------------------------------------- |
+| File | the manifest that the publication names (default `PULP_MANIFEST`)                             |
+| RPM  | `repomd.xml`, the smallest package with digest                                                |
+| Deb  | `dists/<dist>/Release` (verbatim flat: `Release`), the smallest package of `Packages`, digest |
 
 It also reports retention on a derived repository. A new promotion of the bound version
 fixes drift.
@@ -297,7 +297,8 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
   * A checkpoint distribution: the remote URL is its newest checkpoint publication at
     `<base>/<timestamp>/` (`ops::served_url`); the bare base path only lists the timestamps.
   * Deb: the remote's `distributions` are the `dists/` directories of the served
-    publication (`deb::layout`, as verify probes them). The replica publishes in the mode of
+    publication (`deb::layout`, as verify probes them); for a verbatim one, the synced Release
+    files (`/` for a flat repository at the root). The replica publishes in the mode of
     that publication (`ops::publication_mode`, verbatim too), without its signing service:
     that is an href of the upstream server. The dry run notes an upstream APT publication
     that is signed (its service, else its repository's service or release overrides) when

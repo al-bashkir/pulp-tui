@@ -233,12 +233,14 @@ pub async fn plan(
 /// the repository's release override (structured releases only) or service. A verbatim publication serves the synced
 /// signatures as they are, so its replica serves them too. Only the API is read: `base_url` is the upstream content
 /// origin as the destination server reaches it, which this client may not resolve. `Err`: the note of a SKIP row.
-/// shortcut: a verbatim publication of a flat repository (`/`) is served at the root, but `layout` gives `flat-repo`;
-/// read the synced Release files when a flat upstream must be replicated.
+/// A verbatim publication of a flat repository serves it at the root: the replica remote syncs `/` (`deb::layout`).
 async fn deb_source(src: &PulpClient, p: &Value) -> std::result::Result<(String, Value, bool), String> {
     let unreadable = |e: PulpError| format!("upstream publication not readable: {e}");
     let version = p["repository_version"].as_str().unwrap_or_default();
     let (dists, _) = deb::layout(src, version, p).await.map_err(unreadable)?;
+    if dists.is_empty() {
+        return Err("upstream verbatim publication serves no Release file (no sync made its version); publish it as APT".into());
+    }
     let mut mode = ops::publication_mode(RepoType::Deb, p);
     if let Some(m) = mode.as_object_mut() {
         m.remove("signing_service");
@@ -430,6 +432,8 @@ mod tests {
             dist("plain", "publication", &publication(4)),
             dist("simple", "publication", &publication(3)),
             dist("verb", "repository", &repo(9)),
+            dist("verbflat", "publication", "/pulp/api/v3/publications/deb/verbatim/5/"),
+            dist("verbnone", "publication", "/pulp/api/v3/publications/deb/verbatim/6/"),
         ]);
         get("distributions/deb/apt/").respond_with(ok(page(dists))).mount(&up).await;
         // Publications that sign with a service of the upstream server (1), with a release override of their
@@ -460,15 +464,34 @@ mod tests {
         let p9 = json!([{ "pulp_href": "/pulp/api/v3/publications/deb/verbatim/3/", "repository_version": v9,
             "pulp_created": "2026-01-01T00:00:00Z" }]);
         get("publications/deb/verbatim/").and(query_param("repository", repo(9))).respond_with(ok(page(p9))).mount(&up).await;
+        // "verbflat" serves a verbatim publication of a flat repository synced with distributions "/": pulp_deb stores
+        // it as distribution flat-repo, and its Release file is at the root (relative path "Release").
+        // "verbnone" serves a verbatim publication of a version that no sync made: no Release file, nothing to sync.
+        let (v5, v6) = (format!("{}versions/1/", repo(5)), format!("{}versions/1/", repo(6)));
+        for (n, v) in [(5, &v5), (6, &v6)] {
+            let p = json!({ "pulp_href": format!("/pulp/api/v3/publications/deb/verbatim/{n}/"), "repository_version": v });
+            get(&format!("publications/deb/verbatim/{n}/")).respond_with(ok(p)).mount(&up).await;
+        }
         let comp = |d: &str| json!({ "distribution": d, "plain_component": "main" });
+        let flat = json!([{ "distribution": "flat-repo", "plain_component": "flat-repo-component" }]);
         for (version, comps) in [
             (format!("{}versions/1/", repo(1)), json!([comp("fixture")])),
             (format!("{}versions/1/", repo(2)), json!([comp("fixture"), comp("/")])),
-            (v9, json!([comp("fixture")])),
+            (v9.clone(), json!([comp("fixture")])),
+            (v5.clone(), flat),
+            (v6.clone(), json!([])),
         ] {
             get("content/deb/release_components/")
                 .and(query_param("repository_version", version.as_str()))
                 .respond_with(ok(page(comps)))
+                .mount(&up)
+                .await;
+        }
+        let file = |d: &str, p: &str| json!([{ "distribution": d, "relative_path": p }]);
+        for (version, files) in [(v9, file("fixture", "dists/fixture/Release")), (v5, file("flat-repo", "Release")), (v6, json!([]))] {
+            get("content/deb/release_files/")
+                .and(query_param("repository_version", version.as_str()))
+                .respond_with(ok(page(files)))
                 .mount(&up)
                 .await;
         }
@@ -488,13 +511,17 @@ mod tests {
                 ("plain", &PlanAction::Create, base("plain"), Some("default"), simple.clone()),
                 ("simple", &PlanAction::Create, base("simple"), Some("default"), simple),
                 ("verb", &PlanAction::Create, base("verb"), Some("fixture"), json!({ "verbatim": true })),
+                // A pulp_deb remote syncs a flat repository at the root as distribution "/".
+                ("verbflat", &PlanAction::Create, base("verbflat"), Some("/"), json!({ "verbatim": true })),
+                ("verbnone", &PlanAction::Skip, String::new(), None, json!({})),
             ]
         );
         let new = "new remote + repository + distribution";
         let loses_signature =
             format!("{new}; upstream Release is signed, the replica will be unsigned (the destination repository has no signing service)");
+        let none = "upstream verbatim publication serves no Release file (no sync made its version); publish it as APT";
         let notes: Vec<_> = plan.iter().map(|i| i.note.as_str()).collect();
-        assert_eq!(notes, ["re-sync existing replica", &loses_signature, new, &loses_signature, new]);
+        assert_eq!(notes, ["re-sync existing replica", &loses_signature, new, &loses_signature, new, new, none]);
     }
 
     /// A Deb replica: the remote syncs the served dists, the publication has the upstream mode, the distribution
