@@ -143,8 +143,7 @@ pub struct Settings {
     /// Upload chunk size for the Pulp chunked upload API.
     pub upload_chunk_mb: u64,
     /// Labels of the screens that the Screens pane hides (`x` there); the palette still lists them.
-    /// Unknown labels are ignored.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Unknown labels are ignored. Always written, so that an emptied list keeps its line and comment.
     pub hidden_screens: Vec<String>,
     /// Removed setting, ignored: read so that configs of older versions still load, never saved.
     #[serde(skip_serializing)]
@@ -385,6 +384,74 @@ fn parse_error(path: &Path, s: &str, message: &str, span: Option<std::ops::Range
     anyhow::anyhow!("invalid config {} line {line}: {message}", path.display())
 }
 
+/// Make `file` hold `new`, where `old` is what it holds now (both as `toml` writes them). Values that are the same
+/// in `old` and `new` stay as they are in `file`, also when `file` does not have them (defaults).
+/// `kept` gets the position and the comments above the header of each removed table.
+fn merge(
+    file: &mut dyn toml_edit::TableLike,
+    old: &dyn toml_edit::TableLike,
+    new: &dyn toml_edit::TableLike,
+    kept: &mut Vec<(isize, String)>,
+) {
+    use toml_edit::Item;
+    let empty = toml_edit::Table::new();
+    for (k, n) in new.iter() {
+        let o = old.get(k);
+        if let Some(n) = n.as_table_like() {
+            // `Table` displays only its own values, so tables are compared value by value.
+            let created = !file.get(k).is_some_and(Item::is_table_like);
+            if created {
+                let mut t = toml_edit::Table::new();
+                t.set_implicit(true);
+                file.insert(k, Item::Table(t));
+            }
+            let sub = file.get_mut(k).and_then(Item::as_table_like_mut).expect("a table was inserted");
+            merge(sub, o.and_then(Item::as_table_like).unwrap_or(&empty), n, kept);
+            if created && sub.is_empty() {
+                file.remove(k);
+            }
+        } else if o.is_none_or(|o| o.to_string() != n.to_string()) {
+            let mut v = n.clone();
+            if let (Some(v), Some(f)) = (v.as_value_mut(), file.get(k).and_then(Item::as_value)) {
+                *v.decor_mut() = f.decor().clone();
+            }
+            // `insert` would reset the key and drop the comments above it.
+            match file.get_mut(k) {
+                Some(f) => *f = v,
+                None => {
+                    file.insert(k, v);
+                }
+            }
+        }
+    }
+    for (k, _) in old.iter() {
+        if new.get(k).is_some() {
+            continue;
+        }
+        if let Some(Item::Table(t)) = file.get(k)
+            && let (Some(p), Some(c)) = (t.position(), t.decor().prefix().and_then(|r| r.as_str()))
+            && c.contains('#')
+        {
+            kept.push((p, c.to_string()));
+        }
+        file.remove(k);
+    }
+}
+
+/// The document positions of `t` and of the tables in it.
+fn table_positions(t: &toml_edit::Table) -> Vec<isize> {
+    let subs = t.iter().filter_map(|(_, i)| i.as_table()).flat_map(table_positions);
+    t.position().into_iter().chain(subs).collect()
+}
+
+/// The table at document position `pos` in `t`.
+fn table_at(t: &mut toml_edit::Table, pos: isize) -> Option<&mut toml_edit::Table> {
+    if t.position() == Some(pos) {
+        return Some(t);
+    }
+    t.iter_mut().filter_map(|(_, i)| i.as_table_mut()).find_map(|s| table_at(s, pos))
+}
+
 /// Atomic write (temp file + rename) so a crash never leaves a truncated config. A symlink is followed
 /// (the link stays) and an existing file keeps its permissions.
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
@@ -424,37 +491,41 @@ impl Config {
         }
     }
 
-    /// Write the whole config; comments in the file are lost.
+    /// Write the config, and change in the file only the keys whose values changed: comments, order and layout
+    /// stay. A changed value keeps its comment; a removed key goes with the comments above it. The comments above
+    /// a removed table stay (they can belong to the table before it). A file that is not valid stays as it is (error).
     pub fn save(&self, path: &Path) -> Result<()> {
-        write_atomic(path, &toml::to_string_pretty(self)?)
-    }
-
-    /// Write `settings.hidden_screens` into the config file and keep the rest of the file as it is, comments too.
-    /// An existing key keeps its place and comment, also when the list is empty.
-    pub fn save_hidden_screens(&self, path: &Path) -> Result<()> {
         let text = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
+        let old: Config = toml::from_str(&text).map_err(|e| parse_error(path, &text, e.message(), e.span()))?;
         let mut doc: toml_edit::DocumentMut =
             text.parse().map_err(|e: toml_edit::TomlError| parse_error(path, &text, e.message(), e.span()))?;
-        let settings = doc.entry("settings").or_insert(toml_edit::table()).as_table_like_mut().context("settings is not a table")?;
-        let hidden = &self.settings.hidden_screens;
-        let mut list = toml_edit::Value::from(hidden.iter().map(String::as_str).collect::<toml_edit::Array>());
-        match settings.get_mut("hidden_screens") {
-            Some(old) => {
-                if let Some(v) = old.as_value() {
-                    *list.decor_mut() = v.decor().clone();
+        let as_doc = |c: &Config| -> Result<toml_edit::DocumentMut> { Ok(toml::to_string_pretty(c)?.parse()?) };
+        let mut kept = vec![];
+        merge(doc.as_table_mut(), as_doc(&old)?.as_table(), as_doc(self)?.as_table(), &mut kept);
+        // The comments of a removed header go before the next header, or to the end of the file. Prepended from the
+        // last one, so they keep their order.
+        kept.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
+        for (p, comments) in kept {
+            let next = table_positions(doc.as_table()).into_iter().filter(|&q| q > p).min();
+            match next.and_then(|q| table_at(doc.as_table_mut(), q)) {
+                Some(t) => {
+                    let prefix = format!("{comments}{}", t.decor().prefix().and_then(|r| r.as_str()).unwrap_or(""));
+                    t.decor_mut().set_prefix(prefix);
                 }
-                *old = toml_edit::Item::Value(list);
+                None => {
+                    let trailing = format!("{}\n{}", comments.trim_end(), doc.trailing().as_str().unwrap_or(""));
+                    doc.set_trailing(trailing);
+                }
             }
-            None if !hidden.is_empty() => {
-                settings.insert("hidden_screens", toml_edit::Item::Value(list));
-            }
-            None => {}
         }
-        write_atomic(path, &doc.to_string())
+        let merged = doc.to_string();
+        // A layout that the merge gets wrong gets the whole config written instead, without comments.
+        let out = if toml::from_str::<Config>(&merged).ok().as_ref() == Some(self) { merged } else { toml::to_string_pretty(self)? };
+        write_atomic(path, &out)
     }
 
     pub fn pick_profile(&self, requested: Option<&str>) -> Option<String> {
@@ -594,37 +665,73 @@ read_only = true
     }
 
     #[test]
-    fn saving_hidden_screens_keeps_the_rest_of_the_file_and_its_comments() {
+    fn save_changes_only_the_changed_keys_and_keeps_the_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let read = || std::fs::read_to_string(&path).unwrap();
-        let example = include_str!("../examples/config.toml");
-        let mut cfg: Config = toml::from_str(example).unwrap();
-        // No file yet: the key goes into a new [settings].
+        // No file yet: only what differs from the defaults is written.
+        let mut cfg = Config::default();
         cfg.settings.hidden_screens = vec!["Logs".into()];
-        cfg.save_hidden_screens(&path).unwrap();
+        cfg.save(&path).unwrap();
         assert_eq!(read(), "[settings]\nhidden_screens = [\"Logs\"]\n");
 
-        // No key: it goes after the last key of [settings]; every other line stays.
+        // A new key goes after the last key of its table; every other line stays.
+        let example = include_str!("../examples/config.toml");
+        let mut cfg: Config = toml::from_str(example).unwrap();
         std::fs::write(&path, example).unwrap();
-        cfg.save_hidden_screens(&path).unwrap();
+        cfg.settings.hidden_screens = vec!["Logs".into()];
+        cfg.save(&path).unwrap();
         let size = "upload_chunk_mb = 8           # chunked upload size\n";
         assert_eq!(read(), example.replace(size, &format!("{size}hidden_screens = [\"Logs\"]\n")));
         assert_eq!(Config::load(&path).unwrap(), cfg);
 
-        // A key: it keeps its place and its comment, also when the list becomes empty.
+        // A changed value keeps its place and its comment, also an emptied list.
         let commented = example.replace("# hidden_screens", "hidden_screens");
         std::fs::write(&path, &commented).unwrap();
-        cfg.save_hidden_screens(&path).unwrap();
+        cfg.save(&path).unwrap();
         assert_eq!(read(), commented.replace(r#"["Uploads", "Artifacts"]"#, r#"["Logs"]"#));
         cfg.settings.hidden_screens.clear();
-        cfg.save_hidden_screens(&path).unwrap();
-        assert_eq!(read(), commented.replace(r#"["Uploads", "Artifacts"]"#, "[]"));
+        cfg.save(&path).unwrap();
+        let commented = commented.replace(r#"["Uploads", "Artifacts"]"#, "[]");
+        assert_eq!(read(), commented);
+
+        // Profile edits: changed values only; a new profile goes at the end; a removed one goes.
+        let prod = cfg.profiles.get_mut("prod").unwrap();
+        prod.read_only = true;
+        prod.timeout_secs = 60;
+        cfg.save(&path).unwrap();
+        let edited = commented
+            .replace("timeout_secs = 30", "timeout_secs = 60")
+            .replace("read_only = false\n# Own Content View", "read_only = true\n# Own Content View");
+        assert_eq!(read(), edited);
+        let mut new = cfg.profiles["lab"].clone();
+        new.url = "https://new.example.com".into();
+        cfg.profiles.insert("new".into(), new);
+        cfg.save(&path).unwrap();
+        let text = read();
+        assert!(text.starts_with(&edited) && text[edited.len()..].starts_with("\n[profiles.new]\n"), "{text}");
+        assert_eq!(Config::load(&path).unwrap(), cfg);
+        cfg.profiles.remove("new");
+        cfg.save(&path).unwrap();
+        assert_eq!(read(), edited);
+        // The comments above a removed header stay: here they belong to [profiles.prod] and to [database].
+        cfg.profiles.remove("upstream");
+        cfg.save(&path).unwrap();
+        let upstream = "\n[profiles.upstream]\nurl = \"https://pulp-upstream.example.com\"\nauth = \"bearer\"\n\
+            secret = \"file:/run/secrets/pulp-upstream-token\"\n\
+            read_only = true              # source for fallback replication only\n";
+        let edited = edited.replace(upstream, "");
+        assert_eq!(read(), edited);
+        cfg.profiles.remove("lab");
+        cfg.default_profile = Some("prod".into());
+        cfg.save(&path).unwrap();
+        let lab = "[profiles.lab]\nurl = \"http://localhost:8080\"\nusername = \"admin\"\nsecret = \"env:PULP_PASSWORD\"\n";
+        assert_eq!(read(), edited.replace(lab, "").replace("default_profile = \"lab\"", "default_profile = \"prod\""));
         assert_eq!(Config::load(&path).unwrap(), cfg);
 
         // A file that is not TOML stays as it is; the error does not quote its text.
         std::fs::write(&path, "x = \"hunter2\n").unwrap();
-        let e = format!("{:#}", cfg.save_hidden_screens(&path).unwrap_err());
+        let e = format!("{:#}", cfg.save(&path).unwrap_err());
         assert!(e.contains("line 1") && !e.contains("hunter2"), "{e}");
         assert_eq!(read(), "x = \"hunter2\n");
     }

@@ -21,8 +21,7 @@
 * In the screen list, `x` hides the screen under the cursor, or shows it again. The list is saved
   as `hidden_screens` in `[settings]` of the config file (you can also edit it there). `.` shows
   the hidden screens too, dim and marked `×`. The palette always lists all screens. Dashboard and
-  Servers cannot be hidden. The save changes only this key; the rest of the file and its comments
-  stay as they are.
+  Servers cannot be hidden. The save keeps the comments in the file (see "Server profiles").
 * A narrow terminal hides the screen list (use the palette) and the details pane. Below 60x15 the
   UI asks for a larger terminal.
 * `▶` and reverse video show the selection, so it does not depend on color.
@@ -905,6 +904,10 @@ cut at 64 KiB. The log keeps 1000 rows in memory only and is gone when you quit.
 The config file is `--config`, `$PULP_TUI_CONFIG`, or `$XDG_CONFIG_HOME/pulp-tui/config.toml`.
 `pulp-tui config-example` prints a full example. The profile is the first of: `--profile`,
 `$PULP_TUI_PROFILE`, `default_profile`, the first profile.
+
+When the TUI saves the config (a profile, hidden screens), it changes only the keys whose values
+changed. Comments, order and layout stay. A removed key goes with the comments above it; the
+comments above a removed profile stay. A file that is not valid TOML is not changed (error).
 
 Secrets are references:
 
