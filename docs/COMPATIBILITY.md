@@ -114,12 +114,13 @@ General rules:
 | Form                           | Optional fields                                                                          |
 | ------------------------------ | ---------------------------------------------------------------------------------------- |
 | Repository                     | checksum type, signing services, retain package versions, manifest, `retain_checkpoints` |
-| RPM repository                 | compression, layout, repo config, package signing                                        |
+| RPM repository                 | compression, layout, repo config, package signing, `osv_config`                          |
 | Remote                         | timeouts, `max_retries`, `headers`; Deb `excluded_package_metadata_fields`               |
 | Distribution                   | `hidden`, `checkpoint`; RPM `generate_repo_config`                                       |
 | Publication (**c**)            | options of `rpm.RpmPublication`, `file.FilePublication`, `deb.AptPublication`            |
 | Deb upload (**u**)             | `distribution`, `component` of `deb.Package`                                             |
 | Upload (**u**)                 | `overwrite` of `rpm.Package`, `file.FileContent`, `deb.Package`                          |
+| Filesystem export (**E**)      | `start_repository_version` of `FilesystemExport`                                         |
 | Sync                           | `optimize` (RPM, File, Deb), `skip_types` (RPM): `{Rpm,File,Apt}RepositorySyncURL`       |
 | Upstream Pulp (`UpstreamPulp`) | `policy`, replica download policy, concurrency, retries, timeouts                        |
 
@@ -718,7 +719,14 @@ Source: pulpcore 3.123.1 `tasks/export.py`, `tasks/importer.py` and their serial
   hyperlink - Object does not exist.". `start_versions` with `full` true: "start_versions
   is only valid for incremental exports (full=False)". All are 400. With `full: false`,
   `start_versions` works without a previous export.
-* **Filesystem export** takes one of `publication` and `repository_version`; Pulp checks
+* **`dry_run`** ("Generate report on what would be exported and disk-space required") is in
+  `PulpExportSerializer`, but neither the viewset nor `pulp_export` reads it: the task writes
+  the tar and TOC and sets `last_export` (live, `pulp_export_dry_run_still_writes_the_export`).
+  The Export form does not offer it.
+* **Filesystem export** takes one of `publication` and `repository_version`, and optionally
+  `start_repository_version` (any version; the form sends one of the same repository): then
+  the task writes only the artifacts that the start version lacks, plus all published metadata
+  of a publication (`_export_publication_to_file_system`). Pulp checks
   the allowed path again on the export POST. The directory
   must not exist (live): "Cannot export to directories that contain existing data"
   (publication) or "[Errno 17] File exists" (version). `hardlink` falls back to `write`

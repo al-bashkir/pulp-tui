@@ -1350,20 +1350,23 @@ fn chosen_versions(text: &str, exporter: &str, repos: &[ExportRepo]) -> Result<V
 /// Export the files of one publication (the newest of the version) or of one repository version.
 fn fs_export(app: &mut App, href: String, name: String, path: String) {
     let what = vec!["publication".to_string(), "repository version".to_string()];
-    let form = Form::new(
-        format!("Export {name}"),
-        vec![
-            Field::pick("repo", "Repository", Source::Repos(None)).required(),
-            Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
-            Field::new("what", "Export", FieldKind::Choice(what)).help("publication: the newest publication of the version"),
-        ],
-    )
-    .note(format!("Pulp makes {path} on the Pulp server and writes the files into it."))
-    .note("It must not exist yet: for the next export, edit the exporter's directory first.");
+    let mut fields = vec![
+        Field::pick("repo", "Repository", Source::Repos(None)).required(),
+        Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
+    ];
+    if caps(app).is_none_or(|c| c.has_field("FilesystemExport", "start_repository_version")) {
+        let help = "only the files that this version of the repository lacks (a publication: and its metadata); empty = all";
+        fields.push(Field::new("start", "Start version number", FieldKind::Number).help(help));
+    }
+    fields.push(Field::new("what", "Export", FieldKind::Choice(what)).help("publication: the newest publication of the version"));
+    let form = Form::new(format!("Export {name}"), fields)
+        .note(format!("Pulp makes {path} on the Pulp server and writes the files into it."))
+        .note("It must not exist yet: for the next export, edit the exporter's directory first.");
     app.form(form, move |app, f| {
         let repo = f.get("repo").to_string();
         let t = RepoType::from_href(&repo).ok_or("pick an RPM, File or Deb repository")?;
         let (number, publication) = (f.number("number"), f.get("what") == "publication");
+        let start = f.number("start").map(|n| format!("{repo}versions/{n}/"));
         let (href, name, path) = (href.clone(), name.clone(), path.clone());
         app.job(format!("export {name}"), move |ctx| async move {
             let c = &ctx.client;
@@ -1371,7 +1374,7 @@ fn fs_export(app: &mut App, href: String, name: String, path: String) {
                 Some(n) => format!("{repo}versions/{n}/"),
                 None => s(&c.get::<Value>(&repo, &[]).await?, "latest_version_href"),
             };
-            let body = if publication {
+            let mut body = if publication {
                 let q = [("repository_version", v.clone()), ("ordering", "-pulp_created".into()), ("limit", "1".into())];
                 let newest = c.list::<Value>(&c.api(t.publications()), &q).await?.results.first().map(|p| s(p, "pulp_href"));
                 let p = newest
@@ -1380,6 +1383,9 @@ fn fs_export(app: &mut App, href: String, name: String, path: String) {
             } else {
                 json!({ "repository_version": v })
             };
+            if let Some(s) = start {
+                body["start_repository_version"] = s.into();
+            }
             ops::create(c, &format!("{href}exports/"), &body, "/exports/", &ctx.on_task()).await?;
             let what = if publication { "publication" } else { "repository version" };
             ap(move |app| app.ok(format!("export {name}: {what} written to {path}")))
@@ -2472,6 +2478,22 @@ mod tests {
             [json!({ "publication": format!("{PUBS}9/") }), json!({ "repository_version": format!("{REPO}versions/2/") })],
             "the newest publication of the latest version; nothing for a version without one"
         );
+
+        // A start version: Pulp writes only the files that it lacks (and the metadata of a publication).
+        let (mut f, mut submit) = open_form(&mut app, Act::Export, item.clone());
+        for (k, v) in [("repo", REPO), ("number", "2"), ("what", "repository version"), ("start", "1")] {
+            set(&mut f, k, v);
+        }
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let want = json!({ "repository_version": format!("{REPO}versions/2/"), "start_repository_version": format!("{REPO}versions/1/") });
+        assert_eq!(sent(&server).await.pop().unwrap().2, want);
+        // A server without the field: not offered.
+        let mut caps = crate::pulp::Capabilities::default();
+        caps.schemas.insert("FilesystemExport".into(), ["publication", "repository_version"].map(String::from).into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let (f, _) = open_form(&mut app, Act::Export, item);
+        assert_eq!(f.fields.iter().map(|x| x.key.as_str()).collect::<Vec<_>>(), ["repo", "number", "what"]);
     }
 
     const IMP: &str = "/pulp/api/v3/importers/core/pulp/1/";

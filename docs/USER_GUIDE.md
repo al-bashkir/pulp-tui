@@ -702,6 +702,7 @@ Pulp exporters:
   * **Versions** (`web=3,os=7`): export these versions; the others get their latest version.
   * At the end, pulp-tui shows the TOC file (`<directory>/export-<id>-<time>-toc.json`) and the
     output files. Copy them to the disconnected server and import the TOC there.
+  * There is no dry run: pulpcore 3.123.1 accepts `dry_run` but writes the export all the same.
 * **o** lists the exports (time, repository versions, TOC). **d** on an export deletes its record.
 * **d** on an exporter shows its number of exports; type its name. The export files stay on the
   server disk.
@@ -710,7 +711,9 @@ Filesystem exporters write the plain files of one publication or version:
 
 * **c** / **e**: name, directory, method (`write`, `hardlink` or `symlink`).
 * **E**: a repository, a version (empty = latest), and the publication (the newest of that
-  version) or the version.
+  version) or the version. **Start version number** (optional, same repository): Pulp writes
+  only the files that this version does not have (a publication: and all its metadata files),
+  for example the changes since the version of the previous export.
 * The directory must not exist. Change it before the next export.
 
 ### Importers

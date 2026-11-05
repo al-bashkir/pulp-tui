@@ -113,6 +113,28 @@ async fn pulp_export_and_import_of_a_file_repository() {
     cleanup(&c, &[&dst, &repo, &remote]).await;
 }
 
+/// pulpcore 3.123.1 declares `dry_run` on a Pulp export but no code reads it: the task writes the export and
+/// makes it the exporter's last export (the base of the next incremental one). So the Export form does not offer
+/// it (audit F28). A pulpcore that implements it fails here: then offer it.
+#[tokio::test]
+async fn pulp_export_dry_run_still_writes_the_export() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = unique("it-dryrun");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &name, "file/PULP_MANIFEST", "mirror").await;
+    let body = json!({ "name": name, "path": format!("{EXPORTS}/{name}"), "repositories": [repo] });
+    let exporter = create(&c, "exporters/core/pulp/", body, "/exporters/").await;
+    let export = ops::create(&c, &format!("{exporter}exports/"), &json!({ "dry_run": true }), "/exports/", &no_progress).await.unwrap();
+    let e: Value = c.get(&export, &[]).await.unwrap();
+    let files = e["output_file_info"].as_object().unwrap();
+    assert!(files.keys().any(|f| f.ends_with(".tar")) && e["toc_info"]["file"].is_string(), "{e}");
+    let ex: Value = c.get(&exporter, &[]).await.unwrap();
+    assert_eq!(ex["last_export"].as_str(), Some(export.as_str()));
+    cleanup(&c, &[&exporter, &repo, &remote]).await;
+}
+
 #[tokio::test]
 async fn filesystem_export_of_a_file_publication() {
     if !live_enabled() {
