@@ -303,7 +303,8 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   (`constants.py:124`) of `pulp_created` in UTC (`TIME_ZONE = "UTC"`, `settings.py:215`).
   Another timestamp redirects to the one of the served publication, and the bare base path is a
   listing of the timestamps (`CheckpointListings`); a file directly under it gets HTTP 301.
-  Verify reads the newest checkpoint publication at its timestamp. The rollback confirm reads
+  Verify reads the newest checkpoint publication at its timestamp, and fallback replication
+  syncs the replica from there (all types; `live_replication`, File). The rollback confirm reads
   the distribution again, so a Checkpoint set after the preview is refused too. The publication
   delete impact names `<base path>/<timestamp>/` of a deleted checkpoint publication and the
   older checkpoint publication that it then serves (or nothing); a deleted publication that is

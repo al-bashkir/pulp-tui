@@ -688,6 +688,10 @@ Native Upstream Pulp objects (tech preview).
     has a signing service; the dry run row says when the upstream is signed and the replica will
     not be. Set the service before the first run: a rerun reuses the publication of an unchanged
     version.
+  * A checkpoint distribution serves its checkpoints at `<base path>/<timestamp>/` only. The
+    replica syncs the newest checkpoint at the time of the run (the row names its timestamp); a
+    later run moves the replica to the checkpoint that is newest then. An upstream checkpoint
+    distribution without a checkpoint publication is a `SKIP` row.
   * It does not follow an upstream base path change: the row shows a 409 conflict. Delete or move
     the replica distribution by hand.
 

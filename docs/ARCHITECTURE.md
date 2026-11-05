@@ -294,6 +294,8 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
   * A dry run shows CREATE / SYNC / SKIP. The run checks the label again.
   * Objects without the label are conflicts and are skipped.
   * A File item without a readable served manifest is skipped (no URL guess).
+  * A checkpoint distribution: the remote URL is its newest checkpoint publication at
+    `<base>/<timestamp>/` (`ops::served_url`); the bare base path only lists the timestamps.
   * Deb: the remote's `distributions` are the `dists/` directories of the served
     publication (`deb::layout`, as verify probes them). The replica publishes in the mode of
     that publication (`ops::publication_mode`, verbatim too), without its signing service:

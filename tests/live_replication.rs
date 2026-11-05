@@ -250,6 +250,40 @@ async fn deb_fallback_replication() {
     assert!(res.iter().all(|l| l.starts_with("completed")), "{res:?}");
 }
 
+/// A checkpoint File distribution on pulp2 serves its newest checkpoint publication at `<base>/<timestamp>/` only. The
+/// replica on pulp1 syncs from there, says so in the dry run, and serves the files.
+#[tokio::test]
+async fn checkpoint_fallback_replication() {
+    if !live_enabled() {
+        return;
+    }
+    let (dst, up) = (client(), upstream_client());
+    let t = RepoType::File;
+    if !Capabilities::detect(&up).await.unwrap().has_field(t.distribution_schema(), "checkpoint") {
+        eprintln!("skipping: the upstream distributions have no `checkpoint` field (older pulpcore)");
+        return;
+    }
+    let prefix = unique("fbcp");
+    let (repo, _) = synced_repo(&up, t, &prefix, "file/PULP_MANIFEST", "mirror").await;
+    // Pulp makes a checkpoint publication only with `repository` (of its latest version).
+    create(&up, t.publications(), json!({ "repository": repo, "checkpoint": true }), "/publications/").await;
+    let body = json!({ "name": prefix, "base_path": prefix, "repository": repo, "checkpoint": true });
+    create(&up, t.distributions(), body, "/distributions/").await;
+
+    let plan = replication::plan(&up, &dst, &[t], &prefix, None).await.unwrap();
+    assert_eq!(plan.len(), 1, "{plan:?}");
+    let url = &plan[0].remote_url;
+    let at = url.trim_end_matches("/PULP_MANIFEST").rsplit('/').next().unwrap();
+    assert!(url.ends_with("Z/PULP_MANIFEST") && url.contains(&format!("/{prefix}/{at}/")), "{url}");
+    let note = format!("the replica follows the newest checkpoint at the time of the run ({at})");
+    assert!(plan[0].note.ends_with(&note), "{}", plan[0].note);
+    let store = Store::open_in_memory().await.unwrap();
+    let res = replication::run(&dst, &store, up.profile(), &plan, false, &|_| {}, &no_progress).await.unwrap();
+    assert!(res.iter().all(|l| l.starts_with("completed")), "{res:?}");
+    let d: Distribution = ops::find_by_name(&dst, &dst.api(t.distributions()), &prefix).await.unwrap().unwrap();
+    assert_eq!(served(&dst, &format!("{}docs/readme.txt", d.base_url.unwrap())).await.0, 200);
+}
+
 /// `export-repos` on pulp2 and `import-repos` on pulp1: a repository gets the remote of the same name on pulp1,
 /// no secret is in the file, and a rerun keeps everything.
 #[tokio::test]

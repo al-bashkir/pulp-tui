@@ -136,33 +136,47 @@ pub async fn plan(
                 continue;
             }
             let base = if base.ends_with('/') { base } else { format!("{base}/") };
-            let mut upstream_signed = false;
-            it.remote_url = match t {
-                RepoType::Rpm => base,
-                RepoType::File => {
-                    // pulp_file serves only from publications: only a served manifest name makes a remote URL.
-                    // The capabilities matter only for Deb publications, which this File branch never reads.
-                    let m = match ops::served_publication(src, &Capabilities::default(), t, &serde_json::to_value(&d)?).await {
-                        Err(e) => Err(format!("upstream publication not readable: {e}")),
-                        Ok(None) => Err("upstream distribution serves nothing (no publication)".to_string()),
-                        Ok(Some(p)) => p["manifest"].as_str().map(str::to_string).ok_or("upstream publication has no manifest".to_string()),
-                    };
-                    match m {
-                        Ok(m) => {
-                            it.manifest = Some(m.clone());
-                            format!("{base}{m}")
-                        }
-                        Err(note) => {
-                            it.note = note;
-                            out.push(it);
-                            continue;
-                        }
+            // The served publication: pulp_file serves only from publications (its manifest name makes the URL), the
+            // Deb layout depends on it, and a checkpoint distribution serves its newest checkpoint publication at
+            // `<base>/<timestamp>/` only (its bare base path lists the timestamps). An RPM one that is not a
+            // checkpoint distribution needs no read. No OpenAPI: unknown endpoints count as present, so the Deb
+            // verbatim publications of a repository are read too.
+            let served = if t == RepoType::Rpm && !d.checkpoint {
+                Value::Null
+            } else {
+                match ops::served_publication(src, &Capabilities::default(), t, &json!(d)).await {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        it.note = "upstream distribution serves nothing (no publication)".into();
+                        out.push(it);
+                        continue;
+                    }
+                    Err(e) => {
+                        it.note = format!("upstream publication not readable: {e}");
+                        out.push(it);
+                        continue;
                     }
                 }
-                RepoType::Deb => match deb_source(src, &d).await {
+            };
+            let url = ops::served_url(&base, d.checkpoint, &served);
+            let mut upstream_signed = false;
+            it.remote_url = match t {
+                RepoType::Rpm => url.clone(),
+                RepoType::File => match served["manifest"].as_str() {
+                    Some(m) => {
+                        it.manifest = Some(m.into());
+                        format!("{url}{m}")
+                    }
+                    None => {
+                        it.note = "upstream publication has no manifest".into();
+                        out.push(it);
+                        continue;
+                    }
+                },
+                RepoType::Deb => match deb_source(src, &served).await {
                     Ok((dists, mode, signed)) => {
                         (it.distributions, it.mode, upstream_signed) = (Some(dists), mode, signed);
-                        base
+                        url.clone()
                     }
                     Err(note) => {
                         it.note = note;
@@ -201,29 +215,31 @@ pub async fn plan(
             if it.action != PlanAction::Skip && upstream_signed && !replica_signs {
                 it.note += "; upstream Release is signed, the replica will be unsigned (the destination repository has no signing service)";
             }
+            if it.action != PlanAction::Skip && d.checkpoint {
+                let at = url.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+                it.note += &format!(
+                    "; upstream is a checkpoint distribution: the replica follows the newest checkpoint at the time of the run ({at})"
+                );
+            }
             out.push(it);
         }
     }
     Ok(out)
 }
 
-/// What the Deb replica of upstream distribution `d` syncs and how it publishes: the `dists/` directories of the
-/// served publication (`deb::layout`), the publication's mode without its signing service (an upstream href), and
-/// whether upstream signs that APT publication. pulp_deb signs with the publication's service, else with the
-/// repository's release override (structured releases only) or service. A verbatim publication serves the synced
+/// What the Deb replica of the upstream publication `p` (the one its distribution serves) syncs and how it publishes:
+/// the `dists/` directories of `p` (`deb::layout`), the publication's mode without its signing service (an upstream
+/// href), and whether upstream signs that APT publication. pulp_deb signs with the publication's service, else with
+/// the repository's release override (structured releases only) or service. A verbatim publication serves the synced
 /// signatures as they are, so its replica serves them too. Only the API is read: `base_url` is the upstream content
 /// origin as the destination server reaches it, which this client may not resolve. `Err`: the note of a SKIP row.
 /// shortcut: a verbatim publication of a flat repository (`/`) is served at the root, but `layout` gives `flat-repo`;
 /// read the synced Release files when a flat upstream must be replicated.
-async fn deb_source(src: &PulpClient, d: &Distribution) -> std::result::Result<(String, Value, bool), String> {
+async fn deb_source(src: &PulpClient, p: &Value) -> std::result::Result<(String, Value, bool), String> {
     let unreadable = |e: PulpError| format!("upstream publication not readable: {e}");
-    // No OpenAPI: unknown endpoints count as present, so the verbatim publications of a repository are read too.
-    let Some(p) = ops::served_publication(src, &Capabilities::default(), RepoType::Deb, &json!(d)).await.map_err(unreadable)? else {
-        return Err("upstream distribution serves nothing (no publication)".into());
-    };
     let version = p["repository_version"].as_str().unwrap_or_default();
-    let (dists, _) = deb::layout(src, version, &p).await.map_err(unreadable)?;
-    let mut mode = ops::publication_mode(RepoType::Deb, &p);
+    let (dists, _) = deb::layout(src, version, p).await.map_err(unreadable)?;
+    let mut mode = ops::publication_mode(RepoType::Deb, p);
     if let Some(m) = mode.as_object_mut() {
         m.remove("signing_service");
     }
@@ -710,6 +726,84 @@ mod tests {
         let plan = plan(&client(&up, "up"), &client(&down, "down"), &[RepoType::File], "", None).await.unwrap();
         assert_eq!((plan[0].remote_url.as_str(), &plan[0].action), ("https://up/pulp/content/files/CUSTOM", &PlanAction::Create));
         assert_eq!(plan[0].manifest.as_deref(), Some("CUSTOM"), "the replica publishes under that name too");
+    }
+
+    /// A checkpoint distribution serves its newest checkpoint publication at `<base>/<timestamp>/` only (its bare
+    /// base path lists the timestamps): the replica remote syncs from there, for every type, and the note says so.
+    #[tokio::test]
+    async fn a_checkpoint_distribution_is_replicated_from_its_newest_checkpoint() {
+        use wiremock::matchers::{method, path, query_param};
+        let (up, down) = (wiremock::MockServer::start().await, wiremock::MockServer::start().await);
+        serve_status(&up, &["rpm", "file"]).await;
+        serve_status(&down, &["rpm", "file"]).await;
+        let page = |r: Value| json!({ "count": r.as_array().map_or(0, Vec::len), "next": null, "results": r });
+        let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+        let dist = |t: &str, name: &str, repo: &str| {
+            json!({ "pulp_href": format!("/pulp/api/v3/distributions/{t}/{t}/{name}/"), "name": name, "base_path": name,
+                "base_url": format!("https://up/pulp/content/{name}/"), "repository": repo, "checkpoint": true })
+        };
+        let (os, empty, files) =
+            ("/pulp/api/v3/repositories/rpm/rpm/1/", "/pulp/api/v3/repositories/rpm/rpm/2/", "/pulp/api/v3/repositories/file/file/1/");
+        let rpm_dists = json!([dist("rpm", "empty", empty), dist("rpm", "os", os)]);
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/distributions/rpm/rpm/"))
+            .respond_with(ok(page(rpm_dists)))
+            .mount(&up)
+            .await;
+        let file_dists = json!([dist("file", "files", files)]);
+        wiremock::Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/distributions/file/file/"))
+            .respond_with(ok(page(file_dists)))
+            .mount(&up)
+            .await;
+        let publication = |repo: &str, n: u32, created: &str, checkpoint: bool| {
+            json!({ "pulp_href": format!("{repo}p/{n}/"), "repository_version": format!("{repo}versions/{n}/"), "pulp_created": created,
+                "checkpoint": checkpoint, "manifest": "PULP_MANIFEST" })
+        };
+        // The newest checkpoint publication counts, not a newer one that is no checkpoint.
+        let pubs = [
+            (
+                "rpm",
+                os,
+                json!([
+                    publication(os, 1, "2026-01-01T00:00:00Z", true),
+                    publication(os, 2, "2026-02-03T04:05:06.123456Z", true),
+                    publication(os, 3, "2026-03-01T00:00:00Z", false)
+                ]),
+            ),
+            ("rpm", empty, json!([publication(empty, 1, "2026-01-01T00:00:00Z", false)])),
+            ("file", files, json!([publication(files, 1, "2026-03-01T10:20:30Z", true)])),
+        ];
+        for (t, repo, p) in pubs {
+            wiremock::Mock::given(method("GET"))
+                .and(path(format!("/pulp/api/v3/publications/{t}/{t}/")))
+                .and(query_param("repository", repo))
+                .respond_with(ok(page(p)))
+                .mount(&up)
+                .await;
+        }
+        wiremock::Mock::given(method("GET")).respond_with(ok(page(json!([])))).mount(&down).await;
+        let plan = plan(&client(&up, "up"), &client(&down, "down"), &[RepoType::Rpm, RepoType::File], "", None).await.unwrap();
+        let rows: Vec<_> = plan.iter().map(|i| (i.name.as_str(), &i.action, i.remote_url.as_str(), i.note.as_str())).collect();
+        let follows = |ts: &str| {
+            format!(
+                "new remote + repository + distribution; upstream is a checkpoint distribution: the replica follows the newest \
+                 checkpoint at the time of the run ({ts})"
+            )
+        };
+        assert_eq!(
+            rows,
+            [
+                ("empty", &PlanAction::Skip, "", "upstream distribution serves nothing (no publication)"),
+                ("os", &PlanAction::Create, "https://up/pulp/content/os/20260203T040506Z/", follows("20260203T040506Z").as_str()),
+                (
+                    "files",
+                    &PlanAction::Create,
+                    "https://up/pulp/content/files/20260301T102030Z/PULP_MANIFEST",
+                    follows("20260301T102030Z").as_str()
+                ),
+            ]
+        );
     }
 
     /// Only a manifest that the upstream serves makes a remote URL; the plan goes on with the other distributions.
