@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions, AnyRow};
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{AnyConnection, AnyPool, ConnectOptions, Connection, Executor, Row};
+use sqlx::{AnyConnection, AnyPool, AssertSqlSafe, ConnectOptions, Connection, Executor, Row};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
@@ -406,12 +406,12 @@ async fn migrate_on(c: &mut AnyConnection, b: Backend, upto: usize) -> Result<i6
     for (i, m) in list.iter().enumerate().take(upto).skip(v as usize) {
         let mut tx = c.begin().await?;
         // `Executor::execute`, not `RawSql::execute`: rustc cannot prove the latter `Send` in a spawned job.
-        tx.execute(sqlx::raw_sql(m)).await.with_context(|| format!("migration {}", i + 1))?;
+        tx.execute(sqlx::raw_sql(*m)).await.with_context(|| format!("migration {}", i + 1))?;
         let set = match b {
             Backend::Sqlite => format!("PRAGMA user_version = {}", i + 1),
             Backend::Postgres => format!("DELETE FROM schema_version; INSERT INTO schema_version(version) VALUES ({})", i + 1),
         };
-        tx.execute(sqlx::raw_sql(&set)).await?;
+        tx.execute(sqlx::raw_sql(AssertSqlSafe(set))).await?; // only the batch number goes in; PRAGMA cannot bind
         tx.commit().await?;
     }
     Ok(v)
@@ -885,7 +885,7 @@ impl Store {
         let sql =
             format!("SELECT v.state, v.number, c.name FROM cv_versions v JOIN content_views c ON c.id = v.cv_id WHERE v.id = $1{share}");
         for u in used {
-            let r = sqlx::query(&sql).bind(u).fetch_one(&mut *tx).await?;
+            let r = sqlx::query(AssertSqlSafe(sql.as_str())).bind(u).fetch_one(&mut *tx).await?; // `share` is a literal
             let (state, n, name): (String, i64, String) = (r.try_get(0)?, r.try_get(1)?, r.try_get(2)?);
             if state != "published" {
                 bail!("version v{n} of {name} is no longer published");
@@ -1197,8 +1197,8 @@ impl Store {
 
     /// Forget view `cv_id` in environment `env_id`: its served rows, then its binding.
     pub async fn delete_binding(&self, env_id: i64, cv_id: i64) -> Result<()> {
-        for t in ["binding_repos", "bindings"] {
-            sqlx::query(&format!("DELETE FROM {t} WHERE env_id = $1 AND cv_id = $2")).bind(env_id).bind(cv_id).execute(&self.pool).await?;
+        for sql in ["DELETE FROM binding_repos WHERE env_id = $1 AND cv_id = $2", "DELETE FROM bindings WHERE env_id = $1 AND cv_id = $2"] {
+            sqlx::query(sql).bind(env_id).bind(cv_id).execute(&self.pool).await?;
         }
         Ok(())
     }
@@ -2538,8 +2538,8 @@ mod tests {
         let s = Store::open_in_memory().await.unwrap();
         let cv = s.create_cv("k", "web", "").await.unwrap();
         let insert = format!("INSERT INTO locks VALUES ({cv}, 'a@h', 't', 'publish', '2026-01-01T00:00:00Z', 1)");
-        sqlx::raw_sql(&insert).execute(&s.pool).await.unwrap();
-        assert!(sqlx::raw_sql(&insert).execute(&s.pool).await.is_err(), "one lock per view");
+        sqlx::raw_sql(AssertSqlSafe(insert.as_str())).execute(&s.pool).await.unwrap();
+        assert!(sqlx::raw_sql(AssertSqlSafe(insert.as_str())).execute(&s.pool).await.is_err(), "one lock per view");
         s.delete_cv(cv).await.unwrap();
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM locks").fetch_one(&s.pool).await.unwrap();
         assert_eq!(n, 0);

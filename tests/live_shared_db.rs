@@ -13,7 +13,7 @@ use pulp_tui::cv::CvLock;
 use pulp_tui::pulp::RepoType;
 use pulp_tui::store::{BindingRepo, CvRepo, CvVersion, CvVersionRepo, NotMigrated, PG_MIGRATIONS, Store};
 use pulp_tui::tui::app::{App, NO_PROFILE};
-use sqlx::{Connection, Executor};
+use sqlx::{AssertSqlSafe, Connection, Executor};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,7 +41,7 @@ impl Schema {
         let name = unique("ptui").replace('-', "_");
         sqlx::any::install_default_drivers();
         let mut c = sqlx::AnyConnection::connect(&admin).await.expect("PostgreSQL is not reachable; run tests/env/pulp-env.sh pg-up");
-        c.execute(sqlx::raw_sql(&format!("CREATE SCHEMA {name}"))).await.unwrap();
+        c.execute(sqlx::raw_sql(AssertSqlSafe(format!("CREATE SCHEMA {name}")))).await.unwrap();
         let db = Database { url: format!("{base}?options=-csearch_path%3D{name}"), secret, ca_cert: None };
         Schema { name, db, admin }
     }
@@ -65,13 +65,13 @@ impl Schema {
     /// Pretend that another pulp-tui version migrated this schema.
     async fn set_version(&self, v: i64) {
         let mut c = sqlx::AnyConnection::connect(&self.connect()).await.unwrap();
-        c.execute(sqlx::raw_sql(&format!("UPDATE schema_version SET version = {v}"))).await.unwrap();
+        c.execute(sqlx::raw_sql(AssertSqlSafe(format!("UPDATE schema_version SET version = {v}")))).await.unwrap();
     }
 
     /// Best-effort; a failed test leaves its schema behind (`pg-down` removes everything).
     async fn drop_schema(self) {
         if let Ok(mut c) = sqlx::AnyConnection::connect(&self.admin).await {
-            let _ = c.execute(sqlx::raw_sql(&format!("DROP SCHEMA {} CASCADE", self.name))).await;
+            let _ = c.execute(sqlx::raw_sql(AssertSqlSafe(format!("DROP SCHEMA {} CASCADE", self.name)))).await;
         }
     }
 }
@@ -132,7 +132,7 @@ async fn postgres_migration_3_keeps_served_paths() {
     {
         let mut c = sqlx::AnyConnection::connect(&s.connect()).await.unwrap();
         for m in &PG_MIGRATIONS[..2] {
-            c.execute(sqlx::raw_sql(m)).await.unwrap();
+            c.execute(sqlx::raw_sql(*m)).await.unwrap();
         }
         // "Dev" and "dev" share the segment `dev`. The new store code writes columns schema 2 lacks, so this is raw SQL.
         c.execute(sqlx::raw_sql(
@@ -169,7 +169,7 @@ async fn postgres_served_rows_need_their_environment() {
     {
         let mut c = sqlx::AnyConnection::connect(&s.connect()).await.unwrap();
         for m in &PG_MIGRATIONS[..5] {
-            c.execute(sqlx::raw_sql(m)).await.unwrap();
+            c.execute(sqlx::raw_sql(*m)).await.unwrap();
         }
         c.execute(sqlx::raw_sql(
             "INSERT INTO schema_version(version) VALUES (5);
