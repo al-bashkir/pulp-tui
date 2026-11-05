@@ -67,7 +67,7 @@ async fn pulp_export_and_import_of_a_file_repository() {
     let tmp = tempfile::tempdir().unwrap();
     let new_file = tmp.path().join("new.txt");
     std::fs::write(&new_file, format!("{name} new\n")).unwrap();
-    ops::upload(&c, RepoType::File, &new_file, Some("new.txt"), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
+    ops::upload(&c, RepoType::File, &new_file, Some("new.txt"), Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
     let inc = ops::create(&c, &exports, &json!({ "full": false }), "/exports/", &no_progress).await.unwrap();
     let e: Value = c.get(&inc, &[]).await.unwrap();
     assert_eq!(e["params"], json!({ "full": false }));

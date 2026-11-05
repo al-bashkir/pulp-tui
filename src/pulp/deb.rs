@@ -132,17 +132,20 @@ async fn served_package(c: &PulpClient, base: &str, p: &DebPackage, index: &str)
 
 /// Upload a `.deb` (`ops::upload_fields`), optionally into `repository`. There pulp_deb lists it in component
 /// `component` of distribution `distribution` (it adds the release records); each one left out is the server
-/// default (`pulp`, `upload`). Pulp sets the pool path from the package.
+/// default (`pulp`, `upload`). Pulp sets the pool path from the package. `overwrite`: as `ops::upload`.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload(
     c: &PulpClient,
     path: &Path,
     repository: Option<&str>,
     distribution: Option<&str>,
     component: Option<&str>,
+    overwrite: bool,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
     on: OnTask<'_>,
 ) -> Result<UploadResult> {
-    let fields = [("repository", repository), ("distribution", distribution), ("component", component)];
+    let overwrite = (!overwrite).then_some("false");
+    let fields = [("repository", repository), ("distribution", distribution), ("component", component), ("overwrite", overwrite)];
     let fields = fields.into_iter().filter_map(|(k, v)| Some((k, v?.to_string()))).collect();
     ops::upload_fields(c, RepoType::Deb, path, fields, progress, on).await
 }

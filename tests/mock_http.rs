@@ -608,13 +608,14 @@ async fn deb_package_upload_sends_the_release_and_checks_the_package() {
         let c = client(&server, |_, s| s.upload_chunk_mb = 1);
 
         let (dist, comp) = (release.map(|r| r.0), release.map(|r| r.1));
-        let r = deb::upload(&c, &file, Some(&repo), dist, comp, &|_, _| {}, &no_progress).await.unwrap();
+        // Overwrite on is the server default: not sent.
+        let r = deb::upload(&c, &file, Some(&repo), dist, comp, true, &|_, _| {}, &no_progress).await.unwrap();
         assert_eq!((r.content_href, r.sha256), (pkg.clone(), sha));
         let sent = server.received_requests().await.unwrap();
         let post = sent.iter().find(|r| r.url.path() == format!("{API}content/deb/packages/")).unwrap();
         let body = String::from_utf8_lossy(&post.body).replace("\r\n", "\n");
         let field = |k: &str, v: &str| format!("name=\"{k}\"\n\n{v}\n");
-        assert!(body.contains(&field("repository", &repo)) && !body.contains("relative_path"), "{body}");
+        assert!(body.contains(&field("repository", &repo)) && !body.contains("relative_path") && !body.contains("overwrite"), "{body}");
         match release {
             Some((d, cp)) => assert!(body.contains(&field("distribution", d)) && body.contains(&field("component", cp)), "{body}"),
             None => assert!(!body.contains("distribution") && !body.contains("component"), "{body}"),

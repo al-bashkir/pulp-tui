@@ -119,6 +119,7 @@ General rules:
 | Distribution                   | `hidden`, `checkpoint`; RPM `generate_repo_config`                                       |
 | Publication (**c**)            | options of `rpm.RpmPublication`, `file.FilePublication`, `deb.AptPublication`            |
 | Deb upload (**u**)             | `distribution`, `component` of `deb.Package`                                             |
+| Upload (**u**)                 | `overwrite` of `rpm.Package`, `file.FileContent`, `deb.Package`                          |
 | Sync                           | `optimize` (RPM, File, Deb), `skip_types` (RPM): `{Rpm,File,Apt}RepositorySyncURL`       |
 | Upstream Pulp (`UpstreamPulp`) | `policy`, replica download policy, concurrency, retries, timeouts                        |
 
@@ -418,6 +419,14 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   `replace` first removes the groups, categories, environments and langpacks. The advisory
   JSON needs `id`, `issued` and `updated`; a package without `sum_type` fails with
   `[RPM0018] "None" is not supported.`
+* **Upload `overwrite`** (pulpcore 3.123.1 `NoArtifactContentUploadSerializer`; write-only,
+  default true, used only with `repository`). False: before the new version,
+  `Repository.check_content_overwrite` compares the `repo_key_fields` of the content type
+  (File `relative_path`; RPM `name`, `version`, `release`, `arch`, `location_href`) with the
+  latest version, and other content with the same key fails the task
+  (`ContentOverwriteError`; the same content again is no conflict). pulp-tui sends it only when
+  off. On pulp1 the second File upload to the same path failed and the version kept the first
+  file (`file_upload_without_overwrite_keeps_the_file_of_the_same_path`).
 * **Chunked uploads** (pulpcore 3.123.1): the commit task deletes the upload
   (`tasks/upload.py`), so `uploads/` lists only uploads that are not committed. The list has
   no date filter (`size` filters only); `ordering=pulp_created` lists the oldest first.

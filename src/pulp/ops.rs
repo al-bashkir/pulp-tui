@@ -742,18 +742,24 @@ pub fn chunked(c: &PulpClient, size: u64) -> bool {
 
 /// Upload a local file as RPM package, File content or Deb package, optionally adding it to a repository
 /// (`relative_path`: File only; Deb sets the pool path itself, see `deb::upload` for its release).
+/// `overwrite` false: the task fails when the repository has other content with the same key (Pulp's default replaces it).
+#[allow(clippy::too_many_arguments)]
 pub async fn upload(
     c: &PulpClient,
     t: RepoType,
     path: &Path,
     relative_path: Option<&str>,
     repository: Option<&str>,
+    overwrite: bool,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
     on: OnTask<'_>,
 ) -> Result<UploadResult> {
     let mut fields: Vec<(&str, String)> = vec![];
     if let Some(r) = repository {
         fields.push(("repository", r.into()));
+    }
+    if !overwrite {
+        fields.push(("overwrite", "false".into()));
     }
     match t {
         RepoType::Rpm | RepoType::Deb => {}

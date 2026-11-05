@@ -300,7 +300,7 @@ async fn checkpoint_distribution_verifies_and_refuses_rollback() {
         let path = dir.path().join(format!("{i}.txt"));
         // Unique bytes, so a rerun does not find the content unit of an earlier run.
         std::fs::write(&path, format!("{name} {i}\n")).unwrap();
-        ops::upload(&c, t, &path, Some(&format!("{i}.txt")), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
+        ops::upload(&c, t, &path, Some(&format!("{i}.txt")), Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
         // Pulp makes a checkpoint publication only with `repository` (of its latest version).
         create(&c, t.publications(), json!({ "repository": repo, "checkpoint": true }), "/publications/").await;
     }

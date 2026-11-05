@@ -1430,6 +1430,15 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                     .map(|(k, label, help)| Field::text(k, label).help(help)),
                 ),
             }
+            let schema = match t {
+                RepoType::Rpm => "rpm.Package",
+                RepoType::File => "file.FileContent",
+                RepoType::Deb => "deb.Package",
+            };
+            if caps(app).is_none_or(|c| c.has_field(schema, "overwrite")) {
+                let help = "off = fail when the repository has other content with the same key (File: relative path)";
+                fields.push(Field::new("overwrite", "Overwrite", FieldKind::Bool).value("true").help(help));
+            }
             app.form(
                 Form::new(format!("Upload to {name}"), fields)
                     .note("Large files use the chunked upload API; the server digest is verified."),
@@ -1439,7 +1448,8 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         return Err(format!("{} is not a readable file", path.display()));
                     }
                     let [rel, dist, comp] = ["relative_path", "distribution", "component"].map(|k| f.opt(k).map(str::to_string));
-                    let href = href.clone();
+                    // Without the field (an older server) nothing is sent.
+                    let (href, overwrite) = (href.clone(), f.get("overwrite") != "false");
                     app.job(format!("upload {}", path.display()), move |ctx| async move {
                         if ops::chunked(&ctx.client, tokio::fs::metadata(&path).await?.len()) {
                             ctx.caps.require(Feature::ChunkedUpload)?;
@@ -1450,8 +1460,12 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                         };
                         let (c, on) = (&ctx.client, ctx.on_task());
                         let r = match t {
-                            RepoType::Deb => deb::upload(c, &path, Some(&href), dist.as_deref(), comp.as_deref(), &progress, &on).await?,
-                            RepoType::Rpm | RepoType::File => ops::upload(c, t, &path, rel.as_deref(), Some(&href), &progress, &on).await?,
+                            RepoType::Deb => {
+                                deb::upload(c, &path, Some(&href), dist.as_deref(), comp.as_deref(), overwrite, &progress, &on).await?
+                            }
+                            RepoType::Rpm | RepoType::File => {
+                                ops::upload(c, t, &path, rel.as_deref(), Some(&href), overwrite, &progress, &on).await?
+                            }
                         };
                         let version = r.task.as_ref().and_then(|t| t.created_matching("/versions/"));
                         let version = version.map(|v| format!(": new version {}", version_number(&v))).unwrap_or_default();
@@ -7709,6 +7723,42 @@ mod tests {
         }
     }
 
+    /// Overwrite (pulpcore, default on): off sends `overwrite=false`, so the task fails instead of replacing other
+    /// content with the same key; on sends nothing.
+    #[tokio::test]
+    async fn an_upload_with_overwrite_off_says_so_and_the_default_sends_nothing() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (repo, file) = (format!("{API}repositories/file/file/r/"), format!("{API}content/file/files/1/"));
+        answer(&server, "POST", &format!("{API}content/file/files/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        let done = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [format!("{repo}versions/2/"), file] });
+        get(&server, &format!("{API}tasks/1/"), done).await;
+        get(&server, &file, json!({ "sha256": hex::encode(<sha2::Sha256 as sha2::Digest>::digest("a")) })).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "a").unwrap();
+        let (mut app, mut rx) = connected(&server).await;
+        for overwrite in ["false", "true"] {
+            repo_action(&mut app, RepoType::File, Act::Upload, json!({ "pulp_href": repo, "name": "iso" }));
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no upload form") };
+            assert_eq!(form.get("overwrite"), "true", "the server default");
+            set(&mut form, "path", &path.display().to_string());
+            set(&mut form, "overwrite", overwrite);
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+        }
+        let sent = server.received_requests().await.unwrap();
+        let posts: Vec<String> =
+            sent.iter().filter(|r| r.method.as_str() == "POST").map(|r| String::from_utf8_lossy(&r.body).replace("\r\n", "\n")).collect();
+        assert_eq!(posts.len(), 2);
+        assert!(
+            posts[0].contains("name=\"overwrite\"\n\nfalse\n") && posts[0].contains("name=\"relative_path\"\n\na.txt\n"),
+            "{}",
+            posts[0]
+        );
+        assert!(!posts[1].contains("overwrite"), "{}", posts[1]);
+    }
+
     #[tokio::test]
     async fn deb_upload_asks_for_the_release_and_reports_the_package_and_the_new_version() {
         use crate::tui::app::Modal;
@@ -7735,20 +7785,21 @@ mod tests {
             let Some(Modal::Form { form, submit }) = app.modal.take() else { panic!("no upload form") };
             (form, submit)
         };
-        assert_eq!(keys(&form(&mut app, RepoType::Rpm).0), ["path"]);
-        assert_eq!(keys(&form(&mut app, RepoType::File).0), ["path", "relative_path"]);
+        assert_eq!(keys(&form(&mut app, RepoType::Rpm).0), ["path", "overwrite"]);
+        assert_eq!(keys(&form(&mut app, RepoType::File).0), ["path", "relative_path", "overwrite"]);
 
         let (mut f, mut submit) = form(&mut app, RepoType::Deb);
-        assert_eq!(keys(&f), ["path", "distribution", "component"]);
+        assert_eq!(keys(&f), ["path", "distribution", "component", "overwrite"]);
         set(&mut f, "path", &deb.display().to_string());
         set(&mut f, "distribution", "bookworm");
         set(&mut f, "component", "main");
+        set(&mut f, "overwrite", "false");
         submit(&mut app, &f).unwrap();
         settle(&mut app, &mut rx).await;
         assert_eq!(last(&app), format!("uploaded {} (sha256 2aa5b79a98d5…) as 0190abcd-1234: new version 2", deb.display()));
         let sent = server.received_requests().await.unwrap();
         let body = String::from_utf8_lossy(&sent.iter().find(|r| r.method.as_str() == "POST").unwrap().body).replace("\r\n", "\n");
-        for (k, v) in [("repository", repo.as_str()), ("distribution", "bookworm"), ("component", "main")] {
+        for (k, v) in [("repository", repo.as_str()), ("distribution", "bookworm"), ("component", "main"), ("overwrite", "false")] {
             assert!(body.contains(&format!("name=\"{k}\"\n\n{v}\n")), "{k}: {body}");
         }
         assert!(body.contains("filename=\"hello_1.0_amd64.deb\""), "{body}");

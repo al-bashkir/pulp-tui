@@ -274,7 +274,7 @@ async fn an_uploaded_deb_package_is_published_and_served() {
     let name = unique("it-deb-upload");
     let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
     let file = fixtures().join("upstream/deb/pool/main/f/fixture-alpha/fixture-alpha_1.0-1_amd64.deb");
-    let up = deb::upload(&c, &file, Some(&repo), Some("uploads"), Some("main"), &|_, _| {}, &no_progress).await.unwrap();
+    let up = deb::upload(&c, &file, Some(&repo), Some("uploads"), Some("main"), true, &|_, _| {}, &no_progress).await.unwrap();
     assert!(up.content_href.contains("/content/deb/packages/"), "{}", up.content_href);
     let v1 = up.task.as_ref().and_then(|t| t.created_matching("/versions/")).expect("a new version");
     assert_eq!(v1, latest(&c, &repo).await);

@@ -195,6 +195,9 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
 * **u** uploads a local file: an RPM package, File content with its relative path, or a `.deb`
   package. Large files go in chunks with progress. pulp-tui verifies the server digest and
   deletes a failed chunked upload. The message names the new content and the new version.
+  * **Overwrite** (default on, as Pulp): the new content replaces other content of the repository
+    with the same key (File: the relative path; RPM: name, version, release, architecture and
+    location). Off: the task fails instead, and the repository does not change.
   * Deb: **Distribution** and **Component** name the release that lists the package (empty =
     `pulp` and `upload`, the pulp_deb defaults). Pulp adds the release records to the new
     version and sets the `pool/` path. A structured publication serves the package under

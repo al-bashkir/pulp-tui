@@ -30,11 +30,11 @@ async fn rpm_lifecycle() {
     // Local repository populated by upload; the digest is verified by ops::upload.
     let local = create(&c, t.repositories(), json!({ "name": format!("{name}-local") }), "/repositories/").await;
     let rpm = fixtures().join("rpms/fixture-upload-3.0-1.noarch.rpm");
-    let up = ops::upload(&c, t, &rpm, None, Some(&local), &|_, _| {}, &no_progress).await.unwrap();
+    let up = ops::upload(&c, t, &rpm, None, Some(&local), true, &|_, _| {}, &no_progress).await.unwrap();
     assert!(up.content_href.contains("/content/rpm/packages/"));
     assert!(latest(&c, &local).await.ends_with("/versions/1/"));
     // Uploading the same package again is idempotent for content and creates no new version.
-    ops::upload(&c, t, &rpm, None, Some(&local), &|_, _| {}, &no_progress).await.unwrap();
+    ops::upload(&c, t, &rpm, None, Some(&local), true, &|_, _| {}, &no_progress).await.unwrap();
     assert!(latest(&c, &local).await.ends_with("/versions/1/"));
 
     // Remote + sync; advisories survive (metadata is not dropped).
@@ -205,7 +205,7 @@ async fn file_lifecycle() {
 
     // Local repository: small single-request upload and a chunked upload (> 1 MiB chunk).
     let local = create(&c, t.repositories(), json!({ "name": format!("{name}-local") }), "/repositories/").await;
-    ops::upload(&c, t, &fixtures().join("files/one.txt"), Some("a/one.txt"), Some(&local), &|_, _| {}, &no_progress).await.unwrap();
+    ops::upload(&c, t, &fixtures().join("files/one.txt"), Some("a/one.txt"), Some(&local), true, &|_, _| {}, &no_progress).await.unwrap();
     let progress = std::sync::Mutex::new(vec![]);
     let up = ops::upload(
         &c,
@@ -213,6 +213,7 @@ async fn file_lifecycle() {
         &fixtures().join("files/big.bin"),
         Some("big.bin"),
         Some(&local),
+        true,
         &|d, _| progress.lock().unwrap().push(d),
         &no_progress,
     )
@@ -295,7 +296,7 @@ async fn served_versions_are_protected_from_delete() {
         let path = dir.path().join(format!("{i}.txt"));
         // Unique bytes, so a rerun does not find the content unit of an earlier run.
         std::fs::write(&path, format!("{name} {i}\n")).unwrap();
-        ops::upload(&c, t, &path, Some(&format!("{i}.txt")), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
+        ops::upload(&c, t, &path, Some(&format!("{i}.txt")), Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
         let version = latest(&c, &repo).await;
         ops::ensure_publication(&c, t, &version, &json!({}), &no_progress).await.unwrap();
         v.push(version);
@@ -345,7 +346,7 @@ async fn file_path_with_a_comma_is_served_and_verified() {
     let path = dir.path().join("q1.txt");
     // Unique bytes, so a rerun does not find the content unit of an earlier run.
     std::fs::write(&path, format!("{name}\n")).unwrap();
-    ops::upload(&c, t, &path, Some("reports/q1,2024.txt"), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
+    ops::upload(&c, t, &path, Some("reports/q1,2024.txt"), Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
     let version = latest(&c, &repo).await;
     let publication = ops::ensure_publication(&c, t, &version, &json!({}), &no_progress).await.unwrap();
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
@@ -373,7 +374,7 @@ async fn restored_version_is_served_after_publish() {
         let path = dir.path().join(format!("{i}.txt"));
         // Unique bytes, so a rerun does not find the content unit of an earlier run.
         std::fs::write(&path, format!("{name} {i}\n")).unwrap();
-        ops::upload(&c, t, &path, Some(&format!("{i}.txt")), Some(&repo), &|_, _| {}, &no_progress).await.unwrap();
+        ops::upload(&c, t, &path, Some(&format!("{i}.txt")), Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
         v.push(latest(&c, &repo).await);
     }
     let follow = json!({ "name": name, "base_path": name, "repository": repo });
@@ -707,4 +708,37 @@ async fn rpm_osv_config_survives_a_label_edit_through_the_tui() {
     let r: Value = c.get(&href, &[]).await.unwrap();
     assert_eq!((&r["osv_config"], &r["pulp_labels"]), (&Value::Null, &json!({ "a": "1" })));
     cleanup(&c, &[&href]).await;
+}
+
+/// Upload with Overwrite off (audit F28): other content with the same relative path fails the task and the
+/// repository keeps its file; the default (on) replaces it in a new version.
+#[tokio::test]
+async fn file_upload_without_overwrite_keeps_the_file_of_the_same_path() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::File, unique("it-overwrite"));
+    if !Capabilities::detect(&c).await.unwrap().has_field("file.FileContent", "overwrite") {
+        // The upload form hides the option on such a server (an older pulpcore answers 400 "Unexpected field").
+        eprintln!("skipping: this server's File uploads have no `overwrite` field (older pulpcore)");
+        return;
+    }
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, new) = (dir.path().join("old.txt"), dir.path().join("new.txt"));
+    // Unique bytes, so a rerun does not find the content units of an earlier run.
+    std::fs::write(&old, format!("{name} old\n")).unwrap();
+    std::fs::write(&new, format!("{name} new\n")).unwrap();
+    let up = |path, overwrite| ops::upload(&c, t, path, Some("same.txt"), Some(&repo), overwrite, &|_, _| {}, &no_progress);
+    let first = up(&old, false).await.unwrap().content_href;
+    let e = up(&new, false).await.unwrap_err();
+    assert!(e.to_string().contains("overwrite"), "{e}");
+    let content = async |v: String| {
+        let q = [("repository_version", v), ("fields", "pulp_href".to_string())];
+        c.list::<Value>(&c.api(t.content()), &q).await.unwrap().results.iter().map(|x| x["pulp_href"].clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(content(latest(&c, &repo).await).await, [json!(first)], "the old file stays");
+    let second = up(&new, true).await.unwrap().content_href;
+    assert_eq!(content(latest(&c, &repo).await).await, [json!(second)], "replaced");
+    cleanup(&c, &[&repo]).await;
 }
