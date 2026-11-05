@@ -7854,8 +7854,7 @@ mod tests {
         get(&server, &pkg, json!({ "sha256": hex::encode(<sha2::Sha256 as sha2::Digest>::digest("not really a deb")) })).await;
         let (mut app, mut rx) = connected(&server).await;
         let item = json!({ "pulp_href": repo, "name": "apt" });
-        // The task callback also queues a write of the task row; its notice can come after the upload one.
-        let last = |app: &App| app.notices.iter().rfind(|n| n.level == Level::Ok).map(|n| n.text.clone()).unwrap_or_default();
+        let last = |app: &App| app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
         let form = |app: &mut App, t| {
             repo_action(app, t, Act::Upload, item.clone());
             let Some(Modal::Form { form, submit }) = app.modal.take() else { panic!("no upload form") };

@@ -443,8 +443,11 @@ impl Store {
     }
 
     pub async fn open_in_memory() -> Result<Self> {
-        // Each SQLite memory connection is a separate database: keep exactly one, forever.
-        let pool = AnyPoolOptions::new().max_connections(1).min_connections(1).idle_timeout(None).max_lifetime(None);
+        // Each SQLite memory connection is a separate database: keep exactly one, forever. No ping before acquire:
+        // sqlx closes a connection whose caller is cancelled during that ping (an aborted job), and the pool then
+        // opens a new, empty database ("no such table"). A connection in this process needs no check.
+        let pool =
+            AnyPoolOptions::new().max_connections(1).min_connections(1).idle_timeout(None).max_lifetime(None).test_before_acquire(false);
         let s = Self::connect("sqlite::memory:".parse()?, pool, Backend::Sqlite).await?;
         s.migrate(MIGRATIONS.len()).await?;
         s.with_db_id().await
@@ -2136,6 +2139,22 @@ mod tests {
     #[test]
     fn migration_lists_match() {
         assert_eq!(MIGRATIONS.len(), PG_MIGRATIONS.len());
+    }
+
+    /// The in-memory database lives in its one connection. A call that is cancelled (an aborted job, such as a
+    /// Dashboard load that a refresh replaces) must not close it: the pool would open a new, empty database.
+    #[tokio::test]
+    async fn a_cancelled_call_keeps_the_in_memory_database() {
+        let s = Store::open_in_memory().await.unwrap();
+        use futures::FutureExt;
+        for _ in 0..5 {
+            s.track_task("p", "/t/1/", "sync", "running").await.unwrap();
+            // The connection is idle again (sqlx returns it in a task of its own).
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // Polled once and dropped: cancelled at its first wait (before the fix: the pool's ping of the idle connection).
+            drop(s.tasks("p", 1).now_or_never());
+            assert_eq!(s.tasks("p", 1).await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]
