@@ -606,6 +606,9 @@ Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
 * **Refused sync pairs** (pulp_rpm 3.39.5, HTTP 400): `mirror_complete` with `skip_types`
   or `autopublish`, and both mirror policies with `retain_package_versions` above 0. The
   sync form refuses them first (it reads both settings from the repository row).
+* **`retain_package_versions`** (pulp_rpm `IntegerField(min_value=0)`, not nullable; model
+  default 0 = keep all): an emptied field on edit sends 0 (live,
+  `rpm_retain_package_versions_cleared_through_the_tui`).
 * **Sync options** `optimize` (RPM, File, Deb; default `true`) and `skip_types` (RPM) exist
   in every tested version.
 * **Clearing remote fields** (3.123.0). `null` unsets `ca_cert`, `client_cert`,

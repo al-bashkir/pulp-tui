@@ -887,7 +887,7 @@ fn repo_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec
                 fields.push(
                     Field::new("retain_package_versions", "Retain package versions", FieldKind::Number)
                         .value(s(v, "retain_package_versions"))
-                        .help("0 = keep all"),
+                        .help("0 or empty = keep all"),
                 );
             }
             for (k, label) in
@@ -1054,6 +1054,8 @@ fn repo_body(f: &Form, edit: bool) -> Result<Value, String> {
             (_, FieldKind::Number) if v.is_empty() && edit && matches!(fld.key.as_str(), "retain_repo_versions" | "retain_checkpoints") => {
                 Value::Null
             }
+            // pulp_rpm: not nullable; 0 keeps all versions of each package.
+            ("retain_package_versions", _) if v.is_empty() && edit => 0.into(),
             (_, FieldKind::Number) if v.is_empty() => continue,
             (_, FieldKind::Number) => v.parse::<i64>().map_err(|_| format!("{} must be a number", fld.label))?.into(),
             (_, _) if v.is_empty() && edit => Value::Null,
@@ -3759,6 +3761,18 @@ mod tests {
         old.schemas.insert("rpm.RpmRepository".into(), ["name"].map(String::from).into());
         let f = repo_form(RepoType::Rpm, Some(&old), Some(&item), "");
         assert!(f.get("labels").contains("osv.rpm.config=") && !f.fields.iter().any(|x| x.key == "osv_config"), "{:?}", f.get("labels"));
+    }
+
+    #[test]
+    fn an_emptied_retain_package_versions_sends_zero() {
+        // pulp_rpm: an integer, min 0, not nullable; 0 keeps all versions of each package.
+        let item = json!({ "name": "os", "retain_package_versions": 3, "pulp_labels": {} });
+        let mut f = repo_form(RepoType::Rpm, None, Some(&item), "");
+        f.fields.iter_mut().find(|x| x.key == "retain_package_versions").unwrap().value.clear();
+        assert_eq!(repo_body(&f, true).unwrap(), json!({ "retain_package_versions": 0 }));
+        let mut new = repo_form(RepoType::Rpm, None, None, "");
+        new.fields[0].value = "os".into();
+        assert!(repo_body(&new, false).unwrap().get("retain_package_versions").is_none(), "create: empty is the server default");
     }
 
     /// pulp_rpm merges the current labels into a request that also has `osv_config` (a removed label stays), and

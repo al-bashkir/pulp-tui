@@ -742,3 +742,22 @@ async fn file_upload_without_overwrite_keeps_the_file_of_the_same_path() {
     assert_eq!(content(latest(&c, &repo).await).await, [json!(second)], "replaced");
     cleanup(&c, &[&repo]).await;
 }
+
+/// Edit (audit F28): an emptied Retain package versions removes the limit (pulp_rpm: 0, not null).
+#[tokio::test]
+async fn rpm_retain_package_versions_cleared_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("it-retain"));
+    let repo = create(&c, RepoType::Rpm.repositories(), json!({ "name": name, "retain_package_versions": 3 }), "/repositories/").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(RepoType::Rpm, false);
+    run(&mut app, Act::Edit, c.get(&repo, &[]).await.unwrap());
+    fill(&mut app, &[("retain_package_versions", "")]);
+    settle(&mut app, &mut rx).await;
+    settle_submitted(&c, &app).await;
+    let r: Value = c.get(&repo, &[]).await.unwrap();
+    assert_eq!(r["retain_package_versions"], 0, "{:?}", texts(&app));
+    cleanup(&c, &[&repo]).await;
+}

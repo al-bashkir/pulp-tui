@@ -253,6 +253,8 @@ All types have **Retain checkpoints**: the number of checkpoint publications tha
 
 RPM fields:
 
+* **Retain package versions**: the versions of each non-modular package (name and architecture)
+  that a new repository version keeps; older ones go. `0` or empty = all (empty on edit removes the limit).
 * **Checksum type** of the published metadata and packages (`sha256` or stronger).
 * **Metadata compression**: `zstd`, `gz` or `none`.
 * **Package layout**: `nested_alphabetically` (`Packages/<letter>/`), `flat` or `nested_by_digest`.
