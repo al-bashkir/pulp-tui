@@ -13,6 +13,7 @@ poll_min_ms = 1000            # adaptive task polling bounds
 poll_max_ms = 10000
 max_response_mb = 64          # larger API responses are rejected
 upload_chunk_mb = 8           # chunked upload size
+# hidden_screens = ["Uploads", "Artifacts"]   # screen list labels; x in the screen list sets it
 
 # Shared Content View / lifecycle database (optional): the default for profiles without their own
 # `database` (see [profiles.prod.database] below). Without either, they stay in the local file.

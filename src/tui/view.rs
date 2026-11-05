@@ -82,7 +82,7 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) {
     let mut rows: Vec<(Option<usize>, Line)> = vec![];
     let mut group = "";
     let screens = std::iter::once(("", "Dashboard")).chain(kinds::NAV.iter().map(|(g, l, _)| (*g, *l)));
-    for (i, (g, l)) in screens.enumerate() {
+    for (i, (g, l)) in screens.enumerate().filter(|(i, _)| app.nav_shown(*i)) {
         if g != group && !g.is_empty() {
             rows.push((
                 None,
@@ -90,7 +90,8 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
         group = g;
-        let marker = if i == app.nav { "▶ " } else { "  " };
+        let hidden = app.nav_hidden(i);
+        let marker = format!("{}{}", if i == app.nav { "▶" } else { " " }, if hidden { "×" } else { " " });
         let style = if i == app.nav && app.focus == Focus::Nav {
             sel()
         } else if i == app.nav {
@@ -98,6 +99,7 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default()
         };
+        let style = if hidden { style.add_modifier(Modifier::DIM) } else { style };
         rows.push((Some(i), Line::styled(format!("{marker}{l}"), style)));
     }
     // Rows scroll so the cursor stays visible, as in the palette; the borders count the screens out of view.
@@ -107,7 +109,7 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) {
     let screens_in = |r: &[(Option<usize>, Line)]| r.iter().filter(|(i, _)| i.is_some()).count();
     let (above, below) = (screens_in(&rows[..top]), screens_in(&rows[(top + h).min(rows.len())..]));
     let border = if app.focus == Focus::Nav { Style::default().fg(Color::Cyan) } else { Style::default() };
-    let mut block = Block::bordered().title(" Screens ").border_style(border);
+    let mut block = Block::bordered().title(if app.nav_all { " All screens " } else { " Screens " }).border_style(border);
     if above > 0 {
         block = block.title_top(Line::from(format!(" ▲ {above} ")).right_aligned());
     }
@@ -276,7 +278,7 @@ fn detail_lines(kind: &Kind, v: &serde_json::Value) -> Vec<String> {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match (&app.modal, &app.screen, app.focus) {
         (Some(m), _, _) => modal_hint(m),
-        (_, _, Focus::Nav) => "j/k g/G: choose screen  l/Enter: open  Tab: list  :: palette  ?: help  q: quit".into(),
+        (_, _, Focus::Nav) => "j/k g/G: move  l/Enter: open  x: hide/show  .: all screens  Tab: list  :: palette  ?: help  q: quit".into(),
         (_, Screen::List(_), _) => "j/k g/G Ctrl-D/U  h: screens  Enter: actions  /: search  s/S: sort  n/p: page  Space: mark  t: type  r: refresh  Esc: back  Tab: screens  :: palette  q: quit".into(),
         _ => "Tab: screens  r: refresh  :: palette  ?: help  N: notifications  q: quit".into(),
     };
@@ -598,6 +600,7 @@ pub fn help_lines() -> Vec<String> {
         "  ?              this help (a text view: j k g G Ctrl-D/U scroll, Esc closes)",
         "  N              notifications log        q  quit (Ctrl-C: immediate)",
         "  j k g G        in the screen list: choose a screen; l or Enter opens it",
+        "  x  .           in the screen list: hide or show the screen (saved in the config); show hidden screens too",
         "",
         "Lists",
         "  ↑↓ j k  PgUp PgDn Ctrl-D Ctrl-U  g G  move   h  screen list     Enter  action menu (shortcut letters shown)",

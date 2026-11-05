@@ -509,7 +509,7 @@ fn profile_from_form(f: &Form, inherited: Option<&Database>, local_db: &Path) ->
     Ok(p)
 }
 
-fn save_config(app: &App, cfg: &crate::config::Config) -> Result<(), String> {
+pub(super) fn save_config(app: &App, cfg: &crate::config::Config) -> Result<(), String> {
     cfg.save(&app.cfg_path).map_err(|e| format!("cannot save {}: {e:#}", app.cfg_path.display()))
 }
 

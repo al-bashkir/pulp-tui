@@ -142,6 +142,10 @@ pub struct Settings {
     pub max_response_mb: u64,
     /// Upload chunk size for the Pulp chunked upload API.
     pub upload_chunk_mb: u64,
+    /// Labels of the screens that the Screens pane hides (`x` there); the palette still lists them.
+    /// Unknown labels are ignored.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden_screens: Vec<String>,
     /// Removed setting, ignored: read so that configs of older versions still load, never saved.
     #[serde(skip_serializing)]
     pub cv_base_path_prefix: Option<String>,
@@ -155,6 +159,7 @@ impl Default for Settings {
             poll_max_ms: 10_000,
             max_response_mb: 64,
             upload_chunk_mb: 8,
+            hidden_screens: vec![],
             cv_base_path_prefix: None,
         }
     }

@@ -233,6 +233,8 @@ pub struct App {
     pub connecting: bool,
     pub screen: Screen,
     pub nav: usize,
+    /// The Screens pane also shows the screens in `settings.hidden_screens` (`.` toggles).
+    pub nav_all: bool,
     pub focus: Focus,
     pub list: ListState,
     pub history: Vec<(Screen, ListState)>,
@@ -276,6 +278,7 @@ impl App {
             connecting: false,
             screen: Screen::Dashboard,
             nav: 0,
+            nav_all: false,
             focus: Focus::List,
             list: ListState::new(Kind::Profiles),
             history: vec![],
@@ -1190,13 +1193,52 @@ impl App {
         }
     }
 
+    /// Screen `i` of the Screens pane (0 is Dashboard, then `NAV`) is in `settings.hidden_screens`.
+    /// Dashboard and Servers are never hidden.
+    pub fn nav_hidden(&self, i: usize) -> bool {
+        i > 0
+            && kinds::NAV[i - 1].2 != Kind::Profiles
+            && self.cfg.settings.hidden_screens.iter().any(|h| h.eq_ignore_ascii_case(kinds::NAV[i - 1].1))
+    }
+
+    /// The Screens pane shows screen `i`: it is not hidden, `.` shows all, or the cursor is on it.
+    pub fn nav_shown(&self, i: usize) -> bool {
+        self.nav_all || i == self.nav || !self.nav_hidden(i)
+    }
+
+    /// Hide the screen under the cursor of the Screens pane, or show it again, and save the config.
+    fn toggle_hidden(&mut self) {
+        let i = self.nav;
+        if i == 0 || kinds::NAV[i - 1].2 == Kind::Profiles {
+            return self.notify(Level::Warn, "Dashboard and Servers cannot be hidden");
+        }
+        let label = kinds::NAV[i - 1].1;
+        let hide = !self.nav_hidden(i);
+        let mut next = self.cfg.clone();
+        next.settings.hidden_screens.retain(|h| !h.eq_ignore_ascii_case(label));
+        if hide {
+            next.settings.hidden_screens.push(label.into());
+        }
+        match super::actions::save_config(self, &next) {
+            Ok(()) => {
+                self.cfg = next;
+                self.ok(if hide { format!("{label} hidden (. shows hidden screens)") } else { format!("{label} shown") });
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
     fn nav_key(&mut self, k: KeyEvent) {
         let n = kinds::NAV.len() + 1; // + Dashboard
+        // The nearest shown screen in steps of `step` (n - 1 goes up); Dashboard is always shown.
+        let next = |app: &App, from: usize, step: usize| (1..=n).map(|d| (from + d * step) % n).find(|&i| app.nav_shown(i)).unwrap_or(0);
         match k.code {
-            KeyCode::Up | KeyCode::Char('k') => self.nav = (self.nav + n - 1) % n,
-            KeyCode::Down | KeyCode::Char('j') => self.nav = (self.nav + 1) % n,
+            KeyCode::Up | KeyCode::Char('k') => self.nav = next(self, self.nav, n - 1),
+            KeyCode::Down | KeyCode::Char('j') => self.nav = next(self, self.nav, 1),
             KeyCode::Char('g') => self.nav = 0,
-            KeyCode::Char('G') => self.nav = n - 1,
+            KeyCode::Char('G') => self.nav = next(self, 0, n - 1),
+            KeyCode::Char('x') => self.toggle_hidden(),
+            KeyCode::Char('.') => self.nav_all = !self.nav_all,
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let s = match self.nav {
                     0 => Screen::Dashboard,
@@ -2950,6 +2992,50 @@ mod tests {
         app.handle_key(ch('G'));
         let s = draw(&app);
         assert!(s.contains("▶ Logs") && s.contains("│ SYSTEM ") && s.contains("▲ 10") && !s.contains("▼"), "{s}");
+    }
+
+    #[tokio::test]
+    async fn screens_pane_hides_screens_and_saves_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_on(Kind::Profiles).await;
+        app.cfg_path = dir.path().join("config.toml");
+        app.focus = Focus::Nav;
+        let at = |l: &str| 1 + kinds::NAV.iter().position(|(_, n, _)| *n == l).unwrap();
+        let saved = |app: &App| Config::load(&app.cfg_path).unwrap().settings.hidden_screens;
+        app.nav = at("Deb Repositories");
+        app.handle_key(ch('x'));
+        assert_eq!(saved(&app), ["Deb Repositories"]);
+        // The cursor leaves it, and then j and k skip it.
+        app.handle_key(ch('k'));
+        assert_eq!(app.nav, at("File Repositories"));
+        app.handle_key(ch('j'));
+        assert_eq!(app.nav, at("Remotes"));
+        // `.` shows it, and `x` on it shows it again.
+        app.handle_key(ch('.'));
+        app.handle_key(ch('k'));
+        assert_eq!(app.nav, at("Deb Repositories"));
+        app.handle_key(ch('x'));
+        assert!(saved(&app).is_empty());
+        app.nav = at("Servers");
+        app.handle_key(ch('x'));
+        assert!(saved(&app).is_empty() && !app.nav_hidden(app.nav), "Servers cannot be hidden");
+
+        // A hand-written list: any case; a group with no screen left loses its header.
+        app.nav_all = false;
+        app.cfg.settings.hidden_screens =
+            ["tasks", "Task Schedules", "Uploads", "Artifacts", "Logs", "No Such Screen"].map(String::from).to_vec();
+        app.handle_key(ch('G'));
+        assert_eq!(app.nav, at("Access Policies"));
+        let draw = |app: &App| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+            t.draw(|f| super::super::view::draw(f, app)).unwrap();
+            t.backend().to_string()
+        };
+        let s = draw(&app);
+        assert!(!s.contains("SYSTEM") && !s.contains("Uploads") && s.contains(" Screens "), "{s}");
+        app.handle_key(ch('.'));
+        let s = draw(&app);
+        assert!(s.contains("│ SYSTEM ") && s.contains("│ ×Uploads ") && s.contains(" All screens "), "{s}");
     }
 
     #[tokio::test]
