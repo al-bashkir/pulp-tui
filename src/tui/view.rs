@@ -78,9 +78,18 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_nav(f: &mut Frame, app: &App, area: Rect) {
-    let mut lines = vec![];
-    let labels = std::iter::once("Dashboard").chain(kinds::NAV.iter().map(|(l, _)| *l)).chain(std::iter::once("Help"));
-    for (i, l) in labels.enumerate() {
+    // Each row with its `app.nav` index; a group header has none.
+    let mut rows: Vec<(Option<usize>, Line)> = vec![];
+    let mut group = "";
+    let screens = std::iter::once(("", "Dashboard")).chain(kinds::NAV.iter().map(|(g, l, _)| (*g, *l)));
+    for (i, (g, l)) in screens.enumerate() {
+        if g != group && !g.is_empty() {
+            rows.push((
+                None,
+                Line::styled(format!(" {}", g.to_uppercase()), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            ));
+        }
+        group = g;
         let marker = if i == app.nav { "▶ " } else { "  " };
         let style = if i == app.nav && app.focus == Focus::Nav {
             sel()
@@ -89,10 +98,24 @@ fn draw_nav(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default()
         };
-        lines.push(Line::styled(format!("{marker}{l}"), style));
+        rows.push((Some(i), Line::styled(format!("{marker}{l}"), style)));
     }
+    // Rows scroll so the cursor stays visible, as in the palette; the borders count the screens out of view.
+    let h = area.height.saturating_sub(2) as usize;
+    let cur = rows.iter().position(|(i, _)| *i == Some(app.nav)).unwrap_or(0);
+    let top = cur.saturating_sub(h.saturating_sub(1));
+    let screens_in = |r: &[(Option<usize>, Line)]| r.iter().filter(|(i, _)| i.is_some()).count();
+    let (above, below) = (screens_in(&rows[..top]), screens_in(&rows[(top + h).min(rows.len())..]));
     let border = if app.focus == Focus::Nav { Style::default().fg(Color::Cyan) } else { Style::default() };
-    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Screens ").border_style(border)), area);
+    let mut block = Block::bordered().title(" Screens ").border_style(border);
+    if above > 0 {
+        block = block.title_top(Line::from(format!(" ▲ {above} ")).right_aligned());
+    }
+    if below > 0 {
+        block = block.title_bottom(Line::from(format!(" ▼ {below} more ")).right_aligned());
+    }
+    let lines: Vec<Line> = rows.into_iter().skip(top).take(h).map(|(_, l)| l).collect();
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_text_screen(f: &mut Frame, title: &str, lines: &[String], area: Rect) {

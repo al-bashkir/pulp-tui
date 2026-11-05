@@ -7,14 +7,17 @@
 ┌ Screens ─────────┐┌ <screen title> [items, filter, sort, marks] ─┐┌ Details ───────────────┐
 │▶ Dashboard       ││ ▶ row                                         ││ explanation + full JSON│
 │  Servers         ││   row                                         ││                        │
+│ CONTENT          ││                                               ││                        │
 │  …               ││                                               ││                        │
-└──────────────────┘└───────────────────────────────────────────────┘└────────────────────────┘
+└──── ▼ 20 more ───┘└───────────────────────────────────────────────┘└────────────────────────┘
  key hints
  [ok] last notification  (or the running operation and its progress)
 ```
 
 * The header shows the active server. A read-only profile shows a yellow tag. A production
   profile makes the header red.
+* The screen list puts the screens in groups: Content, Lifecycle, Admin and System. It scrolls
+  with the cursor; `▲ n` and `▼ n more` on its border count the screens out of view.
 * A narrow terminal hides the screen list (use the palette) and the details pane. Below 60x15 the
   UI asks for a larger terminal.
 * `▶` and reverse video show the selection, so it does not depend on color.

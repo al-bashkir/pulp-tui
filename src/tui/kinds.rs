@@ -85,32 +85,34 @@ pub enum Kind {
     },
 }
 
-pub const NAV: &[(&str, Kind)] = &[
-    ("Servers", Kind::Profiles),
-    ("RPM Repositories", Kind::Repos(RepoType::Rpm, false)),
-    ("File Repositories", Kind::Repos(RepoType::File, false)),
-    ("Deb Repositories", Kind::Repos(RepoType::Deb, false)),
-    ("Remotes", Kind::Remotes(RepoType::Rpm, false)),
-    ("Alternate Sources", Kind::Acs(RepoType::Rpm)),
-    ("Repository Versions", Kind::Versions(None)),
-    ("Publications", Kind::Publications(RepoType::Rpm)),
-    ("Distributions", Kind::Distributions(RepoType::Rpm)),
-    ("Content Guards", Kind::ContentGuards),
-    ("Content Views", Kind::ContentViews),
-    ("Lifecycle Envs", Kind::Environments),
-    ("Replication", Kind::UpstreamPulps),
-    ("Exporters", Kind::PulpExporters),
-    ("Importers", Kind::Importers),
-    ("Users", Kind::Users),
-    ("Groups", Kind::Groups),
-    ("Roles", Kind::Roles),
-    ("Domains", Kind::Domains),
-    ("Access Policies", Kind::AccessPolicies),
-    ("Tasks", Kind::Tasks),
-    ("Task Schedules", Kind::TaskSchedules),
-    ("Uploads", Kind::Uploads),
-    ("Artifacts", Kind::Artifacts),
-    ("Logs", Kind::Logs { polls: false }),
+/// The Screens pane after Dashboard: (group, label, screen). Rows of a group are adjacent; "" has no header.
+/// A label fits the 20 columns of the pane after the 2-column marker.
+pub const NAV: &[(&str, &str, Kind)] = &[
+    ("", "Servers", Kind::Profiles),
+    ("Content", "RPM Repositories", Kind::Repos(RepoType::Rpm, false)),
+    ("Content", "File Repositories", Kind::Repos(RepoType::File, false)),
+    ("Content", "Deb Repositories", Kind::Repos(RepoType::Deb, false)),
+    ("Content", "Remotes", Kind::Remotes(RepoType::Rpm, false)),
+    ("Content", "Alt. Sources", Kind::Acs(RepoType::Rpm)),
+    ("Content", "Versions", Kind::Versions(None)),
+    ("Content", "Publications", Kind::Publications(RepoType::Rpm)),
+    ("Content", "Distributions", Kind::Distributions(RepoType::Rpm)),
+    ("Content", "Content Guards", Kind::ContentGuards),
+    ("Lifecycle", "Content Views", Kind::ContentViews),
+    ("Lifecycle", "Environments", Kind::Environments),
+    ("Lifecycle", "Replication", Kind::UpstreamPulps),
+    ("Lifecycle", "Exporters", Kind::PulpExporters),
+    ("Lifecycle", "Importers", Kind::Importers),
+    ("Admin", "Users", Kind::Users),
+    ("Admin", "Groups", Kind::Groups),
+    ("Admin", "Roles", Kind::Roles),
+    ("Admin", "Domains", Kind::Domains),
+    ("Admin", "Access Policies", Kind::AccessPolicies),
+    ("System", "Tasks", Kind::Tasks),
+    ("System", "Task Schedules", Kind::TaskSchedules),
+    ("System", "Uploads", Kind::Uploads),
+    ("System", "Artifacts", Kind::Artifacts),
+    ("System", "Logs", Kind::Logs { polls: false }),
 ];
 
 /// API collection path, extra query and search parameter of a screen.
@@ -1235,7 +1237,7 @@ mod tests {
     #[test]
     fn action_keys_are_unique_per_screen_and_avoid_list_keys() {
         let reserved = "jkgGhnprsSt q?:N/";
-        let kinds = NAV.iter().map(|(_, k)| k.clone()).chain([
+        let kinds = NAV.iter().map(|(_, _, k)| k.clone()).chain([
             Kind::Versions(Some(("/r/".into(), "r".into()))),
             Kind::Content { version: "/x/rpm/rpm/1/versions/1/".into(), ctype: 0 },
             Kind::CvVersions { cv: 1, name: "x".into() },
@@ -1439,7 +1441,7 @@ mod tests {
         for t in RepoType::ALL {
             assert!(Kind::Repos(t, false).actions().contains(&Act::Upload), "{t:?}");
         }
-        assert!(NAV.iter().any(|(l, k)| *l == "Deb Repositories" && *k == Kind::Repos(RepoType::Deb, false)));
+        assert!(NAV.iter().any(|(_, l, k)| *l == "Deb Repositories" && *k == Kind::Repos(RepoType::Deb, false)));
         let names = |k: &Kind| k.columns().iter().map(|c| c.title).collect::<Vec<_>>();
         let content = |ctype| Kind::Content { version: "/pulp/api/v3/repositories/deb/apt/1/versions/1/".into(), ctype };
         assert_eq!(
@@ -1486,7 +1488,7 @@ mod tests {
         assert!(!k.needs_connection());
         assert_eq!(k.toggle(), Some(Kind::Logs { polls: true }));
         assert_eq!(k.actions(), vec![Act::Inspect]);
-        assert!(NAV.iter().any(|(l, k)| *l == "Logs" && *k == Kind::Logs { polls: false }));
+        assert!(NAV.iter().any(|(_, l, k)| *l == "Logs" && *k == Kind::Logs { polls: false }));
         assert!(k.title().ends_with("[t: show/hide task polling]"));
         assert!(Kind::Logs { polls: true }.title().ends_with(" — polling shown"));
         assert!(!Act::Inspect.mutates(&k, false));
@@ -1540,7 +1542,7 @@ mod tests {
     #[test]
     fn exporter_screens_list_exporters_and_their_exports() {
         let k = Kind::PulpExporters;
-        assert!(NAV.iter().any(|(l, n)| *l == "Exporters" && *n == k));
+        assert!(NAV.iter().any(|(_, l, n)| *l == "Exporters" && *n == k));
         assert_eq!(k.source().unwrap().0, "exporters/core/pulp/");
         assert!(k.searchable());
         assert_eq!(k.actions(), [Act::Export, Act::Exports, Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
@@ -1584,7 +1586,7 @@ mod tests {
     #[test]
     fn importer_screens_list_importers_and_their_imports() {
         let k = Kind::Importers;
-        assert!(NAV.iter().any(|(l, n)| *l == "Importers" && *n == k));
+        assert!(NAV.iter().any(|(_, l, n)| *l == "Importers" && *n == k));
         assert_eq!(k.source().unwrap().0, "importers/core/pulp/");
         assert_eq!(k.actions(), [Act::Import, Act::Imports, Act::Create, Act::Edit, Act::Delete, Act::Inspect]);
         assert!(Act::Import.mutates(&k, false) && !Act::Imports.mutates(&k, false));
@@ -1608,7 +1610,7 @@ mod tests {
     #[test]
     fn acs_screens_list_each_type_and_need_its_endpoint() {
         let k = Kind::Acs(RepoType::Rpm);
-        assert!(NAV.iter().any(|(l, n)| *l == "Alternate Sources" && *n == k));
+        assert!(NAV.iter().any(|(_, l, n)| *l == "Alt. Sources" && *n == k));
         assert_eq!(k.title(), "RPM Alternate Content Sources  [t: toggle type]");
         assert_eq!(k.toggle(), Some(Kind::Acs(RepoType::File)));
         let paths: Vec<String> = RepoType::ALL.iter().map(|t| Kind::Acs(*t).source().unwrap().0).collect();
@@ -1639,7 +1641,7 @@ mod tests {
     #[test]
     fn rpm_uln_remotes_have_their_own_screen_and_need_the_endpoint() {
         let k = Kind::Remotes(RepoType::Rpm, false);
-        assert!(NAV.iter().any(|(l, n)| *l == "Remotes" && *n == k));
+        assert!(NAV.iter().any(|(_, l, n)| *l == "Remotes" && *n == k));
         let uln = k.toggle().unwrap();
         assert_eq!(uln, Kind::Remotes(RepoType::Rpm, true));
         assert_eq!(uln.title(), "RPM ULN Remotes  [t: toggle type]");
@@ -1681,7 +1683,7 @@ mod tests {
     #[test]
     fn content_guard_screen_lists_type_and_distributions_and_manages_rbac_access() {
         let k = Kind::ContentGuards;
-        assert!(NAV.iter().any(|(l, n)| *l == "Content Guards" && *n == k));
+        assert!(NAV.iter().any(|(_, l, n)| *l == "Content Guards" && *n == k));
         assert_eq!(k.source().unwrap().0, "contentguards/");
         assert!(k.searchable());
         let row =
@@ -1712,7 +1714,7 @@ mod tests {
     #[test]
     fn uploads_screen_lists_unfinished_uploads_oldest_first() {
         let k = Kind::Uploads;
-        assert!(NAV.iter().any(|(l, n)| *l == "Uploads" && *n == k));
+        assert!(NAV.iter().any(|(_, l, n)| *l == "Uploads" && *n == k));
         let (path, q, search) = k.source().unwrap();
         assert_eq!((path.as_str(), q, search), ("uploads/", vec![("ordering", "pulp_created".to_string())], None), "no name to search");
         let row = json!({ "pulp_href": "/pulp/api/v3/uploads/0190abcd-1234-5678/", "pulp_created": "2026-11-02T10:00:00.123Z", "size": 2048, "completed": null });
@@ -1729,7 +1731,7 @@ mod tests {
     #[test]
     fn task_schedules_screen_is_read_only_and_opens_the_last_task() {
         let k = Kind::TaskSchedules;
-        assert!(NAV.iter().any(|(l, n)| *l == "Task Schedules" && *n == k));
+        assert!(NAV.iter().any(|(_, l, n)| *l == "Task Schedules" && *n == k));
         assert_eq!(k.source().unwrap(), ("task-schedules/".into(), vec![("ordering", "name".into())], Some("name__contains")));
         let row = json!({ "name": "Clean up stale content periodically", "task_name": "pulpcore.app.tasks.orphan.orphan_cleanup",
             "dispatch_interval": "1 00:00:00", "next_dispatch": "2026-11-05T21:19:15.559891Z", "last_task": "/pulp/api/v3/tasks/01a1a86e-55a7-75e4/" });
@@ -1778,7 +1780,7 @@ mod tests {
     #[test]
     fn artifacts_screen_is_read_only_and_finds_one_sha256() {
         let k = Kind::Artifacts;
-        assert!(NAV.iter().any(|(l, n)| *l == "Artifacts" && *n == k));
+        assert!(NAV.iter().any(|(_, l, n)| *l == "Artifacts" && *n == k));
         assert_eq!(k.source().unwrap(), ("artifacts/".into(), vec![("ordering", "-pulp_created".into())], Some("sha256")));
         assert!(k.title().contains("/ finds one sha256"), "the API filters on the exact digest only");
         let sha = "8ad22026c8f6461cf3b292ab6637d6398e0d0fb1e7ef5ddbf20add80a37061f3";
@@ -1799,7 +1801,7 @@ mod tests {
     #[test]
     fn access_policies_screen_lists_the_viewsets_and_resets_one() {
         let k = Kind::AccessPolicies;
-        assert!(NAV.iter().any(|(l, n)| *l == "Access Policies" && *n == k));
+        assert!(NAV.iter().any(|(_, l, n)| *l == "Access Policies" && *n == k));
         let src = ("access_policies/".into(), vec![("ordering", "viewset_name".into())], Some("viewset_name__icontains"));
         assert_eq!(k.source().unwrap(), src);
         let row = json!({ "viewset_name": "repositories/rpm/rpm", "customized": true, "statements": [{}, {}, {}] });
@@ -1816,7 +1818,7 @@ mod tests {
     #[test]
     fn domains_screen_needs_domains_enabled_and_shows_the_storage() {
         let k = Kind::Domains;
-        assert!(NAV.iter().any(|(l, n)| *l == "Domains" && *n == k));
+        assert!(NAV.iter().any(|(_, l, n)| *l == "Domains" && *n == k));
         assert_eq!(k.source().unwrap(), ("domains/".into(), vec![("ordering", "name".into())], Some("name__icontains")));
         let row = json!({ "name": "edge", "storage_class": "storages.backends.s3.S3Storage", "description": "EU mirror" });
         assert_eq!(k.columns().iter().map(|c| (c.get)(&row)).collect::<Vec<_>>(), ["edge", "S3Storage", "EU mirror"]);

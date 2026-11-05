@@ -885,7 +885,7 @@ impl App {
 
     pub fn open(&mut self, s: Screen) {
         if let Screen::List(k) = &s {
-            if let Some(i) = kinds::NAV.iter().position(|(_, n)| n == k) {
+            if let Some(i) = kinds::NAV.iter().position(|(_, _, n)| n == k) {
                 self.nav = i + 1;
             }
             self.list = ListState::new(k.clone());
@@ -1191,7 +1191,7 @@ impl App {
     }
 
     fn nav_key(&mut self, k: KeyEvent) {
-        let n = kinds::NAV.len() + 2; // + Dashboard + Help
+        let n = kinds::NAV.len() + 1; // + Dashboard
         match k.code {
             KeyCode::Up | KeyCode::Char('k') => self.nav = (self.nav + n - 1) % n,
             KeyCode::Down | KeyCode::Char('j') => self.nav = (self.nav + 1) % n,
@@ -1200,8 +1200,7 @@ impl App {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let s = match self.nav {
                     0 => Screen::Dashboard,
-                    i if i <= kinds::NAV.len() => Screen::List(kinds::NAV[i - 1].1.clone()),
-                    _ => return self.text("Help", help_lines()),
+                    i => Screen::List(kinds::NAV[i - 1].2.clone()),
                 };
                 self.history.clear();
                 self.open(s);
@@ -1477,7 +1476,7 @@ impl App {
                 a.open(Screen::Dashboard);
             }),
         ));
-        for (label, k) in kinds::NAV {
+        for (_, label, k) in kinds::NAV {
             let k = k.clone();
             out.push((
                 format!("Go: {label}"),
@@ -2931,9 +2930,26 @@ mod tests {
         let mut app = app_on(Kind::Profiles).await;
         app.focus = Focus::Nav;
         app.handle_key(ch('G'));
-        assert_eq!(app.nav, kinds::NAV.len() + 1);
+        assert_eq!(app.nav, kinds::NAV.len());
         app.handle_key(ch('g'));
         assert_eq!(app.nav, 0);
+    }
+
+    #[tokio::test]
+    async fn screens_pane_has_groups_and_scrolls_to_the_cursor() {
+        let mut app = app_on(Kind::Profiles).await;
+        app.focus = Focus::Nav;
+        let draw = |app: &App| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            t.draw(|f| super::super::view::draw(f, app)).unwrap();
+            t.backend().to_string()
+        };
+        // 30 rows (26 screens, 4 headers) in 19 lines.
+        let s = draw(&app);
+        assert!(s.contains("│ CONTENT ") && s.contains("│  File Repositories │") && s.contains("▼ 10 more"), "{s}");
+        app.handle_key(ch('G'));
+        let s = draw(&app);
+        assert!(s.contains("▶ Logs") && s.contains("│ SYSTEM ") && s.contains("▲ 10") && !s.contains("▼"), "{s}");
     }
 
     #[tokio::test]
