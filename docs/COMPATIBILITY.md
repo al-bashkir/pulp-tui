@@ -117,7 +117,7 @@ General rules:
 | RPM repository                 | compression, layout, repo config, package signing, `osv_config`                          |
 | Remote                         | timeouts, `max_retries`, `headers`; Deb `excluded_package_metadata_fields`               |
 | Distribution                   | `hidden`, `checkpoint`; RPM `generate_repo_config`                                       |
-| Publication (**c**)            | options of `rpm.RpmPublication`, `file.FilePublication`, `deb.AptPublication`            |
+| Publication (**c**, **P**)     | options of `rpm.RpmPublication`, `file.FilePublication`, `deb.AptPublication`            |
 | Deb upload (**u**)             | `distribution`, `component` of `deb.Package`                                             |
 | Upload (**u**)                 | `overwrite` of `rpm.Package`, `file.FileContent`, `deb.Package`                          |
 | Filesystem export (**E**)      | `start_repository_version` of `FilesystemExport`                                         |

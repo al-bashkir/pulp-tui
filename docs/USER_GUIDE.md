@@ -214,7 +214,9 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   writes into `modules.yaml` unchanged, on one line: `--- {document: modulemd, version: 2, ...}`. A
   modulemd made here lists no packages.
 * **P** publishes the latest version. It always makes a new publication, with the repository
-  settings of that moment.
+  settings of that moment. The form has the publication options of **c** on Publications
+  (without **Checkpoint**); empty uses the repository setting, so `Ctrl-S` at once publishes as
+  before.
 * **D** distributes: pin the latest version (publication), or follow the repository latest. Pulp
   cannot pin a checkpoint distribution: **D** refuses it before any change (see Distributions).
 * **P** and **D** on Deb ask for an optional signing service (empty = the keys of the repository).
@@ -352,7 +354,8 @@ From a repository (**v**), or for all repositories. Columns: number, created, pr
 removed counts.
 
 * **o** content. **i** full JSON.
-* **P** publishes this version (always a new publication). **D** distributes it. The form offers
+* **P** publishes this version (always a new publication), with the publication options of **c**
+  on Publications (without **Checkpoint**). **D** distributes it. The form offers
   the repository name as the distribution name, and as the base path with every character other
   than letters, digits, `-`, `_` and `.` changed to `-` (the same on Repositories and
   Publications). On Deb, both ask
@@ -430,8 +433,8 @@ releases, components, indices and more). `/` searches package names or file path
   for Deb the **Kind** (`apt` or `verbatim`, when the server has verbatim publications) and an
   optional signing service. It also has the publication options of the server. Empty means the
   repository setting or the server default. A verbatim publication takes no signing service and
-  no options. (**P** in Repositories and Versions asks only for the kind and the signing
-  service.)
+  no options. **P** in Repositories and Versions has the same fields, except **Checkpoint**
+  (Pulp makes a checkpoint of the latest version only).
   * **Checksum type**, **Metadata compression**, **Repo config** (RPM): as the repository fields.
   * **Package layout** (RPM, Deb).
   * **Simple** / **Structured** (Deb): one component, or the upstream components (default). One of

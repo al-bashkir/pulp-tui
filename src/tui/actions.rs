@@ -1851,15 +1851,17 @@ fn publication_options(f: &Form) -> Result<Value, String> {
     Ok(b)
 }
 
-/// Run `go` with the mode of a publish: the kind (`kind_field`) and the signing service (`signing_field`) are
-/// asked first when the server offers them, else the repository default.
+/// Run `go` with the mode of a publish: the kind (`kind_field`), the signing service (`signing_field`) and the
+/// options of the New publication form are asked first when the server offers them, else the repository default.
 fn publish_form(app: &mut App, t: RepoType, title: String, go: impl Fn(&mut App, Value) + 'static) {
-    let fields: Vec<Field> = kind_field(app, t).into_iter().chain(signing_field(app, t)).collect();
+    // Not Checkpoint: Pulp makes a checkpoint of the latest version only, and P publishes a chosen one.
+    let options = publication_fields(caps(app).as_deref(), t).into_iter().filter(|f| f.key != "checkpoint");
+    let fields: Vec<Field> = kind_field(app, t).into_iter().chain(signing_field(app, t)).chain(options).collect();
     if fields.is_empty() {
         return go(app, json!({ "signing_service": null }));
     }
     app.form(Form::new(title, fields), move |app, f| {
-        go(app, publish_mode(f, json!({ "signing_service": f.opt("signing_service") }))?);
+        go(app, publish_mode(f, publication_options(f)?)?);
         Ok(())
     });
 }
@@ -4823,7 +4825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_deb_publish_asks_for_a_signing_service() {
+    async fn publish_asks_for_the_publication_options_and_only_deb_for_a_signing_service() {
         use crate::tui::app::Modal;
         use wiremock::matchers::{method, path};
         let server = wiremock::MockServer::start().await;
@@ -4838,13 +4840,21 @@ mod tests {
         let (mut app, mut rx) = connected(&server).await;
         let repo = |t: &str| json!({ "pulp_href": format!("{API}repositories/{t}/r/"), "name": "r", "latest_version_href": "/v/" });
 
+        // The options of the Publications screen (c), without Checkpoint: that one publishes the latest version.
         repo_action(&mut app, RepoType::Rpm, Act::Publish, repo("rpm/rpm"));
-        assert!(app.modal.is_none(), "RPM publishes at once");
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        assert_eq!(keys(&form), ["checksum_type", "compression_type", "layout", "repo_config"]);
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        set(&mut form, "layout", "flat");
+        set(&mut form, "repo_config", r#"{"gpgcheck": 1}"#);
+        submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
 
         repo_action(&mut app, RepoType::Deb, Act::Publish, repo("deb/apt"));
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
-        assert_eq!(keys(&form), ["kind", "signing_service"]);
+        let deb = ["simple", "structured", "publish_legacy_release_files", "layout", "publish_upstream_release_fields"];
+        assert_eq!(keys(&form), [&["kind", "signing_service"][..], &deb, &["excluded_package_metadata_fields"]].concat());
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
         set(&mut form, "signing_service", "/ss/1/");
@@ -4863,6 +4873,7 @@ mod tests {
             posts,
             [
                 json!({ "repository_version": "/v/" }),
+                json!({ "repository_version": "/v/", "layout": "flat", "repo_config": { "gpgcheck": 1 } }),
                 json!({ "repository_version": "/v/" }),
                 json!({ "repository_version": "/v/", "signing_service": "/ss/1/" }),
             ]
@@ -5089,13 +5100,14 @@ mod tests {
         let v = format!("{API}repositories/deb/apt/r/versions/1/");
         version_action(&mut app, Act::Publish, json!({ "pulp_href": v, "number": 1 }));
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
-        assert_eq!(keys(&form), ["kind", "signing_service"]);
+        assert_eq!(keys(&form)[..3], ["kind", "signing_service", "simple"], "the publication options follow");
         set(&mut form, "signing_service", "/ss/1/");
+        set(&mut form, "simple", "true");
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
         assert_eq!(
             posts_to(&server, &format!("{API}publications/deb/apt/")).await,
-            [json!({ "repository_version": v, "signing_service": "/ss/1/" })]
+            [json!({ "repository_version": v, "signing_service": "/ss/1/", "simple": true })]
         );
         assert!(
             app.notices.iter().any(|n| n.text == format!("publication 9 for {}", short(&v))),
@@ -5266,9 +5278,14 @@ mod tests {
         get(&server, &format!("{API}repositories/rpm/rpm/"), page(json!([repo]))).await;
         let (mut app, mut rx) = connected(&server).await;
 
+        // P asks for the publication options; untouched, the repository settings apply.
         repo_action(&mut app, RepoType::Rpm, Act::Publish, repo);
+        let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no form") };
+        submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
         version_action(&mut app, Act::Publish, json!({ "pulp_href": v, "number": 1 }));
+        let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no form") };
+        submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
         publication_action(&mut app, RepoType::Rpm, Act::Create, Value::Null);
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
@@ -7861,15 +7878,17 @@ mod tests {
         get(&server, &format!("{API}repositories/deb/apt/"), page(json!([r.clone()]))).await;
         let (mut app, mut rx) = connected(&server).await;
 
-        // Repositories P (Versions P has the same form): the kind, then the signing service of an APT publication.
+        // Repositories P (Versions P has the same form): the kind, then the signing service and options of an APT publication.
         repo_action(&mut app, RepoType::Deb, Act::Publish, r.clone());
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
-        assert_eq!(keys(&form), ["kind", "signing_service"]);
+        assert_eq!(keys(&form)[..3], ["kind", "signing_service", "simple"]);
         set(&mut form, "kind", "verbatim");
-        set(&mut form, "signing_service", "/ss/1/");
-        let e = submit(&mut app, &form).unwrap_err();
-        assert!(e.contains("verbatim publication serves the synced Release files as they are"), "{e}");
-        set(&mut form, "signing_service", "");
+        for (k, v) in [("signing_service", "/ss/1/"), ("simple", "true")] {
+            set(&mut form, k, v);
+            let e = submit(&mut app, &form).unwrap_err();
+            assert!(e.contains("verbatim publication serves the synced Release files as they are"), "{k}: {e}");
+            set(&mut form, k, "");
+        }
         submit(&mut app, &form).unwrap();
         settle(&mut app, &mut rx).await;
 
@@ -7894,7 +7913,7 @@ mod tests {
         app.conn.as_mut().unwrap().caps = Arc::new(caps);
         repo_action(&mut app, RepoType::Deb, Act::Publish, r);
         let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
-        assert_eq!(keys(&form), ["signing_service"]);
+        assert_eq!(keys(&form)[..2], ["signing_service", "simple"]);
         publication_action(&mut app, RepoType::Deb, Act::Create, Value::Null);
         let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form") };
         assert!(!keys(&form).contains(&"kind".to_string()));
