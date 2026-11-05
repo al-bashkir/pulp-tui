@@ -1472,11 +1472,16 @@ fn importer_form(app: &mut App, edit: bool, item: &Value) {
 
 /// The import check is the preview; the import runs only after the confirmation.
 fn import_form(app: &mut App, href: String, name: String, mapping: Value) {
-    let toc = Field::text("toc", "TOC file on the Pulp server").required().help("the -toc.json of the export, inside ALLOWED_IMPORT_PATHS");
+    let help = "the -toc.json of the export, or its .tar (an export without chunks); inside ALLOWED_IMPORT_PATHS";
+    let toc = Field::text("toc", "TOC or export file on the Pulp server").required().help(help);
     let form = Form::new(format!("Import with {name}"), vec![toc])
         .note("Pulp checks the file and the mapping first; nothing is imported before you confirm.");
+    let tar_ok = caps(app).is_none_or(|c| c.has_field("PulpImport", "path"));
     app.form(form, move |app, f| {
         let toc = f.get("toc").to_string();
+        if ops::import_field(&toc) == "path" && !tar_ok {
+            return Err("not supported by this server: import from an export .tar (path)".into());
+        }
         let (href, name, mapping) = (href.clone(), name.clone(), mapping.clone());
         app.job(format!("import check {toc}"), move |ctx| async move {
             let (ok, lines) = ops::import_check(&ctx.client, &toc, &mapping).await?;
@@ -2616,6 +2621,45 @@ mod tests {
         );
         let row = app.tasks.items.iter().find(|t| t.href == GROUP).expect("the group is in the Task Center");
         assert_eq!((row.label.as_str(), row.state.as_str()), ("import dvd", "completed"), "final without all_tasks_dispatched");
+    }
+
+    /// A `.tar` (an export without chunks) goes as `path`, in the check and in the import.
+    #[tokio::test]
+    async fn an_import_of_the_export_tar_sends_its_path() {
+        use crate::tui::kinds::Act;
+        const GROUP: &str = "/pulp/api/v3/task-groups/4/";
+        let tar = "/var/lib/pulp/exports/dvd/export-9-20261102_1000.tar";
+        let item = json!({ "pulp_href": IMP, "name": "dvd", "repo_mapping": {} });
+        let server = MockServer::start().await;
+        let check_path = "/pulp/api/v3/importers/core/pulp/import-check/";
+        let check = json!({ "path": { "context": tar, "is_valid": true, "messages": [] },
+            "repo_mapping": { "context": "{}", "is_valid": true, "messages": [] } });
+        serve(&server, "POST", check_path, 200, check).await;
+        serve(&server, "POST", &format!("{IMP}imports/"), 202, json!({ "task_group": GROUP })).await;
+        let group = json!({ "pulp_href": GROUP, "completed": 1,
+            "tasks": [{ "name": "pulpcore.app.tasks.importer.pulp_import", "state": "completed", "pulp_href": "/t/1/" }] });
+        serve(&server, "GET", GROUP, 200, group).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Importers;
+        let (mut f, mut submit) = open_form(&mut app, Act::Import, item.clone());
+        set(&mut f, "toc", tar);
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
+        assert_eq!(lines[..2], ["path: valid", "repo_mapping: valid"]);
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(
+            sent(&server).await.into_iter().map(|(_, p, b)| (p, b)).collect::<Vec<_>>(),
+            [(check_path.to_string(), json!({ "path": tar, "repo_mapping": "{}" })), (format!("{IMP}imports/"), json!({ "path": tar }))]
+        );
+        // A server without `path`: refused before any request.
+        let mut caps = crate::pulp::Capabilities::default();
+        caps.schemas.insert("PulpImport".into(), ["toc"].map(String::from).into());
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let (mut f, mut submit) = open_form(&mut app, Act::Import, item);
+        set(&mut f, "toc", tar);
+        assert_eq!(submit(&mut app, &f).unwrap_err(), "not supported by this server: import from an export .tar (path)");
     }
 
     const GUARDS: &str = "/pulp/api/v3/contentguards/";

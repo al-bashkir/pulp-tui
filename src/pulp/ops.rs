@@ -126,14 +126,21 @@ pub async fn group_report(c: &PulpClient, g: &str, on: &(dyn Fn(&TaskGroup) + Se
     Ok((group, lines))
 }
 
-/// `import-check/` of a TOC file and a mapping: whether every checked value is valid, and one line per value and message.
-pub async fn import_check(c: &PulpClient, toc: &str, mapping: &Value) -> Result<(bool, Vec<String>)> {
-    let body = json!({ "toc": toc, "repo_mapping": mapping.to_string() });
+/// The import field of export file `file`: its TOC (`-toc.json`) is `toc`, the `.tar` of an export without chunks `path`.
+pub fn import_field(file: &str) -> &'static str {
+    if file.ends_with(".json") { "toc" } else { "path" }
+}
+
+/// `import-check/` of an export file (`import_field`) and a mapping: whether every checked value is valid, and one
+/// line per value and message.
+pub async fn import_check(c: &PulpClient, file: &str, mapping: &Value) -> Result<(bool, Vec<String>)> {
+    let field = import_field(file);
+    let body = json!({ field: file, "repo_mapping": mapping.to_string() });
     let Mutation::Object(v) = c.post(&c.api("importers/core/pulp/import-check/"), &body).await? else {
         return Err(PulpError::Decode("import-check returned no evaluation".into()));
     };
     let (mut ok, mut lines) = (true, vec![]);
-    for k in ["toc", "repo_mapping"] {
+    for k in [field, "repo_mapping"] {
         let valid = v[k]["is_valid"] == true;
         ok &= valid;
         lines.push(format!("{k}: {}", if valid { "valid" } else { "NOT valid" }));
@@ -142,14 +149,14 @@ pub async fn import_check(c: &PulpClient, toc: &str, mapping: &Value) -> Result<
     Ok((ok, lines))
 }
 
-/// Import the Pulp export of `toc` with `importer` (a task group), as `group_report`.
+/// Import the Pulp export of `file` (`import_field`) with `importer` (a task group), as `group_report`.
 pub async fn pulp_import(
     c: &PulpClient,
     importer: &str,
-    toc: &str,
+    file: &str,
     on: &(dyn Fn(&TaskGroup) + Send + Sync),
 ) -> Result<(TaskGroup, Vec<String>)> {
-    let Mutation::TaskGroup(g) = c.post(&format!("{importer}imports/"), &json!({ "toc": toc })).await? else {
+    let Mutation::TaskGroup(g) = c.post(&format!("{importer}imports/"), &json!({ import_field(file): file })).await? else {
         return Err(PulpError::Decode("the import returned no task group".into()));
     };
     group_report(c, &g, on).await

@@ -135,6 +135,37 @@ async fn pulp_export_dry_run_still_writes_the_export() {
     cleanup(&c, &[&exporter, &repo, &remote]).await;
 }
 
+/// Import (I) of the `.tar` of an export without chunks (audit F28): the check and the import take it as `path`.
+#[tokio::test]
+async fn pulp_import_of_the_export_tar_by_its_path() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = unique("it-importtar");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &name, "file/PULP_MANIFEST", "mirror").await;
+    let body = json!({ "name": name, "path": format!("{EXPORTS}/{name}"), "repositories": [repo] });
+    let exporter = create(&c, "exporters/core/pulp/", body, "/exporters/").await;
+    let export = ops::create(&c, &format!("{exporter}exports/"), &json!({}), "/exports/", &no_progress).await.unwrap();
+    let e: Value = c.get(&export, &[]).await.unwrap();
+    let tar = e["output_file_info"].as_object().unwrap().keys().find(|f| f.ends_with(".tar")).unwrap().clone();
+    let copy = format!("{name}-copy");
+    let dst = create(&c, RepoType::File.repositories(), json!({ "name": copy }), "/repositories/").await;
+    let mapping = json!({ name.clone(): copy });
+    let importer = create(&c, "importers/core/pulp/", json!({ "name": name, "repo_mapping": mapping }), "/importers/").await;
+    let (ok, lines) = ops::import_check(&c, &tar, &mapping).await.unwrap();
+    assert!(ok && lines[0] == "path: valid", "{lines:?}");
+    let (group, lines) = ops::pulp_import(&c, &importer, &tar, &|_| {}).await.unwrap();
+    assert!(group.is_final() && group.outcome() == "completed", "{lines:?}");
+    let files = async |r: &str| {
+        c.get::<Value>(&latest(&c, r).await, &[]).await.unwrap()["content_summary"]["present"]["file.file"]["count"].clone()
+    };
+    assert_eq!((files(&dst).await, files(&repo).await), (json!(3), json!(3)), "the copy has the 3 exported files");
+    let imports: Page<Value> = c.list(&format!("{importer}imports/"), &[]).await.unwrap();
+    assert_eq!(imports.results[0]["params"]["path"].as_str(), Some(tar.as_str()));
+    cleanup(&c, &[&importer, &exporter, &dst, &repo, &remote]).await;
+}
+
 #[tokio::test]
 async fn filesystem_export_of_a_file_publication() {
     if !live_enabled() {

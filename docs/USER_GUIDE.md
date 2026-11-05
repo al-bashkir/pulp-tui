@@ -724,7 +724,8 @@ Disconnected import of a Pulp export. Copy the export files to a directory in th
 * **c** / **e**: name and mapping `source=destination,...` (an exported repository name, then a
   repository of this server). Each destination must exist; pulp-tui checks it first. An unmapped
   repository goes to the repository of the same name, or Pulp skips it.
-* **I** imports: type the path of the `-toc.json` file on the server. pulp-tui first runs the
+* **I** imports: type the path of the `-toc.json` file on the server, or of the `.tar` of an
+  export without chunks (for example one that came without its TOC). pulp-tui first runs the
   import check and shows its result. When the check fails, nothing is imported. Each imported
   repository gets a new version with exactly the exported content. When Pulp finds no destination
   repository, pulp-tui gives a warning.

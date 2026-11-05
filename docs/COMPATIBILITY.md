@@ -192,7 +192,7 @@ next section.
 * **Pulp import** (`live_export`, same server): import check (valid; not valid for a
   missing TOC); import through a mapping into another repository (one
   `import_repository_version` task, same content count, imports list names the TOC);
-  importer delete (204).
+  importer delete (204); check and import of the `.tar` as `path` (same content count).
 * **Comps and advisories** (`live_content`): a comps.xml makes a version with its group; a
   second with `replace` keeps only its own group; an advisory JSON makes the next version.
 * **Version repair** (`live_content`): RPM version synced `immediate`, with and without
@@ -732,7 +732,11 @@ Source: pulpcore 3.123.1 `tasks/export.py`, `tasks/importer.py` and their serial
   (publication) or "[Errno 17] File exists" (version). `hardlink` falls back to `write`
   across file systems; `hardlink` and `symlink` need file system storage.
 * **Import check** answers 200 with `is_valid` and `messages`: TOC allowed, readable, its
-  directory writable; `repo_mapping` is JSON.
+  directory writable; `repo_mapping` is JSON. It answers for each of `toc` and `path` that the
+  request has.
+* **Import source.** A Pulp import takes exactly one of `toc` (the chunks it lists are checked
+  and joined) and `path` (one `.tar`, an export without chunks); both or neither is 400.
+  pulp-tui sends a file that ends in `.json` as `toc`, any other as `path` (live).
 * **Import** answers 202 with a task group `Import of <toc>`: `pulp_import` checks the chunks,
   imports the artifacts and dispatches one `import_repository_version` per repository,
   which sets the exact exported content. Only a cancel sets `all_tasks_dispatched` (live), so
