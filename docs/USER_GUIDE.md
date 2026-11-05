@@ -21,7 +21,8 @@
 * In the screen list, `x` hides the screen under the cursor, or shows it again. The list is saved
   as `hidden_screens` in `[settings]` of the config file (you can also edit it there). `.` shows
   the hidden screens too, dim and marked `×`. The palette always lists all screens. Dashboard and
-  Servers cannot be hidden. Note: the save writes the config file again, without its comments.
+  Servers cannot be hidden. The save changes only this key; the rest of the file and its comments
+  stay as they are.
 * A narrow terminal hides the screen list (use the palette) and the details pane. Below 60x15 the
   UI asks for a larger terminal.
 * `▶` and reverse video show the selection, so it does not depend on color.

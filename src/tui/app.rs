@@ -1219,12 +1219,12 @@ impl App {
         if hide {
             next.settings.hidden_screens.push(label.into());
         }
-        match super::actions::save_config(self, &next) {
+        match next.save_hidden_screens(&self.cfg_path) {
             Ok(()) => {
                 self.cfg = next;
                 self.ok(if hide { format!("{label} hidden (. shows hidden screens)") } else { format!("{label} shown") });
             }
-            Err(e) => self.error(e),
+            Err(e) => self.error(format!("cannot save {}: {e:#}", self.cfg_path.display())),
         }
     }
 

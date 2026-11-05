@@ -378,6 +378,29 @@ pub fn default_config_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "pulp-tui").map(|d| d.config_dir().join("config.toml"))
 }
 
+/// A config parse error. The toml error text quotes the source line, which can hold a password:
+/// report its message and line only.
+fn parse_error(path: &Path, s: &str, message: &str, span: Option<std::ops::Range<usize>>) -> anyhow::Error {
+    let line = span.map_or(0, |r| s[..r.start].matches('\n').count() + 1);
+    anyhow::anyhow!("invalid config {} line {line}: {message}", path.display())
+}
+
+/// Atomic write (temp file + rename) so a crash never leaves a truncated config. A symlink is followed
+/// (the link stays) and an existing file keeps its permissions.
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)?;
+    if let Ok(m) = std::fs::metadata(&path) {
+        std::fs::set_permissions(&tmp, m.permissions())?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 pub fn default_data_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "pulp-tui").map(|d| d.data_dir().to_path_buf())
 }
@@ -387,11 +410,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                // The toml error text quotes the source line, which can hold a password: report its message and line only.
-                let cfg: Config = toml::from_str(&s).map_err(|e| {
-                    let line = e.span().map_or(0, |r| s[..r.start].matches('\n').count() + 1);
-                    anyhow::anyhow!("invalid config {} line {line}: {}", path.display(), e.message())
-                })?;
+                let cfg: Config = toml::from_str(&s).map_err(|e| parse_error(path, &s, e.message(), e.span()))?;
                 for (name, p) in &cfg.profiles {
                     p.validate().with_context(|| format!("profile {name}"))?;
                 }
@@ -405,20 +424,37 @@ impl Config {
         }
     }
 
-    /// Atomic write (temp file + rename) so a crash never leaves a truncated config. A symlink is followed
-    /// (the link stays) and an existing file keeps its permissions.
+    /// Write the whole config; comments in the file are lost.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+        write_atomic(path, &toml::to_string_pretty(self)?)
+    }
+
+    /// Write `settings.hidden_screens` into the config file and keep the rest of the file as it is, comments too.
+    /// An existing key keeps its place and comment, also when the list is empty.
+    pub fn save_hidden_screens(&self, path: &Path) -> Result<()> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+        };
+        let mut doc: toml_edit::DocumentMut =
+            text.parse().map_err(|e: toml_edit::TomlError| parse_error(path, &text, e.message(), e.span()))?;
+        let settings = doc.entry("settings").or_insert(toml_edit::table()).as_table_like_mut().context("settings is not a table")?;
+        let hidden = &self.settings.hidden_screens;
+        let mut list = toml_edit::Value::from(hidden.iter().map(String::as_str).collect::<toml_edit::Array>());
+        match settings.get_mut("hidden_screens") {
+            Some(old) => {
+                if let Some(v) = old.as_value() {
+                    *list.decor_mut() = v.decor().clone();
+                }
+                *old = toml_edit::Item::Value(list);
+            }
+            None if !hidden.is_empty() => {
+                settings.insert("hidden_screens", toml_edit::Item::Value(list));
+            }
+            None => {}
         }
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, toml::to_string_pretty(self)?)?;
-        if let Ok(m) = std::fs::metadata(&path) {
-            std::fs::set_permissions(&tmp, m.permissions())?;
-        }
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        write_atomic(path, &doc.to_string())
     }
 
     pub fn pick_profile(&self, requested: Option<&str>) -> Option<String> {
@@ -555,6 +591,42 @@ read_only = true
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(Config::load(&real).unwrap(), cfg);
         assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn saving_hidden_screens_keeps_the_rest_of_the_file_and_its_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let read = || std::fs::read_to_string(&path).unwrap();
+        let example = include_str!("../examples/config.toml");
+        let mut cfg: Config = toml::from_str(example).unwrap();
+        // No file yet: the key goes into a new [settings].
+        cfg.settings.hidden_screens = vec!["Logs".into()];
+        cfg.save_hidden_screens(&path).unwrap();
+        assert_eq!(read(), "[settings]\nhidden_screens = [\"Logs\"]\n");
+
+        // No key: it goes after the last key of [settings]; every other line stays.
+        std::fs::write(&path, example).unwrap();
+        cfg.save_hidden_screens(&path).unwrap();
+        let size = "upload_chunk_mb = 8           # chunked upload size\n";
+        assert_eq!(read(), example.replace(size, &format!("{size}hidden_screens = [\"Logs\"]\n")));
+        assert_eq!(Config::load(&path).unwrap(), cfg);
+
+        // A key: it keeps its place and its comment, also when the list becomes empty.
+        let commented = example.replace("# hidden_screens", "hidden_screens");
+        std::fs::write(&path, &commented).unwrap();
+        cfg.save_hidden_screens(&path).unwrap();
+        assert_eq!(read(), commented.replace(r#"["Uploads", "Artifacts"]"#, r#"["Logs"]"#));
+        cfg.settings.hidden_screens.clear();
+        cfg.save_hidden_screens(&path).unwrap();
+        assert_eq!(read(), commented.replace(r#"["Uploads", "Artifacts"]"#, "[]"));
+        assert_eq!(Config::load(&path).unwrap(), cfg);
+
+        // A file that is not TOML stays as it is; the error does not quote its text.
+        std::fs::write(&path, "x = \"hunter2\n").unwrap();
+        let e = format!("{:#}", cfg.save_hidden_screens(&path).unwrap_err());
+        assert!(e.contains("line 1") && !e.contains("hunter2"), "{e}");
+        assert_eq!(read(), "x = \"hunter2\n");
     }
 
     #[test]

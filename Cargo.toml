@@ -23,6 +23,8 @@ sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 toml = "1.1.8"
+# Edits one key of the config file and keeps its comments.
+toml_edit = { version = "0.25.17", default-features = false, features = ["parse", "display"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
