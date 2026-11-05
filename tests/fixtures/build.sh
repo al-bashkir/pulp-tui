@@ -3,6 +3,7 @@
 #   target/fixtures/rpms/*.rpm             tiny noarch packages for uploads
 #   target/fixtures/upstream/rpm/          yum repository (+ updateinfo advisory) for sync
 #   target/fixtures/upstream/rpm2/         same repository with one newer package
+#   target/fixtures/upstream/rpm-new/      only the two packages rpm2 adds (none in common with rpm)
 #   target/fixtures/upstream/file/         File repository with PULP_MANIFEST
 #   target/fixtures/upstream/git/files.git  bare Git repository (dumb HTTP), tag v1 and branch main
 #   target/fixtures/upstream/deb/          APT repository (dist fixture, component main, amd64)
@@ -13,10 +14,10 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=${FIXTURES_DIR:-$ROOT/target/fixtures}
-STAMP=$OUT/.built-v4
+STAMP=$OUT/.built-v5
 [ -f "$STAMP" ] && { echo "fixtures up to date: $OUT"; exit 0; }
 rm -rf "$OUT"
-mkdir -p "$OUT"/{rpms,files,build,upstream/rpm,upstream/rpm2,upstream/file,upstream/deb}
+mkdir -p "$OUT"/{rpms,files,build,upstream/rpm,upstream/rpm2,upstream/rpm-new,upstream/file,upstream/deb}
 
 build_rpm() { # name version release
   local name=$1 version=$2 release=$3
@@ -78,6 +79,10 @@ modifyrepo_c "$OUT/build/updateinfo.xml" "$OUT/upstream/rpm/repodata"
 cp "$OUT"/upstream/rpm/*.rpm "$OUT"/rpms/fixture-alpha-1.1-1.noarch.rpm "$OUT"/rpms/fixture-gamma-0.5-1.noarch.rpm "$OUT/upstream/rpm2/"
 createrepo_c --quiet "$OUT/upstream/rpm2"
 modifyrepo_c "$OUT/build/updateinfo.xml" "$OUT/upstream/rpm2/repodata"
+
+# Second ACS path with no package in common with rpm: Pulp syncs ACS paths at once (docs/COMPATIBILITY.md).
+cp "$OUT"/rpms/fixture-alpha-1.1-1.noarch.rpm "$OUT"/rpms/fixture-gamma-0.5-1.noarch.rpm "$OUT/upstream/rpm-new/"
+createrepo_c --quiet "$OUT/upstream/rpm-new"
 
 # File content: upstream manifest repository and loose upload files.
 mkdir -p "$OUT/upstream/file/docs" "$OUT/upstream/file/isos"

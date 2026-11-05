@@ -98,7 +98,8 @@ async fn acs_lifecycle() {
     let core = status["versions"].as_array().unwrap().iter().find(|v| v["component"] == "core").unwrap()["version"].clone();
     let minor: u32 = core.as_str().unwrap().split('.').nth(1).unwrap().parse().unwrap();
     for (t, path, paths, tasks) in [
-        (RepoType::Rpm, "", json!(["rpm/", "rpm2/"]), 2),
+        // Paths with a common package can collide in Pulp and fail one sync at random (docs/COMPATIBILITY.md).
+        (RepoType::Rpm, "", json!(["rpm/", "rpm-new/"]), 2),
         (RepoType::File, "file/PULP_MANIFEST", json!([]), 1),
         (RepoType::Deb, "deb/", json!([]), 1),
     ] {

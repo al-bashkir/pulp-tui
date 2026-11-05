@@ -206,8 +206,8 @@ next section.
   access to the server storage).
 * **Reclaim space** (`live_content`): see the behavior below.
 * **Alternate content sources** (`live_content`, 3.123.1): `immediate` remote refused (400);
-  refresh of RPM (two paths), File and Deb ACS as task groups (also as one Task Center
-  task); path edit; delete.
+  refresh of RPM (two paths, no common package), File and Deb ACS as task groups (also as one
+  Task Center task); path edit; delete.
 * **Orphan cleanup** (once, by hand: **O** on Repository Versions, pulp1, 1440 minutes):
   count, typed confirmation, `orphan_cleanup` task, notice from its progress reports.
 * **RBAC**: 401 for a wrong password (any authenticated endpoint; 3.63 has no `login/`), 403
@@ -701,6 +701,16 @@ pulp_file 3.123.1 and pulp_deb 3.11.1.
   `Refreshing <n> alternate content source path(s).` (RPM), `Refreshing <n> alternate
   content source paths.` (File), `Refreshing Alternate Content Source '<name>'.` (Deb).
   pulp_file does not set `last_refreshed`.
+* **RPM paths with a common package can fail a refresh at random.** pulp_rpm dispatches the
+  path syncs with shared locks only (`shared_resources=[acs.remote, acs]`, `viewsets/acs.py`),
+  so with two workers they run at the same time with the same remote. pulpcore
+  `RemoteArtifactSaver` reads the remote artifacts of a package, then calls `bulk_create`
+  (`plugin/stages/artifact_stages.py`). When both paths hold the package, both insert it, and
+  one sync fails with `duplicate key value violates unique constraint
+  "core_remoteartifact_content_artifact_id_remo_f11e4ef2_uniq"`. The group ends with one
+  failed task, so the Task Center row fails. Live: once in about 25 refreshes of `rpm/` and
+  `rpm2/` (2026-11-05). A second refresh completes (source): the sync that completed made the
+  rows, and the saver only updates their URL. The live test uses paths with no common package.
 * **A path edit changes other sources.** Removing a path deletes it from every ACS with that
   path. The Edit form lists them and asks first.
 * **Delete** removes the hidden path repositories, but not the pulp_deb `<name>--repository`.
