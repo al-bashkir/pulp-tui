@@ -6,7 +6,8 @@
 //! remote; other references (signing services) are hrefs of one server and are left out.
 //! Objects that Content Views or replication manage are skipped: their owner creates them.
 //! Import creates what the server does not have and keeps objects with the same name, so a
-//! rerun (also after a crash halfway) ends in the same state.
+//! rerun (also after a crash halfway) ends in the same state. ULN and Git remotes go too; an
+//! object without a field that the server requires (a ULN remote's credentials) is not created.
 
 use crate::cv::{LABEL_CV, LABEL_DB, LABEL_ENV};
 use crate::pulp::ops::{self, no_progress};
@@ -26,6 +27,9 @@ const SECRET_FIELDS: [&str; 2] = ["sles_auth_token", "headers"];
 pub struct ServerExport {
     pub format: u32,
     pub remotes: Vec<Entry>,
+    /// The plugin's second remote type (`RepoType::alt_remote`: ULN, Git). An older pulp-tui ignores them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alt_remotes: Vec<Entry>,
     pub repositories: Vec<Entry>,
 }
 
@@ -114,15 +118,19 @@ fn create_body(e: &Entry, writable: &dyn Fn(&str) -> bool, remotes: &BTreeMap<St
         };
         body.insert(k.clone(), v);
     }
-    if !e.secrets.is_empty() {
-        notes.push(format!("set {} again by hand (not in the export)", e.secrets.join(", ")));
+    // The operator may have added one to the file's fields.
+    let unset: Vec<&str> = e.secrets.iter().map(String::as_str).filter(|s| !e.fields.contains_key(*s)).collect();
+    if !unset.is_empty() {
+        notes.push(format!("set {} again by hand (not in the export)", unset.join(", ")));
     }
     (body.into(), notes)
 }
 
 /// The note for an object the server already has: the fields of the file whose value on the server is different.
-fn kept_note(file: &Map<String, Value>, server: &Map<String, Value>) -> Option<String> {
-    let differs: Vec<&str> = file.iter().filter(|(k, v)| **v != "" && server.get(*k) != Some(v)).map(|(k, _)| k.as_str()).collect();
+/// A secret that the operator added to the file is write-only on the server, so it is not compared.
+fn kept_note(e: &Entry, server: &Map<String, Value>) -> Option<String> {
+    let differs = e.fields.iter().filter(|(k, v)| **v != "" && !e.secrets.contains(k) && server.get(*k) != Some(v));
+    let differs: Vec<&str> = differs.map(|(k, _)| k.as_str()).collect();
     (!differs.is_empty()).then(|| format!("exists; kept (differs: {})", differs.join(", ")))
 }
 
@@ -131,7 +139,7 @@ fn check(caps: &Capabilities, ex: &ServerExport) -> Result<()> {
     if ex.format != 1 {
         bail!("unsupported export format {}", ex.format);
     }
-    for (what, entries) in [("remote", &ex.remotes), ("repository", &ex.repositories)] {
+    for (what, entries) in [("remote", &ex.remotes), ("remote", &ex.alt_remotes), ("repository", &ex.repositories)] {
         let mut seen = HashSet::new();
         for e in entries {
             let t = e.repo_type.label();
@@ -144,6 +152,15 @@ fn check(caps: &Capabilities, ex: &ServerExport) -> Result<()> {
             if !caps.supports(e.repo_type.feature()) {
                 bail!("{t} {what} {}: this server has no {t} plugin", e.name);
             }
+        }
+    }
+    for e in &ex.alt_remotes {
+        let t = e.repo_type.label();
+        let Some((label, _, schema)) = e.repo_type.alt_remote() else {
+            bail!("{t} remote {} is in alt_remotes, but {t} has no second remote type", e.name)
+        };
+        if !caps.schemas.contains_key(schema) {
+            bail!("{t} {label} remote {}: this server has no {label} remotes", e.name);
         }
     }
     Ok(())
@@ -160,15 +177,24 @@ pub async fn export(c: &PulpClient, caps: &Capabilities) -> Result<(ServerExport
     if let Some(s) = types.iter().flat_map(|t| [t.remote_schema(), t.repository_schema()]).find(|s| !caps.schemas.contains_key(*s)) {
         bail!("the server's OpenAPI schema has no {s}; the export needs it to find the writable fields");
     }
-    let mut ex = ServerExport { format: 1, remotes: vec![], repositories: vec![] };
+    let mut ex = ServerExport { format: 1, remotes: vec![], alt_remotes: vec![], repositories: vec![] };
     let (mut notes, mut managed) = (vec![], 0);
     for t in types {
+        // The second remote type (ULN, Git), where the server has it.
+        let alt = t.alt_remote().filter(|(_, _, schema)| caps.schemas.contains_key(*schema));
         let remotes = list(c, t.remotes()).await?;
-        let names = remotes.iter().map(|r| (text(r, "pulp_href"), text(r, "name"))).collect();
+        let alts = match alt {
+            Some((_, collection, _)) => list(c, collection).await?,
+            None => vec![],
+        };
+        let names = remotes.iter().chain(&alts).map(|r| (text(r, "pulp_href"), text(r, "name"))).collect();
         let repos = list(c, t.repositories()).await?;
-        for (what, schema, objs, out) in
-            [("remote", t.remote_schema(), &remotes, &mut ex.remotes), ("repository", t.repository_schema(), &repos, &mut ex.repositories)]
-        {
+        let (alt_what, alt_schema) = alt.map_or((String::new(), ""), |(label, _, schema)| (format!("{label} remote"), schema));
+        for (what, schema, objs, out) in [
+            ("remote", t.remote_schema(), &remotes, &mut ex.remotes),
+            (alt_what.as_str(), alt_schema, &alts, &mut ex.alt_remotes),
+            ("repository", t.repository_schema(), &repos, &mut ex.repositories),
+        ] {
             for o in objs {
                 if OWNER_LABELS.iter().any(|l| o["pulp_labels"].get(l).is_some()) {
                     managed += 1;
@@ -200,7 +226,7 @@ pub async fn plan(c: &PulpClient, caps: &Capabilities, ex: &ServerExport) -> Res
 async fn run(c: &PulpClient, caps: &Capabilities, ex: &ServerExport, apply: bool) -> Result<(usize, usize, Vec<String>)> {
     check(caps, ex)?;
     let (mut created, mut kept, mut notes) = (0, 0, vec![]);
-    for t in ex.remotes.iter().chain(&ex.repositories).map(|e| e.repo_type).collect::<BTreeSet<_>>() {
+    for t in ex.remotes.iter().chain(&ex.alt_remotes).chain(&ex.repositories).map(|e| e.repo_type).collect::<BTreeSet<_>>() {
         let (cr, kp, n) = import_type(c, caps, t, ex, apply).await?;
         (created, kept) = (created + cr, kept + kp);
         notes.extend(n);
@@ -217,33 +243,44 @@ async fn import_type(
     apply: bool,
 ) -> Result<(usize, usize, Vec<String>)> {
     let (mut created, mut kept, mut notes) = (0, 0, vec![]);
-    // Remote href -> name: the server's remotes and the ones this import creates.
+    // Remote href -> name: the server's remotes (both types) and the ones this import creates.
     let mut remotes = BTreeMap::new();
-    for (what, collection, schema, entries) in
-        [("remote", t.remotes(), t.remote_schema(), &ex.remotes), ("repository", t.repositories(), t.repository_schema(), &ex.repositories)]
-    {
+    let alt = t.alt_remote().filter(|(_, _, schema)| caps.schemas.contains_key(*schema));
+    let alt_what = alt.map(|(label, ..)| format!("{label} remote")).unwrap_or_default();
+    let mut kinds = vec![("remote", t.remotes(), t.remote_schema(), &ex.remotes)];
+    kinds.extend(alt.map(|(_, collection, schema)| (alt_what.as_str(), collection, schema, &ex.alt_remotes)));
+    kinds.push(("repository", t.repositories(), t.repository_schema(), &ex.repositories));
+    for (what, collection, schema, entries) in kinds {
         let writable = |f: &str| caps.has_field(schema, f);
         let server = list(c, collection).await?;
-        if what == "remote" {
+        if what != "repository" {
             remotes.extend(server.iter().map(|r| (text(r, "pulp_href"), text(r, "name"))));
         }
         for e in entries.iter().filter(|e| e.repo_type == t) {
             let label = format!("{} {what} {}", t.label(), e.name);
             if let Some(o) = server.iter().find(|o| o["name"] == e.name.as_str()) {
                 kept += 1;
-                notes.extend(
-                    kept_note(&e.fields, &entry(t, o, &writable, &remotes, c.api_prefix()).0.fields).map(|n| format!("{label} {n}")),
-                );
+                notes.extend(kept_note(e, &entry(t, o, &writable, &remotes, c.api_prefix()).0.fields).map(|n| format!("{label} {n}")));
                 continue;
             }
             let (body, left_out) = create_body(e, &writable, &remotes);
+            // A ULN remote needs its username and password, which no export has.
+            let required = caps.required.get(schema).into_iter().flatten().map(String::as_str);
+            let missing: Vec<&str> = required.filter(|f| body.get(*f).is_none()).collect();
+            if !missing.is_empty() {
+                let needs = missing.join(", ");
+                notes.push(format!(
+                    "{label}: not created: it needs {needs} (not in the export); add them to its fields in the file, or create it by hand"
+                ));
+                continue;
+            }
             let href = if apply {
                 ops::create(c, &c.api(collection), &body, collection, &no_progress).await?
             } else {
                 notes.push(format!("{label}: create"));
                 format!("new:{}", e.name) // a repository of the file finds this remote by name
             };
-            if what == "remote" {
+            if what != "repository" {
                 remotes.insert(href, e.name.clone());
             }
             created += 1;
@@ -336,6 +373,123 @@ mod tests {
         }
     }
 
+    /// ULN and Git remotes (the second remote type of pulp_rpm and pulp_file) go in `alt_remotes`, without their
+    /// credentials; a repository names one. Import creates such a remote only with every field that the server
+    /// requires: a ULN remote needs `username` and `password`, which the export never has.
+    #[tokio::test]
+    async fn uln_and_git_remotes_are_exported_and_imported_when_their_required_fields_are_there() {
+        let mut caps = caps();
+        caps.versions.insert("file".into(), "1.0.0".into());
+        caps.load_openapi(&json!({ "paths": {}, "components": { "schemas": {
+            "rpm.UlnRemote": { "required": ["name", "password", "url", "username"], "properties": { "name": {}, "url": {},
+                "uln_server_base_url": {}, "username": {}, "password": {}, "pulp_labels": {} } },
+            "file.FileRemote": { "required": ["name", "url"], "properties": { "name": {}, "url": {}, "pulp_labels": {} } },
+            "file.FileRepository": { "properties": { "name": {}, "remote": {}, "pulp_labels": {} } },
+            "file.FileGitRemote": { "required": ["name", "url"], "properties": { "name": {}, "url": {}, "git_ref": {}, "username": {},
+                "password": {}, "pulp_labels": {} } },
+        } } }));
+        let (uln, git) = (format!("{API}remotes/rpm/uln/1/"), format!("{API}remotes/file/git/1/"));
+        let up = MockServer::start().await;
+        for coll in ["remotes/rpm/rpm/", "remotes/file/file/", "repositories/file/file/"] {
+            serve(&up, coll, json!([])).await;
+        }
+        serve(
+            &up,
+            "remotes/rpm/uln/",
+            json!([{ "pulp_href": uln, "name": "uln-os", "url": "uln://ol8_x86_64_baseos_latest",
+            "uln_server_base_url": "https://linux-update.oracle.com/", "pulp_labels": {},
+            "hidden_fields": [{ "name": "username", "is_set": true }, { "name": "password", "is_set": true }] }]),
+        )
+        .await;
+        serve(
+            &up,
+            "remotes/file/git/",
+            json!([{ "pulp_href": git, "name": "docs-git", "url": "https://git.example/docs.git",
+            "git_ref": "main", "pulp_labels": {}, "hidden_fields": [] }]),
+        )
+        .await;
+        serve(
+            &up,
+            "repositories/rpm/rpm/",
+            json!([{ "pulp_href": format!("{API}repositories/rpm/rpm/1/"), "name": "ol8", "remote": uln,
+            "pulp_labels": {} }]),
+        )
+        .await;
+        let (mut ex, _) = export(&client(&up), &caps).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&ex).unwrap(),
+            json!({ "format": 1, "remotes": [],
+                "alt_remotes": [
+                    { "type": "rpm", "name": "uln-os", "secrets": ["username", "password"],
+                      "fields": { "url": "uln://ol8_x86_64_baseos_latest", "uln_server_base_url": "https://linux-update.oracle.com/",
+                                  "pulp_labels": {} } },
+                    { "type": "file", "name": "docs-git", "fields": { "url": "https://git.example/docs.git", "git_ref": "main", "pulp_labels": {} } },
+                ],
+                "repositories": [{ "type": "rpm", "name": "ol8", "fields": { "remote": "uln-os", "pulp_labels": {} } }] })
+        );
+
+        let down = MockServer::start().await;
+        for coll in [
+            "remotes/rpm/rpm/",
+            "remotes/rpm/uln/",
+            "repositories/rpm/rpm/",
+            "remotes/file/file/",
+            "remotes/file/git/",
+            "repositories/file/file/",
+        ] {
+            serve(&down, coll, json!([])).await;
+        }
+        let (create, keep, notes) = plan(&client(&down), &caps, &ex).await.unwrap();
+        assert_eq!((create, keep), (2, 0));
+        assert_eq!(
+            notes,
+            [
+                "RPM ULN remote uln-os: not created: it needs password, username (not in the export); add them to its fields in the \
+                 file, or create it by hand",
+                "RPM repository ol8: create",
+                "RPM repository ol8: remote uln-os left out (this server does not have it)",
+                "File Git remote docs-git: create",
+            ]
+        );
+        // The operator adds the credentials to the file: the import creates the ULN remote, and the repository gets it.
+        ex.alt_remotes[0].fields.extend([("username".into(), json!("u")), ("password".into(), json!("p"))]);
+        for (coll, href) in [("remotes/rpm/uln/", uln.as_str()), ("repositories/rpm/rpm/", "/r/1/"), ("remotes/file/git/", git.as_str())] {
+            Mock::given(method("POST"))
+                .and(path(format!("{API}{coll}")))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": href })))
+                .mount(&down)
+                .await;
+        }
+        let (created, _, notes) = import(&client(&down), &caps, &ex).await.unwrap();
+        assert_eq!((created, notes), (3, vec![]));
+        let posts: Vec<(String, Value)> = down
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| (r.url.path().to_string(), r.body_json().unwrap()))
+            .collect();
+        assert_eq!(posts[0].1["username"], "u");
+        assert_eq!(posts[1], (format!("{API}repositories/rpm/rpm/"), json!({ "name": "ol8", "remote": uln, "pulp_labels": {} })));
+        assert_eq!(posts[2].0, format!("{API}remotes/file/git/"));
+
+        // A target that has the ULN remote already: it is kept (its credentials are not compared), and the repository
+        // gets it.
+        let has_uln = MockServer::start().await;
+        for coll in ["remotes/rpm/rpm/", "repositories/rpm/rpm/", "remotes/file/file/", "remotes/file/git/", "repositories/file/file/"] {
+            serve(&has_uln, coll, json!([])).await;
+        }
+        let existing = json!({ "pulp_href": uln, "name": "uln-os", "url": "uln://ol8_x86_64_baseos_latest",
+            "uln_server_base_url": "https://linux-update.oracle.com/", "pulp_labels": {} });
+        serve(&has_uln, "remotes/rpm/uln/", json!([existing])).await;
+        let (create, keep, notes) = plan(&client(&has_uln), &caps, &ex).await.unwrap();
+        assert_eq!(
+            (create, keep, notes),
+            (2, 1, vec!["RPM repository ol8: create".to_string(), "File Git remote docs-git: create".into()])
+        );
+    }
+
     #[tokio::test]
     async fn export_refuses_a_server_without_the_request_schema() {
         let server = MockServer::start().await;
@@ -370,6 +524,7 @@ mod tests {
         let ex = ServerExport {
             format: 1,
             remotes: vec![os],
+            alt_remotes: vec![],
             repositories: vec![
                 rpm("app", json!({ "description": "d", "remote": "os", "pulp_labels": {} })),
                 rpm("kept", json!({ "description": "file", "remote": null, "pulp_labels": {} })),
@@ -411,6 +566,7 @@ mod tests {
         let ex = ServerExport {
             format: 1,
             remotes: vec![os],
+            alt_remotes: vec![],
             repositories: vec![
                 rpm("app", json!({ "description": "d", "remote": "os", "pulp_labels": {} })),
                 rpm("kept", json!({ "description": "file", "remote": null, "pulp_labels": {} })),
@@ -451,7 +607,11 @@ mod tests {
         let (body, notes) = create_body(&e, &writable, &BTreeMap::new());
         assert_eq!(body, json!({ "name": "app", "description": "d" }), "\"\" is not set: pulp_rpm 3.39 refuses it");
         let server = json!({ "description": "d", "package_signing_fingerprint": null });
-        assert_eq!(kept_note(&e.fields, server.as_object().unwrap()), Some("exists; kept (differs: layout, remote)".into()));
+        assert_eq!(kept_note(&e, server.as_object().unwrap()), Some("exists; kept (differs: layout, remote)".into()));
+        let mut uln = rpm("uln", json!({ "password": "p" }));
+        assert_eq!(kept_note(&uln, &Map::new()), Some("exists; kept (differs: password)".into()));
+        uln.secrets = vec!["password".into()];
+        assert_eq!(kept_note(&uln, &Map::new()), None, "a secret added to the file is not compared");
         assert_eq!(notes, ["layout left out (this server does not have it)", "remote gone left out (this server does not have it)"]);
         let remotes = BTreeMap::from([(remote_href(3), "gone".to_string())]);
         assert_eq!(create_body(&e, &writable, &remotes).0["remote"], json!(remote_href(3)));
@@ -459,7 +619,8 @@ mod tests {
 
     #[test]
     fn check_refuses_a_file_the_import_would_stop_on_halfway() {
-        let ok = ServerExport { format: 1, remotes: vec![rpm("os", json!({}))], repositories: vec![rpm("os", json!({}))] };
+        let ok =
+            ServerExport { format: 1, remotes: vec![rpm("os", json!({}))], alt_remotes: vec![], repositories: vec![rpm("os", json!({}))] };
         assert!(check(&caps(), &ok).is_ok(), "a remote and a repository can share a name");
         let refused = |ex: ServerExport| check(&caps(), &ex).unwrap_err().to_string();
         assert_eq!(refused(ServerExport { format: 2, ..ok.clone() }), "unsupported export format 2");
@@ -469,6 +630,13 @@ mod tests {
             "RPM repository a is in the file twice"
         );
         let deb = Entry { repo_type: RepoType::Deb, ..rpm("d", json!({})) };
-        assert_eq!(refused(ServerExport { remotes: vec![deb], ..ok }), "Deb remote d: this server has no Deb plugin");
+        assert_eq!(refused(ServerExport { remotes: vec![deb.clone()], ..ok.clone() }), "Deb remote d: this server has no Deb plugin");
+        // The second remote type: only where the plugin has one and the server's OpenAPI has its schema.
+        let uln = ServerExport { alt_remotes: vec![rpm("uln", json!({}))], ..ok.clone() };
+        assert_eq!(refused(uln), "RPM ULN remote uln: this server has no ULN remotes");
+        let mut with_deb = caps();
+        with_deb.versions.insert("deb".into(), "3.0.0".into());
+        let e = check(&with_deb, &ServerExport { alt_remotes: vec![deb], ..ok }).unwrap_err().to_string();
+        assert_eq!(e, "Deb remote d is in alt_remotes, but Deb has no second remote type");
     }
 }

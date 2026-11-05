@@ -1179,8 +1179,13 @@ pulp-tui --profile old export-repos -o repos.json
 pulp-tui --profile new import-repos repos.json
 ```
 
-* The file holds the RPM, File and Deb remotes and repositories. A repository gets the remote of
-  the same name on the target.
+* The file holds the RPM, File and Deb remotes and repositories, and the ULN and Git remotes. A
+  repository gets the remote of the same name on the target.
+* A ULN remote needs its username and password, which the file never has. The import does not
+  create it and says so:
+  `RPM ULN remote ol8: not created: it needs password, username (not in the export); ...`. Add
+  `"username"` and `"password"` to its `fields` in the file and import again, or create it by
+  hand.
 * The export leaves out (with a `note:` line on stderr):
   * secrets (credentials, client keys, `sles_auth_token`, `headers`). The import names them:
     `warning: RPM remote os: set username, password again by hand (not in the export)`. Set them

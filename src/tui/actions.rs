@@ -820,7 +820,7 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
                     let (ex, notes) = crate::repo_export::export(&c, &Capabilities::detect(&c).await?).await?;
                     tokio::fs::write(&path, serde_json::to_string_pretty(&ex)?).await.with_context(|| format!("write {path}"))?;
                     ap(move |app| {
-                        let (r, n) = (ex.remotes.len(), ex.repositories.len());
+                        let (r, n) = (ex.remotes.len() + ex.alt_remotes.len(), ex.repositories.len());
                         app.ok(format!("exported {r} remote(s) and {n} repositories of {profile} to {path} (no secrets)"));
                         if !notes.is_empty() {
                             app.text(format!("Export of {profile}"), notes.iter().map(|n| format!("note: {n}")).collect());

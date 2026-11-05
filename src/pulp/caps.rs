@@ -26,6 +26,8 @@ pub struct Capabilities {
     pub operation_ids: BTreeSet<String>,
     /// Schema name -> property names (request and response schemas).
     pub schemas: BTreeMap<String, BTreeSet<String>>,
+    /// Schema name -> its `required` property names.
+    pub required: BTreeMap<String, BTreeSet<String>>,
     pub enums: BTreeMap<String, Vec<String>>,
     /// (schema, property) -> name of the schema that the property's `$ref` points to.
     pub refs: BTreeMap<(String, String), String>,
@@ -158,6 +160,8 @@ impl Capabilities {
             for (name, s) in schemas {
                 if let Some(props) = s["properties"].as_object() {
                     self.schemas.insert(name.clone(), props.keys().cloned().collect());
+                    let required = s["required"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string));
+                    self.required.insert(name.clone(), required.collect());
                     for (prop, p) in props {
                         // drf-spectacular puts a reference with its own description in `allOf`, an array one in `items`.
                         if let Some(r) = p["$ref"].as_str().or(p["allOf"][0]["$ref"].as_str()).or(p["items"]["$ref"].as_str()) {

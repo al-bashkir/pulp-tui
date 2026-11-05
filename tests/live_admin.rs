@@ -159,7 +159,7 @@ async fn repository_definitions_export_and_import() {
     let entry = |e: pulp_tui::repo_export::Entry| pulp_tui::repo_export::Entry { name: new.clone(), secrets: vec![], ..e };
     let mut p2 = entry(p);
     p2.fields.insert("remote".into(), json!(new));
-    let ex2 = ServerExport { format: 1, remotes: vec![entry(mine(&ex.remotes))], repositories: vec![p2] };
+    let ex2 = ServerExport { format: 1, remotes: vec![entry(mine(&ex.remotes))], alt_remotes: vec![], repositories: vec![p2] };
     std::fs::write(&file, serde_json::to_vec(&ex2).unwrap()).unwrap();
     run(&mut app, Act::ImportRepos, Value::Null);
     type_path(&mut app, &file);

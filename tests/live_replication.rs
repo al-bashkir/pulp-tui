@@ -340,7 +340,8 @@ async fn deb_flat_verbatim_fallback_replication() {
 }
 
 /// `export-repos` on pulp2 and `import-repos` on pulp1: a repository gets the remote of the same name on pulp1,
-/// no secret is in the file, and a rerun keeps everything.
+/// no secret is in the file, and a rerun keeps everything. ULN and Git remotes go too; a ULN remote is created only
+/// after the operator adds its username and password to the file.
 #[tokio::test]
 async fn repo_definitions_move_between_servers() {
     if !live_enabled() {
@@ -357,13 +358,23 @@ async fn repo_definitions_move_between_servers() {
     let deb_remote = create(&up, RepoType::Deb.remotes(), remote, "/remotes/").await;
     create(&up, RepoType::Deb.repositories(), json!({ "name": format!("{p}-deb"), "remote": deb_remote }), "/repositories/").await;
     create(&up, RepoType::File.repositories(), json!({ "name": format!("{p}-file") }), "/repositories/").await;
+    let uln = json!({ "name": format!("{p}-uln"), "url": "uln://ol8_x86_64_baseos_latest", "username": "u", "password": "uln-pw" });
+    create(&up, "remotes/rpm/uln/", uln, "/remotes/").await;
+    let up_caps = Capabilities::detect(&up).await.unwrap();
+    // pulp_file has Git remotes only on newer servers (not on 3.63 or 3.95).
+    let git = usize::from(up_caps.schemas.contains_key("file.FileGitRemote"));
+    if git == 1 {
+        let body = json!({ "name": format!("{p}-git"), "url": "https://git.example/docs.git", "git_ref": "main" });
+        create(&up, "remotes/file/git/", body, "/remotes/").await;
+    }
 
-    let (mut ex, _) = repo_export::export(&up, &Capabilities::detect(&up).await.unwrap()).await.unwrap();
+    let (mut ex, _) = repo_export::export(&up, &up_caps).await.unwrap();
     ex.remotes.retain(|e| e.name.starts_with(&p));
+    ex.alt_remotes.retain(|e| e.name.starts_with(&p));
     ex.repositories.retain(|e| e.name.starts_with(&p));
-    assert_eq!((ex.remotes.len(), ex.repositories.len()), (2, 3));
+    assert_eq!((ex.remotes.len(), ex.alt_remotes.len(), ex.repositories.len()), (2, 1 + git, 3));
     let file = serde_json::to_string(&ex).unwrap();
-    for secret in ["\"pw\"", "tok", "X-Token"] {
+    for secret in ["\"pw\"", "tok", "X-Token", "uln-pw"] {
         assert!(!file.contains(secret), "{secret} in {file}");
     }
     let secrets = &ex.remotes.iter().find(|e| e.name == format!("{p}-rpm")).unwrap().secrets;
@@ -371,7 +382,21 @@ async fn repo_definitions_move_between_servers() {
 
     let caps = Capabilities::detect(&down).await.unwrap();
     let (created, kept, notes) = repo_export::import(&down, &caps, &ex).await.unwrap();
-    assert_eq!((created, kept), (5, 0), "{notes:?}");
+    assert_eq!((created, kept), (5 + git, 0), "{notes:?}");
+    let not_created = format!(
+        "RPM ULN remote {p}-uln: not created: it needs password, username (not in the export); add them to its fields in the file, \
+         or create it by hand"
+    );
+    assert!(notes.contains(&not_created), "{notes:?}");
+    if git == 1 {
+        let r: Value = ops::find_by_name(&down, &down.api("remotes/file/git/"), &format!("{p}-git")).await.unwrap().unwrap();
+        assert_eq!(r["git_ref"], "main");
+    }
+    // The operator adds the ULN credentials to the file: the next import creates that remote too.
+    let uln = ex.alt_remotes.iter_mut().find(|e| e.repo_type == RepoType::Rpm).unwrap();
+    uln.fields.extend([("username".to_string(), json!("u")), ("password".to_string(), json!("uln-pw"))]);
+    let (created, kept, notes) = repo_export::import(&down, &caps, &ex).await.unwrap();
+    assert_eq!((created, kept, notes), (1, 5 + git, vec![]));
     for t in [RepoType::Rpm, RepoType::Deb] {
         let name = format!("{p}-{}", t.component());
         let repo: Value = ops::find_by_name(&down, &down.api(t.repositories()), &name).await.unwrap().unwrap();
@@ -382,6 +407,6 @@ async fn repo_definitions_move_between_servers() {
     assert_eq!((repo["description"].as_str(), repo["retain_repo_versions"].as_u64()), (Some("d"), Some(3)));
 
     let (created, kept, notes) = repo_export::import(&down, &caps, &ex).await.unwrap();
-    assert_eq!((created, kept), (0, 5));
+    assert_eq!((created, kept), (0, 6 + git));
     assert!(notes.is_empty(), "a rerun finds nothing different: {notes:?}");
 }

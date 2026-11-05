@@ -185,7 +185,9 @@ next section.
 * **Fallback replication**: dry run, create, idempotent rerun, upstream update, conflict
   with native-replicated objects, loop guard, self-replication guard.
 * **Repository definitions** (`export-repos` on pulp2, `import-repos` on pulp1): RPM, Deb
-  and File, no secret in the file, remote found by name, idempotent rerun.
+  and File, ULN and Git remotes, no secret in the file, remote found by name, idempotent rerun.
+  `rpm.UlnRemote` requires `username` and `password` (OpenAPI `required`), which GET never
+  returns: the import creates a ULN remote only when the operator added them to the file.
 * **Pulp export** (`live_export`, File): full export (TOC, files, `last_export`), export
   record delete (204), exporter delete (task); incremental export (400 without a previous
   export; after a new file, its import adds the file to the copy); `versions` with an older
@@ -880,7 +882,6 @@ or IpAddress(127.0.0.1)`.
 * RPM layout `nested_by_digest`: served-content checks skip the package probe (metadata is
   still checked).
 * ULN: a sync from a ULN remote is tested with mock HTTP only (it needs a ULN account).
-  `export-repos` leaves out ULN and Git remotes.
 * Signing services can be set on repositories, not created (that needs server scripts).
 * Content guards are not replicated (fallback replication). The object role form lists all
   roles, not only the ones for the object type (Pulp refuses the others).

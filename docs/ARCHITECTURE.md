@@ -331,9 +331,11 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
   repository that is gone (404) fails the export, again with every one named.
 * **Repository and remote definitions** (`src/repo_export.rs`): the export keeps the
   fields of the live request schema. It leaves out readable secrets (`sles_auth_token`,
-  `headers`, credentials in URLs), hrefs and objects with ownership labels. The import
-  creates what is missing and never changes an existing object, so a rerun is a no-op.
-  `repo_export::plan` is the dry run.
+  `headers`, credentials in URLs), hrefs and objects with ownership labels. ULN and Git
+  remotes (`RepoType::alt_remote`) go in `alt_remotes`, which an older pulp-tui ignores. The
+  import creates what is missing and never changes an existing object, so a rerun is a no-op.
+  It does not create an object that lacks a field of the schema's `required` list (a ULN
+  remote's `username` and `password`). `repo_export::plan` is the dry run.
 
 ## Storage
 
