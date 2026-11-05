@@ -1814,7 +1814,7 @@ fn publication_fields(caps: Option<&Capabilities>, t: RepoType) -> Vec<Field> {
             choice("layout", "Package layout"),
             Field::text("repo_config", "Repo config (JSON)").help(r#"e.g. {"gpgcheck": 1}; empty = repository setting"#),
         ],
-        RepoType::File => vec![],
+        RepoType::File => vec![Field::text("manifest", "Manifest file name").help("e.g. PULP_MANIFEST; empty = the repository's")],
         RepoType::Deb => vec![
             flag("simple", "Simple (all packages in one component)"),
             flag("structured", "Structured (the upstream components)"),
@@ -4976,6 +4976,31 @@ mod tests {
         assert_eq!(sent, [service("/ss/1/"), service("/ss/2/")]);
     }
 
+    /// A File publication names its manifest file; empty = the repository's, which the request names (a publish
+    /// request without it gets PULP_MANIFEST from pulp_file).
+    #[tokio::test]
+    async fn a_file_publish_names_its_manifest() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (r, pubs) = (format!("{API}repositories/file/file/r/"), format!("{API}publications/file/file/"));
+        answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}9/") })).await;
+        get(&server, &r, json!({ "manifest": "REPO_MANIFEST" })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let v = format!("{r}versions/1/");
+        for manifest in ["CUSTOM", ""] {
+            repo_action(&mut app, RepoType::File, Act::Publish, json!({ "pulp_href": r, "name": "r", "latest_version_href": v }));
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            assert_eq!(keys(&form), ["manifest"]);
+            set(&mut form, "manifest", manifest);
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+        }
+        assert_eq!(
+            posts_to(&server, &pubs).await,
+            [json!({ "repository_version": v, "manifest": "CUSTOM" }), json!({ "repository_version": v, "manifest": "REPO_MANIFEST" })]
+        );
+    }
+
     #[tokio::test]
     async fn publication_options_follow_the_server_schema_and_send_only_what_is_set() {
         use crate::tui::app::Modal;
@@ -5020,7 +5045,7 @@ mod tests {
         assert_eq!(kind(&form, "layout"), c(&["", "nested_alphabetically", "flat"]));
         assert_eq!(kind(&form, "checkpoint"), c(&["", "true", "false"]), "empty = server default");
         assert!(form.fields[2..].iter().all(|f| f.value.is_empty()), "every option starts at the server default");
-        assert_eq!(keys(&open(&mut app, RepoType::File).0), ["repo", "number", "checkpoint"]);
+        assert_eq!(keys(&open(&mut app, RepoType::File).0), ["repo", "number", "manifest", "checkpoint"]);
 
         let set = |form: &mut Form, values: &[(&str, &str)]| {
             for (k, v) in values {

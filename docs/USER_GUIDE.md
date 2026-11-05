@@ -436,6 +436,8 @@ releases, components, indices and more). `/` searches package names or file path
   no options. **P** in Repositories and Versions has the same fields, except **Checkpoint**
   (Pulp makes a checkpoint of the latest version only).
   * **Checksum type**, **Metadata compression**, **Repo config** (RPM): as the repository fields.
+  * **Manifest file name** (File): the name of the manifest that the publication serves, for
+    example `CUSTOM_MANIFEST`. Empty = the manifest name of the repository.
   * **Package layout** (RPM, Deb).
   * **Simple** / **Structured** (Deb): one component, or the upstream components (default). One of
     them must be `true`.
