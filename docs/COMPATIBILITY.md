@@ -381,8 +381,12 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   of the version and lists with it, then names each package with vulnerabilities. On pulp1 the
   scan of the 3 fixture packages (Rocky Linux 9) reached osv.dev and found none.
   pulp_rpm refuses `pulp_labels` with the key `osv.rpm.config` ("Use the 'osv_config' field"),
-  and `pulp_labels` without it replaces the label set: so the Labels field of the repository form
-  cannot keep or change the OSV config.
+  and `pulp_labels` without it replaces the label set, so the label goes. A request with both
+  `pulp_labels` and `osv_config` merges the current labels into the new ones
+  (`RpmRepositorySerializer.validate`), so a removed label stays. The repository form hides the
+  label from Labels and has an OSV config field; an edit that changes the labels sends them alone,
+  waits for the task, then sets `osv_config` again (the form's value, else the one the server has
+  just before the edit). Checked on pulp1 (`rpm_osv_config_survives_a_label_edit_through_the_tui`).
 
 ### Content and digests
 
@@ -843,9 +847,6 @@ or IpAddress(127.0.0.1)`.
 * ULN: a sync from a ULN remote is tested with mock HTTP only (it needs a ULN account).
   `export-repos` leaves out ULN and Git remotes.
 * Signing services can be set on repositories, not created (that needs server scripts).
-* RPM `osv_config` (the ecosystems of a version scan) is not in the repository form; set it with
-  the API. An edit that changes the Labels of a repository that has it gets HTTP 400 from
-  pulp_rpm; with the `osv.rpm.config` label taken out of the field, the edit removes the config.
 * Content guards are not replicated (fallback replication). The object role form lists all
   roles, not only the ones for the object type (Pulp refuses the others).
 * Reusable filter sets are not implemented; filters are per view repository, so a later

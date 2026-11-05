@@ -902,6 +902,11 @@ fn repo_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec
                 let help = r#"the generated .repo file, e.g. {"gpgcheck": 1, "repo_gpgcheck": 1}"#;
                 fields.push(Field::text("repo_config", "Repo config (JSON)").value(shown.unwrap_or_default()).help(help));
             }
+            if has("osv_config") {
+                let shown = v["osv_config"].as_array().map(|_| v["osv_config"].to_string());
+                let help = r#"ecosystems of a vulnerability scan, e.g. [{"name": "Rocky Linux", "releases": ["9"]}]; empty = none"#;
+                fields.push(Field::text("osv_config", "OSV config (JSON)").value(shown.unwrap_or_default()).help(help));
+            }
             if has("metadata_signing_service") {
                 fields.push(
                     Field::pick("metadata_signing_service", "Metadata signing service", Source::SigningServices)
@@ -990,6 +995,11 @@ fn json_object(v: &str) -> Result<Value, String> {
 /// `remote` is the name of the repository's default remote ("" = none, or not readable).
 fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>, remote: &str) -> Form {
     let v = item.cloned().unwrap_or(Value::Null);
+    let mut labels = v["pulp_labels"].clone();
+    // pulp_rpm keeps the OSV config in this label and refuses it in `pulp_labels`: the OSV config field edits it.
+    if t == RepoType::Rpm && caps.is_none_or(|c| c.has_field(t.repository_schema(), "osv_config")) {
+        labels.as_object_mut().map(|m| m.remove("osv.rpm.config"));
+    }
     let mut fields = vec![
         Field::text("name", "Name").required().value(s(&v, "name")),
         Field::text("description", "Description").value(s(&v, "description")),
@@ -998,7 +1008,7 @@ fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>, rem
             .value(s(&v, "retain_repo_versions"))
             .help("empty = keep all versions"),
         Field::new("autopublish", "Autopublish", FieldKind::Bool).value(if v["autopublish"] == true { "true" } else { "false" }),
-        Field::text("labels", "Labels (k=v,...)").value(format_labels(&v["pulp_labels"])),
+        Field::text("labels", "Labels (k=v,...)").value(format_labels(&labels)),
     ];
     fields.extend(repo_extra_fields(t, caps, &v));
     let mut form =
@@ -1036,6 +1046,10 @@ fn repo_body(f: &Form, edit: bool) -> Result<Value, String> {
                 v.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>().into()
             }
             ("repo_config", _) if !v.is_empty() || edit => json_object(v).map_err(|e| format!("{}: {e}", fld.label))?,
+            ("osv_config", _) if !v.is_empty() => serde_json::from_str::<Value>(v)
+                .ok()
+                .filter(Value::is_array)
+                .ok_or_else(|| format!(r#"{}: must be a JSON list, e.g. [{{"name": "Rocky Linux", "releases": ["9"]}}]"#, fld.label))?,
             (_, FieldKind::Bool) => Value::Bool(v == "true"),
             (_, FieldKind::Number) if v.is_empty() && edit && matches!(fld.key.as_str(), "retain_repo_versions" | "retain_checkpoints") => {
                 Value::Null
@@ -1060,13 +1074,31 @@ fn repo_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
         app.form(form, move |app, f| {
             let mut body = repo_body(f, edit)?;
             let remote = body["remote"].as_str().map(str::to_string);
+            // pulp_rpm merges the current labels into a request that also has `osv_config` (a removed label would stay),
+            // and `pulp_labels` alone drops the OSV label: a label edit goes alone, then the OSV config is set again.
+            let osv = (edit && body.get("pulp_labels").is_some() && f.fields.iter().any(|x| x.key == "osv_config"))
+                .then(|| body.as_object_mut().and_then(|b| b.remove("osv_config")));
             let (href, remotes) = (href.clone(), remotes.clone());
             let label = format!("{} repository {}", if edit { "update" } else { "create" }, f.get("name"));
             submit(app, label, move |c| async move {
                 if let Some(r) = remote {
                     body["remote"] = remote_href(&c, &remotes, &r).await?.into();
                 }
-                Ok(if edit { c.patch(&href, &body).await? } else { c.post(&c.api(t.repositories()), &body).await? })
+                if !edit {
+                    return Ok(c.post(&c.api(t.repositories()), &body).await?);
+                }
+                let osv = match osv {
+                    // Unchanged in the form: the server's config of now (the list row can be old).
+                    Some(None) => c.get::<Value>(&href, &[("fields", "osv_config".into())]).await?["osv_config"].clone(),
+                    Some(Some(v)) => v,
+                    None => Value::Null,
+                };
+                let m = c.patch(&href, &body).await?;
+                if osv.is_null() {
+                    return Ok(m);
+                }
+                ops::settle(&c, m, &ops::no_progress).await?;
+                Ok(c.patch(&href, &json!({ "osv_config": osv })).await?)
             });
             Ok(())
         });
@@ -3681,6 +3713,99 @@ mod tests {
         set(&mut f, "repo_config", "");
         set(&mut f, "retain_checkpoints", "two");
         assert_eq!(repo_body(&f, true).unwrap_err(), "Retain checkpoints must be a number");
+    }
+
+    #[test]
+    fn rpm_osv_config_is_a_json_field_and_its_label_stays_out_of_the_labels() {
+        let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
+        let rocky = json!([{ "name": "Rocky Linux", "releases": ["9"] }]);
+        let labels = json!({ "a": "b", "osv.rpm.config": "%5B%7B%22name%22%3A%20%22Rocky%20Linux%22%7D%5D" });
+        let item = json!({ "name": "os", "osv_config": rocky, "pulp_labels": labels });
+        let mut f = repo_form(RepoType::Rpm, None, Some(&item), "");
+        assert_eq!((f.get("labels"), f.get("osv_config")), ("a=b", r#"[{"name":"Rocky Linux","releases":["9"]}]"#));
+        assert_eq!(repo_body(&f, true).unwrap(), json!({}), "untouched");
+        set(&mut f, "osv_config", r#"[{"name": "AlmaLinux", "releases": ["9", "10"]}]"#);
+        assert_eq!(repo_body(&f, true).unwrap(), json!({ "osv_config": [{ "name": "AlmaLinux", "releases": ["9", "10"] }] }));
+        set(&mut f, "osv_config", "");
+        assert_eq!(repo_body(&f, true).unwrap(), json!({ "osv_config": null }), "cleared: Pulp drops the label");
+        set(&mut f, "osv_config", r#"{"name": "AlmaLinux"}"#);
+        assert_eq!(
+            repo_body(&f, true).unwrap_err(),
+            r#"OSV config (JSON): must be a JSON list, e.g. [{"name": "Rocky Linux", "releases": ["9"]}]"#
+        );
+        let mut new = repo_form(RepoType::Rpm, None, None, "");
+        set(&mut new, "name", "os");
+        assert!(repo_body(&new, false).unwrap().get("osv_config").is_none(), "empty on create: not sent");
+        set(&mut new, "osv_config", &rocky.to_string());
+        assert_eq!(repo_body(&new, false).unwrap()["osv_config"], rocky);
+        // A server without the field: the label is an ordinary one.
+        let mut old = Capabilities::default();
+        old.schemas.insert("rpm.RpmRepository".into(), ["name"].map(String::from).into());
+        let f = repo_form(RepoType::Rpm, Some(&old), Some(&item), "");
+        assert!(f.get("labels").contains("osv.rpm.config=") && !f.fields.iter().any(|x| x.key == "osv_config"), "{:?}", f.get("labels"));
+    }
+
+    /// pulp_rpm merges the current labels into a request that also has `osv_config` (a removed label stays), and
+    /// `pulp_labels` alone drops the OSV label: a label edit goes alone, then the OSV config of the server is set again.
+    #[tokio::test]
+    async fn a_label_edit_keeps_the_osv_config_of_the_rpm_repository() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{body_json, method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/rpm/rpm/r/");
+        let (task1, task2) = (format!("{API}tasks/1/"), format!("{API}tasks/2/"));
+        let alma = json!([{ "name": "AlmaLinux", "releases": ["9"] }]);
+        // The server's config of now, not the one of the list row: another operator changed it.
+        wiremock::Mock::given(method("GET"))
+            .and(path(repo.clone()))
+            .and(query_param("fields", "osv_config"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "osv_config": alma })))
+            .mount(&server)
+            .await;
+        for (body, task) in [(json!({ "pulp_labels": { "a": "c" } }), &task1), (json!({ "osv_config": alma }), &task2)] {
+            wiremock::Mock::given(method("PATCH"))
+                .and(path(repo.clone()))
+                .and(body_json(body))
+                .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": task })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        get(&server, &task1, json!({ "pulp_href": task1, "state": "completed" })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let rocky = json!([{ "name": "Rocky Linux", "releases": ["9"] }]);
+        let item = json!({ "pulp_href": repo, "name": "os", "osv_config": rocky, "pulp_labels": { "a": "b", "osv.rpm.config": "x" } });
+        repo_action(&mut app, RepoType::Rpm, Act::Edit, item.clone());
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        form.fields.iter_mut().find(|f| f.key == "labels").unwrap().value = "a=c".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let notes: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(app.tasks.items.first().map(|t| t.href.as_str()), Some(task2.as_str()), "{notes:?}");
+        let methods: Vec<String> = server.received_requests().await.unwrap().iter().map(|r| r.method.to_string()).collect();
+        assert_eq!(methods.iter().filter(|m| *m == "PATCH").count(), 2, "{methods:?}");
+
+        // Only the OSV config: one request, which keeps the labels.
+        server.reset().await;
+        let only = wiremock::Mock::given(method("PATCH")).and(path(repo.clone())).and(body_json(json!({ "osv_config": null })));
+        only.respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": task1 }))).expect(1).mount(&server).await;
+        repo_action(&mut app, RepoType::Rpm, Act::Edit, item);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        form.fields.iter_mut().find(|f| f.key == "osv_config").unwrap().value.clear();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        // A repository without the field: the labels go alone, nothing is read first.
+        server.reset().await;
+        let files = format!("{API}repositories/file/file/f/");
+        let labels = wiremock::Mock::given(method("PATCH")).and(path(files.clone())).and(body_json(json!({ "pulp_labels": {} })));
+        labels.respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": task1 }))).expect(1).mount(&server).await;
+        repo_action(&mut app, RepoType::File, Act::Edit, json!({ "pulp_href": files, "name": "iso", "pulp_labels": { "a": "b" } }));
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        form.fields.iter_mut().find(|f| f.key == "labels").unwrap().value.clear();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "one PATCH, no GET");
     }
 
     #[test]

@@ -252,6 +252,9 @@ RPM fields:
 * **Metadata compression**: `zstd`, `gz` or `none`.
 * **Package layout**: `nested_alphabetically` (`Packages/<letter>/`), `flat` or `nested_by_digest`.
 * **Repo config (JSON)** for the generated `.repo` file, for example `{"gpgcheck": 1}`.
+* **OSV config (JSON)** (pulp_rpm 3.39): the ecosystems of a vulnerability scan (**V** on
+  Versions), for example `[{"name": "Rocky Linux", "releases": ["9"]}]`. Empty removes it. Pulp
+  keeps it in the label `osv.rpm.config`, which **Labels** does not show: a label edit keeps it.
 * **Metadata signing service**: signs `repomd.xml` of each publication.
 * **Package signing service**: signs the packages that an upload or a modify adds (not a sync or a
   copy). **Package signing fingerprint**: `v4:<hex fingerprint>` or `keyid:<16 hex>`.
@@ -381,9 +384,8 @@ removed counts.
   (`0 missing, 0 corrupt, 0 repaired`).
 * **V** (RPM, pulp_rpm 3.39) scans the version for known vulnerabilities. Pulp asks osv.dev about
   each package, for the ecosystems in the repository's `osv_config`, for example
-  `[{"name": "Rocky Linux", "releases": ["9"]}]`. Pulp refuses a repository without it. The
-  repository form does not have this field yet: set it with the API. The Pulp server needs access
-  to `api.osv.dev`. The result shows the counts of the task and each package with vulnerabilities
+  `[{"name": "Rocky Linux", "releases": ["9"]}]`. Pulp refuses a repository without it: set
+  **OSV config** in the repository form. The Pulp server needs access to `api.osv.dev`. The result shows the counts of the task and each package with vulnerabilities
   (`bash-5.1.8-6.el9.x86_64: RLSA-2024:1, CVE-2024-1`).
 * **d** deletes the version. It names the distributions that serve the version or its
   publications, and you type the version id. Rollback never needs a delete.

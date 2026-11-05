@@ -664,3 +664,47 @@ async fn rpm_version_scan_through_the_tui() {
     assert_eq!(lines[1..], ["0 of 3 packages have known vulnerabilities."]);
     cleanup(&c, &[&repo, &remote]).await;
 }
+
+/// The OSV config through the TUI (audit F28). pulp_rpm keeps it in the label `osv.rpm.config`, which the Labels
+/// field does not show: a label edit that removes a label keeps the config, an emptied OSV config field removes it.
+#[tokio::test]
+async fn rpm_osv_config_survives_a_label_edit_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("it-osv"));
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(RepoType::Rpm, false);
+    run(&mut app, Act::Create, Value::Null);
+    if !app.conn.as_ref().unwrap().caps.has_field(RepoType::Rpm.repository_schema(), "osv_config") {
+        // An older pulp_rpm: the form has no OSV config field.
+        let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no form: {:?}", texts(&app)) };
+        assert!(!form.fields.iter().any(|f| f.key == "osv_config"), "{:?}", form.fields.iter().map(|f| &f.key).collect::<Vec<_>>());
+        return;
+    }
+    let rocky = json!([{ "name": "Rocky Linux", "releases": ["9"] }]);
+    fill(&mut app, &[("name", &name), ("labels", "a=1,b=2"), ("osv_config", &rocky.to_string())]);
+    settle(&mut app, &mut rx).await;
+    let found: Option<Value> = ops::find_by_name(&c, &c.api(RepoType::Rpm.repositories()), &name).await.unwrap();
+    let r = found.unwrap_or_else(|| panic!("not created: {:?}", texts(&app)));
+    let href = r["pulp_href"].as_str().unwrap().to_string();
+    assert_eq!(r["osv_config"], rocky);
+    assert!(r["pulp_labels"].get("osv.rpm.config").is_some(), "{r}");
+
+    run(&mut app, Act::Edit, r);
+    let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no form: {:?}", texts(&app)) };
+    assert_eq!(form.get("labels"), "a=1,b=2");
+    fill(&mut app, &[("labels", "a=1")]);
+    settle(&mut app, &mut rx).await;
+    settle_submitted(&c, &app).await;
+    let r: Value = c.get(&href, &[]).await.unwrap();
+    assert_eq!((&r["osv_config"], r["pulp_labels"].get("b")), (&rocky, None), "{r}");
+
+    run(&mut app, Act::Edit, r);
+    fill(&mut app, &[("osv_config", "")]);
+    settle(&mut app, &mut rx).await;
+    settle_submitted(&c, &app).await;
+    let r: Value = c.get(&href, &[]).await.unwrap();
+    assert_eq!((&r["osv_config"], &r["pulp_labels"]), (&Value::Null, &json!({ "a": "1" })));
+    cleanup(&c, &[&href]).await;
+}
