@@ -127,6 +127,10 @@ General rules:
 * A hidden sync option uses the server default.
 * **Remote**: the form shows only the fields of the type's schema (`rpm.RpmRemote`,
   `rpm.UlnRemote`, `file.FileRemote`, `file.FileGitRemote`, `deb.AptRemote`); Labels always.
+  The four timeouts are floats (`FloatField(min_value=0.0, allow_null=True)`, also on
+  `UpstreamPulp`): the forms take decimal seconds and send a JSON number with a fraction
+  (`2.5`, also `5.0`); 2.5 and 0.1 come back exactly (live,
+  `remote_timeouts_keep_decimal_seconds_through_the_tui`).
 * **Replication filter**: the form shows `q_select`, else `pulp_label_select`.
 * **Deb Content View signing** (`signing_service`, `signing_service_release_overrides`):
   detected in the JSON of the derived repository. Without them, pulp-tui does not send them,

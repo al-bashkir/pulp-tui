@@ -2022,10 +2022,9 @@ fn remote_url(t: RepoType, alt: bool) -> (&'static str, &'static [&'static str])
 fn remote_extra_fields(t: RepoType, alt: bool, caps: Option<&Capabilities>, v: &Value) -> Vec<Field> {
     let has = |f: &str| caps.is_none_or(|c| c.has_field(super::kinds::remote_type(t, alt).2, f));
     let write_only = if v.is_null() { "" } else { WRITE_ONLY };
-    // Floats on the server: `s()` would show `3600.0`, which is not a whole number.
-    // shortcut: whole seconds only (a Number field); a fractional server value must be retyped on edit. Add a decimal kind when needed.
+    // Floats on the server: shown as stored (3600.0 as `3600`, 2.5 as `2.5`).
     let secs = |k: &str, label: &str, help: &str| {
-        let f = Field::new(k, label, FieldKind::Number).value(v[k].as_f64().map(|x| x.to_string()).unwrap_or_default());
+        let f = Field::new(k, label, FieldKind::Decimal).value(v[k].as_f64().map(|x| x.to_string()).unwrap_or_default());
         f.help(help)
     };
     let headers = if v.is_null() { "Name: value; Name: value" } else { "Name: value; ...; empty = unchanged, - = clear" };
@@ -2131,6 +2130,9 @@ fn remote_body(f: &Form, edit: bool, schemes: &[&str]) -> Result<(Value, Vec<(St
                 b[fld.key.as_str()] = val.parse::<i64>().map_err(|_| format!("{} must be a number", fld.label))?.into()
             }
             _ if val.is_empty() => b[fld.key.as_str()] = Value::Null,
+            (_, FieldKind::Decimal) => {
+                b[fld.key.as_str()] = val.parse::<f64>().map_err(|_| format!("{} must be a number", fld.label))?.into()
+            }
             _ => b[fld.key.as_str()] = val.into(),
         }
     }
@@ -3907,6 +3909,24 @@ mod tests {
         assert_eq!(f.fields.iter().find(|x| x.key == "headers").unwrap().kind, FieldKind::Secret);
     }
 
+    /// pulpcore stores the timeouts as floats: the form shows them as stored and takes decimal seconds.
+    #[test]
+    fn remote_timeouts_take_decimal_seconds_as_the_server_stores_them() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let item = json!({ "name": "r", "url": "https://h/", "total_timeout": 3600.0, "connect_timeout": 2.5, "sock_read_timeout": 0.1 });
+        let mut f = remote_form(RepoType::File, None, &item);
+        assert_eq!(["total_timeout", "connect_timeout", "sock_read_timeout"].map(|k| f.get(k)), ["3600", "2.5", "0.1"]);
+        f.focus = f.fields.iter().position(|x| x.key == "sock_connect_timeout").unwrap();
+        for c in "i0.5.x-".chars() {
+            f.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(f.get("sock_connect_timeout"), "0.5", "digits and one point");
+        assert_eq!(f.validate(), Ok(()));
+        assert_eq!(remote_body(&f, true, WEB).unwrap().0, json!({ "sock_connect_timeout": 0.5 }));
+        f.fields.iter_mut().find(|x| x.key == "sock_connect_timeout").unwrap().value = ".".into();
+        assert_eq!(f.validate(), Err("Socket connect timeout (s) must be a number".into()));
+    }
+
     #[test]
     fn remote_body_sends_timeouts_retries_headers_and_excluded_fields() {
         let set = |f: &mut Form, k: &str, v: &str| f.fields.iter_mut().find(|x| x.key == k).unwrap().value = v.into();
@@ -3926,7 +3946,7 @@ mod tests {
         assert_eq!(
             [&b["connect_timeout"], &b["max_retries"], &b["headers"], &b["excluded_package_metadata_fields"]],
             [
-                &json!(5),
+                &json!(5.0),
                 &json!(2),
                 &json!([{ "Authorization": "Bearer t" }, { "X-Org": "a:b" }]),
                 &json!(["Phased-Update-Percentage", "X-Note"])

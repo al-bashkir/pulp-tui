@@ -305,8 +305,9 @@ the note `ULN` or `Git` marks the second type.
   username, password, SLES token (RPM), **Headers** (`Name: value; Name: value`, for example
   `Authorization: Bearer <token>`).
 * **Proxy**: `http://` or `https://` with host and port, for example `http://proxy.corp:3128`.
-* **Total / connect / socket connect / socket read timeout** (whole seconds), **Max retries**
-  after a download failure (server default 3).
+* **Total / connect / socket connect / socket read timeout** (seconds, also decimal: `2.5`; the
+  edit form shows them as the server stores them), **Max retries** after a download failure
+  (server default 3).
 
 RPM ULN fields (Oracle Unbreakable Linux Network; the screen says when the server has no
 `remotes/rpm/uln/`):

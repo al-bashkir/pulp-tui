@@ -761,3 +761,27 @@ async fn rpm_retain_package_versions_cleared_through_the_tui() {
     assert_eq!(r["retain_package_versions"], 0, "{:?}", texts(&app));
     cleanup(&c, &[&repo]).await;
 }
+
+/// Remote timeouts in decimal seconds through the TUI (audit F28): Pulp stores floats, and the edit form shows
+/// them as stored.
+#[tokio::test]
+async fn remote_timeouts_keep_decimal_seconds_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("it-timeout"));
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Remotes(RepoType::File, false);
+    run(&mut app, Act::Create, Value::Null);
+    let url = format!("{}/file/PULP_MANIFEST", upstream());
+    fill(&mut app, &[("name", &name), ("url", &url), ("connect_timeout", "2.5"), ("sock_read_timeout", "0.1")]);
+    settle(&mut app, &mut rx).await;
+    let found: Option<Value> = ops::find_by_name(&c, &c.api(RepoType::File.remotes()), &name).await.unwrap();
+    let r = found.unwrap_or_else(|| panic!("not created: {:?}", texts(&app)));
+    assert_eq!((&r["connect_timeout"], &r["sock_read_timeout"]), (&json!(2.5), &json!(0.1)));
+    run(&mut app, Act::Edit, r.clone());
+    let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no form: {:?}", texts(&app)) };
+    assert_eq!((form.get("connect_timeout"), form.get("sock_read_timeout")), ("2.5", "0.1"), "as stored");
+    app.modal = None;
+    cleanup(&c, &[r["pulp_href"].as_str().unwrap()]).await;
+}

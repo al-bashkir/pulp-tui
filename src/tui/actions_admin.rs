@@ -909,11 +909,11 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                     Field::new("remote_policy", "Replica download policy", FieldKind::Choice(p)).value(s(&v, "remote_policy")).help(help),
                 );
             }
-            let number = |k: &str, label: &str, value: String| {
-                Field::new(k, label, FieldKind::Number).value(value).help("for the replica remotes; empty = server default")
+            let number = |k: &str, label: &str, kind: FieldKind, value: String| {
+                Field::new(k, label, kind).value(value).help("for the replica remotes; empty = server default")
             };
             for (k, label) in [("download_concurrency", "Download concurrency"), ("max_retries", "Max retries")] {
-                fields.extend(has(k).then(|| number(k, label, s(&v, k))));
+                fields.extend(has(k).then(|| number(k, label, FieldKind::Number, s(&v, k))));
             }
             for (k, label) in [
                 ("total_timeout", "Total timeout (s)"),
@@ -921,8 +921,9 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                 ("sock_connect_timeout", "Socket connect timeout (s)"),
                 ("sock_read_timeout", "Socket read timeout (s)"),
             ] {
-                // Floats on the server: `s()` would show `3600.0`, which is not a whole number.
-                fields.extend(has(k).then(|| number(k, label, v[k].as_f64().map(|x| x.to_string()).unwrap_or_default())));
+                // Floats on the server: shown as stored (3600.0 as `3600`, 2.5 as `2.5`).
+                let stored = v[k].as_f64().map(|x| x.to_string()).unwrap_or_default();
+                fields.extend(has(k).then(|| number(k, label, FieldKind::Decimal, stored)));
             }
             let form = Form::new(
                 if edit { format!("Edit upstream {name}") } else { "New Upstream Pulp (native replication, tech preview)".into() },
@@ -948,6 +949,9 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                         _ if val.is_empty() => b[fld.key.as_str()] = Value::Null,
                         (_, FieldKind::Number) => {
                             b[fld.key.as_str()] = val.parse::<i64>().map_err(|_| format!("{} must be a number", fld.label))?.into()
+                        }
+                        (_, FieldKind::Decimal) => {
+                            b[fld.key.as_str()] = val.parse::<f64>().map_err(|_| format!("{} must be a number", fld.label))?.into()
                         }
                         _ => b[fld.key.as_str()] = val.into(),
                     }
@@ -1804,7 +1808,8 @@ mod tests {
         set(&mut f, "download_concurrency", "x");
         assert_eq!(submit(&mut app, &f), Err("Download concurrency must be a number".into()));
         set(&mut f, "download_concurrency", "4");
-        set(&mut f, "sock_read_timeout", "600");
+        // Floats on the server: decimal seconds.
+        set(&mut f, "sock_read_timeout", "600.5");
         submit(&mut app, &f).unwrap();
         settle(&mut app, &mut rx).await;
 
@@ -1826,7 +1831,7 @@ mod tests {
         };
         assert_eq!(
             picked(&bodies[0]),
-            [("remote_policy", json!("on_demand")), ("download_concurrency", json!(4)), ("sock_read_timeout", json!(600))],
+            [("remote_policy", json!("on_demand")), ("download_concurrency", json!(4)), ("sock_read_timeout", json!(600.5))],
             "create: only what is filled"
         );
         assert_eq!(picked(&bodies[1]), [], "untouched edit");

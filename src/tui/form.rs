@@ -34,6 +34,8 @@ pub enum FieldKind {
     Bool,
     Choice(Vec<String>),
     Number,
+    /// A number with an optional fraction, e.g. seconds that Pulp stores as a float.
+    Decimal,
     /// Pick from server objects. Multi: `value` holds the selected values joined with `\n`.
     Pick {
         source: Source,
@@ -281,7 +283,7 @@ fn matching<'a>(f: &'a Field, filter: &str) -> Vec<&'a PickItem> {
 impl Form {
     pub fn new(title: impl Into<String>, fields: Vec<Field>) -> Self {
         // A lone text field starts in edit mode: nothing else could take the keys, and an early `i` would be lost.
-        let editing = matches!(fields.as_slice(), [f] if matches!(f.kind, FieldKind::Text | FieldKind::Secret | FieldKind::Number));
+        let editing = matches!(fields.as_slice(), [f] if matches!(f.kind, FieldKind::Text | FieldKind::Secret | FieldKind::Number | FieldKind::Decimal));
         let cursor = fields.first().map_or(0, |f| f.value.chars().count());
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -329,6 +331,9 @@ impl Form {
             }
             if f.kind == FieldKind::Number && !v.is_empty() && v.parse::<i64>().is_err() {
                 return Err(format!("{} must be a whole number", f.label));
+            }
+            if f.kind == FieldKind::Decimal && !v.is_empty() && v.parse::<f64>().is_err() {
+                return Err(format!("{} must be a number", f.label));
             }
         }
         Ok(())
@@ -549,7 +554,7 @@ impl Form {
         };
         let (next, prev) = ((self.focus + 1) % n, (self.focus + n - 1) % n);
         let f = &mut self.fields[self.focus];
-        let text = matches!(f.kind, FieldKind::Text | FieldKind::Secret | FieldKind::Number);
+        let text = matches!(f.kind, FieldKind::Text | FieldKind::Secret | FieldKind::Number | FieldKind::Decimal);
         match (self.editing, code) {
             (_, KeyCode::Char('s')) if ctrl => return FormEvent::Submit,
             (_, KeyCode::Tab | KeyCode::Down) => (self.focus, self.editing) = (next, false),
@@ -563,6 +568,9 @@ impl Form {
                     && f.kind == FieldKind::Number
                     && !c.is_ascii_digit()
                     && !(c == '-' && self.cursor == 0 && !f.value.starts_with('-')) => {}
+            // A decimal takes digits and one point.
+            (true, KeyCode::Char(c))
+                if !ctrl && f.kind == FieldKind::Decimal && !c.is_ascii_digit() && !(c == '.' && !f.value.contains('.')) => {}
             (true, _) => {
                 edit_line(&mut f.value, &mut self.cursor, k);
             }
