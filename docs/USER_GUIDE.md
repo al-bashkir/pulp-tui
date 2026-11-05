@@ -521,7 +521,9 @@ repositories, latest version, environments with bound versions and states.
   the paths; type the view name) and removes the binding, so you can delete the version. Versions
   and snapshots stay. Refused while a later environment on the path has the view: go back along
   the path (Prod, then Test, then Dev).
-* **D** verifies all environments (drift check).
+* **D** verifies all environments (drift check). For each environment with drift, it tells how to
+  reconcile: promote the bound version again, or, when the prior environment no longer has that
+  version active (Promote refuses it), roll back to it (**b**).
 * **U** breaks the lock of the view. It shows the holder; type the view name. See "Locks".
 * **c** creates. **e** edits the description (composite: also auto publish and the pins).
 * **d** deletes the distributions and snapshot repositories of the view, never the source

@@ -592,26 +592,33 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             });
         }
         Act::CvDrift => app.job(format!("verify {name}"), move |ctx| async move {
-            let (svc, mut lines) = (ctx.cv()?, vec![]);
+            let (svc, mut lines, mut hints) = (ctx.cv()?, vec![], vec![]);
             let running = svc.store.lock_live(id, crate::cv::unix_now()).await?;
             for e in svc.store.environments(&svc.scope).await? {
                 if let Some(b) = svc.store.binding(e.id, id).await? {
-                    let n = svc.store.version(b.version_id).await?.number;
-                    let issues = svc.verify(id, e.id).await?;
+                    let v = svc.store.version(b.version_id).await?;
+                    let (n, issues) = (v.number, svc.verify(id, e.id).await?);
                     lines.push(format!(
                         "{}: v{n} ({}) {}",
                         e.name,
                         crate::cv::shown_state(&b.state, running),
                         if issues.is_empty() { "OK - served content matches" } else { "DRIFT" }
                     ));
+                    if !issues.is_empty() {
+                        // The rule of `CvService::promote`: Rollback to the bound version always runs.
+                        hints.push(match svc.promote_refusal(&v, &e).await? {
+                            None => format!("{}: promote v{n} again (M) to reconcile (idempotent).", e.name),
+                            Some(why) => format!("{}: roll back to v{n} (b) to reconcile; Promote refuses: {why}", e.name),
+                        });
+                    }
                     lines.extend(issues.into_iter().map(|i| format!("    {i}")));
                 }
             }
             if lines.is_empty() {
                 lines.push("not bound to any environment".into());
-            } else {
+            } else if !hints.is_empty() {
                 lines.push(String::new());
-                lines.push("Reconcile drift by promoting the bound version again (idempotent).".into());
+                lines.extend(hints);
             }
             ap(move |app| app.text(format!("Verification of {name}"), lines))
         }),
@@ -746,12 +753,9 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
             lines.push("Rollback only changes bindings; newer versions stay available.".into());
             lines.push("Files of the replaced publications may stay downloadable for Pulp's".into());
             lines.push("DISTRIBUTED_PUBLICATION_RETENTION_PERIOD; repository metadata switches immediately.".into());
-        } else if let Some(prior) = e.prior_id {
-            let ok = st.binding(prior, cv).await?.is_some_and(|b| b.version_id == vid && b.state == "active");
-            if !ok {
-                lines.push(String::new());
-                lines.push("BLOCKED: the version is not active in the prior environment.".into());
-            }
+        } else if svc.promote_refusal(&v, &e).await?.is_some() {
+            lines.push(String::new());
+            lines.push("BLOCKED: the version is not active in the prior environment.".into());
         }
         let protected = e.protected;
         let (title, danger_title, typed) = (format!("{name} -> {env}"), format!("{env} is protected"), env.clone());
@@ -2063,6 +2067,36 @@ mod tests {
         drain(&mut app, &mut rx).await;
         let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
         assert_eq!(lines[..2], ["Dev: v1 (interrupted) DRIFT", "    binding state is interrupted"]);
+    }
+
+    #[tokio::test]
+    async fn drift_names_rollback_when_the_prior_environment_moved_on() {
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn =
+            Some(crate::tui::app::Conn { client: client(&MockServer::start().await), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        let dev = st.create_env("lab", "Dev", lib, false).await.unwrap();
+        let test = st.create_env("lab", "Test", dev, false).await.unwrap();
+        let prod = st.create_env("lab", "Prod", test, false).await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let (v1, v2) = (publish_empty(&st, web).await, publish_empty(&st, web).await);
+        st.set_binding(lib, web, v2.id, "active").await.unwrap();
+        st.set_binding(dev, web, v2.id, "partial").await.unwrap(); // Library has v2 active: Promote works
+        st.set_binding(test, web, v2.id, "partial").await.unwrap(); // Dev has v2, but not active: refused
+        st.set_binding(prod, web, v1.id, "partial").await.unwrap(); // Test moved on to v2: Promote of v1 is refused
+        cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
+        assert_eq!(lines[0], "Library: v2 (active) OK - served content matches");
+        assert_eq!(
+            lines[lines.len() - 4..],
+            [
+                "",
+                "Dev: promote v2 again (M) to reconcile (idempotent).",
+                "Test: roll back to v2 (b) to reconcile; Promote refuses: version 2 is not active in Dev; promote it there first (or use rollback)",
+                "Prod: roll back to v1 (b) to reconcile; Promote refuses: version 1 is not active in Test; promote it there first (or use rollback)"
+            ]
+        );
     }
 
     #[tokio::test]

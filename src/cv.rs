@@ -1125,6 +1125,17 @@ impl CvService {
 
     // ---- promote / rollback --------------------------------------------------------
 
+    /// Why Promote refuses version `v` in `env`: an environment after another takes only the version active there.
+    pub async fn promote_refusal(&self, v: &CvVersion, env: &Environment) -> Result<Option<String>> {
+        let Some(prior) = env.prior_id else { return Ok(None) };
+        if self.store.binding(prior, v.cv_id).await?.is_some_and(|b| b.version_id == v.id && b.state == "active") {
+            return Ok(None);
+        }
+        let envs = self.store.environments(&self.scope).await?;
+        let pname = envs.iter().find(|e| e.id == prior).map_or("?", |e| e.name.as_str());
+        Ok(Some(format!("version {} is not active in {pname}; promote it there first (or use rollback)", v.number)))
+    }
+
     /// Bind `version_id` to `env_id`. Re-points stable distributions; repositories that
     /// are bound in the environment but not part of the version stop being served.
     pub async fn promote(&self, cv_id: i64, version_id: i64, env_id: i64, mode: Mode, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
@@ -1136,13 +1147,9 @@ impl CvService {
         let envs = self.store.environments(&self.scope).await?;
         let env = envs.iter().find(|e| e.id == env_id).ok_or_else(|| anyhow!("unknown environment"))?;
         if mode == Mode::Promote
-            && let Some(prior) = env.prior_id
+            && let Some(why) = self.promote_refusal(&v, env).await?
         {
-            let pb = self.store.binding(prior, cv_id).await?;
-            if pb.as_ref().map(|b| (b.version_id, b.state.as_str())) != Some((version_id, "active")) {
-                let pname = envs.iter().find(|e| e.id == prior).map(|e| e.name.as_str()).unwrap_or("?");
-                bail!("version {} is not active in {pname}; promote it there first (or use rollback)", v.number);
-            }
+            bail!(why);
         }
         if mode == Mode::Rollback && env.prior_id.is_some() {
             let active = match self.store.binding(env_id, cv_id).await? {
