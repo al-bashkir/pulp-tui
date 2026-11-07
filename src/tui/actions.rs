@@ -7,7 +7,7 @@ use super::kinds::{Act, Kind, s, short};
 use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile};
 use crate::filters::{Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
-use crate::pulp::models::{Distribution, Publication, RepoVersion, TASK_FINAL_STATES, Task, TaskGroup};
+use crate::pulp::models::{Distribution, RepoVersion, TASK_FINAL_STATES, Task, TaskGroup};
 use crate::pulp::ops::{self, repo_of_version, version_number};
 use crate::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::Store;
@@ -1228,12 +1228,13 @@ async fn repo_delete_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str) -> a
             sources.push(cv.name);
         }
     }
-    let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", href.to_string())], 100_000).await?;
+    // Deb: Pulp deletes the verbatim publications with the repository too.
+    let pubs = ops::publications_where(c, &ctx.caps, t, ("repository", href)).await?;
     let versions: Page<Value> = c.list(&format!("{href}versions/"), &[("limit", "1".into())]).await?;
     let users = served_by(&ops::distributions(c, t).await?, |d| {
         d.repository.as_deref() == Some(href)
             || d.repository_version.as_ref().is_some_and(|v| v.starts_with(href))
-            || pubs.iter().any(|p| d.publication.as_ref() == Some(&p.pulp_href))
+            || pubs.iter().any(|p| d.publication.as_deref() == p["pulp_href"].as_str())
     });
     let mut lines = vec![format!("Deletes repository {name} with all {} versions and {} publications.", versions.count, pubs.len())];
     if users.is_empty() {
@@ -6026,6 +6027,33 @@ mod tests {
         run(&mut app, purge, Value::Null);
         assert!(app.modal.is_none());
         assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("not supported by this server: task purge (tasks/purge/)"));
+    }
+
+    /// Pulp deletes the verbatim publications of a Deb repository with it: the impact counts them and names the
+    /// distribution pinned to one.
+    #[tokio::test]
+    async fn deb_repository_delete_names_the_distribution_of_a_verbatim_publication() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/deb/apt/r/");
+        let (apt, verbatim) = (format!("{API}publications/deb/apt/1/"), format!("{API}publications/deb/verbatim/2/"));
+        let on_v1 = |p: &str| page(json!([{ "pulp_href": p, "repository_version": format!("{repo}versions/1/") }]));
+        get(&server, &format!("{API}publications/deb/apt/"), on_v1(&apt)).await;
+        get(&server, &format!("{API}publications/deb/verbatim/"), on_v1(&verbatim)).await;
+        get(&server, &format!("{repo}versions/"), json!({ "count": 2, "next": null, "results": [] })).await;
+        let dists = page(json!([
+            { "pulp_href": "/d/1/", "name": "apt", "base_path": "apt", "publication": apt },
+            { "pulp_href": "/d/2/", "name": "flat", "base_path": "flat", "base_url": "http://h/flat/", "publication": verbatim },
+        ]));
+        get(&server, &format!("{API}distributions/deb/apt/"), dists).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Repos(RepoType::Deb, false);
+        run(&mut app, Act::Delete, json!({ "pulp_href": repo, "name": "r" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = &app.modal else { panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert_eq!(lines[0], "Deletes repository r with all 2 versions and 2 publications.");
+        assert!(lines.contains(&"  flat (http://h/flat/)".to_string()), "{lines:?}");
+        assert!(lines.contains(&"WARNING: 2 distribution(s) serve it and stop serving:".to_string()), "{lines:?}");
     }
 
     /// A Content View snapshot repository, also one of another database, is never deleted from the Repositories screen.

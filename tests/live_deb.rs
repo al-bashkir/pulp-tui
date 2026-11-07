@@ -12,6 +12,9 @@ use pulp_tui::pulp::models::{DebPackage, RepoVersion};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{Capabilities, PulpClient, RepoType, deb};
 use pulp_tui::store::{CvRepo, Store};
+use pulp_tui::tui::actions::run;
+use pulp_tui::tui::app::Modal;
+use pulp_tui::tui::kinds::{Act, Kind};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -484,4 +487,46 @@ async fn deb_rollback_keeps_a_simple_publication() {
     let e = ops::verify_served(&c, t, &base, &v1, &json!({})).await.unwrap_err().to_string();
     assert!(e.contains("dists/fixture/Release returned HTTP 404"), "{e}");
     cleanup(&c, &[&dist, &repo, &remote]).await;
+}
+
+/// Repository Delete through the TUI (audit F05): the impact counts the APT and the verbatim publication and names
+/// both distributions; after the delete, Pulp has deleted both publications and neither distribution serves.
+#[tokio::test]
+async fn deb_repository_delete_impact_names_the_distribution_of_a_verbatim_publication() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Deb;
+    let name = unique("it-deb-del");
+    let body = json!({ "name": name, "url": format!("{}/deb/", upstream()), "policy": "immediate", "distributions": "fixture" });
+    let remote = create(&c, t.remotes(), body, "/remotes/").await;
+    let repo = create(&c, t.repositories(), json!({ "name": name, "remote": remote }), "/repositories/").await;
+    ops::settle(&c, ops::sync(&c, t, &repo, None, "mirror").await.unwrap(), &no_progress).await.unwrap();
+    let v1 = latest(&c, &repo).await;
+    let apt = ops::create_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
+    let verbatim = ops::create_publication(&c, t, &v1, &json!({ "verbatim": true }), &no_progress).await.unwrap();
+    let (apt_dist, verbatim_dist) = (format!("{name}-apt"), format!("{name}-verbatim"));
+    let d1 = ops::ensure_distribution(&c, t, &apt_dist, &apt_dist, Some(&apt), &json!({}), None, &no_progress).await.unwrap();
+    let d2 =
+        ops::ensure_distribution(&c, t, &verbatim_dist, &verbatim_dist, Some(&verbatim), &json!({}), None, &no_progress).await.unwrap();
+
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(t, false);
+    run(&mut app, Act::Delete, json!({ "pulp_href": repo, "name": name }));
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(&app)) };
+    assert_eq!(typed.as_deref(), Some(name.as_str()));
+    assert_eq!(lines[0], format!("Deletes repository {name} with all 2 versions and 2 publications."), "{lines:?}");
+    assert!(lines.contains(&"WARNING: 2 distribution(s) serve it and stop serving:".to_string()), "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with(&format!("  {verbatim_dist} ("))), "{lines:?}");
+    yes(&mut app);
+    settle(&mut app, &mut rx).await;
+    settle_submitted(&c, &app).await;
+    for d in [&d1, &d2] {
+        let d: Value = c.get(d, &[]).await.unwrap();
+        assert!(d["publication"].is_null(), "Pulp deleted the publication with the repository: {d}");
+    }
+    assert!(c.get::<Value>(&verbatim, &[]).await.is_err(), "the verbatim publication is gone");
+    cleanup(&c, &[&d1, &d2, &remote]).await;
 }
