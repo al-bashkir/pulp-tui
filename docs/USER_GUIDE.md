@@ -856,7 +856,8 @@ Server tasks:
   first, then you type the profile name.
 
 **Task groups** (newest first, no search): counts of tasks by state. **i** shows the tasks, **X**
-cancels the group. **Workers** (read-only): name, last heartbeat, current task.
+cancels the group. **a** tracks the group as one Task Center row, **W** also opens the live view.
+**Workers** (read-only): name, last heartbeat, current task.
 
 ### Task Schedules
 

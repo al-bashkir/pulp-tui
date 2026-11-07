@@ -979,7 +979,7 @@ impl Kind {
             Kind::Domains => vec![MigrateStorage, Create, Edit, Delete, Inspect],
             Kind::Tasks => vec![WatchTask, Inspect, CancelTask, DismissTasks],
             Kind::ServerTasks(_) => vec![WatchTask, ObjectRoles, Inspect, TrackTask, CancelTask, Filter, Delete, PurgeTasks],
-            Kind::TaskGroups => vec![CancelTask, Inspect],
+            Kind::TaskGroups => vec![WatchTask, TrackTask, CancelTask, Inspect],
             Kind::Uploads => vec![Delete, ObjectRoles, Inspect],
             Kind::TaskSchedules => vec![WatchTask, ObjectRoles, Inspect],
             Kind::Artifacts => vec![RepairServer, Inspect],

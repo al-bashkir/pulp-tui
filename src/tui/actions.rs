@@ -3340,6 +3340,8 @@ async fn save_distribution(ctx: &Ctx, t: RepoType, current: Option<&Value>, mut 
 
 fn task_action(app: &mut App, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
+    // Task Center rows have a label, server tasks a name, task groups a description.
+    let label = ["label", "name", "description"].map(|k| s(&item, k)).into_iter().find(|l| !l.is_empty()).unwrap_or_default();
     match act {
         Act::DismissTasks => {
             let n = app.dismiss_finished_tasks();
@@ -3347,15 +3349,12 @@ fn task_action(app: &mut App, act: Act, item: Value) {
             app.reload();
         }
         // A server task row is Pulp's task: one that ended before is tracked as ended, with no "task ended" notice.
+        // A group row is no Task (no `state`): the Task Center reads it first.
         Act::TrackTask => {
-            app.track_task(&href, &s(&item, "name"), serde_json::from_value(item.clone()).ok());
+            app.track_task(&href, &label, serde_json::from_value(item).ok());
             app.ok("tracking task");
         }
-        Act::WatchTask => {
-            // Task Center rows have a label, server tasks a name.
-            let label = Some(s(&item, "label")).filter(|l| !l.is_empty()).unwrap_or_else(|| s(&item, "name"));
-            app.watch_task(&href, &label, serde_json::from_value(item).ok());
-        }
+        Act::WatchTask => app.watch_task(&href, &label, serde_json::from_value(item).ok()),
         Act::Filter => {
             let Kind::ServerTasks(q) = app.list.kind.clone() else { return };
             let get = |k: &str| q.iter().find(|(p, _)| *p == k).map(|(_, v)| v.clone()).unwrap_or_default();
@@ -6454,7 +6453,7 @@ mod tests {
         let row = app.list.items[0].clone();
         let cols: Vec<String> = Kind::TaskGroups.columns().iter().map(|c| format!("{}={}", c.title, (c.get)(&row))).collect();
         assert_eq!(cols, ["description=Replication of up", "waiting=1", "running=2", "completed=3", "failed=0", "canceled=0", "skipped=0"]);
-        assert_eq!(Kind::TaskGroups.actions(), [Act::CancelTask, Act::Inspect]);
+        assert_eq!(Kind::TaskGroups.actions(), [Act::WatchTask, Act::TrackTask, Act::CancelTask, Act::Inspect]);
         assert!(!Kind::TaskGroups.searchable(), "task-groups/ has no filters");
 
         run(&mut app, Act::CancelTask, row);
@@ -6470,6 +6469,24 @@ mod tests {
         app.conn.as_mut().unwrap().caps = Arc::new(caps);
         app.reload();
         assert_eq!(app.list.error.as_deref(), Some("not supported by this server: task groups API (task-groups/)"));
+    }
+
+    /// A task group row is tracked and watched like a task: the Task Center reads a group as one task
+    /// (`ops::get_task`), named by its description.
+    #[tokio::test]
+    async fn task_groups_screen_tracks_and_watches_a_group() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let group = format!("{API}task-groups/1/");
+        let row = json!({ "pulp_href": group, "description": "Replication of up", "running": 1, "completed": 1 });
+        let (mut app, _rx) = connected(&server).await;
+        app.list.kind = Kind::TaskGroups;
+        assert!(app.available_actions(&row).starts_with(&[Act::WatchTask, Act::TrackTask]), "{:?}", app.available_actions(&row));
+        run(&mut app, Act::TrackTask, row.clone());
+        assert_eq!(tracked(&app), [(group.clone(), "Replication of up".into())]);
+        run(&mut app, Act::WatchTask, row);
+        let Some(Modal::Text { title, watch, .. }) = app.modal.take() else { panic!("no watch") };
+        assert_eq!((title.as_str(), watch.as_deref()), ("Watch task Replication of up", Some(group.as_str())));
     }
 
     /// Answer the open path input with `path`.
