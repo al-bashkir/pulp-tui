@@ -215,6 +215,18 @@ pub enum Focus {
 
 pub const PAGE: u64 = 100;
 
+/// Rows that PgDn and PgUp move in a list.
+const LIST_PAGE_ROWS: usize = 15;
+
+/// A list key with Ctrl-D and Ctrl-U as PgDn and PgUp.
+fn list_code(k: KeyEvent) -> KeyCode {
+    match k.code {
+        KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => KeyCode::PageDown,
+        KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => KeyCode::PageUp,
+        c => c,
+    }
+}
+
 /// A dialog that a job opens ignores keys this long: they were typed before it appeared.
 const KEY_GUARD: Duration = Duration::from_millis(300);
 
@@ -1254,94 +1266,131 @@ impl App {
     }
 
     fn list_key(&mut self, k: KeyEvent) {
-        let len = self.list.items.len();
-        let page = 15;
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let code = match k.code {
-            KeyCode::Char('d') if ctrl => KeyCode::PageDown,
-            KeyCode::Char('u') if ctrl => KeyCode::PageUp,
-            c => c,
+        let code = list_code(k);
+        let done = self.move_in_list(code) || self.page_key(code) || self.list_command(code);
+        if !done
+            && let KeyCode::Char(c) = code
+            && !k.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.action_key(c);
+        }
+    }
+
+    /// j k, PgDn PgUp (Ctrl-D Ctrl-U), g G: move the selection; h: go to the screen list. False for another key.
+    fn move_in_list(&mut self, code: KeyCode) -> bool {
+        let (s, last) = (self.list.selected, self.list.items.len().saturating_sub(1));
+        self.list.selected = match code {
+            KeyCode::Down | KeyCode::Char('j') => (s + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => s.saturating_sub(1),
+            KeyCode::PageDown => (s + LIST_PAGE_ROWS).min(last),
+            KeyCode::PageUp => s.saturating_sub(LIST_PAGE_ROWS),
+            KeyCode::Home | KeyCode::Char('g') => 0,
+            KeyCode::End | KeyCode::Char('G') => last,
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.focus = Focus::Nav;
+                s
+            }
+            _ => return false,
         };
+        true
+    }
+
+    /// n p: the next or previous page of the server's list; r: reload; /: search. False for another key.
+    fn page_key(&mut self, code: KeyCode) -> bool {
         match code {
-            KeyCode::Down | KeyCode::Char('j') => self.list.selected = (self.list.selected + 1).min(len.saturating_sub(1)),
-            KeyCode::Up | KeyCode::Char('k') => self.list.selected = self.list.selected.saturating_sub(1),
-            KeyCode::PageDown => self.list.selected = (self.list.selected + page).min(len.saturating_sub(1)),
-            KeyCode::PageUp => self.list.selected = self.list.selected.saturating_sub(page),
-            KeyCode::Home | KeyCode::Char('g') => self.list.selected = 0,
-            KeyCode::End | KeyCode::Char('G') => self.list.selected = len.saturating_sub(1),
-            KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Nav,
-            KeyCode::Char('n') if self.list.offset + PAGE < self.list.count => {
-                self.list.offset += PAGE;
-                self.list.selected = 0;
-                self.reload();
-            }
-            KeyCode::Char('p') if self.list.offset > 0 => {
-                self.list.offset = self.list.offset.saturating_sub(PAGE);
-                self.list.selected = 0;
-                self.reload();
-            }
+            KeyCode::Char('n') if self.list.offset + PAGE < self.list.count => self.turn_page(self.list.offset + PAGE),
+            KeyCode::Char('p') if self.list.offset > 0 => self.turn_page(self.list.offset.saturating_sub(PAGE)),
             KeyCode::Char('r') => self.reload(),
-            // The server has no filter for it: a search would show every row under "filter: ...".
-            KeyCode::Char('/') if !self.list.kind.searchable() => self.error("this list has no search"),
-            KeyCode::Char('/') => {
-                let cur = self.list.filter.clone();
-                self.input("Search (server-side filter; empty clears)", &cur, |app, s| {
-                    app.list.filter = s;
-                    app.list.offset = 0;
-                    app.list.selected = 0;
-                    app.reload();
-                });
-            }
-            KeyCode::Char('s') | KeyCode::Char('S') => {
-                let ncols = self.list.kind.columns().len().max(1);
-                self.list.sort = Some(match (self.list.sort, k.code) {
-                    (Some((c, d)), KeyCode::Char('S')) => (c, !d),
-                    (Some((c, _)), _) => ((c + 1) % ncols, false),
-                    (None, _) => (0, false),
-                });
-                self.apply_sort();
-            }
-            KeyCode::Char(' ') => {
-                if let Some(v) = self.list.current() {
-                    let key = item_key(v);
-                    if !self.list.marked.remove(&key) {
-                        self.list.marked.insert(key);
-                    }
-                    self.list.selected = (self.list.selected + 1).min(len.saturating_sub(1));
-                }
-            }
-            KeyCode::Char('t') => {
-                if let Some(next) = self.list.kind.toggle() {
-                    if self.history.is_empty() {
-                        self.open(Screen::List(next));
-                    } else {
-                        self.replace(next);
-                    }
-                }
-            }
-            KeyCode::Esc => {
-                if self.list.loading {
-                    self.abort_loads();
-                    self.list.loading = false;
-                    self.list.error = Some("request cancelled".into());
-                } else if !self.list.marked.is_empty() {
-                    self.list.marked.clear();
-                } else {
-                    self.back();
-                }
-            }
+            KeyCode::Char('/') => self.search(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// s S: sort; Space: mark; t: the other type of the screen; Esc; Enter: the action menu. False for another key.
+    fn list_command(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char(c @ ('s' | 'S')) => self.cycle_sort(c == 'S'),
+            KeyCode::Char(' ') => self.toggle_mark(),
+            KeyCode::Char('t') => self.toggle_type(),
+            KeyCode::Esc => self.list_escape(),
             KeyCode::Enter => self.open_menu(),
-            KeyCode::Char(c) if !ctrl => {
-                let item = self.list.current().cloned().unwrap_or(Value::Null);
-                if let Some(a) = self.available_actions(&item).into_iter().find(|a| a.key() == c) {
-                    super::actions::run(self, a, item);
-                } else if let Some(why) = self.unsupported()
-                    && self.list.kind.actions().iter().any(|a| a.key() == c)
-                {
-                    self.error(why);
-                }
-            }
-            _ => {}
+            _ => return false,
+        }
+        true
+    }
+
+    fn turn_page(&mut self, offset: u64) {
+        (self.list.offset, self.list.selected) = (offset, 0);
+        self.reload();
+    }
+
+    fn search(&mut self) {
+        // The server has no filter for it: a search would show every row under "filter: ...".
+        if !self.list.kind.searchable() {
+            return self.error("this list has no search");
+        }
+        let cur = self.list.filter.clone();
+        self.input("Search (server-side filter; empty clears)", &cur, |app, s| {
+            app.list.filter = s;
+            app.list.offset = 0;
+            app.list.selected = 0;
+            app.reload();
+        });
+    }
+
+    /// s: sort by the next column; S (`reverse`): reverse the order.
+    fn cycle_sort(&mut self, reverse: bool) {
+        let ncols = self.list.kind.columns().len().max(1);
+        self.list.sort = Some(match (self.list.sort, reverse) {
+            (Some((c, d)), true) => (c, !d),
+            (Some((c, _)), false) => ((c + 1) % ncols, false),
+            (None, _) => (0, false),
+        });
+        self.apply_sort();
+    }
+
+    /// Mark or unmark the selected row, then select the next one.
+    fn toggle_mark(&mut self) {
+        let Some(v) = self.list.current() else { return };
+        let key = item_key(v);
+        if !self.list.marked.remove(&key) {
+            self.list.marked.insert(key);
+        }
+        self.list.selected = (self.list.selected + 1).min(self.list.items.len().saturating_sub(1));
+    }
+
+    fn toggle_type(&mut self) {
+        let Some(next) = self.list.kind.toggle() else { return };
+        if self.history.is_empty() {
+            self.open(Screen::List(next));
+        } else {
+            self.replace(next);
+        }
+    }
+
+    /// Esc: stop a load, else clear the marks, else go back.
+    fn list_escape(&mut self) {
+        if self.list.loading {
+            self.abort_loads();
+            self.list.loading = false;
+            self.list.error = Some("request cancelled".into());
+        } else if !self.list.marked.is_empty() {
+            self.list.marked.clear();
+        } else {
+            self.back();
+        }
+    }
+
+    /// The action of key `c` on the selected row. On a screen the server does not support, its keys say why.
+    fn action_key(&mut self, c: char) {
+        let item = self.list.current().cloned().unwrap_or(Value::Null);
+        if let Some(a) = self.available_actions(&item).into_iter().find(|a| a.key() == c) {
+            super::actions::run(self, a, item);
+        } else if let Some(why) = self.unsupported()
+            && self.list.kind.actions().iter().any(|a| a.key() == c)
+        {
+            self.error(why);
         }
     }
 
@@ -1828,6 +1877,74 @@ mod tests {
         assert!(!app.available_actions(&Value::Null).contains(&Act::Create));
         super::super::actions::run(&mut app, Act::Create, Value::Null);
         assert!(app.modal.is_none() && app.notices.iter().any(|n| n.text.contains("read-only mode")));
+    }
+
+    /// The list keys of the help: move, page, sort, mark, search, other type, Esc, Enter and an action key.
+    #[tokio::test]
+    async fn list_keys_move_page_sort_mark_and_go_back() {
+        let mut app = app_on(Kind::PulpExporters).await;
+        app.list.items = (0..3).map(|i| serde_json::json!({ "pulp_href": format!("/e/{i}/"), "name": format!("e{i}") })).collect();
+        app.list.count = 250;
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let moves = [
+            (ch('j'), 1),
+            (key(KeyCode::Down), 2),
+            (ch('j'), 2),
+            (ch('k'), 1),
+            (key(KeyCode::Up), 0),
+            (ch('k'), 0),
+            (ctrl('d'), 2),
+            (ctrl('u'), 0),
+            (ch('G'), 2),
+            (ch('g'), 0),
+            (key(KeyCode::End), 2),
+            (key(KeyCode::Home), 0),
+        ];
+        for (k, at) in moves {
+            app.handle_key(k);
+            assert_eq!(app.list.selected, at, "{k:?}");
+        }
+        // Space marks and moves on; on a marked row it unmarks.
+        app.handle_key(ch(' '));
+        app.handle_key(ch(' '));
+        app.handle_key(ch('k'));
+        app.handle_key(ch(' '));
+        assert_eq!((app.list.marked.iter().map(String::as_str).collect::<Vec<_>>(), app.list.selected), (vec!["/e/0/"], 2));
+        // Sort: next column, then the same column reversed.
+        for (k, sort) in [(ch('s'), (0, false)), (ch('s'), (1, false)), (ch('S'), (1, true))] {
+            app.handle_key(k);
+            assert_eq!(app.list.sort, Some(sort));
+        }
+        // Pages of the server's list: n while there is a next page, p back; a new page starts at its first row.
+        for (k, offset, at) in [(ch('n'), 100, 0), (ch('n'), 200, 0), (ch('n'), 200, 2), (ch('p'), 100, 0), (ch('r'), 100, 2)] {
+            app.list.selected = 2;
+            app.handle_key(k);
+            assert_eq!((app.list.offset, app.list.selected), (offset, at), "{k:?}");
+        }
+        app.handle_key(ch('/'));
+        assert!(matches!(app.modal.take(), Some(Modal::Input { .. })), "search");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.list.marked.is_empty(), "Esc clears the marks first");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.modal.take(), Some(Modal::Menu { .. })), "Enter: the action menu");
+        app.handle_key(ch('c'));
+        assert!(matches!(app.modal.take(), Some(Modal::Form { .. })), "c: Create");
+        app.handle_key(ch('t'));
+        assert_eq!(app.list.kind, Kind::FsExporters, "t: the other exporter type");
+        app.push(Kind::PulpExporters);
+        app.handle_key(ch('t'));
+        assert_eq!((app.list.kind.clone(), app.history.len()), (Kind::FsExporters, 1), "a sub-list is replaced, not stacked");
+        app.handle_key(ch('h'));
+        assert_eq!(app.focus, Focus::Nav);
+        app.focus = Focus::List;
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.history.is_empty(), "Esc goes back");
+        let mut app = app_on(Kind::Publications(crate::pulp::RepoType::File)).await;
+        app.handle_key(ch('/'));
+        assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("this list has no search"));
+        app.list.loading = true;
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!((app.list.loading, app.list.error.as_deref()), (false, Some("request cancelled")));
     }
 
     /// A screen the server does not support (`Kind::unsupported`) offers no actions; its key says why.
