@@ -685,6 +685,24 @@ async fn user_create_edit_password_disable_and_delete_through_the_tui() {
     assert!(c.get::<Value>(&s(&u, "pulp_href"), &[]).await.unwrap_err().is_not_found());
 }
 
+/// Servers, Test connection (T): the profile's URL answers, the user and where Pulp serves content.
+#[tokio::test]
+async fn server_profile_test_connection() {
+    if !live_enabled() {
+        return;
+    }
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Profiles, "").await;
+    let p = row(&app, "name", "pulp1").unwrap_or_else(|| panic!("{:?}", app.list.items));
+    run(&mut app, Act::TestProfile, p.clone());
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no result: {:?}", texts(&app)) };
+    assert_eq!((title, lines[0].clone()), ("Test pulp1".to_string(), format!("Connection to {} OK", s(&p, "url"))));
+    assert_eq!(lines[1], "user: admin (staff: Some(true))");
+    let content = lines.iter().find_map(|l| l.strip_prefix("content served at: ")).unwrap_or_default();
+    assert!(content.starts_with("http") && content.contains("/pulp/content/"), "{lines:?}");
+}
+
 /// The role assignments of user or group `owner`: (role, object).
 async fn roles_of(c: &PulpClient, owner: &str) -> Vec<(String, Value)> {
     let p: pulp_tui::pulp::client::Page<Value> = c.list(&format!("{owner}roles/"), &[]).await.unwrap();

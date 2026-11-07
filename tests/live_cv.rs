@@ -15,7 +15,7 @@ use pulp_tui::pulp::{Capabilities, Mutation, PulpClient, RepoType};
 use pulp_tui::store::{CvRepo, Export, Store};
 use pulp_tui::tui::actions::run;
 use pulp_tui::tui::app::{App, Modal, Msg};
-use pulp_tui::tui::kinds::{Act, Kind};
+use pulp_tui::tui::kinds::{Act, Kind, s};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -733,6 +733,76 @@ async fn import_cv_maps_repositories_by_name_to_the_target_server() {
     svc.delete_view(cv1, &quiet, &no_progress).await.unwrap();
     cleanup(&c1, &[&repo1, &remote1]).await;
     cleanup(&c2, &[&repo2, &gone]).await;
+}
+
+/// The local Content View screens through the TUI on a connected profile: an environment made with Create, protected
+/// (L: at once), unprotected (L: after the typed name) and deleted (after the typed name); a view's Edit (description)
+/// and Remove repository (x). Each change is in the store and in the reloaded list.
+#[tokio::test]
+async fn environments_and_view_definition_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let id = unique("cvdef");
+    let (mut app, mut rx) = app().await;
+    let (st, scope) = (app.cv_store.clone().unwrap(), app.conn.as_ref().unwrap().scope.clone());
+    let env = |app: &App| row(app, "name", "Test").unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+
+    open_list(&mut app, &mut rx, Kind::Environments, "").await;
+    run(&mut app, Act::Create, Value::Null);
+    settle(&mut app, &mut rx).await; // the environments are read before the form
+    fill(&mut app, &[("name", "Test"), ("prior", "Library")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, "environment Test created after Library");
+    let e = env(&app);
+    assert_eq!((e["prior"].as_str(), &e["protected"]), (Some("Library"), &json!(false)));
+
+    run(&mut app, Act::ToggleProtected, e);
+    assert!(app.modal.is_none(), "protecting asks nothing");
+    settle(&mut app, &mut rx).await;
+    shown(&app, "Test protected: true");
+    let e = env(&app);
+    assert_eq!(e["protected"], true);
+    run(&mut app, Act::ToggleProtected, e);
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some("Test"));
+    assert!(lines[0].starts_with("Promote and roll back to Test"), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    shown(&app, "Test protected: false");
+    let e = env(&app);
+    assert_eq!(e["protected"], false);
+
+    run(&mut app, Act::Delete, e.clone());
+    settle(&mut app, &mut rx).await; // what it removes is read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    let first = format!("Delete lifecycle environment Test (label {}). No view is bound to it.", s(&e, "label"));
+    assert_eq!((typed.as_deref(), lines[0].clone()), (Some("Test"), first));
+    settle(&mut app, &mut rx).await;
+    shown(&app, "environment Test deleted");
+    assert!(row(&app, "name", "Test").is_none(), "the list reloads without it");
+    assert!(st.environments(&scope).await.unwrap().iter().all(|e| e.name != "Test"));
+
+    // A view of two repositories (definitions only): Edit its description, Remove one repository.
+    let cv = st.create_cv(&scope, &id, "old").await.unwrap();
+    for name in ["docs", "more"] {
+        let repo_href = format!("/pulp/api/v3/repositories/file/file/{id}-{name}/");
+        st.set_cv_repo(cv, &CvRepo { repo_href, repo_name: name.into(), repo_type: RepoType::File, filters: vec![] }).await.unwrap();
+    }
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::Edit, r);
+    fill(&mut app, &[("description", "new")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, "saved");
+    assert_eq!(row(&app, "name", &id).unwrap()["description"], "new", "the list reloads");
+    let r = row(&app, "name", &id).unwrap();
+    run(&mut app, Act::CvRemoveRepo, r);
+    settle(&mut app, &mut rx).await; // the definitions are read before the form
+    fill(&mut app, &[("repo", "more")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, "more removed from the definition; published versions are unchanged");
+    let names: Vec<String> = st.cv_repos(cv).await.unwrap().into_iter().map(|r| r.repo_name).collect();
+    assert_eq!(names, ["docs"]);
+    assert_eq!(row(&app, "name", &id).unwrap()["repos"].as_array().unwrap().len(), 1, "the list reloads");
 }
 
 /// The row of Content View `name` on the Content Views screen, loaded again.
