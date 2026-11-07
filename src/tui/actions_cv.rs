@@ -4,11 +4,11 @@ use super::actions::{ap, caps, confirm_mirror, sync_policies, unsupported};
 use super::app::{App, Ctx, Level, NO_PROFILE, unavailable};
 use super::form::{Field, FieldKind, Form, PickItem, Source};
 use super::kinds::{Act, Kind, s};
-use crate::cv::{Mode, check_repo_clash};
+use crate::cv::{CvService, Drift, Fix, Mode, check_repo_clash};
 use crate::filters::{format_rules, parse_rules};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, RepoType};
-use crate::store::{Binding, Component, CvRepo, CvVersion, LIBRARY, Store};
+use crate::store::{Binding, Component, CvRepo, CvVersion, Environment, LIBRARY, Store};
 use anyhow::{anyhow, bail};
 use futures::future::join_all;
 use serde_json::Value;
@@ -595,24 +595,16 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             let (svc, mut lines, mut hints) = (ctx.cv()?, vec![], vec![]);
             for e in svc.store.environments(&svc.scope).await? {
                 if let Some(b) = svc.store.binding(e.id, id).await? {
-                    // The version that `verify` checks: the served one, else the attempted one.
-                    let v = svc.store.version(b.versions().next().unwrap_or_default()).await?;
-                    let (n, issues) = (v.number, svc.verify(id, e.id).await?);
+                    let drift = svc.drift(id, e.id).await?;
                     lines.push(format!(
                         "{}: {} {}",
                         e.name,
                         shown_binding(&svc.store, &b).await?,
                         // What `verify` reads (`ops::verify_served`): metadata, and one package of RPM and Deb.
-                        if issues.is_empty() { "OK - served metadata match; RPM/Deb: also the smallest package" } else { "DRIFT" }
+                        if drift.is_empty() { "OK - served metadata match; RPM/Deb: also the smallest package" } else { "DRIFT" }
                     ));
-                    if !issues.is_empty() {
-                        // The rule of `CvService::promote`: Rollback to the bound version always runs.
-                        hints.push(match svc.promote_refusal(&v, &e).await? {
-                            None => format!("{}: promote v{n} again (M) to reconcile (idempotent).", e.name),
-                            Some(why) => format!("{}: roll back to v{n} (b) to reconcile; Promote refuses: {why}", e.name),
-                        });
-                    }
-                    lines.extend(issues.into_iter().map(|i| format!("    {i}")));
+                    hints.extend(reconcile_hints(&svc, &e, &b, &drift).await?);
+                    lines.extend(drift.into_iter().map(|d| format!("    {}", d.text)));
                 }
             }
             if lines.is_empty() {
@@ -704,6 +696,40 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
         }),
         _ => {}
     }
+}
+
+/// One line per kind of fix that the `drift` of the view in `e` (binding `b`) needs, each naming an action that fixes
+/// that kind.
+async fn reconcile_hints(svc: &CvService, e: &Environment, b: &Binding, drift: &[Drift]) -> anyhow::Result<Vec<String>> {
+    let mut out = vec![];
+    for fix in [Fix::Bind, Fix::Publish, Fix::Repair, Fix::Origin, Fix::Retention] {
+        if !drift.iter().any(|d| d.fix == fix) {
+            continue;
+        }
+        let line = match fix {
+            Fix::Bind => {
+                // The version that `drift` checks: the served one, else the attempted one. The rule of
+                // `CvService::promote`: Rollback to the bound version always runs.
+                let v = svc.store.version(b.versions().next().unwrap_or_default()).await?;
+                match svc.promote_refusal(&v, e).await? {
+                    None => format!("promote v{} again (M) to reconcile (idempotent).", v.number),
+                    Some(why) => format!("roll back to v{} (b) to reconcile; Promote refuses: {why}", v.number),
+                }
+            }
+            Fix::Publish => "publish a new version (P) and promote it: a snapshot or publication is gone or another one, \
+                             so a promotion of this version cannot fix it."
+                .into(),
+            Fix::Repair => "check the content app, then repair the snapshot version (Repositories, v, F): \
+                            the served files are not those of the snapshot."
+                .into(),
+            Fix::Origin => "set CONTENT_ORIGIN on the Pulp server: a distribution without base_url serves nothing.".into(),
+            Fix::Retention => "clear retain_repo_versions of the snapshot repository with the Pulp API or CLI \
+                               (pulp-tui does not edit snapshot repositories): Pulp would prune its versions."
+                .into(),
+        };
+        out.push(format!("{}: {line}", e.name));
+    }
+    Ok(out)
 }
 
 /// `cv::binding_text` of `b`, read from the store.
@@ -2129,6 +2155,68 @@ mod tests {
                 "  docs (File): new distribution pulp-tui-cv-web-Dev-docs at /dev/web/docs",
                 "  os (RPM): distribution os-moved at /custom/os was renamed outside pulp-tui; the promotion looks for \
                  pulp-tui-cv-web-Dev-os and fails: rename it back"
+            ]
+        );
+    }
+
+    /// Drift that a promotion cannot fix gets a hint that names what fixes it, and no "promote again".
+    #[tokio::test]
+    async fn drift_hints_name_only_actions_that_fix_that_drift() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = st.begin_version(web, "", &[cv_repo("os", "rpm", "1")]).await.unwrap();
+        let (derived, dv, publication, dist) = (
+            format!("{REPOS}rpm/rpm/2/"),
+            format!("{REPOS}rpm/rpm/2/versions/1/"),
+            "/pulp/api/v3/publications/rpm/rpm/1/",
+            "/pulp/api/v3/distributions/rpm/rpm/3/",
+        );
+        let row = crate::store::CvVersionRepo {
+            derived_repo: Some(derived.clone()),
+            derived_version: Some(dv.clone()),
+            publication: Some(publication.into()),
+            ..st.version_repos(v.id).await.unwrap().remove(0)
+        };
+        st.save_version_repo(&row).await.unwrap();
+        st.finish_version(v.id, "published", None).await.unwrap();
+        st.promoted(lib, web, v.id, "active").await.unwrap();
+        let b = crate::store::BindingRepo {
+            env_id: lib,
+            cv_id: web,
+            repo_href: format!("{REPOS}rpm/rpm/1/"),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: dist.into(),
+            base_path: "library/web/os".into(),
+            publication: Some(publication.into()),
+        };
+        st.save_binding_repo(&b).await.unwrap();
+        // It serves the right publication, but the server has no content origin and the snapshot has retention.
+        serve(
+            &server,
+            "GET",
+            dist.into(),
+            200,
+            json!({ "pulp_href": dist, "name": "d", "base_path": "library/web/os", "base_url": null, "publication": publication }),
+        )
+        .await;
+        serve(&server, "GET", publication.into(), 200, json!({ "pulp_href": publication, "repository_version": dv })).await;
+        serve(&server, "GET", dv.clone(), 200, json!({ "pulp_href": dv })).await;
+        serve(&server, "GET", derived.clone(), 200, json!({ "pulp_href": derived, "name": "web-os", "retain_repo_versions": 1 })).await;
+        cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
+        assert_eq!(lines[0], "Library: v1 DRIFT");
+        let hints: Vec<&str> = lines.iter().skip_while(|l| !l.is_empty()).skip(1).map(String::as_str).collect();
+        assert_eq!(
+            hints,
+            [
+                "Library: set CONTENT_ORIGIN on the Pulp server: a distribution without base_url serves nothing.",
+                "Library: clear retain_repo_versions of the snapshot repository with the Pulp API or CLI (pulp-tui does not edit \
+                 snapshot repositories): Pulp would prune its versions."
             ]
         );
     }

@@ -309,6 +309,36 @@ pub fn component_lines(old: &[UsedVersion], new: &[UsedVersion]) -> Vec<String> 
     out
 }
 
+/// What reconciles one kind of drift (`CvService::drift`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fix {
+    /// Promote the version again, or roll back: it re-points the distributions (and ends a promotion that did not
+    /// complete).
+    Bind,
+    /// A snapshot or its publication is gone or another one: a promotion of the same version cannot bring it back;
+    /// only a new version can.
+    Publish,
+    /// Pulp serves other files than the snapshot holds, or cannot serve them: the content app or the storage.
+    Repair,
+    /// A distribution has no `base_url`: the server has no content origin.
+    Origin,
+    /// `retain_repo_versions` on a snapshot repository: Pulp would prune snapshots.
+    Retention,
+}
+
+/// One finding of `CvService::drift`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Drift {
+    pub text: String,
+    pub fix: Fix,
+}
+
+impl Drift {
+    fn new(text: String, fix: Fix) -> Drift {
+        Drift { text, fix }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Requires the version to be active in the prior environment.
@@ -1513,12 +1543,17 @@ impl CvService {
     /// Check that what Pulp serves for an environment is exactly the bound version.
     /// Returns human-readable findings; empty means verified.
     pub async fn verify(&self, cv_id: i64, env_id: i64) -> Result<Vec<String>> {
-        let Some(b) = self.store.binding(env_id, cv_id).await? else { return Ok(vec!["not bound".into()]) };
+        Ok(self.drift(cv_id, env_id).await?.into_iter().map(|d| d.text).collect())
+    }
+
+    /// `verify`, with what reconciles each finding.
+    pub async fn drift(&self, cv_id: i64, env_id: i64) -> Result<Vec<Drift>> {
+        let Some(b) = self.store.binding(env_id, cv_id).await? else { return Ok(vec![Drift::new("not bound".into(), Fix::Bind)]) };
         let mut issues = vec![];
         if let Some(a) = &b.attempt {
             let running = self.store.lock_live(cv_id, unix_now()).await?;
             let n = self.store.version(a.version_id).await?.number;
-            issues.push(format!("promotion of v{n} is {}", shown_state(&a.state, running)));
+            issues.push(Drift::new(format!("promotion of v{n} is {}", shown_state(&a.state, running)), Fix::Bind));
         }
         // The served version; with none yet, the attempted one.
         let Some(target) = b.versions().next() else { return Ok(issues) };
@@ -1532,65 +1567,60 @@ impl CvService {
     }
 
     /// The findings for binding row `br`; `vr` is its row in the bound version (`None`: it must serve nothing).
-    async fn verify_repo(&self, br: &BindingRepo, vr: Option<&CvVersionRepo>) -> Vec<String> {
+    async fn verify_repo(&self, br: &BindingRepo, vr: Option<&CvVersionRepo>) -> Vec<Drift> {
         let want = vr.and_then(|v| v.publication.clone());
         let d: Distribution = match self.client.get(&br.distribution, &[]).await {
             Ok(d) => d,
-            Err(e) => return vec![format!("{}: distribution {}: {e}", br.repo_name, br.distribution)],
+            // A promotion makes a distribution that is gone again.
+            Err(e) => return vec![Drift::new(format!("{}: distribution {}: {e}", br.repo_name, br.distribution), Fix::Bind)],
         };
         if d.publication != want {
-            return vec![format!(
-                "{}: distribution serves {}, expected {}",
-                br.repo_name,
-                d.publication.as_deref().unwrap_or("nothing"),
-                want.as_deref().unwrap_or("nothing")
-            )];
+            let (has, want) = (d.publication.as_deref().unwrap_or("nothing"), want.as_deref().unwrap_or("nothing"));
+            return vec![Drift::new(format!("{}: distribution serves {has}, expected {want}", br.repo_name), Fix::Bind)];
         }
         let Some(vr) = vr else { return vec![] };
         self.verify_publication(br, vr, &d).await
     }
 
     /// The findings for the publication that `d` serves (the one of `vr`): its version, the snapshot, the served content.
-    async fn verify_publication(&self, br: &BindingRepo, vr: &CvVersionRepo, d: &Distribution) -> Vec<String> {
+    /// A promotion of the same version points at the same publication again, so these need a new version.
+    async fn verify_publication(&self, br: &BindingRepo, vr: &CvVersionRepo, d: &Distribution) -> Vec<Drift> {
         let c = &self.client;
         let p: Value = match c.get(d.publication.as_deref().unwrap_or_default(), &[]).await {
             Ok(p) => p,
-            Err(e) => return vec![format!("{}: publication: {e}", br.repo_name)],
+            Err(e) => return vec![Drift::new(format!("{}: publication: {e}", br.repo_name), Fix::Publish)],
         };
         let mut issues = vec![];
         if p["repository_version"].as_str() != vr.derived_version.as_deref() {
-            issues.push(format!(
-                "{}: publication is of {}, expected {}",
-                br.repo_name,
-                p["repository_version"].as_str().unwrap_or("?"),
-                vr.derived_version.as_deref().unwrap_or("?")
-            ));
+            let (has, want) = (p["repository_version"].as_str().unwrap_or("?"), vr.derived_version.as_deref().unwrap_or("?"));
+            issues.push(Drift::new(format!("{}: publication is of {has}, expected {want}", br.repo_name), Fix::Publish));
         }
         if let Some(dv) = &vr.derived_version
             && let Err(e) = c.get::<Value>(dv, &[("fields", "pulp_href".into())]).await
         {
-            issues.push(format!("{}: snapshot {dv} missing (pruned?): {e}", br.repo_name));
+            issues.push(Drift::new(format!("{}: snapshot {dv} missing (pruned?): {e}", br.repo_name), Fix::Publish));
         }
         let Some(base) = d.base_url.as_deref() else {
-            issues.push(format!("{}: distribution has no base_url", br.repo_name));
+            issues.push(Drift::new(format!("{}: distribution has no base_url", br.repo_name), Fix::Origin));
             return issues;
         };
         let dv = vr.derived_version.as_deref().unwrap_or_default();
         if let Err(e) = ops::verify_served(c, br.repo_type, base, dv, &p).await {
-            issues.push(format!("{}: {e}", br.repo_name));
+            issues.push(Drift::new(format!("{}: {e}", br.repo_name), Fix::Repair));
         }
         issues
     }
 
     /// Retention on derived repositories would prune CV snapshots.
-    async fn retention_issues(&self, vrs: &[CvVersionRepo]) -> Vec<String> {
+    async fn retention_issues(&self, vrs: &[CvVersionRepo]) -> Vec<Drift> {
         let mut issues = vec![];
         for vr in vrs {
             if let Some(dr) = &vr.derived_repo
                 && let Ok(r) = self.client.get::<Repository>(dr, &[]).await
                 && r.retain_repo_versions.is_some()
             {
-                issues.push(format!("{}: retain_repo_versions is set on derived repository {}", vr.repo().repo_name, r.name));
+                let text = format!("{}: retain_repo_versions is set on derived repository {}", vr.repo().repo_name, r.name);
+                issues.push(Drift::new(text, Fix::Retention));
             }
         }
         issues
@@ -4050,19 +4080,80 @@ mod tests {
         get(h("publications", "d"), json!({ "pulp_href": h("publications", "d"), "repository_version": "/old/" })).await;
         let da = json!({ "pulp_href": h("repositories", "da"), "name": "docs-a", "retain_repo_versions": 2 });
         get(h("repositories", "da"), da).await;
-        assert_eq!(
-            svc.verify(cv, lib).await.unwrap(),
-            [
-                "promotion of v1 is partial".to_string(),
-                format!("a: distribution {}: not found [404]", h("distributions", "a")),
-                format!("b: distribution serves /other/, expected {}", h("publications", "b")),
-                "c: publication: not found [404]".into(),
-                format!("d: publication is of /old/, expected {}", h("repositories", "dd/versions/1")),
-                format!("d: snapshot {} missing (pruned?): not found [404]", h("repositories", "dd/versions/1")),
-                "d: distribution has no base_url".into(),
-                "a: retain_repo_versions is set on derived repository docs-a".into(),
-            ]
+        let want = [
+            ("promotion of v1 is partial".to_string(), Fix::Bind),
+            (format!("a: distribution {}: not found [404]", h("distributions", "a")), Fix::Bind),
+            (format!("b: distribution serves /other/, expected {}", h("publications", "b")), Fix::Bind),
+            ("c: publication: not found [404]".into(), Fix::Publish),
+            (format!("d: publication is of /old/, expected {}", h("repositories", "dd/versions/1")), Fix::Publish),
+            (format!("d: snapshot {} missing (pruned?): not found [404]", h("repositories", "dd/versions/1")), Fix::Publish),
+            ("d: distribution has no base_url".into(), Fix::Origin),
+            ("a: retain_repo_versions is set on derived repository docs-a".into(), Fix::Retention),
+        ];
+        assert_eq!(svc.verify(cv, lib).await.unwrap(), want.clone().map(|(t, _)| t));
+        let fixes: Vec<_> = svc.drift(cv, lib).await.unwrap().into_iter().map(|d| (d.text, d.fix)).collect();
+        assert_eq!(fixes, want);
+    }
+
+    /// A served manifest that lists other files than the snapshot holds: promoting again cannot fix it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn served_files_that_differ_from_the_snapshot_need_a_repair() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let s = &svc.store;
+        let cv = s.create_cv("k", "docs", "").await.unwrap();
+        let (dist, publication, dv) = (
+            "/pulp/api/v3/distributions/file/file/1/",
+            "/pulp/api/v3/publications/file/file/1/",
+            "/pulp/api/v3/repositories/file/file/2/versions/1/",
         );
+        let r = CvRepo {
+            repo_href: "/pulp/api/v3/repositories/file/file/1/".into(),
+            repo_name: "a".into(),
+            repo_type: RepoType::File,
+            filters: vec![],
+        };
+        let v = s.begin_version(cv, "", std::slice::from_ref(&r)).await.unwrap();
+        let row = CvVersionRepo {
+            derived_version: Some(dv.into()),
+            publication: Some(publication.into()),
+            ..s.version_repos(v.id).await.unwrap().remove(0)
+        };
+        s.save_version_repo(&row).await.unwrap();
+        s.finish_version(v.id, "published", None).await.unwrap();
+        let lib = s.ensure_library("k").await.unwrap();
+        s.promoted(lib, cv, v.id, "active").await.unwrap();
+        let b = BindingRepo {
+            env_id: lib,
+            cv_id: cv,
+            repo_href: r.repo_href.clone(),
+            repo_name: "a".into(),
+            repo_type: RepoType::File,
+            distribution: dist.into(),
+            base_path: "library/docs/a".into(),
+            publication: Some(publication.into()),
+        };
+        s.save_binding_repo(&b).await.unwrap();
+        let get = |p: &str, body: wiremock::ResponseTemplate| {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(p.to_string()))
+                .respond_with(body)
+                .mount(&server)
+        };
+        let ok = |v: Value| wiremock::ResponseTemplate::new(200).set_body_json(v);
+        let base = format!("{}/pulp/content/library/docs/a/", server.uri());
+        get(
+            dist,
+            ok(json!({ "pulp_href": dist, "name": "a", "base_path": "library/docs/a", "base_url": base, "publication": publication })),
+        )
+        .await;
+        get(publication, ok(json!({ "pulp_href": publication, "repository_version": dv, "manifest": "PULP_MANIFEST" }))).await;
+        get(dv, ok(json!({ "pulp_href": dv }))).await;
+        get("/pulp/content/library/docs/a/PULP_MANIFEST", wiremock::ResponseTemplate::new(200).set_body_string("x.txt,abc,1\n")).await;
+        get("/pulp/api/v3/content/file/files/", ok(json!({ "count": 0, "next": null, "results": [] }))).await;
+        let d = svc.drift(cv, lib).await.unwrap();
+        assert_eq!(d.iter().map(|d| d.fix).collect::<Vec<_>>(), [Fix::Repair], "{d:?}");
+        assert!(d[0].text.starts_with("a: served content differs: PULP_MANIFEST does not match the version"), "{d:?}");
     }
 
     /// Server B of the import tests: RPM repository os at `href`, no other RPM or File repository, no pulp_deb.

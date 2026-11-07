@@ -257,8 +257,11 @@ file; the OK line of the drift check says so):
 | RPM  | `repomd.xml`, the smallest package with digest                                                |
 | Deb  | `dists/<dist>/Release` (verbatim flat: `Release`), the smallest package of `Packages`, digest |
 
-It also reports retention on a derived repository. A new promotion of the bound version
-fixes drift.
+It also reports retention on a derived repository. `CvService::drift` gives each finding the
+kind of fix (`cv::Fix`), and the drift check names one action per kind: a new promotion of
+the bound version re-points distributions; a gone or wrong snapshot or publication needs a
+new version; served files that differ need a repair; a missing `base_url` needs
+`CONTENT_ORIGIN`; retention must be cleared outside pulp-tui.
 
 ### Delete
 

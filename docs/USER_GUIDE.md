@@ -563,9 +563,15 @@ retry, or roll back to the served version to clear the failed attempt.
 * **D** verifies all environments (drift check). `OK` means: each distribution serves the
   publication of the snapshot, and the served metadata (`repomd.xml`, `Release`, the File
   manifest) match it; for RPM and Deb also the smallest package with its digest. Other files are
-  not downloaded. For each environment with drift, it tells how to
-  reconcile: promote the bound version again, or, when the prior environment no longer has that
-  version active (Promote refuses it), roll back to it (**b**).
+  not downloaded. For each environment with drift, it names one action per kind of drift:
+  * a distribution that serves another publication, is gone, or a promotion that did not
+    complete: promote the bound version again, or, when the prior environment no longer has that
+    version active (Promote refuses it), roll back to it (**b**);
+  * a snapshot or publication that is gone or another one: publish a new version and promote it
+    (a promotion of the same version cannot bring it back);
+  * served files that differ: check the content app, then **Repair** the snapshot version;
+  * no `base_url`: set `CONTENT_ORIGIN` on the Pulp server;
+  * `retain_repo_versions` on a snapshot repository: clear it with the Pulp API or CLI.
 * **U** breaks the lock of the view. It shows the holder; type the view name. See "Locks".
 * **c** creates. **e** edits the description (composite: also auto publish and the pins).
 * **d** deletes the distributions and snapshot repositories of the view, never the source
