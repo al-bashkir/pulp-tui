@@ -11,11 +11,14 @@ use pulp_tui::cv::{CvService, Mode, base_path, export, import};
 use pulp_tui::filters::parse_rules;
 use pulp_tui::pulp::models::{RepoVersion, Task};
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{Capabilities, Mutation, RepoType};
+use pulp_tui::pulp::{Capabilities, Mutation, PulpClient, RepoType};
 use pulp_tui::store::{CvRepo, Export, Store};
-use pulp_tui::tui::kinds::Kind;
-use serde_json::json;
+use pulp_tui::tui::actions::run;
+use pulp_tui::tui::app::{App, Modal, Msg};
+use pulp_tui::tui::kinds::{Act, Kind};
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 fn quiet(_: String) {}
 
@@ -730,4 +733,200 @@ async fn import_cv_maps_repositories_by_name_to_the_target_server() {
     svc.delete_view(cv1, &quiet, &no_progress).await.unwrap();
     cleanup(&c1, &[&repo1, &remote1]).await;
     cleanup(&c2, &[&repo2, &gone]).await;
+}
+
+/// The row of Content View `name` on the Content Views screen, loaded again.
+async fn cv_row(app: &mut App, rx: &mut UnboundedReceiver<Msg>, name: &str) -> Value {
+    open_list(app, rx, Kind::ContentViews, "").await;
+    row(app, "name", name).unwrap_or_else(|| panic!("no view {name}: {:?}", app.list.items))
+}
+
+/// Publish (P) of view `name`: the form, the preview, the confirmation, the job.
+async fn tui_publish(app: &mut App, rx: &mut UnboundedReceiver<Msg>, name: &str, notes: &str) {
+    let r = cv_row(app, rx, name).await;
+    run(app, Act::CvPublish, r);
+    settle(app, rx).await; // the repositories are read before the form
+    fill(app, &[("notes", notes)]);
+    settle(app, rx).await;
+    let (lines, typed) = yes(app);
+    assert_eq!((typed, lines[0].as_str()), (None, "Publishing creates a new immutable version and makes it active in Library."));
+    settle(app, rx).await;
+}
+
+/// Promote (M) or Rollback (b) of view `name` to version `number` in `env`: the form, the preview (its lines), the job.
+async fn tui_promote(app: &mut App, rx: &mut UnboundedReceiver<Msg>, name: &str, act: Act, number: &str, env: &str) -> Vec<String> {
+    let r = cv_row(app, rx, name).await;
+    run(app, act, r);
+    settle(app, rx).await; // the environments are read before the form
+    fill(app, &[("version", number), ("env", env)]);
+    settle(app, rx).await;
+    let (lines, typed) = yes(app);
+    assert_eq!(typed, None, "a plain confirmation: {env} is not protected");
+    settle(app, rx).await;
+    lines
+}
+
+/// The PULP_MANIFEST that the File repository `docs` of view `cv` serves in `env`, and the hrefs of the view's
+/// distributions there.
+async fn served_docs(c: &PulpClient, st: &Store, env: i64, cv: i64) -> (String, Vec<String>) {
+    let rows = st.binding_repos(env, cv).await.unwrap();
+    let docs = rows.iter().find(|b| b.repo_name == "docs").expect("docs is served");
+    let d: Value = c.get(&docs.distribution, &[]).await.unwrap();
+    let (status, body) = served(c, &format!("{}PULP_MANIFEST", d["base_url"].as_str().unwrap())).await;
+    assert_eq!(status, 200);
+    (String::from_utf8(body).unwrap(), rows.into_iter().map(|b| b.distribution).collect())
+}
+
+/// The Content View workflows through the TUI, on a File and an RPM repository with default remotes (not synced):
+/// Sync repositories (f), Publish (P), Verify (D), Promote (M), Filters (F) then a second Publish, Rollback (b),
+/// Compare on the Versions screen, Unpromote (u), Delete of a version, Delete of the view. Each step answers the
+/// real forms and confirmations, then checks what Pulp serves and what the screen shows.
+#[tokio::test]
+async fn content_view_workflows_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvtui"));
+    let mut sources = vec![];
+    for (t, name, path) in [(RepoType::File, "docs", "file/PULP_MANIFEST"), (RepoType::Rpm, "os", "rpm/")] {
+        let full = format!("{id}-{name}");
+        let body = json!({ "name": full, "url": format!("{}/{path}", upstream()), "policy": "immediate" });
+        let remote = create(&c, t.remotes(), body, "/remotes/").await;
+        let repo = create(&c, t.repositories(), json!({ "name": full, "remote": remote }), "/repositories/").await;
+        sources.push((t, name, repo, remote));
+    }
+    let (mut app, mut rx) = app().await;
+    let (st, scope) = (app.cv_store.clone().unwrap(), app.conn.as_ref().unwrap().scope.clone());
+    let cv = st.create_cv(&scope, &id, "").await.unwrap();
+    for (t, name, repo, _) in &sources {
+        st.set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: name.to_string(), repo_type: *t, filters: vec![] }).await.unwrap();
+    }
+    let lib = st.ensure_library(&scope).await.unwrap();
+    let dev = st.create_env(&scope, "Dev", lib, false).await.unwrap();
+
+    // Sync repositories (f): both sync from their default remotes; the result names each new version.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvSyncRepos, r);
+    fill(&mut app, &[("policy", "additive")]);
+    settle_tasks(&mut app, &mut rx).await;
+    let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no sync result: {:?}", texts(&app)) };
+    assert_eq!((title, lines[0].as_str()), (format!("Sync of {id}"), "2 synced, 0 failed, 0 skipped"));
+    for (_, name, repo, _) in &sources {
+        assert!(lines.contains(&format!("  {name}: synced, new version 1")), "{lines:?}");
+        assert!(latest(&c, repo).await.ends_with("/versions/1/"));
+        assert!(texts(&app).contains(&format!("task completed: sync {name} (additive)")), "{:?}", texts(&app));
+    }
+
+    // Publish (P) v1: active in Library; Verify (D) checks what Library serves.
+    tui_publish(&mut app, &mut rx, &id, "first").await;
+    assert!(texts(&app).contains(&format!("{id} version 1 published and active in Library")), "{:?}", texts(&app));
+    let r = row(&app, "name", &id).unwrap();
+    assert_eq!(r["latest"], "v1", "the list reloads");
+    let v1 = st.versions(cv).await.unwrap().into_iter().find(|v| v.number == 1).unwrap();
+    assert_eq!(st.binding(lib, cv).await.unwrap().unwrap().active(), Some(v1.id));
+    assert!(served_docs(&c, &st, lib, cv).await.0.contains("isos/boot.iso"));
+    run(&mut app, Act::CvDrift, r);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verify result: {:?}", texts(&app)) };
+    assert_eq!(lines, ["Library: v1 OK - served metadata match; RPM/Deb: also the smallest package"]);
+
+    // Promote (M) v1 to Dev.
+    let lines = tui_promote(&mut app, &mut rx, &id, Act::Promote, "1", "Dev").await;
+    assert_eq!(lines[0], format!("{id}: Dev now serves nothing; will serve v1"));
+    assert!(texts(&app).contains(&format!("{id} v1 active in Dev; served metadata verified")), "{:?}", texts(&app));
+    let (manifest, dev_dists) = served_docs(&c, &st, dev, cv).await;
+    assert!(manifest.contains("isos/boot.iso") && dev_dists.len() == 2, "{manifest} {dev_dists:?}");
+
+    // Filters (F) of docs, then v2 without the ISO; Promote v2 to Dev.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvFilters, r);
+    settle(&mut app, &mut rx).await; // the definitions are read before the form
+    fill(&mut app, &[("repo", "docs"), ("filters", "exclude path=isos/*")]);
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).contains(&"filters of docs: exclude path=isos/*".to_string()), "{:?}", texts(&app));
+    tui_publish(&mut app, &mut rx, &id, "no iso").await;
+    assert!(texts(&app).contains(&format!("{id} version 2 published and active in Library")), "{:?}", texts(&app));
+    assert!(!served_docs(&c, &st, lib, cv).await.0.contains("isos/boot.iso"), "Library serves v2");
+    tui_promote(&mut app, &mut rx, &id, Act::Promote, "2", "Dev").await;
+    assert!(texts(&app).contains(&format!("{id} v2 active in Dev; served metadata verified")), "{:?}", texts(&app));
+    assert!(!served_docs(&c, &st, dev, cv).await.0.contains("isos/boot.iso"));
+
+    // Rollback (b) Dev to v1: Dev serves the ISO again; v2 stays published.
+    let lines = tui_promote(&mut app, &mut rx, &id, Act::Rollback, "1", "Dev").await;
+    assert!(lines.contains(&"Rollback only changes bindings; newer versions stay available.".to_string()), "{lines:?}");
+    assert!(texts(&app).contains(&format!("{id} v1 active in Dev; served metadata verified")), "{:?}", texts(&app));
+    assert!(served_docs(&c, &st, dev, cv).await.0.contains("isos/boot.iso"));
+    assert_eq!(st.binding(dev, cv).await.unwrap().unwrap().active(), Some(v1.id));
+    assert_eq!(cv_row(&mut app, &mut rx, &id).await["bound"], "Library:v2  Dev:v1", "the list shows the bindings");
+
+    // Compare (m) on the Versions screen: v1 marked, v2 selected.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvVersions, r);
+    settle(&mut app, &mut rx).await;
+    let v2_row = app.list.items.iter().find(|v| v["number"] == 2).cloned().unwrap();
+    app.list.marked = [v1.id.to_string()].into();
+    run(&mut app, Act::Compare, v2_row);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no comparison: {:?}", texts(&app)) };
+    assert!(lines.iter().any(|l| l.starts_with("- ") && l.contains("isos/boot.iso")), "{lines:?}");
+    app.list.marked.clear();
+    app.back();
+    settle(&mut app, &mut rx).await;
+
+    // Unpromote (u) from Dev: its distributions go, after the typed name.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::Unpromote, r);
+    settle(&mut app, &mut rx).await;
+    fill(&mut app, &[("env", "Dev")]);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some(id.as_str()));
+    assert!(lines[0].starts_with(&format!("Unpromote {id} from Dev: delete its distributions")), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).contains(&format!("{id} is not in Dev any more")), "{:?}", texts(&app));
+    assert_eq!(st.binding(dev, cv).await.unwrap(), None);
+    for d in &dev_dists {
+        assert!(c.get::<Value>(d, &[]).await.unwrap_err().is_not_found(), "{d} is deleted");
+    }
+
+    // Delete v1 (Versions, d): the objects it alone uses go, after the typed version.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvVersions, r);
+    settle(&mut app, &mut rx).await;
+    let v1_row = app.list.items.iter().find(|v| v["number"] == 1).cloned().unwrap();
+    run(&mut app, Act::Delete, v1_row);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some("v1"));
+    let gone: Vec<String> = lines.iter().filter_map(|l| l.split_once(": delete ").map(|(_, h)| h.to_string())).collect();
+    assert!(!gone.is_empty(), "the docs snapshot of v1 is its own: {lines:?}");
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).contains(&"version deleted".to_string()), "{:?}", texts(&app));
+    assert_eq!(st.version(v1.id).await.unwrap().state, "deleted");
+    assert!(app.list.items.iter().find(|v| v["number"] == 1).is_none_or(|v| v["state"] == "deleted"), "the list reloads");
+    for h in &gone {
+        assert!(c.get::<Value>(h, &[]).await.unwrap_err().is_not_found(), "{h} is deleted");
+    }
+    app.back();
+    settle(&mut app, &mut rx).await;
+
+    // Delete the view (d): its Library distributions and snapshot repositories go, after the typed name.
+    let snapshots: Vec<String> = st.version_repos(v1.id).await.unwrap().into_iter().filter_map(|r| r.derived_repo).collect();
+    let (_, lib_dists) = served_docs(&c, &st, lib, cv).await;
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::Delete, r);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some(id.as_str()));
+    assert!(lines.contains(&"Served now:".to_string()), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).contains(&format!("content view {id} deleted")), "{:?}", texts(&app));
+    assert!(row(&app, "name", &id).is_none(), "the list reloads without it");
+    assert_eq!(snapshots.len(), 2);
+    for h in snapshots.iter().chain(&lib_dists) {
+        assert!(c.get::<Value>(h, &[]).await.unwrap_err().is_not_found(), "{h} is deleted");
+    }
+    for (_, _, repo, remote) in &sources {
+        cleanup(&c, &[repo, remote]).await;
+    }
 }
