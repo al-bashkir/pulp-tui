@@ -721,8 +721,10 @@ for example `web:v1 (v2 partial)`.
 * **e** edits the **label**, the part of the served path that names the environment. A new
   environment gets its name in lower case (`Dev` gives `dev`). A label has 1-64 characters of
   `a-z 0-9 - _ .` and is unique on the server. No other distribution may have the label, or a
-  path below it (`<label>/…`), as its base path: Pulp refuses overlapping base paths. The edit
-  refuses such a label and names the distribution, before it changes anything.
+  path below it (`<label>/…`), as its base path: the paths below a label belong to its
+  environment, and Pulp refuses overlapping base paths, so a later promotion could fail there.
+  The edit refuses such a label and names the distribution, before it changes anything. A new
+  environment gets no such check; a promotion that overlaps fails on that repository only.
 * The relabel shows the paths that move (`/old -> /new`), and you type the environment name. Then
   it moves each distribution in place (one task each), and shows the result and the drift check of
   each bound view. It locks every view bound in the environment. A row that fails stays at its old

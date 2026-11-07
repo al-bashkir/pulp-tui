@@ -1472,9 +1472,10 @@ impl CvService {
         Ok(out)
     }
 
-    /// Refused when another distribution (not in `own`) has the base path `label` or one below it: a served path
-    /// `<label>/<view>/<repo>` would overlap it, and Pulp refuses a base path that equals, contains or is inside
-    /// another one (USER_GUIDE "Lifecycle Environments").
+    /// Refused when another distribution (not in `own`) has the base path `label` or one below it. The paths below a
+    /// label belong to its environment: Pulp refuses a base path that equals, contains or is inside another one, so a
+    /// promotion to `<label>/<view>/<repo>` could fail on it later, even when no path that moves now overlaps it
+    /// (USER_GUIDE "Lifecycle Environments").
     async fn refuse_label_overlap(&self, label: &str, own: &[String]) -> Result<()> {
         let c = &self.client;
         let found: Vec<Distribution> = c.list_all(&c.api("distributions/"), &[("base_path__contains", label.into())], 100_000).await?;
@@ -1482,7 +1483,7 @@ impl CvService {
         if let Some(d) = found.iter().find(|d| !own.contains(&d.pulp_href) && under(&d.base_path)) {
             bail!(
                 "label {label} is refused: distribution {} has base path /{}, the label or below it \
-                 (served paths would overlap it; Pulp refuses that)",
+                 (the paths below a label are its environment's: a promotion there could overlap it)",
                 d.name,
                 d.base_path
             );
@@ -3384,7 +3385,7 @@ mod tests {
         }
         for (label, clash) in [("qa", "dqa/legacy has base path /qa/legacy"), ("stage", "dstage has base path /stage")] {
             let want = format!(
-                "label {label} is refused: distribution {clash}, the label or below it (served paths would overlap it; Pulp refuses that)"
+                "label {label} is refused: distribution {clash}, the label or below it (the paths below a label are its environment's: a promotion there could overlap it)"
             );
             assert_eq!(svc.relabel_impact(dev, label).await.unwrap_err().to_string(), want, "the preview refuses");
             assert_eq!(svc.relabel_env(dev, label, &|_| {}, &ops::no_progress).await.unwrap_err().to_string(), want);
