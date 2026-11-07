@@ -3038,11 +3038,13 @@ const DIST_FLAGS: [(&str, &str, &str); 3] = [
 fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
     match act {
-        Act::CopyUrl => {
-            let url = s(&item, "base_url");
-            copy_to_clipboard(&url);
-            app.ok(format!("copied {url}"));
-        }
+        Act::CopyUrl => match s(&item, "base_url") {
+            url if url.is_empty() => app.error(format!("distribution {name} has no base_url: nothing copied")),
+            url => {
+                copy_to_clipboard(&url);
+                app.ok(format!("copied {url}"));
+            }
+        },
         Act::Verify => distribution_verify(app, t, href, name),
         Act::Rollback => repoint_form(app, t, name),
         Act::Create => distribution_form(app, t, None),
@@ -7861,6 +7863,15 @@ mod tests {
             lines[2..4],
             ["  will serve:  b@v1 (pinned)", "  WARNING: version 1 of repository b, but the distribution serves repository a now"]
         );
+    }
+
+    #[tokio::test]
+    async fn copy_url_of_a_distribution_without_a_base_url_is_an_error() {
+        let server = wiremock::MockServer::start().await;
+        let (mut app, _rx) = connected(&server).await;
+        distribution_action(&mut app, RepoType::File, Act::CopyUrl, json!({ "name": "docs", "base_url": null }));
+        let last = app.notices.back().map(|n| (n.level, n.text.as_str()));
+        assert_eq!(last, Some((Level::Error, "distribution docs has no base_url: nothing copied")));
     }
 
     #[tokio::test]
