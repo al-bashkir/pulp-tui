@@ -893,7 +893,8 @@ async fn uploaded(
 
 /// The uploaded unit `content_href` must have the local digest `sha256`: Pulp can return an existing unit instead.
 pub async fn check_digest(c: &PulpClient, content_href: &str, sha256: &str) -> Result<()> {
-    let content: Value = c.get(content_href, &[("fields", "sha256".into())]).await?;
+    // pulp_deb 3.11 answers HTTP 500 to a source package read without `artifacts`; other types ignore the name.
+    let content: Value = c.get(content_href, &[("fields", "sha256,artifacts".into())]).await?;
     if content["sha256"].as_str() != Some(sha256) {
         return Err(PulpError::Decode(format!("digest mismatch for {content_href}: local {sha256}, server {}", content["sha256"])));
     }

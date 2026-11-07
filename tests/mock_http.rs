@@ -771,6 +771,15 @@ async fn deb_installer_and_generic_uploads_go_to_their_endpoints() {
     }
 }
 
+/// Source package `src` with digest `sha256`, read as pulp_deb 3.11 answers: HTTP 500 when `fields` lacks `artifacts`
+/// (its serializer sets that field read-only in `__init__`).
+async fn mount_source_package(server: &MockServer, src: &str, sha256: &str) {
+    let full = Mock::given(method("GET")).and(path(src.to_string())).and(query_param("fields", "sha256,artifacts"));
+    let found = ResponseTemplate::new(200).set_body_json(json!({ "sha256": sha256, "artifacts": {} }));
+    full.respond_with(found).with_priority(1).mount(server).await;
+    Mock::given(method("GET")).and(path(src.to_string())).respond_with(ResponseTemplate::new(500)).mount(server).await;
+}
+
 /// A source package: pulp_deb reads the `.dsc` from an artifact and needs an artifact of each file that it lists. An
 /// artifact with the listed sha256 is reused, the other files and the `.dsc` are uploaded first (a file above one
 /// chunk through `uploads/` and its `commit/`); then the source package is made from the `.dsc` artifact. A listed
@@ -814,7 +823,7 @@ async fn deb_source_upload_sends_the_listed_files_and_the_dsc_as_artifacts() {
     let task =
         json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [format!("{repo}versions/2/"), src] });
     answer("GET", &format!("{API}tasks/1/"), 200, task).mount(&server).await;
-    answer("GET", &src, 200, json!({ "sha256": sha(text.as_bytes()) })).mount(&server).await;
+    mount_source_package(&server, &src, &sha(text.as_bytes())).await;
     let c = client(&server, |_, s| s.upload_chunk_mb = 1);
 
     let r = deb::upload(&c, &deb::Upload::Source, &dsc, Some(&repo), false, &|_, _| {}, &no_progress).await.unwrap();
@@ -853,7 +862,7 @@ async fn deb_source_upload_refuses_the_kept_package_of_another_dsc() {
     answer("POST", &format!("{API}content/deb/source_packages/"), 202, json!({ "task": format!("{API}tasks/1/") })).mount(&server).await;
     let task = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [src] });
     answer("GET", &format!("{API}tasks/1/"), 200, task).mount(&server).await;
-    answer("GET", &src, 200, json!({ "sha256": "0".repeat(64) })).mount(&server).await;
+    mount_source_package(&server, &src, &"0".repeat(64)).await;
     let c = client(&server, |_, _| {});
 
     let e = deb::upload(&c, &deb::Upload::Source, &dsc, None, true, &|_, _| {}, &no_progress).await.unwrap_err().to_string();
