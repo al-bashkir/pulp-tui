@@ -127,6 +127,11 @@ pub async fn settle_submitted(c: &PulpClient, app: &App) {
     ops::settle(c, Mutation::Task(href), &no_progress).await.unwrap();
 }
 
+/// Assert that the notice `text` is shown.
+pub fn shown(app: &App, text: &str) {
+    assert!(texts(app).iter().any(|t| t == text), "no notice {text:?}: {:?}", texts(app));
+}
+
 /// Let the jobs end (one submits a task), then poll the Task Center as the UI loop does until every tracked task is
 /// final, then let the jobs (the list reload that a finished task starts) end.
 pub async fn settle_tasks(app: &mut App, rx: &mut UnboundedReceiver<Msg>) {

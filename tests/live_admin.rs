@@ -630,11 +630,6 @@ async fn access_policy_reset_restores_the_default() {
     assert_eq!((after["customized"].clone(), after["statements"].clone()), (json!(false), before), "{:?}", texts(&app));
 }
 
-/// The notice `text` is shown.
-fn shown(app: &App, text: &str) {
-    assert!(texts(app).iter().any(|t| t == text), "no notice {text:?}: {:?}", texts(app));
-}
-
 /// Users through the TUI: Create with a password, Edit, Password (w), Disable (A), Delete. Each change shows in the
 /// reloaded list and in Pulp; the passwords are checked by signing in with them.
 #[tokio::test]

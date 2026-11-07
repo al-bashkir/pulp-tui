@@ -7,13 +7,14 @@ mod common;
 
 use common::*;
 use crossterm::event::{KeyCode, KeyEvent};
-use pulp_tui::pulp::RepoType;
 use pulp_tui::pulp::client::Page;
 use pulp_tui::pulp::ops::{self, no_progress};
+use pulp_tui::pulp::{PulpClient, RepoType};
 use pulp_tui::tui::actions::run;
-use pulp_tui::tui::app::Modal;
-use pulp_tui::tui::kinds::{Act, Kind};
+use pulp_tui::tui::app::{App, Modal, Msg};
+use pulp_tui::tui::kinds::{Act, Kind, short};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// In `ALLOWED_EXPORT_PATHS` and `ALLOWED_IMPORT_PATHS` of the test containers (tests/env/pulp-env.sh).
 const EXPORTS: &str = "/var/lib/pulp/exports";
@@ -238,4 +239,178 @@ async fn filesystem_export_of_a_file_publication() {
     ops::create(&c, &exports, &json!({ "repository_version": v }), "/exports/", &no_progress).await.unwrap();
 
     cleanup(&c, &[&exporter, &publication, &repo, &remote]).await;
+}
+
+/// The export records of `exporter`.
+async fn exports_of(c: &PulpClient, exporter: &str) -> Vec<Value> {
+    c.list::<Value>(&format!("{exporter}exports/"), &[]).await.unwrap().results
+}
+
+/// Delete (d) of the exporter or importer row `r` of the open list: the impact (its first line), the typed name, then
+/// the request; the object is gone in Pulp and from the reloaded list.
+async fn tui_delete(app: &mut App, rx: &mut UnboundedReceiver<Msg>, r: Value, first: &str) {
+    let (href, name) = (r["pulp_href"].as_str().unwrap().to_string(), r["name"].as_str().unwrap().to_string());
+    run(app, Act::Delete, r);
+    settle(app, rx).await; // the impact is read before the confirmation
+    let (lines, typed) = yes(app);
+    assert_eq!((typed.as_deref(), lines[0].as_str()), (Some(name.as_str()), first));
+    settle_tasks(app, rx).await;
+    assert!(row(app, "name", &name).is_none(), "the list reloads without it: {:?}", texts(app));
+    assert!(client().get::<Value>(&href, &[]).await.unwrap_err().is_not_found(), "{:?}", texts(app));
+}
+
+/// The Pulp Exporters and Importers screens through the TUI, on one server: Create an exporter, Edit its directory
+/// (a task), Export (E), list and Delete the export record; Create an importer that maps the repository to a
+/// decoy, Edit the mapping to the copy, Import (I): the check, the confirmation, the task group; the copy gets the
+/// exported files and the decoy nothing; list the imports, Delete the importer and the exporter.
+#[tokio::test]
+async fn pulp_exporter_and_importer_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = unique("it-tui-export");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &name, "file/PULP_MANIFEST", "mirror").await;
+    let (copy, decoy) = (format!("{name}-copy"), format!("{name}-decoy"));
+    let dst = create(&c, RepoType::File.repositories(), json!({ "name": copy }), "/repositories/").await;
+    let other = create(&c, RepoType::File.repositories(), json!({ "name": decoy }), "/repositories/").await;
+    let (dir, dir2) = (format!("{EXPORTS}/{name}"), format!("{EXPORTS}/{name}-2"));
+    let (mut app, mut rx) = app().await;
+
+    // Exporter: Create, then Edit of its directory (Pulp updates an exporter in a task).
+    open_list(&mut app, &mut rx, Kind::PulpExporters, &name).await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("name", &name), ("path", &dir), ("repositories", &repo)]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("create exporter {name}: done"));
+    let r = row(&app, "name", &name).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    assert_eq!((r["path"].as_str(), &r["repositories"]), (Some(dir.as_str()), &json!([repo])));
+    let exporter = r["pulp_href"].as_str().unwrap().to_string();
+    run(&mut app, Act::Edit, r);
+    fill(&mut app, &[("path", &dir2)]);
+    settle_tasks(&mut app, &mut rx).await;
+    shown(&app, &format!("task completed: update exporter {name}"));
+    let r = row(&app, "name", &name).unwrap();
+    assert_eq!((r["path"].as_str(), &r["repositories"]), (Some(dir2.as_str()), &json!([repo])), "the list reloads");
+
+    // Export (E): a full export of the latest version; the result names the TOC file.
+    run(&mut app, Act::Export, r.clone());
+    settle(&mut app, &mut rx).await; // the repositories and the last export are read before the form
+    fill(&mut app, &[]);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no export result: {:?}", texts(&app)) };
+    let export = exports_of(&c, &exporter).await.into_iter().next().unwrap_or_else(|| panic!("no export: {lines:?}"));
+    let toc = export["toc_info"]["file"].as_str().unwrap().to_string();
+    assert_eq!((title, lines[0].clone()), (format!("Export of {name}"), format!("TOC: {toc}")));
+    assert!(toc.starts_with(&format!("{dir2}/")), "{toc}");
+    assert_eq!(export["exported_resources"], json!([latest(&c, &repo).await]));
+
+    // Importer: Create with the decoy mapping, then Edit the mapping to the copy.
+    open_list(&mut app, &mut rx, Kind::Importers, &name).await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("name", &name), ("repo_mapping", &format!("{name}={decoy}"))]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("create importer {name}: done"));
+    let i = row(&app, "name", &name).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    assert_eq!(i["repo_mapping"], json!({ name.clone(): decoy }));
+    run(&mut app, Act::Edit, i);
+    fill(&mut app, &[("repo_mapping", &format!("{name}={copy}"))]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("update importer {name}: done"));
+    let i = row(&app, "name", &name).unwrap();
+    assert_eq!(i["repo_mapping"], json!({ name.clone(): copy }), "the list reloads");
+
+    // Import (I): the check is the preview; the confirmation names the mapping that Pulp has.
+    run(&mut app, Act::Import, i.clone());
+    fill(&mut app, &[("toc", &toc)]);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed, None, "a plain confirmation on a profile that is not production");
+    assert!(lines.contains(&format!("  {name} -> {copy}")), "{lines:?}");
+    settle_tasks(&mut app, &mut rx).await;
+    let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no import result: {:?}", texts(&app)) };
+    assert_eq!(title, format!("Import of {toc}"), "{lines:?}");
+    let files = async |r: &str| {
+        let v: Value = c.get(&latest(&c, r).await, &[]).await.unwrap();
+        v["content_summary"]["present"]["file.file"]["count"].clone()
+    };
+    assert_eq!((files(&dst).await, files(&other).await), (json!(3), Value::Null), "the copy has the 3 exported files");
+    run(&mut app, Act::Imports, i.clone());
+    settle(&mut app, &mut rx).await;
+    assert_eq!(app.list.items.len(), 1, "Imports lists the import: {:?}", app.list.error);
+    app.back();
+    settle(&mut app, &mut rx).await;
+    let i = row(&app, "name", &name).unwrap();
+    tui_delete(&mut app, &mut rx, i, &format!("Delete importer {name} and the records of its 1 import(s).")).await;
+
+    // Exports (o) lists the export; Delete removes its record (the files stay); then Delete the exporter (a task).
+    open_list(&mut app, &mut rx, Kind::PulpExporters, &name).await;
+    let r = row(&app, "name", &name).unwrap();
+    run(&mut app, Act::Exports, r);
+    settle(&mut app, &mut rx).await;
+    let id = short(export["pulp_href"].as_str().unwrap());
+    let e = row(&app, "pulp_href", export["pulp_href"].as_str().unwrap()).unwrap_or_else(|| panic!("{:?}", app.list.items));
+    run(&mut app, Act::Delete, e);
+    let (lines, typed) = yes(&mut app);
+    assert_eq!((typed.as_deref(), lines[0].clone()), (Some(id.as_str()), format!("Delete the record of export {id} (TOC {toc}).")));
+    settle(&mut app, &mut rx).await;
+    assert!(app.list.items.is_empty() && exports_of(&c, &exporter).await.is_empty(), "{:?}", texts(&app));
+    app.back();
+    settle(&mut app, &mut rx).await;
+    let r = row(&app, "name", &name).unwrap();
+    tui_delete(&mut app, &mut rx, r, &format!("Delete exporter {name} and the records of its 0 export(s).")).await;
+    shown(&app, &format!("task completed: delete exporter {name}"));
+    cleanup(&c, &[&dst, &other, &repo, &remote]).await;
+}
+
+/// The Filesystem Exporters screen through the TUI: Create (method write), Export (E) of the newest publication, Edit
+/// of the directory (a task; Pulp needs a new one for each export), Export of the repository version, Delete.
+#[tokio::test]
+async fn filesystem_exporter_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::File;
+    let name = unique("it-tui-fsexport");
+    let (repo, remote) = synced_repo(&c, t, &name, "file/PULP_MANIFEST", "mirror").await;
+    let v = latest(&c, &repo).await;
+    let publication = ops::create_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap();
+    let (dir, dir2) = (format!("{EXPORTS}/{name}"), format!("{EXPORTS}/{name}-2"));
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::FsExporters, &name).await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("name", &name), ("path", &dir), ("method", "write")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("create exporter {name}: done"));
+    let r = row(&app, "name", &name).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    assert_eq!((r["path"].as_str(), r["method"].as_str()), (Some(dir.as_str()), Some("write")));
+    let exporter = r["pulp_href"].as_str().unwrap().to_string();
+
+    // Export (E) "publication", version empty: the newest publication of the latest version.
+    run(&mut app, Act::Export, r.clone());
+    fill(&mut app, &[("repo", &repo), ("what", "publication")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("export {name}: publication written to {dir}"));
+    let made = exports_of(&c, &exporter).await;
+    assert_eq!(made.iter().map(|e| e["exported_resources"].clone()).collect::<Vec<_>>(), [json!([publication])]);
+
+    // Edit the directory, then Export (E) "repository version".
+    run(&mut app, Act::Edit, r);
+    fill(&mut app, &[("path", &dir2)]);
+    settle_tasks(&mut app, &mut rx).await;
+    shown(&app, &format!("task completed: update exporter {name}"));
+    let r = row(&app, "name", &name).unwrap();
+    assert_eq!(r["path"].as_str(), Some(dir2.as_str()), "the list reloads");
+    run(&mut app, Act::Export, r.clone());
+    fill(&mut app, &[("repo", &repo), ("what", "repository version")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("export {name}: repository version written to {dir2}"));
+    let mut made: Vec<Value> = exports_of(&c, &exporter).await.into_iter().map(|e| e["exported_resources"].clone()).collect();
+    made.sort_by_key(Value::to_string);
+    assert_eq!(made, [json!([publication]), json!([v])]);
+
+    tui_delete(&mut app, &mut rx, r, &format!("Delete exporter {name} and the records of its 2 export(s).")).await;
+    shown(&app, &format!("task completed: delete exporter {name}"));
+    cleanup(&c, &[&publication, &repo, &remote]).await;
 }
