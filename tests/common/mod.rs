@@ -76,7 +76,11 @@ pub async fn create(c: &PulpClient, path: &str, body: Value, needle: &str) -> St
 
 pub async fn synced_repo(c: &PulpClient, t: RepoType, name: &str, upstream_path: &str, policy: &str) -> (String, String) {
     let url = format!("{}/{upstream_path}", upstream());
-    let remote = create(c, t.remotes(), json!({ "name": name, "url": url, "policy": "immediate" }), "/remotes/").await;
+    let mut body = json!({ "name": name, "url": url, "policy": "immediate" });
+    if t == RepoType::Deb {
+        body["distributions"] = "fixture".into(); // the release of the Deb fixture
+    }
+    let remote = create(c, t.remotes(), body, "/remotes/").await;
     let repo = create(c, t.repositories(), json!({ "name": name, "remote": remote }), "/repositories/").await;
     let m = ops::sync(c, t, &repo, None, policy).await.unwrap();
     ops::settle(c, m, &no_progress).await.unwrap();

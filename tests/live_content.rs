@@ -10,6 +10,7 @@ use pulp_tui::pulp::{Mutation, RepoType, rpm};
 use pulp_tui::tui::actions::run;
 use pulp_tui::tui::kinds::{Act, Kind};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// A fixture of `tests/fixtures/` with `from` replaced by `to` (a unique id), as a file in a temporary directory.
@@ -324,5 +325,140 @@ async fn a_modulemd_made_through_the_tui_is_in_the_new_version() {
     settle(&mut app, &mut rx).await;
     let shown: Vec<&str> = app.list.items.iter().map(|v| v["name"].as_str().unwrap_or_default()).collect();
     assert_eq!(shown, [name.as_str()], "the Content screen (modulemds) lists it");
+    cleanup(&c, &[&repo]).await;
+}
+
+/// The `pulp_href` of each unit of `collection` in `version`.
+async fn units_in(c: &pulp_tui::pulp::PulpClient, collection: &str, version: &str) -> BTreeSet<String> {
+    let q = [("repository_version", version.to_string()), ("fields", "pulp_href".into())];
+    let all: Vec<Value> = c.list_all(&c.api(collection), &q, 1000).await.unwrap();
+    all.iter().map(|u| u["pulp_href"].as_str().unwrap().to_string()).collect()
+}
+
+/// The Content screen through the TUI for File, RPM and Deb, on a synced repository: Add to another repository (a)
+/// of two marked units (Deb: a structured copy), then Remove (x) of one unit: the confirmation, then the screen
+/// moves to the new version, which lacks it; version 1 keeps it.
+#[tokio::test]
+async fn content_add_and_remove_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let (mut app, mut rx) = app().await;
+    for (t, path) in [(RepoType::File, "file/PULP_MANIFEST"), (RepoType::Rpm, "rpm/"), (RepoType::Deb, "deb/")] {
+        let name = unique(&format!("it-units-{}", t.component()));
+        let (repo, remote) = synced_repo(&c, t, &name, path, "additive").await;
+        let target_name = format!("{name}-target");
+        let target = create(&c, t.repositories(), json!({ "name": target_name }), "/repositories/").await;
+        let v1 = latest(&c, &repo).await;
+        app.push(Kind::Content { version: v1.clone(), ctype: 0 });
+        settle(&mut app, &mut rx).await;
+        assert!(app.list.items.len() > 2, "{:?}", app.list.error);
+
+        // Add to another repository (a): two marked units.
+        let two: BTreeSet<String> = app.list.items[..2].iter().map(|u| u["pulp_href"].as_str().unwrap().to_string()).collect();
+        app.list.marked = two.iter().cloned().collect();
+        run(&mut app, Act::AddToRepo, Value::Null);
+        fill(&mut app, &[("target", &target_name)]);
+        settle(&mut app, &mut rx).await;
+        shown(&app, &format!("added 2 unit(s) to {target_name}: version 1"));
+        assert!(app.list.marked.is_empty(), "the marks go after the success");
+        assert_eq!(units_in(&c, t.content(), &latest(&c, &target).await).await, two);
+
+        // Remove (x) one unit: the screen moves to version 2.
+        let unit = app.list.items[0]["pulp_href"].as_str().unwrap().to_string();
+        app.list.marked = [unit.clone()].into();
+        run(&mut app, Act::RemoveContent, Value::Null);
+        settle(&mut app, &mut rx).await; // the repository is read before the confirmation
+        let (lines, typed) = yes(&mut app);
+        assert_eq!(typed, None, "no version goes: a plain confirmation");
+        assert_eq!(
+            lines,
+            [
+                format!("Create a new version of {name} without 1 unit(s)."),
+                "The current and older versions are immutable and keep the content.".into()
+            ]
+        );
+        settle(&mut app, &mut rx).await;
+        shown(&app, "removed 1 unit(s): now showing version 2");
+        let v2 = latest(&c, &repo).await;
+        assert!(v2.ends_with("/versions/2/") && app.list.kind == Kind::Content { version: v2.clone(), ctype: 0 }, "{:?}", app.list.kind);
+        assert!(!units_in(&c, t.content(), &v2).await.contains(&unit), "version 2 lacks it");
+        assert!(app.list.items.iter().all(|u| u["pulp_href"] != unit.as_str()), "the screen lists version 2");
+        assert!(units_in(&c, t.content(), &v1).await.contains(&unit), "version 1 keeps it");
+        app.back();
+        cleanup(&c, &[&target, &repo, &remote]).await;
+    }
+}
+
+/// RPM metadata through the TUI on the Repositories screen: comps.xml (U) twice, the second with Replace; an advisory
+/// (A); modulemd defaults and obsoletes (M). Each makes a new version that the notice names and that has the unit.
+#[tokio::test]
+async fn rpm_metadata_uploads_and_module_content_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name, dir) = (client(), RepoType::Rpm, unique("it-rpmmeta"), tempfile::tempdir().unwrap());
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(t, false);
+    let item = json!({ "pulp_href": repo, "name": name });
+    let field = async |path: &str, key: &str| -> Vec<String> {
+        let q = [("repository_version", latest(&c, &repo).await), ("fields", key.to_string())];
+        let all: Vec<Value> = c.list_all(&c.api(path), &q, 100).await.unwrap();
+        all.iter().map(|u| u[key].as_str().unwrap_or_default().to_string()).collect()
+    };
+
+    for (n, group, replace) in [(1, "a", "false"), (2, "b", "true")] {
+        let comps = fixture_as(&dir, "comps.xml", "pulp-tui-fixture", &format!("{name}-{group}"));
+        run(&mut app, Act::UploadComps, item.clone());
+        fill(&mut app, &[("path", comps.to_str().unwrap()), ("replace", replace)]);
+        settle(&mut app, &mut rx).await;
+        shown(&app, &format!("upload comps.xml to {name}: new version {n}"));
+        assert_eq!(field("content/rpm/packagegroups/", "id").await, [format!("{name}-{group}")], "Replace removes group a");
+    }
+
+    let id = format!("{name}:0001");
+    let advisory = fixture_as(&dir, "advisory.json", "PULP-TUI-2026:0002", &id);
+    run(&mut app, Act::UploadAdvisory, item.clone());
+    fill(&mut app, &[("path", advisory.to_str().unwrap())]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("upload advisory to {name}: new version 3"));
+    assert_eq!(field(rpm::ADVISORIES, "id").await, [id]);
+
+    let defaults =
+        format!("--- {{document: modulemd-defaults, version: 1, data: {{module: {name}, stream: '1', profiles: {{'1': [default]}}}}}}");
+    let obsoletes = format!(
+        "--- {{document: modulemd-obsoletes, version: 1, data: {{modified: 2026-01-01T00:00Z, module: {name}, stream: '1', message: gone}}}}"
+    );
+    let n = name.as_str();
+    let kinds = [
+        (
+            "modulemd_defaults",
+            vec![("module", n), ("stream", "1"), ("profiles", r#"{"1": ["default"]}"#), ("snippet", &defaults)],
+            "content/rpm/modulemd_defaults/",
+            "module",
+        ),
+        (
+            "modulemd_obsoletes",
+            vec![
+                ("module_name", n),
+                ("module_stream", "1"),
+                ("modified", "2026-01-01T00:00Z"),
+                ("message", "gone"),
+                ("snippet", &obsoletes),
+            ],
+            "content/rpm/modulemd_obsoletes/",
+            "module_name",
+        ),
+    ];
+    for (number, (kind, values, path, key)) in (4..).zip(kinds) {
+        run(&mut app, Act::CreateModule, item.clone());
+        fill(&mut app, &[("kind", kind)]);
+        fill(&mut app, &values);
+        settle(&mut app, &mut rx).await;
+        shown(&app, &format!("create {kind} {name}:1 in {name}: new version {number}"));
+        assert_eq!(field(path, key).await, [n]);
+    }
     cleanup(&c, &[&repo]).await;
 }

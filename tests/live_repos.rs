@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use pulp_tui::pulp::models::{Package, RepoVersion};
+use pulp_tui::pulp::models::{Package, RepoVersion, Task};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{Capabilities, Mutation, PulpClient, RepoType, file, rpm};
 use pulp_tui::tui::actions::run;
@@ -814,14 +814,7 @@ async fn snapshot_repository_of_another_database_is_not_deleted_through_the_tui(
 
 /// A repository of type `t` synced from `path` (version 1), and version 2 without one unit of version 1.
 async fn two_versions(c: &PulpClient, t: RepoType, name: &str, path: &str) -> (String, String, [String; 2]) {
-    let url = format!("{}/{path}", upstream());
-    let mut body = json!({ "name": name, "url": url, "policy": "immediate" });
-    if t == RepoType::Deb {
-        body["distributions"] = "fixture".into();
-    }
-    let remote = create(c, t.remotes(), body, "/remotes/").await;
-    let repo = create(c, t.repositories(), json!({ "name": name, "remote": remote }), "/repositories/").await;
-    ops::settle(c, ops::sync(c, t, &repo, None, "additive").await.unwrap(), &no_progress).await.unwrap();
+    let (repo, remote) = synced_repo(c, t, name, path, "additive").await;
     let v1 = latest(c, &repo).await;
     let q = [("repository_version", v1.clone()), ("limit", "1".to_string())];
     let unit = c.list::<Value>(&c.api(t.content()), &q).await.unwrap().results[0]["pulp_href"].clone();
@@ -1118,5 +1111,243 @@ async fn remotes_create_edit_and_delete_through_the_tui() {
         assert!(c.get::<Value>(&href, &[]).await.unwrap_err().is_not_found());
         assert_eq!(c.get::<Value>(&repo, &[]).await.unwrap()["remote"], Value::Null, "Pulp unsets the default remote");
         cleanup(&c, &[&repo]).await;
+    }
+}
+
+/// Row `number` of the open Versions list.
+fn version_row(app: &App, number: i64) -> Value {
+    app.list.items.iter().find(|v| v["number"] == number).cloned().unwrap_or_else(|| panic!("no version {number}: {:?}", app.list.items))
+}
+
+/// How many units of `version` have their stored files, of how many (synced units of an `immediate` remote have them).
+async fn stored(c: &PulpClient, t: RepoType, version: &str) -> (usize, usize) {
+    let q = [("repository_version", version.to_string()), ("fields", "artifact".into())];
+    let units: Vec<Value> = c.list_all(&c.api(t.content()), &q, 1000).await.unwrap();
+    (units.iter().filter(|u| u["artifact"].is_string()).count(), units.len())
+}
+
+/// The Versions screen of type `t` through the TUI, on a repository with versions 1 and 2 (`two_versions`; `path`: its
+/// fixture), then Reclaim space on Repositories:
+/// * Compare (m) of the marked version 1 with version 2 lists the removed unit;
+/// * Restore (R) of version 1: the preview, then version 3 with the content of version 1; the list reloads with it;
+/// * Repair (F) of version 1: the confirmation, the task, its counts;
+/// * Delete (d) of the marked version 2: the typed id, the Task Center, the mark goes, the list reloads without it;
+/// * Reclaim space (R): the impact (versions, remote), the typed name, the task; the files it reports are gone.
+async fn version_actions_through_the_tui(t: RepoType, path: &str) {
+    let (c, name) = (client(), unique(&format!("it-ver-{}", t.component())));
+    let (repo, remote, [v1, v2]) = two_versions(&c, t, &name, path).await;
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Versions(Some((repo.clone(), name.clone()))), "").await;
+
+    // Compare (m): version 1 marked, version 2 selected.
+    app.list.marked = [v1.clone()].into();
+    let r = version_row(&app, 2);
+    run(&mut app, Act::Compare, r);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no comparison: {:?}", texts(&app)) };
+    let removed = lines.iter().filter(|l| l.starts_with("- ")).count();
+    let head = format!("{} -> {}: +0 added, -{removed} removed", short(&v1), short(&v2));
+    assert_eq!((title.as_str(), lines[0].as_str()), ("Version comparison", head.as_str()), "{lines:?}");
+    // pulp_deb also drops the Release files and indices from every new version.
+    assert!(removed == 1 || (t == RepoType::Deb && removed > 1), "{lines:?}");
+    app.list.marked.clear();
+
+    // Restore (R) version 1 as latest: version 3 has its content.
+    let r = version_row(&app, 1);
+    run(&mut app, Act::Restore, r);
+    settle(&mut app, &mut rx).await; // the preview is read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed, None, "a plain confirmation on a profile that is not production");
+    assert_eq!(lines[0], format!("Make a new latest version of {name} with the content of version 1; newer versions are kept."));
+    assert!(lines.iter().any(|l| l.starts_with(&format!("latest {} -> new (= v1): +", short(&v2)))), "{lines:?}");
+    settle_tasks(&mut app, &mut rx).await;
+    shown(&app, &format!("restore {name} v1 as latest: new version 3"));
+    let v3 = latest(&c, &repo).await;
+    assert!(v3.ends_with("/versions/3/"), "{v3}");
+    let keys = async |v: &str| ops::content_keys(&c, t, Some(v)).await.unwrap();
+    assert_eq!(keys(&v3).await, keys(&v1).await);
+    assert_eq!(version_row(&app, 3)["pulp_href"], v3.as_str(), "the list reloads with it");
+
+    // Repair (F) version 1: a task that counts nothing to repair.
+    let r = version_row(&app, 1);
+    run(&mut app, Act::Repair, r);
+    fill(&mut app, &[("verify_checksums", "true")]);
+    settle(&mut app, &mut rx).await; // the version is read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    let first = format!("Repair version 1 ({}): Pulp checks the files of its ", short(&v1));
+    assert!(typed.is_none() && lines[0].starts_with(&first), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    shown(&app, "repair version 1: 0 missing, 0 corrupt, 0 repaired");
+    let task: Task = c.get(&app.tasks.items[0].href, &[]).await.unwrap();
+    assert!(task.name.ends_with("repair_version") && task.state == "completed", "{task:?}");
+
+    // Delete (d) the marked version 2: the typed id, the task; the mark goes.
+    app.list.marked = [v2.clone()].into();
+    let r = version_row(&app, 2);
+    run(&mut app, Act::Delete, r);
+    settle(&mut app, &mut rx).await; // the impact is read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed, Some(short(&v2)));
+    assert_eq!(lines[0], format!("Delete repository version 2 ({}) and its 0 publication(s).", short(&v2)));
+    settle_tasks(&mut app, &mut rx).await;
+    shown(&app, "task completed: delete version 2");
+    assert!(app.list.marked.is_empty(), "the mark goes when the delete completed");
+    assert!(app.list.items.iter().all(|v| v["number"] != 2), "the list reloads without it");
+    assert!(c.get::<Value>(&v2, &[]).await.unwrap_err().is_not_found());
+
+    // Reclaim space (R on Repositories): the files that only this repository has go; the content stays.
+    let (before, units) = stored(&c, t, &v3).await;
+    open_list(&mut app, &mut rx, Kind::Repos(t, false), &name).await;
+    let r = row(&app, "name", &name).unwrap();
+    run(&mut app, Act::Reclaim, r);
+    fill(&mut app, &[("keep", "")]);
+    settle(&mut app, &mut rx).await; // the impact is read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some(name.as_str()));
+    assert!(lines[1].starts_with("The content stays in all 3 versions: "), "{lines:?}");
+    assert_eq!(lines[3..], [format!("Default remote: {name} (policy immediate)."), "No version keeps its files.".into()]);
+    settle(&mut app, &mut rx).await;
+    let done = texts(&app).into_iter().find_map(|n| n.strip_prefix(&format!("reclaim space of {name}: deleted ")).map(String::from));
+    let deleted: usize = done.unwrap_or_else(|| panic!("no result: {:?}", texts(&app))).trim_end_matches(" file(s)").parse().unwrap();
+    let (after, still) = stored(&c, t, &v3).await;
+    assert_eq!(still, units, "the content stays in the version");
+    // Units that another repository of the server also has keep their file (other tests sync the fixtures too).
+    assert_eq!(before - after, deleted, "{before} with a file before, {after} after");
+    let task: Task = c.get(&app.tasks.items[0].href, &[]).await.unwrap();
+    assert!(task.name.ends_with("reclaim_space") && task.state == "completed", "{task:?}");
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
+#[tokio::test]
+async fn file_version_actions_through_the_tui() {
+    if live_enabled() {
+        version_actions_through_the_tui(RepoType::File, "file/PULP_MANIFEST").await;
+    }
+}
+
+#[tokio::test]
+async fn rpm_version_actions_through_the_tui() {
+    if live_enabled() {
+        version_actions_through_the_tui(RepoType::Rpm, "rpm/").await;
+    }
+}
+
+#[tokio::test]
+async fn deb_version_actions_through_the_tui() {
+    if live_enabled() {
+        version_actions_through_the_tui(RepoType::Deb, "deb/").await;
+    }
+}
+
+/// Prune orphans (O on Versions) with an age that no content of a running test has (a year): the confirmation shows
+/// Pulp's count for that age and asks for the profile name; the notice gives what the cleanup task deleted.
+#[tokio::test]
+async fn prune_orphans_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    const YEAR: &str = "525600";
+    let c = client();
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Versions(None), "").await;
+    run(&mut app, Act::PruneOrphans, Value::Null);
+    fill(&mut app, &[("minutes", YEAR)]);
+    settle(&mut app, &mut rx).await; // the orphans are counted before the confirmation
+    let n = c.list::<Value>(&c.api("content/"), &[("orphaned_for", YEAR.into()), ("limit", "1".into())]).await.unwrap().count;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(
+        (typed.as_deref(), lines[1].as_str()),
+        (Some("pulp1"), format!("{n} content unit(s) orphaned for {YEAR} minutes or more.").as_str())
+    );
+    settle(&mut app, &mut rx).await;
+    let task: Task = c.get(&app.tasks.items[0].href, &[]).await.unwrap();
+    assert!(task.name.ends_with("orphan_cleanup") && task.state == "completed", "{task:?}");
+    let done = |code: &str| task.progress_reports.iter().find(|r| r.code == code).and_then(|r| r.done).unwrap_or(0);
+    let (units, files) = (done("clean-up.content"), done("clean-up.artifacts"));
+    shown(&app, &format!("prune orphans on pulp1: deleted {units} content unit(s) and {files} artifact(s)"));
+}
+
+/// Upload (u) through the TUI into an empty repository of each type: a File at its relative path, an RPM package,
+/// and a .deb into a release (distribution and component). Each makes version 1 with the unit, and the list reloads.
+#[tokio::test]
+async fn uploads_of_each_type_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name, dir) = (client(), unique("it-upload"), tempfile::tempdir().unwrap());
+    let txt = dir.path().join("u.txt");
+    std::fs::write(&txt, format!("{name}\n")).unwrap(); // unique bytes: a rerun makes new content
+    let (rel, release) = (format!("docs/{name}.txt"), format!("release component {name}/main"));
+    let rpm = fixtures().join("rpms/fixture-upload-3.0-1.noarch.rpm");
+    let deb = fixtures().join("upstream/deb/pool/main/f/fixture-alpha/fixture-alpha_1.0-1_amd64.deb");
+    let (mut app, mut rx) = app().await;
+    for (t, file, values, key) in [
+        (RepoType::File, txt, vec![("relative_path", rel.as_str())], format!("{rel}  (")),
+        (RepoType::Rpm, rpm, vec![], "fixture-upload-3.0-1.noarch".into()),
+        (RepoType::Deb, deb, vec![("distribution", name.as_str()), ("component", "main")], "fixture-alpha_1.0-1_amd64".into()),
+    ] {
+        let repo_name = format!("{name}-{}", t.component());
+        let repo = create(&c, t.repositories(), json!({ "name": repo_name }), "/repositories/").await;
+        open_list(&mut app, &mut rx, Kind::Repos(t, false), &repo_name).await;
+        let r = row(&app, "name", &repo_name).unwrap();
+        run(&mut app, Act::Upload, r);
+        let path = file.display().to_string();
+        fill(&mut app, &[&[("path", path.as_str())][..], &values].concat());
+        settle(&mut app, &mut rx).await;
+        let done = texts(&app).into_iter().find(|n| n.starts_with(&format!("uploaded {path} (sha256 ")));
+        assert!(done.is_some_and(|d| d.ends_with(": new version 1")), "{:?}", texts(&app));
+        let v1 = latest(&c, &repo).await;
+        let keys = ops::content_keys(&c, t, Some(&v1)).await.unwrap();
+        assert!(keys.len() == 1 && keys.iter().all(|k| k.starts_with(&key)), "{keys:?}");
+        assert_eq!(row(&app, "name", &repo_name).unwrap()["latest_version_href"], v1.as_str(), "the list reloads");
+        if t == RepoType::Deb {
+            let all = ops::all_content_keys(&c, &Capabilities::default(), t, &v1).await.unwrap();
+            assert!(all.iter().any(|k| k.starts_with(&release)), "the release of the form: {all:?}");
+        }
+        cleanup(&c, &[&repo]).await;
+    }
+}
+
+/// Copy content (C) through the TUI into an empty repository of each type: File with a path rule (`modify/`), RPM
+/// without rules (`rpm/copy/` of all content), Deb with a name rule (structured `deb/copy/`). The confirmation says
+/// what goes; the Task Center follows the task; the target has exactly the chosen units.
+#[tokio::test]
+async fn copy_content_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let (mut app, mut rx) = app().await;
+    for (t, path, rules, left_out) in [
+        (RepoType::File, "file/PULP_MANIFEST", "exclude path=isos/*", Some("isos/")),
+        (RepoType::Rpm, "rpm/", "", None),
+        (RepoType::Deb, "deb/", "exclude name=*-dbg", Some("fixture-beta-dbg_")),
+    ] {
+        let name = unique(&format!("it-copy-{}", t.component()));
+        let (src, remote) = synced_repo(&c, t, &name, path, "additive").await;
+        let sv = latest(&c, &src).await;
+        let dst_name = format!("{name}-dst");
+        let dst = create(&c, t.repositories(), json!({ "name": dst_name }), "/repositories/").await;
+
+        open_list(&mut app, &mut rx, Kind::Repos(t, false), &dst_name).await;
+        let r = row(&app, "name", &dst_name).unwrap();
+        run(&mut app, Act::CopyContent, r);
+        let mut values = vec![("source", name.as_str()), ("filters", rules)];
+        if t == RepoType::Rpm {
+            values.push(("deps", "false"));
+        }
+        fill(&mut app, &values);
+        settle(&mut app, &mut rx).await; // the preview reads the source
+        let want: std::collections::BTreeSet<String> =
+            ops::content_keys(&c, t, Some(&sv)).await.unwrap().into_iter().filter(|k| left_out.is_none_or(|p| !k.starts_with(p))).collect();
+        let (lines, typed) = yes(&mut app);
+        let what = if rules.is_empty() { "all content".to_string() } else { format!("{} unit(s)", want.len()) };
+        assert_eq!((typed, lines[0].clone()), (None, format!("Copy {what} from {} into {dst_name}.", short(&sv))));
+        settle_tasks(&mut app, &mut rx).await;
+        shown(&app, &format!("task completed: copy {name} -> {dst_name}"));
+        let got = ops::content_keys(&c, t, Some(&latest(&c, &dst).await)).await.unwrap();
+        assert!(!want.is_empty() && got == want, "{rules}: {got:?}");
+        assert_eq!(row(&app, "name", &dst_name).unwrap()["latest_version_href"], latest(&c, &dst).await.as_str(), "the list reloads");
+        cleanup(&c, &[&dst, &src, &remote]).await;
     }
 }
