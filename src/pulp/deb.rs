@@ -169,24 +169,53 @@ async fn served_package(c: &PulpClient, base: &str, p: &DebPackage, index: &str)
     fail(format!("package {path} not served with the expected digest"))
 }
 
-/// Upload a `.deb` (`ops::upload_fields`), optionally into `repository`. There pulp_deb lists it in component
-/// `component` of distribution `distribution` (it adds the release records); each one left out is the server
-/// default (`pulp`, `upload`). Pulp sets the pool path from the package. `overwrite`: as `ops::upload`.
-#[allow(clippy::too_many_arguments)]
+/// What a local file goes to pulp_deb as; the upload form decides it once (from its Kind or the file name).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Upload {
+    /// A `.deb`. In a repository, pulp_deb lists it in component `component` of distribution `distribution` and adds
+    /// the release records; each `None` is the server default (`upload`, `pulp`). Pulp sets the pool path.
+    Package { distribution: Option<String>, component: Option<String> },
+    /// A `.udeb` (section `debian-installer`): no release records.
+    Installer,
+    /// Any file, served at `relative_path` of a publication.
+    Generic { relative_path: String },
+}
+
+impl Upload {
+    pub fn endpoint(&self) -> &'static str {
+        match self {
+            Upload::Package { .. } => "content/deb/packages/",
+            Upload::Installer => "content/deb/installer_packages/",
+            Upload::Generic { .. } => "content/deb/generic_contents/",
+        }
+    }
+}
+
+/// Upload `path` as `up` (`ops::upload_fields`), optionally into `repository`. `overwrite`: as `ops::upload`.
 pub async fn upload(
     c: &PulpClient,
+    up: &Upload,
     path: &Path,
     repository: Option<&str>,
-    distribution: Option<&str>,
-    component: Option<&str>,
     overwrite: bool,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
     on: OnTask<'_>,
 ) -> Result<UploadResult> {
+    let (distribution, component, relative_path) = match up {
+        Upload::Package { distribution, component } => (distribution.as_deref(), component.as_deref(), None),
+        Upload::Installer => (None, None, None),
+        Upload::Generic { relative_path } => (None, None, Some(relative_path.as_str())),
+    };
     let overwrite = (!overwrite).then_some("false");
-    let fields = [("repository", repository), ("distribution", distribution), ("component", component), ("overwrite", overwrite)];
+    let fields = [
+        ("repository", repository),
+        ("distribution", distribution),
+        ("component", component),
+        ("relative_path", relative_path),
+        ("overwrite", overwrite),
+    ];
     let fields = fields.into_iter().filter_map(|(k, v)| Some((k, v?.to_string()))).collect();
-    ops::upload_fields(c, RepoType::Deb, path, fields, progress, on).await
+    ops::upload_fields(c, up.endpoint(), path, fields, progress, on).await
 }
 
 /// Hrefs of the release records (`PackageReleaseComponent`) in `version` whose package is in `packages`.

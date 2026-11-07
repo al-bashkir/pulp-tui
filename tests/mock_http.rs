@@ -645,9 +645,9 @@ async fn deb_package_upload_sends_the_release_and_checks_the_package() {
         answer("GET", &pkg, 200, json!({ "sha256": sha })).mount(&server).await;
         let c = client(&server, |_, s| s.upload_chunk_mb = 1);
 
-        let (dist, comp) = (release.map(|r| r.0), release.map(|r| r.1));
+        let up = deb::Upload::Package { distribution: release.map(|r| r.0.into()), component: release.map(|r| r.1.into()) };
         // Overwrite on is the server default: not sent.
-        let r = deb::upload(&c, &file, Some(&repo), dist, comp, true, &|_, _| {}, &no_progress).await.unwrap();
+        let r = deb::upload(&c, &up, &file, Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
         assert_eq!((r.content_href, r.sha256), (pkg.clone(), sha));
         let sent = server.received_requests().await.unwrap();
         let post = sent.iter().find(|r| r.url.path() == format!("{API}content/deb/packages/")).unwrap();
@@ -666,6 +666,38 @@ async fn deb_package_upload_sends_the_release_and_checks_the_package() {
             assert!(body.contains("filename=\"p10.deb\"") && !body.contains("name=\"upload\""), "{body}");
             assert_eq!(puts, 0);
         }
+    }
+}
+
+/// A `.udeb` goes to `content/deb/installer_packages/`, any other file to `content/deb/generic_contents/` with its
+/// relative path (required there). Neither takes a release; the digest is checked on the unit that the task names.
+#[tokio::test]
+async fn deb_installer_and_generic_uploads_go_to_their_endpoints() {
+    let repo = format!("{API}repositories/deb/apt/r/");
+    let dir = tempfile::tempdir().unwrap();
+    let generic = deb::Upload::Generic { relative_path: "docs/x.txt".into() };
+    for (up, endpoint) in [(deb::Upload::Installer, "installer_packages"), (generic, "generic_contents")] {
+        let file = dir.path().join(endpoint);
+        std::fs::write(&file, endpoint).unwrap();
+        let unit = format!("{API}content/deb/{endpoint}/1/");
+        let server = MockServer::start().await;
+        let answer = |verb: &str, p: &str, status: u16, body: Value| {
+            Mock::given(method(verb)).and(path(p.to_string())).respond_with(ResponseTemplate::new(status).set_body_json(body))
+        };
+        answer("POST", &format!("{API}content/deb/{endpoint}/"), 202, json!({ "task": format!("{API}tasks/1/") })).mount(&server).await;
+        let task = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [format!("{repo}versions/2/"), unit] });
+        answer("GET", &format!("{API}tasks/1/"), 200, task).mount(&server).await;
+        answer("GET", &unit, 200, json!({ "sha256": hex::encode(Sha256::digest(endpoint)) })).mount(&server).await;
+        let c = client(&server, |_, _| {});
+
+        let r = deb::upload(&c, &up, &file, Some(&repo), false, &|_, _| {}, &no_progress).await.unwrap();
+        assert_eq!(r.content_href, unit);
+        let sent = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&sent.iter().find(|r| r.method.as_str() == "POST").unwrap().body).replace("\r\n", "\n");
+        let field = |k: &str, v: &str| format!("name=\"{k}\"\n\n{v}\n");
+        assert!(body.contains(&field("repository", &repo)) && body.contains(&field("overwrite", "false")), "{body}");
+        assert!(!body.contains("distribution") && !body.contains("component"), "{body}");
+        assert_eq!(body.contains(&field("relative_path", "docs/x.txt")), endpoint == "generic_contents", "{body}");
     }
 }
 

@@ -277,7 +277,8 @@ async fn an_uploaded_deb_package_is_published_and_served() {
     let name = unique("it-deb-upload");
     let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
     let file = fixtures().join("upstream/deb/pool/main/f/fixture-alpha/fixture-alpha_1.0-1_amd64.deb");
-    let up = deb::upload(&c, &file, Some(&repo), Some("uploads"), Some("main"), true, &|_, _| {}, &no_progress).await.unwrap();
+    let release = deb::Upload::Package { distribution: Some("uploads".into()), component: Some("main".into()) };
+    let up = deb::upload(&c, &release, &file, Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
     assert!(up.content_href.contains("/content/deb/packages/"), "{}", up.content_href);
     let v1 = up.task.as_ref().and_then(|t| t.created_matching("/versions/")).expect("a new version");
     assert_eq!(v1, latest(&c, &repo).await);
@@ -296,6 +297,36 @@ async fn an_uploaded_deb_package_is_published_and_served() {
     let index = String::from_utf8_lossy(&index);
     assert!(status == 200 && index.contains(&format!("SHA256: {}\n", up.sha256)), "{status} {index}");
     cleanup(&c, &[&dist, &repo]).await;
+}
+
+/// Upload (u) in the TUI: a `.udeb` (Kind auto) becomes an installer package, another file (Kind generic) generic
+/// content at its relative path; each goes into a new version of the repository.
+#[tokio::test]
+async fn the_tui_uploads_a_udeb_and_generic_content_as_their_types() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Deb;
+    let name = unique("it-deb-kinds");
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(t, false);
+    let (udeb, txt) = (fixtures().join("deb-upload/fixture-installer_1.0_amd64.udeb"), fixtures().join("files/one.txt"));
+    let rel = format!("docs/{name}.txt");
+    let forms =
+        [vec![("path", udeb.to_str().unwrap())], vec![("path", txt.to_str().unwrap()), ("kind", "generic"), ("relative_path", &rel)]];
+    for values in forms {
+        run(&mut app, Act::Upload, json!({ "pulp_href": repo, "name": name }));
+        fill(&mut app, &values);
+        settle(&mut app, &mut rx).await;
+    }
+    let uploaded: Vec<String> = texts(&app).into_iter().filter(|n| n.starts_with("uploaded ")).collect();
+    assert!(uploaded.len() == 2 && uploaded[1].ends_with(": new version 2"), "{:?}", texts(&app));
+    let all = ops::all_content_keys(&c, &Capabilities::default(), t, &latest(&c, &repo).await).await.unwrap();
+    assert!(all.contains("installer package fixture-installer_1.0_amd64"), "{all:?}");
+    assert!(all.iter().any(|k| k.starts_with(&format!("generic content {rel}  ("))), "{all:?}");
+    cleanup(&c, &[&repo]).await;
 }
 
 /// An operator repository with its own signing service: a publication without one is signed by the

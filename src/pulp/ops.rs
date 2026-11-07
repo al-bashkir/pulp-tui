@@ -775,15 +775,15 @@ pub async fn upload(
             fields.push(("relative_path", relative_path.unwrap_or(file_name).into()));
         }
     }
-    upload_fields(c, t, path, fields, progress, on).await
+    upload_fields(c, t.content(), path, fields, progress, on).await
 }
 
-/// Upload a local file with the form `fields` of the content type of `t` (`repository`, ...).
+/// Upload a local file with the form `fields` (`repository`, ...) to the content endpoint `content`.
 /// Small files go in one request; large ones use the chunked upload API. The server's
 /// digest is compared with the local one, and an unfinished chunked upload is deleted on failure.
 pub async fn upload_fields(
     c: &PulpClient,
-    t: RepoType,
+    content: &str,
     path: &Path,
     mut fields: Vec<(&str, String)>,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
@@ -801,7 +801,7 @@ pub async fn upload_fields(
         f.read_to_end(&mut buf).await.map_err(io)?;
         hasher.update(&buf);
         progress(size, size);
-        (c.post_form(&c.api(t.content()), &fields, Some((file_name, buf))).await?, None)
+        (c.post_form(&c.api(content), &fields, Some((file_name, buf))).await?, None)
     } else {
         let up = c.post(&c.api("uploads/"), &json!({ "size": size })).await?;
         let Mutation::Object(o) = up else { return Err(PulpError::Decode("upload create returned no object".into())) };
@@ -828,7 +828,7 @@ pub async fn upload_fields(
                 progress(offset, size);
             }
             fields.push(("upload", href.clone()));
-            c.post_form(&c.api(t.content()), &fields, None).await
+            c.post_form(&c.api(content), &fields, None).await
         }
         .await;
         guard.0 = None;
@@ -853,7 +853,7 @@ pub async fn upload_fields(
         }
     };
     // A Deb upload task also names the release records it made.
-    let content_href = created_href(obj.as_ref(), task.as_ref(), &format!("/{}", t.content()))?;
+    let content_href = created_href(obj.as_ref(), task.as_ref(), &format!("/{content}"))?;
     let content: Value = c.get(&content_href, &[("fields", "sha256".into())]).await?;
     if content["sha256"].as_str() != Some(sha256.as_str()) {
         return Err(PulpError::Decode(format!("digest mismatch for {content_href}: local {sha256}, server {}", content["sha256"])));

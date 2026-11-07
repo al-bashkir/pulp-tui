@@ -8,13 +8,14 @@
 #   target/fixtures/upstream/git/files.git  bare Git repository (dumb HTTP), tag v1 and branch main
 #   target/fixtures/upstream/deb/          APT repository (dist fixture, component main, amd64)
 #   target/fixtures/files/                 loose files for uploads
+#   target/fixtures/deb-upload/            a .udeb for Deb uploads
 # Requires rpmbuild, createrepo_c, modifyrepo_c, git, and GNU ar, tar, gzip (the .debs are built
 # without dpkg-deb).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=${FIXTURES_DIR:-$ROOT/target/fixtures}
-STAMP=$OUT/.built-v5
+STAMP=$OUT/.built-v6
 [ -f "$STAMP" ] && { echo "fixtures up to date: $OUT"; exit 0; }
 rm -rf "$OUT"
 mkdir -p "$OUT"/{rpms,files,build,upstream/rpm,upstream/rpm2,upstream/rpm-new,upstream/file,upstream/deb}
@@ -116,17 +117,17 @@ PACKAGES=$DEB/dists/fixture/main/binary-amd64/Packages
 mkdir -p "$(dirname "$PACKAGES")"
 : >"$PACKAGES"
 
-build_deb() ( # name version (subshell: umask stays local)
+deb_archive() ( # name version out [control lines after Architecture] (subshell: umask stays local)
   umask 022
-  local name=$1 version=$2 w="$OUT/build/deb-$1-$2"
-  local pool="pool/main/${name:0:1}/$name" file="${name}_${version}_amd64.deb"
-  mkdir -p "$w/control" "$w/data/usr/share/$name" "$DEB/$pool"
+  local name=$1 version=$2 out=$3 w="$OUT/build/deb-$1-$2"
+  mkdir -p "$w/control" "$w/data/usr/share/$name" "$(dirname "$out")"
   echo "$name $version" >"$w/data/usr/share/$name/version"
   cat >"$w/control/control" <<EOF
 Package: $name
 Version: $version
 Architecture: amd64
-Maintainer: pulp-tui <pulp-tui@example.com>
+${4:+$4
+}Maintainer: pulp-tui <pulp-tui@example.com>
 Description: pulp-tui test fixture $name
 EOF
   echo 2.0 >"$w/debian-binary"
@@ -134,20 +135,31 @@ EOF
     tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$w/$part" -cf - . | gzip -n >"$w/$part.tar.gz"
   done
   # D: deterministic archive (no current mtime/uid in the member headers).
-  (cd "$w" && ar rcD "$DEB/$pool/$file" debian-binary control.tar.gz data.tar.gz)
+  (cd "$w" && ar rcD "$out" debian-binary control.tar.gz data.tar.gz)
+)
+
+build_deb() { # name version: into the upstream repository and its Packages index
+  local name=$1 version=$2
+  local pool="pool/main/${name:0:1}/$name" file="${name}_${version}_amd64.deb"
+  deb_archive "$name" "$version" "$DEB/$pool/$file"
   {
-    cat "$w/control/control"
+    cat "$OUT/build/deb-$name-$version/control/control"
     echo "Filename: $pool/$file"
     echo "Size: $(stat -c %s "$DEB/$pool/$file")"
     echo "SHA256: $(sha256sum "$DEB/$pool/$file" | cut -d' ' -f1)"
     echo
   } >>"$PACKAGES"
-)
+}
 
 build_deb fixture-alpha 1.0-1
 build_deb fixture-alpha 1.1-1
 build_deb fixture-beta 2.0-1
 build_deb fixture-beta-dbg 2.0-1
+
+# Deb uploads of other kinds: pulp_deb takes a .udeb only with section debian-installer.
+deb_archive fixture-installer 1.0 "$OUT/deb-upload/fixture-installer_1.0_amd64.udeb" \
+  "Section: debian-installer
+Package-Type: udeb"
 
 # Only the plain Packages index is listed; a sync needs no compressed variant.
 cat >"$DEB/dists/fixture/Release" <<EOF

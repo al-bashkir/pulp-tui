@@ -797,6 +797,11 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
   `created_resources` also names these records when they are new, so pulp-tui takes the one
   under `content/deb/packages/`. Pulp sets `relative_path` (`pool/...`) from the package and
   reuses an equal package (same `sha256`, `relative_path` and metadata).
+* **Other uploads** take `file` or `upload` and `repository` too, but no release:
+  `content/deb/installer_packages/` (a `.udeb`; pulp_deb refuses a package whose section is not
+  `debian-installer`, and `packages/` refuses one whose section is) and
+  `content/deb/generic_contents/` (`relative_path` required; an equal `sha256` and path is
+  reused). pulp_deb 3.5.4, 3.8.1 and 3.11.1 have both endpoints (read in their source).
 * **`sha256` is `null` until download** for `on_demand` packages. Verify takes the digest
   from the served `Packages` index (what apt checks) and fails when the API differs.
 * **Structured copy.** `deb/copy/` with `structured: true` also copies the

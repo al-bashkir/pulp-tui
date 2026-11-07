@@ -200,9 +200,13 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   * **Skip srpm**, **Skip treeinfo** (RPM): do not download source packages or `.treeinfo`.
   * The form refuses what Pulp refuses: skip types with `mirror_complete`, `mirror_complete` with
     autopublish on, and a mirror policy with **retain package versions** above 0.
-* **u** uploads a local file: an RPM package, File content with its relative path, or a `.deb`
-  package. Large files go in chunks with progress. pulp-tui verifies the server digest and
+* **u** uploads a local file: an RPM package, File content with its relative path, or Deb
+  content. Large files go in chunks with progress. pulp-tui verifies the server digest and
   deletes a failed chunked upload. The message names the new content and the new version.
+  * Deb **Kind**: `auto` (default) takes the kind from the file name: a `.deb` is a package and a
+    `.udeb` an installer package. Any other file needs a Kind: `generic` uploads it as generic
+    content at **Relative path** (default: the file name). The form refuses a field of another
+    kind, and a kind whose endpoint the server does not have.
   * **Overwrite** (default on, as Pulp): the new content replaces other content of the repository
     with the same key (File: the relative path; RPM: name, version, release, architecture and
     location). Off: the task fails instead, and the repository does not change.

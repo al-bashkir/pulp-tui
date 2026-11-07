@@ -1518,29 +1518,75 @@ fn repo_upload(app: &mut App, t: RepoType, href: String, name: String) {
         if !path.is_file() {
             return Err(format!("{} is not a readable file", path.display()));
         }
-        let fields = ["relative_path", "distribution", "component"].map(|k| f.opt(k).map(str::to_string));
+        let deb = match t {
+            RepoType::Deb => Some(deb_upload(app, f, &path)?),
+            RepoType::Rpm | RepoType::File => None,
+        };
         // Without the field (an older server) nothing is sent.
-        upload_file(app, t, href.clone(), path, fields, f.get("overwrite") != "false");
+        upload_file(app, t, href.clone(), path, (f.opt("relative_path").map(str::to_string), deb), f.get("overwrite") != "false");
         Ok(())
     });
 }
 
-/// The upload form of type `t`; the Deb release and Overwrite fields when the server has them.
+/// The Kind choice of the Deb upload form: `auto` takes the extension of the file.
+const DEB_KINDS: [&str; 4] = ["auto", "deb", "udeb", "generic"];
+
+/// What the Deb upload form sends `path` as: its Kind, or the kind of its extension; another file needs a Kind. The
+/// fields of another kind, and a kind that the server cannot take, are refused.
+fn deb_upload(app: &App, f: &Form, path: &Path) -> Result<deb::Upload, String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let kind = match f.get("kind") {
+        "auto" => ext,
+        k => k,
+    };
+    let (distribution, component, rel) = (f.opt("distribution"), f.opt("component"), f.opt("relative_path"));
+    let up = match kind {
+        "deb" => deb::Upload::Package { distribution: distribution.map(Into::into), component: component.map(Into::into) },
+        "udeb" => deb::Upload::Installer,
+        "generic" => {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            deb::Upload::Generic { relative_path: rel.map_or(name, Into::into) }
+        }
+        _ => return Err(format!("pick the Kind: {} is not a .deb or .udeb file", path.display())),
+    };
+    if kind != "deb" && (distribution.is_some() || component.is_some()) {
+        return Err("Distribution and Component are for a .deb package".into());
+    }
+    if kind != "generic" && rel.is_some() {
+        return Err("Relative path is for generic content".into());
+    }
+    match caps(app) {
+        Some(c) if !c.has_operation(up.endpoint(), "post") => {
+            Err(format!("not supported by this server: Deb {kind} upload ({})", up.endpoint()))
+        }
+        _ => Ok(up),
+    }
+}
+
+/// The upload form of type `t`; the Deb release, relative path and Overwrite fields when the server has them.
 fn upload_fields(app: &App, t: RepoType) -> Vec<Field> {
     let mut fields = vec![Field::text("path", "Local file path").required()];
     match t {
         RepoType::Rpm => {}
         RepoType::File => fields.push(Field::text("relative_path", "Relative path in repository").help("default: file name")),
-        // The release whose indices list the package; older pulp_deb has no such fields.
-        RepoType::Deb => fields.extend(
-            [
-                ("distribution", "Distribution", "empty = pulp (server default)"),
-                ("component", "Component", "empty = upload (server default)"),
-            ]
-            .into_iter()
-            .filter(|(k, ..)| caps(app).is_none_or(|c| c.has_field("deb.Package", k)))
-            .map(|(k, label, help)| Field::text(k, label).help(help)),
-        ),
+        RepoType::Deb => {
+            let kinds = DEB_KINDS.map(String::from).to_vec();
+            fields.push(Field::new("kind", "Kind", FieldKind::Choice(kinds)).help("auto = by file name (.deb, .udeb); generic = any file"));
+            // The release whose indices list the package; older pulp_deb has no such fields.
+            fields.extend(
+                [
+                    ("distribution", "Distribution", ".deb only; empty = pulp (server default)"),
+                    ("component", "Component", ".deb only; empty = upload (server default)"),
+                    ("relative_path", "Relative path", "generic content only; default: file name"),
+                ]
+                .into_iter()
+                .filter(|(k, ..)| {
+                    let schema = if *k == "relative_path" { "deb.GenericContent" } else { "deb.Package" };
+                    caps(app).is_none_or(|c| c.has_field(schema, k))
+                })
+                .map(|(k, label, help)| Field::text(k, label).help(help)),
+            );
+        }
     }
     let schema = match t {
         RepoType::Rpm => "rpm.Package",
@@ -1554,13 +1600,13 @@ fn upload_fields(app: &App, t: RepoType) -> Vec<Field> {
     fields
 }
 
-/// Upload `path` to repository `href`; `[relative_path, distribution, component]` as the form has them.
+/// Upload `path` to repository `href`: as `deb` (a Deb repository), else with the relative path of the form.
 fn upload_file(
     app: &mut App,
     t: RepoType,
     href: String,
     path: std::path::PathBuf,
-    [rel, dist, comp]: [Option<String>; 3],
+    (rel, deb): (Option<String>, Option<deb::Upload>),
     overwrite: bool,
 ) {
     app.job(format!("upload {}", path.display()), move |ctx| async move {
@@ -1570,9 +1616,9 @@ fn upload_file(
         let p2 = ctx.clone();
         let progress = move |d: u64, total: u64| p2.progress(format!("{:.1}/{:.1} MiB", d as f64 / 1048576.0, total as f64 / 1048576.0));
         let (c, on) = (&ctx.client, ctx.on_task());
-        let r = match t {
-            RepoType::Deb => deb::upload(c, &path, Some(&href), dist.as_deref(), comp.as_deref(), overwrite, &progress, &on).await?,
-            RepoType::Rpm | RepoType::File => ops::upload(c, t, &path, rel.as_deref(), Some(&href), overwrite, &progress, &on).await?,
+        let r = match deb {
+            Some(up) => deb::upload(c, &up, &path, Some(&href), overwrite, &progress, &on).await?,
+            None => ops::upload(c, t, &path, rel.as_deref(), Some(&href), overwrite, &progress, &on).await?,
         };
         let version = r.task.as_ref().and_then(|t| t.created_matching("/versions/"));
         let version = version.map(|v| format!(": new version {}", version_number(&v))).unwrap_or_default();
@@ -8435,7 +8481,8 @@ mod tests {
         assert_eq!(keys(&form(&mut app, RepoType::File).0), ["path", "relative_path", "overwrite"]);
 
         let (mut f, mut submit) = form(&mut app, RepoType::Deb);
-        assert_eq!(keys(&f), ["path", "distribution", "component", "overwrite"]);
+        assert_eq!(keys(&f), ["path", "kind", "distribution", "component", "relative_path", "overwrite"]);
+        assert_eq!(f.get("kind"), "auto", "the kind follows the file name");
         set(&mut f, "path", &deb.display().to_string());
         set(&mut f, "distribution", "bookworm");
         set(&mut f, "component", "main");
@@ -8454,7 +8501,71 @@ mod tests {
         let mut caps = plugins();
         caps.load_openapi(&json!({ "components": { "schemas": { "deb.Package": { "properties": { "file": {}, "repository": {} } } } } }));
         app.conn.as_mut().unwrap().caps = Arc::new(caps);
-        assert_eq!(keys(&form(&mut app, RepoType::Deb).0), ["path"]);
+        assert_eq!(keys(&form(&mut app, RepoType::Deb).0), ["path", "kind"]);
+    }
+
+    /// The Kind of a Deb upload follows the file name (`.deb`, `.udeb`); another file needs a Kind. A `.udeb` goes to
+    /// the installer packages and generic content takes its relative path (default: the file name). The fields of
+    /// another kind and an endpoint that the server lacks are refused in the form, before any request.
+    #[tokio::test]
+    async fn deb_upload_sends_the_kind_of_the_file_to_its_endpoint() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/deb/apt/r/");
+        let dir = tempfile::tempdir().unwrap();
+        for (i, (file, endpoint)) in
+            [("d-i_1.0_amd64.udeb", "installer_packages"), ("notes.txt", "generic_contents")].into_iter().enumerate()
+        {
+            let (task, unit) = (format!("{API}tasks/{i}/"), format!("{API}content/deb/{endpoint}/{i}/"));
+            answer(&server, "POST", &format!("{API}content/deb/{endpoint}/"), 202, json!({ "task": task })).await;
+            let created = json!([format!("{repo}versions/{}/", i + 2), unit]);
+            get(&server, &task, json!({ "pulp_href": task, "state": "completed", "created_resources": created })).await;
+            get(&server, &unit, json!({ "sha256": hex::encode(<sha2::Sha256 as sha2::Digest>::digest(file)) })).await;
+            std::fs::write(dir.path().join(file), file).unwrap();
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        let path = |f: &str| dir.path().join(f).display().to_string();
+        let submit = |app: &mut App, values: &[(&str, &str)]| {
+            repo_action(app, RepoType::Deb, Act::Upload, json!({ "pulp_href": repo, "name": "apt" }));
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no upload form") };
+            values.iter().for_each(|(k, v)| set(&mut form, k, v));
+            submit(app, &form)
+        };
+        let not_deb = format!("pick the Kind: {} is not a .deb or .udeb file", path("notes.txt"));
+        assert_eq!(submit(&mut app, &[("path", &path("notes.txt"))]), Err(not_deb));
+        let release = "Distribution and Component are for a .deb package".to_string();
+        assert_eq!(submit(&mut app, &[("path", &path("d-i_1.0_amd64.udeb")), ("component", "main")]), Err(release));
+        let rel = "Relative path is for generic content".to_string();
+        assert_eq!(submit(&mut app, &[("path", &path("d-i_1.0_amd64.udeb")), ("relative_path", "x")]), Err(rel));
+        assert!(app.jobs.is_empty() && server.received_requests().await.unwrap().is_empty(), "nothing sent");
+
+        submit(&mut app, &[("path", &path("d-i_1.0_amd64.udeb"))]).unwrap();
+        settle(&mut app, &mut rx).await;
+        submit(&mut app, &[("path", &path("notes.txt")), ("kind", "generic")]).unwrap();
+        settle(&mut app, &mut rx).await;
+        let last = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        assert!(last.starts_with(&format!("uploaded {} (sha256 ", path("notes.txt"))) && last.ends_with(": new version 3"), "{last}");
+        let posts: Vec<(String, String)> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| (r.url.path().to_string(), String::from_utf8_lossy(&r.body).replace("\r\n", "\n")))
+            .collect();
+        assert_eq!(
+            posts.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(),
+            [format!("{API}content/deb/installer_packages/"), format!("{API}content/deb/generic_contents/")]
+        );
+        assert!(!posts[0].1.contains("relative_path") && !posts[0].1.contains("distribution"), "{}", posts[0].1);
+        assert!(posts[1].1.contains("name=\"relative_path\"\n\nnotes.txt\n"), "{}", posts[1].1);
+
+        // A server without the installer package endpoint.
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/content/deb/packages/": { "post": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let unsupported = "not supported by this server: Deb udeb upload (content/deb/installer_packages/)".to_string();
+        assert_eq!(submit(&mut app, &[("path", &path("d-i_1.0_amd64.udeb"))]), Err(unsupported));
     }
 
     #[tokio::test]
