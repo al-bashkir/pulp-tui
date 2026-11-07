@@ -111,16 +111,23 @@ async fn remove_units(c: &PulpClient, t: RepoType, latest: &str, units: Vec<Stri
     }
 }
 
+/// What a run of batches made (`made`: the version of each batch, `None`: no new version): the newest version, and
+/// " in K batches (version 4, no new version)" when there was more than one batch.
+fn batches_made(made: &[Option<String>]) -> (Option<String>, String) {
+    let each = |m: &Option<String>| m.as_deref().map_or_else(|| "no new version".to_string(), |v| format!("version {}", version_number(v)));
+    let note = match made {
+        [_] => String::new(),
+        _ => format!(" in {} batches ({})", made.len(), made.iter().map(each).collect::<Vec<_>>().join(", ")),
+    };
+    (made.iter().flatten().last().cloned(), note)
+}
+
 /// A Remove ended; `made`: the version of each batch (`None`: no new version). A Content screen that still shows
 /// the browsed version moves to the newest one.
 fn content_removed(app: &mut App, old: &str, n: usize, made: &[Option<String>]) {
-    let Some(new) = made.iter().flatten().last().cloned() else {
+    let (newest, batches) = batches_made(made);
+    let Some(new) = newest else {
         return app.ok(format!("removed {n} unit(s): no new version (the latest version did not have them)"));
-    };
-    let each = |m: &Option<String>| m.as_deref().map_or_else(|| "no new version".to_string(), |v| format!("version {}", version_number(v)));
-    let batches = match made {
-        [_] => String::new(),
-        _ => format!(" in {} batches ({})", made.len(), made.iter().map(each).collect::<Vec<_>>().join(", ")),
     };
     let v = version_number(&new);
     match &app.screen {
@@ -3009,7 +3016,7 @@ fn add_run(app: &mut App, t: RepoType, version: String, target: String, units: V
         }
         let dest = s(&r, "pulp_href");
         let (dest, version) = (&dest, &version);
-        let (_, m) = one_by_one(&ctx, ops::batches(&units), move |b| async move {
+        let (mut made, m) = one_by_one(&ctx, ops::batches(&units), move |b| async move {
             match t {
                 RepoType::Rpm | RepoType::File => ops::add_content(c, dest, b.to_vec()).await,
                 // modify/ adds no release component records, so apt would not see the packages.
@@ -3023,10 +3030,10 @@ fn add_run(app: &mut App, t: RepoType, version: String, target: String, units: V
                 if app.list.kind == kind {
                     app.list.marked.clear();
                 }
-                let v = t
-                    .created_matching("/versions/")
-                    .map_or("no new version (it has them already)".into(), |v| format!("version {}", version_number(&v)));
-                app.ok(format!("added {n} unit(s) to {target}: {v}"));
+                made.push(t.created_matching("/versions/"));
+                let (newest, batches) = batches_made(&made);
+                let v = newest.map_or("no new version (it has them already)".into(), |v| format!("version {}", version_number(&v)));
+                app.ok(format!("added {n} unit(s) to {target}{batches}: {v}"));
             })
         })
     });
@@ -5130,6 +5137,37 @@ mod tests {
         settle(&mut app, &mut rx).await;
         let last = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
         assert_eq!(last, "removed 30000 unit(s) in 2 batches (version 4, no new version): new version 4");
+    }
+
+    /// Add to another repository in two batches: the result names the outcome of each batch, also when the last one
+    /// made no version (the target had those units).
+    #[tokio::test]
+    async fn content_add_reports_every_batch() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let dst = format!("{API}repositories/file/file/dst/");
+        get(&server, &format!("{API}repositories/file/file/"), page(json!([{ "pulp_href": dst, "name": "dst" }]))).await;
+        for (i, created) in [(1, json!([format!("{dst}versions/4/")])), (2, json!([]))] {
+            let task = format!("{API}tasks/{i}/");
+            let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": task }));
+            wiremock::Mock::given(method("POST"))
+                .and(path(format!("{dst}modify/")))
+                .respond_with(accepted)
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            get(&server, &task, json!({ "pulp_href": task, "state": "completed", "created_resources": created })).await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.marked = (0..30_000).map(|i| format!("{API}content/file/files/{i:036}/")).collect();
+        content_action(&mut app, format!("{API}repositories/file/file/src/versions/1/"), Act::AddToRepo);
+        let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+        form.fields[0].value = "dst".into();
+        submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let last = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        assert_eq!(last, "added 30000 unit(s) to dst in 2 batches (version 4, no new version): version 4");
     }
 
     #[tokio::test]
