@@ -383,6 +383,10 @@ pub struct Task {
 
 pub const TASK_FINAL_STATES: [&str; 4] = ["completed", "failed", "canceled", "skipped"];
 
+/// An idle task group whose newest task ended this long ago is final (`TaskGroup::is_final`). Long enough for a
+/// client clock that is some minutes ahead of Pulp's; a parent task dispatches its children before it ends.
+const IDLE_FINAL_SECS: u64 = 600;
+
 impl Task {
     pub fn is_final(&self) -> bool {
         TASK_FINAL_STATES.contains(&self.state.as_str())
@@ -438,12 +442,23 @@ impl TaskGroup {
     /// `all_tasks_dispatched` is not reliable (pulpcore 3.123 leaves it false after a
     /// replication, an import or an RPM prune), so a failure, the replication finalizer or the completed
     /// `pulp_import` or `prune_packages` (each dispatches every repository task) also ends the group. An
-    /// ACS refresh dispatches all its tasks before it answers and never sets the flag.
+    /// ACS refresh dispatches all its tasks before it answers and never sets the flag. Last, a group whose
+    /// newest task ended `IDLE_FINAL_SECS` ago is final, so the Task Center stops polling an unknown kind.
     pub fn is_final(&self) -> bool {
         let last = |n: &str| ["finalize_replication", "importer.pulp_import", "prune.prune_packages"].iter().any(|s| n.ends_with(s));
         let finalized = self.tasks.iter().any(|t| t["name"].as_str().is_some_and(last) && t["state"] == "completed");
         let refresh = self.description.starts_with("Refreshing ") && self.description.to_lowercase().contains("alternate content source");
-        self.active() == 0 && self.done() > 0 && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh)
+        self.active() == 0
+            && self.done() > 0
+            && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh || self.idle_long())
+    }
+    /// The newest `finished_at` (Pulp's UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`) is older than `IDLE_FINAL_SECS` by the
+    /// client clock; the same format compares as text.
+    fn idle_long(&self) -> bool {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let cutoff = crate::store::rfc3339(now.saturating_sub(IDLE_FINAL_SECS));
+        let newest = self.tasks.iter().filter_map(|t| t["finished_at"].as_str()?.get(..19)).max();
+        newest.is_some_and(|f| f < &cutoff[..19])
     }
     /// How a final group ended: a failed task fails it; a canceled or skipped task is not a success either.
     pub fn outcome(&self) -> &'static str {
@@ -458,7 +473,6 @@ impl TaskGroup {
         }
     }
     /// The group as one Task Center task. Its state is `outcome` once final; the counts are the error when not completed.
-    // shortcut: a group that only `wait_task_group`'s three-poll rule ends stays `running` here; no supported pulpcore does that.
     pub fn as_task(&self) -> Task {
         let state = match self.is_final() {
             true => self.outcome(),
@@ -862,5 +876,27 @@ mod tests {
         let other = json!({ "pulp_href": "/g/2/", "description": "Replication of up", "completed": 2, "tasks": [{}, {}] });
         let other: TaskGroup = serde_json::from_value(other).unwrap();
         assert!(!other.is_final(), "another group may still dispatch tasks");
+    }
+
+    /// A group that no other rule ends (unknown kind, flag never set) is final once it was idle for
+    /// `IDLE_FINAL_SECS`: its Task Center row stops polling.
+    #[test]
+    fn an_idle_group_of_an_unknown_kind_ends_after_a_while() {
+        use serde_json::json;
+        let group = |tasks: Value| -> TaskGroup {
+            let done = |s: &str| tasks.as_array().unwrap().iter().filter(|t| t["state"] == s).count();
+            let g = json!({ "pulp_href": "/g/4/", "description": "Something new", "all_tasks_dispatched": false,
+                "completed": done("completed"), "skipped": done("skipped"), "running": done("running"), "tasks": tasks });
+            serde_json::from_value(g).unwrap()
+        };
+        let state = |g: TaskGroup| (g.is_final(), g.as_task().state);
+        let long_ago = "2000-01-01T00:00:00.123456Z";
+        let old = group(json!([{ "state": "completed", "finished_at": long_ago }, { "state": "skipped", "finished_at": long_ago }]));
+        assert_eq!(state(old), (true, "skipped".into()));
+        let now = crate::store::now();
+        let recent = group(json!([{ "state": "completed", "finished_at": long_ago }, { "state": "completed", "finished_at": now }]));
+        assert_eq!(state(recent), (false, "waiting".into()), "the newest task ended just now: more may come");
+        let busy = group(json!([{ "state": "completed", "finished_at": long_ago }, { "state": "running" }]));
+        assert_eq!(state(busy), (false, "running".into()));
     }
 }

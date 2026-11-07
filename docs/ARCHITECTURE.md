@@ -89,14 +89,16 @@ running, at least one is done, and one of these is true:
 3. the replication finalizer completed;
 4. the `pulp_import` task completed;
 5. the description is an ACS refresh (it dispatches all tasks before it answers);
-6. the pulp_rpm `prune_packages` task completed (it dispatches every repository task).
+6. the pulp_rpm `prune_packages` task completed (it dispatches every repository task);
+7. its newest task ended 10 minutes ago or more (`finished_at`, client clock): the last
+   fallback for a group of an unknown kind, so its Task Center row stops polling.
 
 Its state is `failed`, `canceled` or `skipped` when a task ended so, else `completed`.
 pulpcore 3.123 leaves `all_tasks_dispatched` false after a replication or an import, and
-pulp_rpm 3.39 after a prune (rules 3, 4 and 6 cover them). As a last fallback,
-`ops::wait_task_group` also ends an idle group whose counts stay the same for three polls;
-`as_task` does not have this rule. Replication, import and prune jobs report each group
-snapshot to the Task Center (`actions::group_progress`), so a restart re-attaches it.
+pulp_rpm 3.39 after a prune (rules 3, 4 and 6 cover them). A workflow does not wait for
+rule 7: `ops::wait_task_group` also ends an idle group whose counts stay the same for three
+polls. Replication, import and prune jobs report each group snapshot to the Task Center
+(`actions::group_progress`), so a restart re-attaches it.
 
 ## Pulp objects and pulp-tui objects
 
