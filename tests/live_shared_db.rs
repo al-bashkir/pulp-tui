@@ -410,7 +410,9 @@ async fn store_methods_on_postgres() {
     // Export and import between two servers' scopes of the same database.
     let ex = st.export(k).await.unwrap();
     assert_eq!(st.import("https://copy/pulp/#default", &ex).await.unwrap(), (1, 2, vec![]));
-    assert_eq!(st.import("https://copy/pulp/#default", &ex).await.unwrap(), (0, 0, vec![]));
+    let (cvs, envs, warnings) = st.import("https://copy/pulp/#default", &ex).await.unwrap();
+    assert_eq!((cvs, envs), (0, 0));
+    assert!(warnings.iter().all(|w| w.ends_with(" exists; not changed")) && warnings.len() == 3, "{warnings:?}");
 
     // db copy from a local (SQLite) store: new ids, history kept, aliases recorded.
     let local = Store::open_in_memory().await.unwrap();

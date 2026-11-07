@@ -4110,7 +4110,7 @@ mod tests {
         st.set_cv_repo(old, &CvRepo { repo_name: "gone".into(), ..os.clone() }).await.unwrap();
         st.create_cv("b", "old", "").await.unwrap();
         let (cvs, _, warnings) = import(&svc.client, &caps, st, "b", &st.export("a").await.unwrap()).await.unwrap();
-        assert_eq!((cvs, warnings), (1, vec![]));
+        assert_eq!((cvs, warnings), (1, vec!["content view old exists; not changed".to_string()]));
         let id = st.content_views("b").await.unwrap().into_iter().find(|v| v.name == "web").unwrap().id;
         assert_eq!(st.cv_repos(id).await.unwrap(), [CvRepo { repo_href: b.into(), ..os }]);
     }

@@ -685,18 +685,7 @@ impl Store {
 
     async fn insert_cv(&self, profile: &str, name: &str, description: &str, composite: bool) -> Result<i64> {
         validate_name(name)?;
-        let id = sqlx::query_scalar(
-            "INSERT INTO content_views(profile, name, description, created_at, composite) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-        )
-        .bind(profile)
-        .bind(name)
-        .bind(description)
-        .bind(now())
-        .bind(composite as i64)
-        .fetch_one(&self.pool)
-        .await
-        .with_context(|| format!("content view {name} already exists?"))?;
-        Ok(id)
+        insert_view(&mut *self.pool.acquire().await?, profile, name, description, composite, false).await
     }
 
     pub async fn update_cv(&self, id: i64, description: &str) -> Result<()> {
@@ -769,16 +758,7 @@ impl Store {
                 bail!("v{} is not a published version of {}", v.number, component.name);
             }
         }
-        sqlx::query(
-            "INSERT INTO cv_components(composite_id, component_id, version_id) VALUES ($1, $2, $3)
-             ON CONFLICT(composite_id, component_id) DO UPDATE SET version_id = excluded.version_id",
-        )
-        .bind(composite_id)
-        .bind(component_id)
-        .bind(pinned)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        upsert_component(&mut *self.pool.acquire().await?, composite_id, component_id, pinned).await
     }
 
     pub async fn remove_component(&self, composite_id: i64, component_id: i64) -> Result<()> {
@@ -867,18 +847,7 @@ impl Store {
     }
 
     pub async fn set_cv_repo(&self, cv_id: i64, repo: &CvRepo) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO cv_repos(cv_id, repo_href, repo_name, repo_type, filters) VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(cv_id, repo_href) DO UPDATE SET filters = excluded.filters, repo_name = excluded.repo_name",
-        )
-        .bind(cv_id)
-        .bind(&repo.repo_href)
-        .bind(&repo.repo_name)
-        .bind(type_str(repo.repo_type))
-        .bind(serde_json::to_string(&repo.filters)?)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        upsert_cv_repo(&mut *self.pool.acquire().await?, cv_id, repo).await
     }
 
     pub async fn remove_cv_repo(&self, cv_id: i64, repo_href: &str) -> Result<()> {
@@ -1117,28 +1086,14 @@ impl Store {
     }
 
     pub async fn create_env(&self, profile: &str, name: &str, prior_id: i64, protected: bool) -> Result<i64> {
-        self.insert_env(profile, name, prior_id, protected, &default_label(name)).await
-    }
-
-    async fn insert_env(&self, profile: &str, name: &str, prior_id: i64, protected: bool, label: &str) -> Result<i64> {
         validate_name(name)?;
-        validate_label(label)?;
+        let label = default_label(name);
+        validate_label(&label)?;
         // shortcut: label uniqueness is checked, not indexed (old databases can hold case-only duplicates); add a unique index once none are left.
-        if let Some(used) = self.label_user(profile, label, 0).await? {
+        if let Some(used) = self.label_user(profile, &label, 0).await? {
             bail!("label {label} is already used by environment {used}");
         }
-        let id = sqlx::query_scalar(
-            "INSERT INTO environments(profile, name, prior_id, protected, label) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-        )
-        .bind(profile)
-        .bind(name)
-        .bind(prior_id)
-        .bind(protected as i64)
-        .bind(label)
-        .fetch_one(&self.pool)
-        .await
-        .with_context(|| format!("environment {name} already exists?"))?;
-        Ok(id)
+        insert_env_row(&mut *self.pool.acquire().await?, profile, name, prior_id, protected, &label).await
     }
 
     /// Name of another environment (not `except`) of the scope that has this label.
@@ -1578,46 +1533,55 @@ impl Store {
         Ok(Export { format: 2, content_views: views, environments })
     }
 
-    /// Import definitions (format 1 or 2); existing objects with the same name are left unchanged.
-    /// Returns the views and environments created and warnings. A component pin (a version number) becomes
-    /// latest: the versions of another database do not exist here. Components are added to the composites
+    /// Import definitions (format 1 or 2) in one transaction. An existing object with the same name is left unchanged,
+    /// with a warning. Returns the views and environments created and warnings. A component pin (a version number)
+    /// becomes latest: the versions of another database do not exist here. Components are added to the composites
     /// this call created, after all views exist, so the order of the file does not matter.
     pub async fn import(&self, profile: &str, ex: &Export) -> Result<(usize, usize, Vec<String>)> {
         if !(1..=2).contains(&ex.format) {
             bail!("unsupported export format {}", ex.format);
         }
-        // Checked before any write: an entry refused halfway would leave the composites created before it empty.
-        for v in &ex.content_views {
-            validate_name(&v.name).with_context(|| format!("content view {:?}", v.name))?;
-            for r in &v.repos {
-                for f in &r.filters {
-                    crate::filters::parse_rule(&f.to_string(), r.repo_type).map_err(|e| anyhow!("{} {}: {e}", v.name, r.repo_name))?;
-                }
-            }
+        check_import_entries(ex)?;
+        let (existing, views) = (self.environments(profile).await?, self.content_views(profile).await?);
+        let ((label, protected), order) = self.import_env_plan(profile, ex, &existing).await?;
+        let mut ids: HashMap<&str, i64> = existing.iter().map(|e| (e.name.as_str(), e.id)).collect();
+        let mut warnings: Vec<String> = ex
+            .environments
+            .iter()
+            .filter(|e| e.name != LIBRARY && ids.contains_key(e.name.as_str()))
+            .map(|e| format!("environment {} exists; not changed", e.name))
+            .collect();
+        let mut tx = self.pool.begin().await?;
+        ids.insert(LIBRARY, library_in(&mut tx, profile, &label, protected).await?);
+        for e in &order {
+            let id = insert_env_row(&mut tx, profile, &e.name, ids[e.prior.as_str()], e.protected, &export_label(e)).await?;
+            ids.insert(&e.name, id);
         }
-        for e in &ex.environments {
-            validate_name(&e.name).with_context(|| format!("environment {:?}", e.name))?;
-            if !e.label.is_empty() {
-                validate_label(&e.label).with_context(|| format!("environment {}", e.name))?;
-            }
-        }
-        // Clashes in the file and with the target: the writes below would stop halfway on them.
-        let mut views = HashSet::new();
-        if let Some(v) = ex.content_views.iter().find(|v| !views.insert(v.name.as_str())) {
-            bail!("content view {} is in the file twice", v.name);
-        }
-        let existing = self.environments(profile).await?;
-        let label_of = |e: &ExportEnv| if e.label.is_empty() { default_label(&e.name) } else { e.label.clone() };
-        // A Library that this import creates gets the label and the flag of the file's (format 2), else the defaults.
+        let (cvs, more) = import_views(&mut tx, profile, ex, &views).await?;
+        warnings.extend(more);
+        tx.commit().await?;
+        Ok((cvs, order.len(), warnings))
+    }
+
+    /// The Library that `import` creates when there is none (label and flag of the file's in format 2, else the
+    /// defaults), and the environments to create, each after its prior. Clashes in the file and with the target are
+    /// refused here, before any write.
+    async fn import_env_plan<'a>(
+        &self,
+        profile: &str,
+        ex: &'a Export,
+        existing: &[Environment],
+    ) -> Result<((String, bool), Vec<&'a ExportEnv>)> {
         let file_library = ex.environments.iter().find(|e| e.name == LIBRARY);
-        let new_library = existing.iter().all(|x| x.name != LIBRARY).then(|| file_library.map_or_else(|| default_label(LIBRARY), label_of));
+        let new_library =
+            existing.iter().all(|x| x.name != LIBRARY).then(|| file_library.map_or_else(|| default_label(LIBRARY), export_label));
         let mut known: HashSet<&str> = existing.iter().map(|e| e.name.as_str()).chain([LIBRARY]).collect();
         let (mut names, mut labels) = (HashSet::new(), HashSet::new());
         for e in ex.environments.iter().filter(|e| !known.contains(e.name.as_str())) {
             if !names.insert(e.name.as_str()) {
                 bail!("environment {} is in the file twice", e.name);
             }
-            let label = label_of(e);
+            let label = export_label(e);
             let library = (new_library.as_ref() == Some(&label)).then(|| LIBRARY.to_string());
             if let Some(used) = library.or(self.label_user(profile, &label, 0).await?) {
                 bail!("label {label} is already used by environment {used}");
@@ -1627,12 +1591,14 @@ impl Store {
             }
         }
         let mut left: Vec<&ExportEnv> = ex.environments.iter().filter(|e| !known.contains(e.name.as_str())).collect();
+        let mut order = vec![];
         while !left.is_empty() {
             let before = left.len();
             left.retain(|e| {
                 let ready = known.contains(e.prior.as_str());
                 if ready {
                     known.insert(&e.name);
+                    order.push(*e);
                 }
                 !ready
             });
@@ -1640,69 +1606,8 @@ impl Store {
                 bail!("environment(s) with unknown prior: {}", left.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", "));
             }
         }
-        let library_label = new_library.unwrap_or_else(|| default_label(LIBRARY)); // unused when Library exists
-        library_in(&mut *self.pool.acquire().await?, profile, &library_label, file_library.is_some_and(|l| l.protected)).await?;
-        let mut envs = 0;
-        // Parents come before children in exports; loop until no progress for safety.
-        let mut pending: Vec<&ExportEnv> = ex.environments.iter().collect();
-        while !pending.is_empty() {
-            let before = pending.len();
-            let existing = self.environments(profile).await?;
-            let mut waiting = vec![];
-            for e in pending {
-                if existing.iter().any(|x| x.name == e.name) {
-                    continue;
-                }
-                match existing.iter().find(|x| x.name == e.prior) {
-                    Some(p) => {
-                        let label = if e.label.is_empty() { default_label(&e.name) } else { e.label.clone() };
-                        self.insert_env(profile, &e.name, p.id, e.protected, &label).await?;
-                        envs += 1;
-                    }
-                    None => waiting.push(e),
-                }
-            }
-            pending = waiting;
-            if pending.len() == before {
-                bail!("environment(s) with unknown prior: {}", pending.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", "));
-            }
-        }
-        let mut cvs = 0;
-        let existing = self.content_views(profile).await?;
-        let mut composites = vec![];
-        for v in &ex.content_views {
-            if existing.iter().any(|c| c.name == v.name) {
-                continue;
-            }
-            if v.composite {
-                let id = self.create_composite(profile, &v.name, &v.description).await?;
-                self.set_auto_publish(id, v.auto_publish).await?;
-                composites.push((id, v));
-            } else {
-                let id = self.create_cv(profile, &v.name, &v.description).await?;
-                for r in &v.repos {
-                    self.set_cv_repo(id, r).await?;
-                }
-            }
-            cvs += 1;
-        }
-        let mut warnings = vec![];
-        let views = self.content_views(profile).await?;
-        for (id, v) in composites {
-            for c in &v.components {
-                match views.iter().find(|x| x.name == c.name) {
-                    None => warnings.push(format!("{}: component {} not found; skipped", v.name, c.name)),
-                    Some(x) if x.composite => warnings.push(format!("{}: component {} is a composite; skipped", v.name, c.name)),
-                    Some(x) => {
-                        self.set_component(id, x.id, None).await?;
-                        if let Some(k) = c.pinned {
-                            warnings.push(format!("{}: component {} was pinned to v{k}; imported as latest", v.name, c.name));
-                        }
-                    }
-                }
-            }
-        }
-        Ok((cvs, envs, warnings))
+        let library = (new_library.unwrap_or_else(|| default_label(LIBRARY)), file_library.is_some_and(|l| l.protected)); // unused when Library exists
+        Ok((library, order))
     }
 
     // ---- db copy ---------------------------------------------------------------------
@@ -2010,6 +1915,133 @@ async fn library_in(c: &mut AnyConnection, profile: &str, label: &str, protected
         .await?)
 }
 
+/// The checks of `Store::import` that need no database: names, labels, filter rules, a view in the file twice.
+fn check_import_entries(ex: &Export) -> Result<()> {
+    for v in &ex.content_views {
+        validate_name(&v.name).with_context(|| format!("content view {:?}", v.name))?;
+        for r in &v.repos {
+            for f in &r.filters {
+                crate::filters::parse_rule(&f.to_string(), r.repo_type).map_err(|e| anyhow!("{} {}: {e}", v.name, r.repo_name))?;
+            }
+        }
+    }
+    for e in &ex.environments {
+        validate_name(&e.name).with_context(|| format!("environment {:?}", e.name))?;
+        if !e.label.is_empty() {
+            validate_label(&e.label).with_context(|| format!("environment {}", e.name))?;
+        }
+    }
+    let mut views = HashSet::new();
+    if let Some(v) = ex.content_views.iter().find(|v| !views.insert(v.name.as_str())) {
+        bail!("content view {} is in the file twice", v.name);
+    }
+    Ok(())
+}
+
+/// The label of an exported environment; a format 1 file has none: the default for its name.
+fn export_label(e: &ExportEnv) -> String {
+    if e.label.is_empty() { default_label(&e.name) } else { e.label.clone() }
+}
+
+/// `Store::import` of the views of `ex` that `existing` lacks, on `c`; then the components of the new composites.
+/// Returns how many views it created and the warnings.
+async fn import_views(c: &mut AnyConnection, profile: &str, ex: &Export, existing: &[ContentView]) -> Result<(usize, Vec<String>)> {
+    let mut ids: HashMap<&str, (i64, bool)> = existing.iter().map(|v| (v.name.as_str(), (v.id, v.composite))).collect();
+    let (mut warnings, mut composites) = (vec![], vec![]);
+    for v in &ex.content_views {
+        if ids.contains_key(v.name.as_str()) {
+            warnings.push(format!("content view {} exists; not changed", v.name));
+            continue;
+        }
+        let id = insert_view(c, profile, &v.name, &v.description, v.composite, v.composite && v.auto_publish).await?;
+        ids.insert(&v.name, (id, v.composite));
+        if v.composite {
+            composites.push((id, v));
+            continue;
+        }
+        for r in &v.repos {
+            upsert_cv_repo(c, id, r).await?;
+        }
+    }
+    let created = ids.len() - existing.len(); // names are unique in the file (checked) and in the scope
+    for (id, v) in composites {
+        for k in &v.components {
+            match ids.get(k.name.as_str()) {
+                None => warnings.push(format!("{}: component {} not found; skipped", v.name, k.name)),
+                Some((_, true)) => warnings.push(format!("{}: component {} is a composite; skipped", v.name, k.name)),
+                Some((cid, false)) => {
+                    upsert_component(c, id, *cid, None).await?;
+                    if let Some(n) = k.pinned {
+                        warnings.push(format!("{}: component {} was pinned to v{n}; imported as latest", v.name, k.name));
+                    }
+                }
+            }
+        }
+    }
+    Ok((created, warnings))
+}
+
+/// Insert a Content View row (its name passed `validate_name`).
+async fn insert_view(c: &mut AnyConnection, profile: &str, name: &str, description: &str, composite: bool, auto: bool) -> Result<i64> {
+    let id = sqlx::query_scalar(
+        "INSERT INTO content_views(profile, name, description, created_at, composite, auto_publish) VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id",
+    )
+    .bind(profile)
+    .bind(name)
+    .bind(description)
+    .bind(now())
+    .bind(composite as i64)
+    .bind(auto as i64)
+    .fetch_one(&mut *c)
+    .await
+    .with_context(|| format!("content view {name} already exists?"))?;
+    Ok(id)
+}
+
+/// Insert an environment row (its name and label passed the checks of `Store::insert_env`).
+async fn insert_env_row(c: &mut AnyConnection, profile: &str, name: &str, prior_id: i64, protected: bool, label: &str) -> Result<i64> {
+    let id =
+        sqlx::query_scalar("INSERT INTO environments(profile, name, prior_id, protected, label) VALUES ($1, $2, $3, $4, $5) RETURNING id")
+            .bind(profile)
+            .bind(name)
+            .bind(prior_id)
+            .bind(protected as i64)
+            .bind(label)
+            .fetch_one(&mut *c)
+            .await
+            .with_context(|| format!("environment {name} already exists?"))?;
+    Ok(id)
+}
+
+async fn upsert_cv_repo(c: &mut AnyConnection, cv_id: i64, repo: &CvRepo) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO cv_repos(cv_id, repo_href, repo_name, repo_type, filters) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT(cv_id, repo_href) DO UPDATE SET filters = excluded.filters, repo_name = excluded.repo_name",
+    )
+    .bind(cv_id)
+    .bind(&repo.repo_href)
+    .bind(&repo.repo_name)
+    .bind(type_str(repo.repo_type))
+    .bind(serde_json::to_string(&repo.filters)?)
+    .execute(&mut *c)
+    .await?;
+    Ok(())
+}
+
+async fn upsert_component(c: &mut AnyConnection, composite_id: i64, component_id: i64, pinned: Option<i64>) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO cv_components(composite_id, component_id, version_id) VALUES ($1, $2, $3)
+         ON CONFLICT(composite_id, component_id) DO UPDATE SET version_id = excluded.version_id",
+    )
+    .bind(composite_id)
+    .bind(component_id)
+    .bind(pinned)
+    .execute(&mut *c)
+    .await?;
+    Ok(())
+}
+
 async fn insert_version_repo(c: &mut AnyConnection, vr: &CvVersionRepo) -> Result<()> {
     let r = vr.repo();
     sqlx::query(
@@ -2244,7 +2276,9 @@ mod tests {
         let ex = s.export("lab").await.unwrap();
         let s2 = Store::open_in_memory().await.unwrap();
         assert_eq!(s2.import("lab", &ex).await.unwrap(), (1, 2, vec![]));
-        assert_eq!(s2.import("lab", &ex).await.unwrap(), (0, 0, vec![]));
+        let skipped =
+            ["environment Dev exists; not changed", "environment Prod exists; not changed", "content view base exists; not changed"];
+        assert_eq!(s2.import("lab", &ex).await.unwrap(), (0, 0, skipped.map(String::from).to_vec()));
         assert_eq!(s2.export("lab").await.unwrap(), ex);
 
         s.delete_cv(cv).await.unwrap();
@@ -2627,6 +2661,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_is_one_transaction_and_a_rerun_names_what_it_skips() {
+        let s = Store::open_in_memory().await.unwrap();
+        let ex: Export = serde_json::from_value(serde_json::json!({ "format": 2,
+            "environments": [{ "name": "Dev", "prior": "Library" }],
+            "content_views": [
+                { "name": "rocky9", "composite": true, "auto_publish": true, "components": [{ "name": "os" }], "repos": [] },
+                { "name": "os", "repos": [{ "repo_href": "/r/1/", "repo_name": "baseos", "repo_type": "rpm" }] }
+            ] }))
+        .unwrap();
+        // A write that fails after the composite exists (another operator, a database error): nothing stays.
+        sqlx::raw_sql("CREATE TRIGGER refuse BEFORE INSERT ON cv_components BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let e = format!("{:#}", s.import("k", &ex).await.unwrap_err());
+        assert!(e.contains("refused by the test"), "{e}");
+        assert!(s.content_views("k").await.unwrap().is_empty(), "no composite without its components");
+        assert!(s.environments("k").await.unwrap().is_empty(), "not even Library");
+        sqlx::raw_sql("DROP TRIGGER refuse").execute(&s.pool).await.unwrap();
+        assert_eq!(s.import("k", &ex).await.unwrap(), (2, 1, vec![]));
+        let rocky9 = s.content_views("k").await.unwrap().into_iter().find(|v| v.name == "rocky9").unwrap();
+        assert!(rocky9.composite && rocky9.auto_publish);
+        assert_eq!(s.components(rocky9.id).await.unwrap()[0].name, "os");
+        assert_eq!(s.cv_repos(s.content_views("k").await.unwrap()[0].id).await.unwrap()[0].repo_name, "baseos");
+        let skipped =
+            ["environment Dev exists; not changed", "content view rocky9 exists; not changed", "content view os exists; not changed"];
+        assert_eq!(s.import("k", &ex).await.unwrap(), (0, 0, skipped.map(String::from).to_vec()));
+    }
+
+    #[tokio::test]
     async fn import_checks_every_entry_before_it_writes() {
         let s = Store::open_in_memory().await.unwrap();
         // A rule without criteria would exclude every package; the composite must not be created without its components.
@@ -2672,7 +2736,8 @@ mod tests {
                 "{want}: nothing written"
             );
         }
-        s.insert_env("k", "Staging", s.ensure_library("k").await.unwrap(), false, "qa").await.unwrap();
+        let staging = s.create_env("k", "Staging", s.ensure_library("k").await.unwrap(), false).await.unwrap();
+        s.set_env_label(staging, "qa").await.unwrap();
         let e = s.import("k", &Export { format: 2, content_views: vec![view("os")], environments: vec![env("QA", "Library", "")] }).await;
         assert_eq!(e.unwrap_err().to_string(), "label qa is already used by environment Staging");
         assert!(s.content_views("k").await.unwrap().is_empty());
@@ -3258,7 +3323,8 @@ mod tests {
         let got = dst.components(imported.id).await.unwrap();
         assert_eq!(got.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["extras", "os"]);
         assert!(got.iter().all(|x| x.pinned.is_none()));
-        assert_eq!(dst.import("k", &ex).await.unwrap(), (0, 0, vec![]));
+        let (cvs, envs, warnings) = dst.import("k", &ex).await.unwrap();
+        assert_eq!((cvs, envs, warnings.len()), (0, 0, 3), "{warnings:?}");
 
         // A component that is missing or is a composite is skipped with a named warning.
         let comp = |name: &str| ExportComponent { name: name.into(), pinned: None };

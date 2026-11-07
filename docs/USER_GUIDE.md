@@ -1199,6 +1199,10 @@ file still imports.
   with a warning, for example
   `warning: rocky9: component os was pinned to v1; imported as latest`. Pin it again with **e**.
 * A component that the import does not find, or that is a composite, is skipped with a warning.
+* A view or environment that exists with the same name is kept as it is, with a warning, for
+  example `warning: content view web exists; not changed`. So a second run of the same file
+  changes nothing and names each entry.
+* The import writes in one transaction: when a write fails, nothing is imported.
 * The file holds the repository hrefs of the server that exported it. For each view that it
   creates, `import-cv` finds each repository on the server of the profile by name and type, and
   stores the href of that server. So you can import into another server when it has repositories
