@@ -354,11 +354,13 @@ fn role_action(app: &mut App, act: Act, item: Value) {
                 .as_array()
                 .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
                 .unwrap_or_default();
+            // Create starts from the selected role's permissions only: its name would be a duplicate (400).
+            let own = |k: &str| if edit { s(&item, k) } else { String::new() };
             let form = Form::new(
                 if edit { format!("Edit role {name}") } else { "New role".into() },
                 vec![
-                    Field::text("name", "Name").required().value(name.clone()),
-                    Field::text("description", "Description").value(s(&item, "description")),
+                    Field::text("name", "Name").required().value(own("name")),
+                    Field::text("description", "Description").value(own("description")),
                     Field::text("permissions", "Permissions (comma separated)")
                         .required()
                         .value(perms)
@@ -1828,6 +1830,27 @@ mod tests {
         yes(&mut app);
         settle(&mut app, &mut rx).await;
         assert_eq!(sent(&server).await, [("DELETE".into(), UP.into(), Value::Null)]);
+    }
+
+    /// Create on a selected role starts from its permissions, never its name: an unchanged submit would be a duplicate.
+    #[tokio::test]
+    async fn role_create_copies_the_permissions_but_not_the_name() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        serve(&server, "POST", "/pulp/api/v3/roles/", 201, json!({ "pulp_href": "/pulp/api/v3/roles/9/" })).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Roles;
+        let selected = json!({ "pulp_href": "/pulp/api/v3/roles/1/", "name": "rpm.viewer", "description": "view RPM", "locked": true,
+            "permissions": ["rpm.view_rpmrepository", "rpm.view_rpmremote"] });
+        let (mut f, mut submit) = open_form(&mut app, Act::Create, selected);
+        assert_eq!((f.get("name"), f.get("description")), ("", ""));
+        assert_eq!(f.get("permissions"), "rpm.view_rpmrepository,rpm.view_rpmremote");
+        assert!(f.validate().is_err(), "a name is required");
+        set(&mut f, "name", "my.viewer");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let want = json!({ "name": "my.viewer", "description": "", "permissions": ["rpm.view_rpmrepository", "rpm.view_rpmremote"] });
+        assert_eq!(sent(&server).await, [("POST".into(), "/pulp/api/v3/roles/".into(), want)]);
     }
 
     /// Edit: the label names the upstream, a stored destructive policy asks again only when it changes, and set
