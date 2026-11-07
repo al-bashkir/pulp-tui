@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions, AnyRow};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{AnyConnection, AnyPool, AssertSqlSafe, ConnectOptions, Connection, Executor, Row};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -753,12 +753,18 @@ impl Store {
             bail!("{} is a composite; a composite cannot be a component", component.name);
         }
         if let Some(id) = pinned {
-            let v = self.version(id).await?;
-            if v.cv_id != component_id || v.state != "published" {
-                bail!("v{} is not a published version of {}", v.number, component.name);
-            }
+            self.refuse_pin(id, &component).await?;
         }
         upsert_component(&mut *self.pool.acquire().await?, composite_id, component_id, pinned).await
+    }
+
+    /// Refused unless version `id` is a published version of `component`: a composite pins only those.
+    async fn refuse_pin(&self, id: i64, component: &ContentView) -> Result<()> {
+        let v = self.version(id).await?;
+        if v.cv_id != component.id || v.state != "published" {
+            bail!("v{} is not a published version of {}", v.number, component.name);
+        }
+        Ok(())
     }
 
     pub async fn remove_component(&self, composite_id: i64, component_id: i64) -> Result<()> {
@@ -1162,15 +1168,7 @@ impl Store {
             Backend::Sqlite => "UPDATE environments SET protected = protected WHERE id = $1",
             Backend::Postgres => "SELECT id FROM environments WHERE id = $1 FOR UPDATE",
         };
-        sqlx::query(lock).bind(id).execute(&mut *tx).await?;
-        let used: i64 = sqlx::query_scalar(
-            "SELECT (SELECT COUNT(*) FROM bindings WHERE env_id = $1) + (SELECT COUNT(*) FROM promotions WHERE env_id = $1)
-                + (SELECT COUNT(*) FROM environments WHERE prior_id = $1)",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if used > 0 {
+        if env_in_use(&mut tx, lock, id).await? {
             bail!("environment is in use (bindings or successor environments exist)");
         }
         sqlx::query("DELETE FROM binding_repos WHERE env_id = $1").bind(id).execute(&mut *tx).await?;
@@ -1211,21 +1209,22 @@ impl Store {
 
     /// The bindings of view `cv_id`, by environment id.
     pub async fn bindings_for_cv(&self, cv_id: i64) -> Result<Vec<Binding>> {
-        let served = sqlx::query("SELECT env_id, version_id FROM bindings WHERE cv_id = $1").bind(cv_id).fetch_all(&self.pool).await?;
-        let attempts =
-            sqlx::query("SELECT env_id, version_id, state FROM promotions WHERE cv_id = $1").bind(cv_id).fetch_all(&self.pool).await?;
-        let mut out = BTreeMap::new();
-        let empty = |env_id| Binding { env_id, cv_id, served: None, attempt: None };
-        for r in &served {
-            let env_id: i64 = r.try_get(0)?;
-            out.entry(env_id).or_insert_with(|| empty(env_id)).served = Some(r.try_get(1)?);
-        }
-        for r in &attempts {
-            let env_id: i64 = r.try_get(0)?;
-            let attempt = Some(Attempt { version_id: r.try_get(1)?, state: r.try_get(2)? });
-            out.entry(env_id).or_insert_with(|| empty(env_id)).attempt = attempt;
-        }
-        Ok(out.into_values().collect())
+        let rows = sqlx::query(
+            "SELECT e.env_id, b.version_id, p.version_id, p.state
+             FROM (SELECT env_id FROM bindings WHERE cv_id = $1 UNION SELECT env_id FROM promotions WHERE cv_id = $1) e
+             LEFT JOIN bindings b ON b.env_id = e.env_id AND b.cv_id = $1
+             LEFT JOIN promotions p ON p.env_id = e.env_id AND p.cv_id = $1 ORDER BY e.env_id",
+        )
+        .bind(cv_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let attempt: (Option<i64>, Option<String>) = (r.try_get(2)?, r.try_get(3)?);
+                let attempt = attempt.0.zip(attempt.1).map(|(version_id, state)| Attempt { version_id, state });
+                Ok(Binding { env_id: r.try_get(0)?, cv_id, served: r.try_get(1)?, attempt })
+            })
+            .collect()
     }
 
     /// Record that the promotion of `version_id` holding lock `token` starts. The served version stays.
@@ -1750,28 +1749,7 @@ impl Store {
                         .map(|x| version_ids[&x.id])
                         .context("a binding points at a version of another view")
                 };
-                if let Some(served) = b.served {
-                    sqlx::query("INSERT INTO bindings(env_id, cv_id, version_id, updated_at) VALUES ($1, $2, $3, $4)")
-                        .bind(env_id)
-                        .bind(cv_id)
-                        .bind(version(served)?)
-                        .bind(now())
-                        .execute(&mut *tx)
-                        .await?;
-                }
-                if let Some(a) = &b.attempt {
-                    // No lock token: the promotion's workflow ran against the source database.
-                    sqlx::query(
-                        "INSERT INTO promotions(env_id, cv_id, version_id, state, token, updated_at) VALUES ($1, $2, $3, $4, '', $5)",
-                    )
-                    .bind(env_id)
-                    .bind(cv_id)
-                    .bind(version(a.version_id)?)
-                    .bind(&a.state)
-                    .bind(now())
-                    .execute(&mut *tx)
-                    .await?;
-                }
+                copy_binding(&mut tx, b, env_id, cv_id, version).await?;
                 for r in src.binding_repos(b.env_id, v.id).await? {
                     sqlx::query(
                         "INSERT INTO binding_repos(env_id, cv_id, repo_href, repo_name, repo_type, distribution, base_path, publication)
@@ -1915,15 +1893,50 @@ async fn library_in(c: &mut AnyConnection, profile: &str, label: &str, protected
         .await?)
 }
 
+/// Run `lock` on environment `id`, then tell whether it has a served version, a promotion that has not completed, or
+/// a successor environment.
+async fn env_in_use(c: &mut AnyConnection, lock: &str, id: i64) -> Result<bool> {
+    sqlx::query(AssertSqlSafe(lock)).bind(id).execute(&mut *c).await?; // `lock` is a literal of `Store::delete_env`
+    let used: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM bindings WHERE env_id = $1) + (SELECT COUNT(*) FROM promotions WHERE env_id = $1)
+            + (SELECT COUNT(*) FROM environments WHERE prior_id = $1)",
+    )
+    .bind(id)
+    .fetch_one(&mut *c)
+    .await?;
+    Ok(used > 0)
+}
+
+/// `Store::copy_from` of binding `b` (its served version and its attempt) as `env_id` and `cv_id` on `c`; `version`
+/// gives the target id of a source version id.
+async fn copy_binding(c: &mut AnyConnection, b: &Binding, env_id: i64, cv_id: i64, version: impl Fn(i64) -> Result<i64>) -> Result<()> {
+    if let Some(served) = b.served {
+        sqlx::query("INSERT INTO bindings(env_id, cv_id, version_id, updated_at) VALUES ($1, $2, $3, $4)")
+            .bind(env_id)
+            .bind(cv_id)
+            .bind(version(served)?)
+            .bind(now())
+            .execute(&mut *c)
+            .await?;
+    }
+    if let Some(a) = &b.attempt {
+        // No lock token: the promotion's workflow ran against the source database.
+        sqlx::query("INSERT INTO promotions(env_id, cv_id, version_id, state, token, updated_at) VALUES ($1, $2, $3, $4, '', $5)")
+            .bind(env_id)
+            .bind(cv_id)
+            .bind(version(a.version_id)?)
+            .bind(&a.state)
+            .bind(now())
+            .execute(&mut *c)
+            .await?;
+    }
+    Ok(())
+}
+
 /// The checks of `Store::import` that need no database: names, labels, filter rules, a view in the file twice.
 fn check_import_entries(ex: &Export) -> Result<()> {
     for v in &ex.content_views {
-        validate_name(&v.name).with_context(|| format!("content view {:?}", v.name))?;
-        for r in &v.repos {
-            for f in &r.filters {
-                crate::filters::parse_rule(&f.to_string(), r.repo_type).map_err(|e| anyhow!("{} {}: {e}", v.name, r.repo_name))?;
-            }
-        }
+        check_import_view(v)?;
     }
     for e in &ex.environments {
         validate_name(&e.name).with_context(|| format!("environment {:?}", e.name))?;
@@ -1934,6 +1947,17 @@ fn check_import_entries(ex: &Export) -> Result<()> {
     let mut views = HashSet::new();
     if let Some(v) = ex.content_views.iter().find(|v| !views.insert(v.name.as_str())) {
         bail!("content view {} is in the file twice", v.name);
+    }
+    Ok(())
+}
+
+/// `check_import_entries` of one view: its name and the filter rules of each repository.
+fn check_import_view(v: &ExportView) -> Result<()> {
+    validate_name(&v.name).with_context(|| format!("content view {:?}", v.name))?;
+    for r in &v.repos {
+        for f in &r.filters {
+            crate::filters::parse_rule(&f.to_string(), r.repo_type).map_err(|e| anyhow!("{} {}: {e}", v.name, r.repo_name))?;
+        }
     }
     Ok(())
 }
@@ -1953,32 +1977,47 @@ async fn import_views(c: &mut AnyConnection, profile: &str, ex: &Export, existin
             warnings.push(format!("content view {} exists; not changed", v.name));
             continue;
         }
-        let id = insert_view(c, profile, &v.name, &v.description, v.composite, v.composite && v.auto_publish).await?;
+        let id = import_view(c, profile, v).await?;
         ids.insert(&v.name, (id, v.composite));
         if v.composite {
             composites.push((id, v));
-            continue;
-        }
-        for r in &v.repos {
-            upsert_cv_repo(c, id, r).await?;
         }
     }
     let created = ids.len() - existing.len(); // names are unique in the file (checked) and in the scope
     for (id, v) in composites {
-        for k in &v.components {
-            match ids.get(k.name.as_str()) {
-                None => warnings.push(format!("{}: component {} not found; skipped", v.name, k.name)),
-                Some((_, true)) => warnings.push(format!("{}: component {} is a composite; skipped", v.name, k.name)),
-                Some((cid, false)) => {
-                    upsert_component(c, id, *cid, None).await?;
-                    if let Some(n) = k.pinned {
-                        warnings.push(format!("{}: component {} was pinned to v{n}; imported as latest", v.name, k.name));
-                    }
+        warnings.extend(import_components(c, id, v, &ids).await?);
+    }
+    Ok((created, warnings))
+}
+
+/// Create view `v` of an import, with its repositories (a composite has none: its components come after all views).
+async fn import_view(c: &mut AnyConnection, profile: &str, v: &ExportView) -> Result<i64> {
+    let id = insert_view(c, profile, &v.name, &v.description, v.composite, v.composite && v.auto_publish).await?;
+    if !v.composite {
+        for r in &v.repos {
+            upsert_cv_repo(c, id, r).await?;
+        }
+    }
+    Ok(id)
+}
+
+/// The components of composite `v`, created as `id` by `import_views` (`ids`: every view by name, with its id and
+/// whether it is a composite). A pin becomes latest. Returns the warnings.
+async fn import_components(c: &mut AnyConnection, id: i64, v: &ExportView, ids: &HashMap<&str, (i64, bool)>) -> Result<Vec<String>> {
+    let mut warnings = vec![];
+    for k in &v.components {
+        match ids.get(k.name.as_str()) {
+            None => warnings.push(format!("{}: component {} not found; skipped", v.name, k.name)),
+            Some((_, true)) => warnings.push(format!("{}: component {} is a composite; skipped", v.name, k.name)),
+            Some((cid, false)) => {
+                upsert_component(c, id, *cid, None).await?;
+                if let Some(n) = k.pinned {
+                    warnings.push(format!("{}: component {} was pinned to v{n}; imported as latest", v.name, k.name));
                 }
             }
         }
     }
-    Ok((created, warnings))
+    Ok(warnings)
 }
 
 /// Insert a Content View row (its name passed `validate_name`).

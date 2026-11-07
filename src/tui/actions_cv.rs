@@ -706,30 +706,43 @@ async fn reconcile_hints(svc: &CvService, e: &Environment, b: &Binding, drift: &
         if !drift.iter().any(|d| d.fix == fix) {
             continue;
         }
-        let line = match fix {
-            Fix::Bind => {
-                // The version that `drift` checks: the served one, else the attempted one. The rule of
-                // `CvService::promote`: Rollback to the bound version always runs.
-                let v = svc.store.version(b.versions().next().unwrap_or_default()).await?;
-                match svc.promote_refusal(&v, e).await? {
-                    None => format!("promote v{} again (M) to reconcile (idempotent).", v.number),
-                    Some(why) => format!("roll back to v{} (b) to reconcile; Promote refuses: {why}", v.number),
-                }
-            }
-            Fix::Publish => "publish a new version (P) and promote it: a snapshot or publication is gone or another one, \
-                             so a promotion of this version cannot fix it."
-                .into(),
-            Fix::Repair => "check the content app, then repair the snapshot version (Repositories, v, F): \
-                            the served files are not those of the snapshot."
-                .into(),
-            Fix::Origin => "set CONTENT_ORIGIN on the Pulp server: a distribution without base_url serves nothing.".into(),
-            Fix::Retention => "clear retain_repo_versions of the snapshot repository with the Pulp API or CLI \
-                               (pulp-tui does not edit snapshot repositories): Pulp would prune its versions."
-                .into(),
+        let line = match fix_hint(fix) {
+            Some(hint) => hint.to_string(),
+            None => bind_hint(svc, e, b).await?,
         };
         out.push(format!("{}: {line}", e.name));
     }
     Ok(out)
+}
+
+/// The action that fixes drift of kind `fix`; `None` for `Fix::Bind`, whose action names a version (`bind_hint`).
+fn fix_hint(fix: Fix) -> Option<&'static str> {
+    Some(match fix {
+        Fix::Bind => return None,
+        Fix::Publish => {
+            "publish a new version (P) and promote it: a snapshot or publication is gone or another one, \
+             so a promotion of this version cannot fix it."
+        }
+        Fix::Repair => {
+            "check the content app, then repair the snapshot version (Repositories, v, F): the served files are not those of \
+             the snapshot."
+        }
+        Fix::Origin => "set CONTENT_ORIGIN on the Pulp server: a distribution without base_url serves nothing.",
+        Fix::Retention => {
+            "clear retain_repo_versions of the snapshot repository with the Pulp API or CLI (pulp-tui does not edit snapshot \
+             repositories): Pulp would prune its versions."
+        }
+    })
+}
+
+/// Promote the version that `drift` checks again (the served one, else the attempted one), or roll back to it when
+/// Promote refuses it: the rule of `CvService::promote`, where Rollback to the bound version always runs.
+async fn bind_hint(svc: &CvService, e: &Environment, b: &Binding) -> anyhow::Result<String> {
+    let v = svc.store.version(b.versions().next().unwrap_or_default()).await?;
+    Ok(match svc.promote_refusal(&v, e).await? {
+        None => format!("promote v{} again (M) to reconcile (idempotent).", v.number),
+        Some(why) => format!("roll back to v{} (b) to reconcile; Promote refuses: {why}", v.number),
+    })
 }
 
 /// `cv::binding_text` of `b`, read from the store.
@@ -944,11 +957,7 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
             let lines = vec![format!("Resume {name} v{number}: it becomes active in Library unless a newer version is published.")];
             app.load_job(format!("check resume of {name} v{number}"), move |ctx| async move {
                 let svc = ctx.cv()?;
-                let v = svc.store.version(vid).await?;
-                // Of the newest version: a composite whose auto publish after it did not run is left to do.
-                let newest = svc.store.versions(cv).await?.into_iter().find(|n| n.state == "published").is_some_and(|n| n.id == vid);
-                let lagging = newest && !svc.lagging_composites(cv).await?.is_empty();
-                if v.state == "published" && !svc.library_interrupted(&v).await? && !lagging {
+                if !svc.resume_left(&svc.store.version(vid).await?).await? {
                     return ap(|app| app.notify(Level::Info, "version is already published"));
                 }
                 // As for Publish: every Deb copy step uses `deb/copy/`.

@@ -814,6 +814,16 @@ impl CvService {
         }
     }
 
+    /// Whether `resume` of version `v` has work left: it is not published, its Library step stopped, or it is the
+    /// newest published version and a composite with auto publish lacks it (`lagging_composites`).
+    pub async fn resume_left(&self, v: &CvVersion) -> Result<bool> {
+        if v.state != "published" || self.library_interrupted(v).await? {
+            return Ok(true);
+        }
+        let newest = self.store.versions(v.cv_id).await?.into_iter().find(|n| n.state == "published").is_some_and(|n| n.id == v.id);
+        Ok(newest && !self.lagging_composites(v.cv_id).await?.is_empty())
+    }
+
     /// Whether Library is protected: re-pointing it then needs a typed confirmation.
     pub async fn library_protected(&self) -> Result<bool> {
         Ok(self.store.environments(&self.scope).await?.iter().any(|e| e.name == LIBRARY && e.protected))
@@ -1157,9 +1167,7 @@ impl CvService {
         let gone = matches!(task, Err(PulpError::TaskUnknown { .. }))
             && self.client.get::<Value>(&h, &[]).await.is_err_and(|e| e.status() == Some(404));
         if gone || matches!(task, Err(PulpError::TaskFailed { .. })) {
-            vr.pending_task = None;
-            self.alive()?;
-            self.store.save_version_repo(vr).await?;
+            self.clear_task(vr).await?;
         }
         if gone {
             log(format!("{}: task {h} is gone (purged?); sending that step again", vr.repo().repo_name));
@@ -1190,11 +1198,16 @@ impl CvService {
         self.alive()?;
         let task = ops::wait_task(&self.client, &h, on).await;
         if let Err(PulpError::TaskFailed { .. }) = &task {
-            vr.pending_task = None;
-            self.alive()?;
-            self.store.save_version_repo(vr).await?;
+            self.clear_task(vr).await?;
         }
         Ok(task?)
+    }
+
+    /// Forget the task that `vr` records (it failed, was canceled or skipped, or is gone): Resume sends that step again.
+    async fn clear_task(&self, vr: &mut CvVersionRepo) -> Result<()> {
+        vr.pending_task = None;
+        self.alive()?;
+        self.store.save_version_repo(vr).await
     }
 
     // ---- promote / rollback --------------------------------------------------------
@@ -1347,23 +1360,25 @@ impl CvService {
         if let Some(d) = self.named_distribution(cv, env, repo).await? {
             return Ok(format!("{what}: distribution {} at /{}", d.name, d.base_path));
         }
-        let recorded = match row {
-            Some(b) => match self.client.get::<Distribution>(&b.distribution, &[]).await {
-                Ok(d) => Some(d),
-                Err(e) if e.is_not_found() => None,
-                Err(e) => return Err(e.into()),
-            },
-            None => None,
-        };
-        let ours =
-            |d: &Distribution| d.pulp_labels.get(LABEL_CV) == Some(&slug(cv)) && d.pulp_labels.get(LABEL_ENV) == Some(&slug(&env.name));
-        Ok(match recorded.filter(ours) {
+        Ok(match self.recorded_distribution(cv, env, row).await? {
             Some(d) => format!(
                 "{what}: distribution {} at /{} was renamed outside pulp-tui; the promotion looks for {name} and fails: rename it back",
                 d.name, d.base_path
             ),
             None => format!("{what}: new distribution {name} at /{}", base_path(cv, &env.label, &repo.repo_name)),
         })
+    }
+
+    /// The distribution that `row` records, when Pulp still has it with the labels of view `cv` in `env`.
+    async fn recorded_distribution(&self, cv: &str, env: &Environment, row: Option<&BindingRepo>) -> Result<Option<Distribution>> {
+        let Some(b) = row else { return Ok(None) };
+        let d: Distribution = match self.client.get(&b.distribution, &[]).await {
+            Ok(d) => d,
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let ours = d.pulp_labels.get(LABEL_CV) == Some(&slug(cv)) && d.pulp_labels.get(LABEL_ENV) == Some(&slug(&env.name));
+        Ok(ours.then_some(d))
     }
 
     async fn bind_repo(&self, cv: &str, env: &Environment, vr: &CvVersionRepo, on: OnTask<'_>) -> Result<()> {
@@ -1435,18 +1450,23 @@ impl CvService {
         if let Some(e) = self.store.environments(&self.scope).await?.into_iter().find(|e| e.id != env_id && e.label == label) {
             bail!("label {label} is already used by environment {}", e.name);
         }
-        let (mut own, mut out) = (vec![], vec![]);
+        let rows = self.env_rows(env_id).await?;
+        let own: Vec<String> = rows.iter().map(|(_, b)| b.distribution.clone()).collect();
+        self.refuse_label_overlap(label, &own).await?;
+        let moves = rows.into_iter().map(|(cv, b)| {
+            let new = base_path(&cv, label, &b.repo_name);
+            (b, new)
+        });
+        Ok(moves.filter(|(b, new)| b.base_path != *new).collect())
+    }
+
+    /// The served rows of environment `env_id`, each with the name of its view.
+    async fn env_rows(&self, env_id: i64) -> Result<Vec<(String, BindingRepo)>> {
+        let mut out = vec![];
         for cv_id in self.store.env_cv_ids(env_id).await? {
             let cv = self.store.content_view(cv_id).await?.name;
-            for b in self.store.binding_repos(env_id, cv_id).await? {
-                own.push(b.distribution.clone());
-                let new = base_path(&cv, label, &b.repo_name);
-                if b.base_path != new {
-                    out.push((b, new));
-                }
-            }
+            out.extend(self.store.binding_repos(env_id, cv_id).await?.into_iter().map(|b| (cv.clone(), b)));
         }
-        self.refuse_label_overlap(label, &own).await?;
         Ok(out)
     }
 

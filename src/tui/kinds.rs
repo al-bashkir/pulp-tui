@@ -1034,6 +1034,16 @@ fn sum_counts(v: &Value) -> String {
     v.as_object().map(|m| m.values().filter_map(|x| x["count"].as_u64()).sum::<u64>().to_string()).unwrap_or_default()
 }
 
+/// The environment of binding `b` on the Versions screen row of version `v`: its name where `v` is served, with the
+/// state where `v` is the attempt of a promotion that has not completed (`Dev (failed)`).
+fn version_env(b: &crate::store::Binding, envs: &[crate::store::Environment], v: i64, running: bool) -> Option<String> {
+    let e = envs.iter().find(|e| e.id == b.env_id)?;
+    match &b.attempt {
+        Some(a) if a.version_id == v => Some(format!("{} ({})", e.name, crate::cv::shown_state(&a.state, running))),
+        _ => (b.served == Some(v)).then(|| e.name.clone()),
+    }
+}
+
 /// Load one page of a screen. API screens query Pulp; Content View screens read the CV store
 /// (`cv`: the store or why it is unavailable) under `scope`; `profile` marks the active server.
 #[allow(clippy::too_many_arguments)]
@@ -1159,17 +1169,7 @@ pub async fn load(
             let mut out = vec![];
             for v in store.versions(*cv).await? {
                 let state = crate::cv::shown_state(&v.state, running);
-                // Served, or the attempt of a promotion that has not completed (`Dev (failed)`).
-                let in_envs: Vec<String> = bindings
-                    .iter()
-                    .filter_map(|b| {
-                        let e = envs.iter().find(|e| e.id == b.env_id)?;
-                        match &b.attempt {
-                            Some(a) if a.version_id == v.id => Some(format!("{} ({})", e.name, crate::cv::shown_state(&a.state, running))),
-                            _ => (b.served == Some(v.id)).then(|| e.name.clone()),
-                        }
-                    })
-                    .collect();
+                let in_envs: Vec<String> = bindings.iter().filter_map(|b| version_env(b, &envs, v.id, running)).collect();
                 let repos: Vec<Value> = store
                     .version_repos(v.id)
                     .await?
