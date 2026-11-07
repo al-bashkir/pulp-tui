@@ -64,10 +64,10 @@ fn entry(t: RepoType, obj: &Value, writable: &dyn Fn(&str) -> bool, remotes: &BT
 fn field(k: &str, v: &Value, remotes: &BTreeMap<String, String>, api: &str) -> (Option<Value>, Option<String>) {
     match (k, v) {
         _ if crate::session_log::is_secret(k) => (None, (!v.is_null()).then(|| format!("{k} left out (it can hold a secret)"))),
-        ("remote", Value::String(h)) => match remotes.get(h) {
-            Some(name) => (Some(name.clone().into()), None),
-            None => (None, Some(format!("remote {h} left out (not found)"))),
-        },
+        ("remote", Value::String(h)) => {
+            let name = remotes.get(h);
+            (name.map(|n| n.clone().into()), name.is_none().then(|| format!("remote {h} left out (not found)")))
+        }
         ("url" | "proxy_url", Value::String(u)) => match without_credentials(u) {
             Some(clean) => (Some(clean.into()), Some(format!("credentials in {k} left out"))),
             None => (Some(v.clone()), None),
@@ -241,6 +241,23 @@ async fn run(c: &PulpClient, caps: &Capabilities, ex: &ServerExport, apply: bool
     Ok((created, kept, notes))
 }
 
+/// The fields of `schema`'s `required` list that `body` lacks, joined (a ULN remote needs its username and
+/// password, which no export has); None when it has them all.
+fn missing_required(caps: &Capabilities, schema: &str, body: &Value) -> Option<String> {
+    let required = caps.required.get(schema).into_iter().flatten().map(String::as_str);
+    let missing: Vec<&str> = required.filter(|f| body.get(*f).is_none()).collect();
+    (!missing.is_empty()).then(|| missing.join(", "))
+}
+
+/// Create `body` in `collection` (`apply`), else plan it: the new href (a plan: `new:<name>`, by which a repository
+/// of the file finds this remote), or Pulp's refusal. Never retried.
+async fn create_or_plan(c: &PulpClient, collection: &str, body: &Value, name: &str, apply: bool) -> std::result::Result<String, String> {
+    if !apply {
+        return Ok(format!("new:{name}"));
+    }
+    ops::create(c, &c.api(collection), body, collection, &no_progress).await.map_err(|e| format!("{e:#}"))
+}
+
 /// `import` (or with `apply` false, `plan`) for the entries of one plugin type: created, kept, notes, failures.
 async fn import_type(
     c: &PulpClient,
@@ -262,9 +279,8 @@ async fn import_type(
     for (what, collection, schema, entries) in kinds {
         let writable = |f: &str| caps.has_field(schema, f);
         let server = list(c, collection).await?;
-        if what != "repository" {
-            remotes.extend(server.iter().map(|r| (text(r, "pulp_href"), text(r, "name"))));
-        }
+        let remote_kind = what != "repository";
+        remotes.extend(server.iter().filter(|_| remote_kind).map(|r| (text(r, "pulp_href"), text(r, "name"))));
         for e in entries.iter().filter(|e| e.repo_type == t) {
             let label = format!("{} {what} {}", t.label(), e.name);
             if let Some(o) = server.iter().find(|o| o["name"] == e.name.as_str()) {
@@ -277,34 +293,22 @@ async fn import_type(
                 continue;
             }
             let (body, left_out) = create_body(e, &writable, &remotes);
-            // A ULN remote needs its username and password, which no export has.
-            let required = caps.required.get(schema).into_iter().flatten().map(String::as_str);
-            let missing: Vec<&str> = required.filter(|f| body.get(*f).is_none()).collect();
-            if !missing.is_empty() {
-                let needs = missing.join(", ");
+            if let Some(needs) = missing_required(caps, schema, &body) {
                 notes.push(format!(
                     "{label}: not created: it needs {needs} (not in the export); add them to its fields in the file, or create it by hand"
                 ));
                 continue;
             }
-            let href = if apply {
-                match ops::create(c, &c.api(collection), &body, collection, &no_progress).await {
-                    Ok(h) => h,
-                    Err(err) => {
-                        failed.push(format!("{label}: {err:#}"));
-                        if what != "repository" {
-                            refused.insert(e.name.clone());
-                        }
-                        continue;
-                    }
+            let href = match create_or_plan(c, collection, &body, &e.name, apply).await {
+                Ok(h) => h,
+                Err(err) => {
+                    failed.push(format!("{label}: {err}"));
+                    refused.extend(remote_kind.then(|| e.name.clone()));
+                    continue;
                 }
-            } else {
-                notes.push(format!("{label}: create"));
-                format!("new:{}", e.name) // a repository of the file finds this remote by name
             };
-            if what != "repository" {
-                remotes.insert(href, e.name.clone());
-            }
+            notes.extend((!apply).then(|| format!("{label}: create")));
+            remotes.extend(remote_kind.then(|| (href, e.name.clone())));
             created += 1;
             notes.extend(left_out.into_iter().map(|n| format!("{label}: {n}")));
         }
