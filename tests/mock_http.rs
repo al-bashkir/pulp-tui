@@ -669,6 +669,40 @@ async fn deb_package_upload_sends_the_release_and_checks_the_package() {
     }
 }
 
+/// A chunked upload that the content POST refuses, or whose task fails, is deleted; a unit whose server digest is not
+/// the local one is an error.
+#[tokio::test]
+async fn a_failed_chunked_upload_is_deleted_and_a_digest_mismatch_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("big.txt");
+    std::fs::write(&file, vec![1u8; 1024 * 1024 + 1]).unwrap();
+    let (files, upload, unit) = (format!("{API}content/file/files/"), format!("{API}uploads/1/"), format!("{API}content/file/files/1/"));
+    let answer = |verb: &str, p: &str, status: u16, body: Value| {
+        Mock::given(method(verb)).and(path(p.to_string())).respond_with(ResponseTemplate::new(status).set_body_json(body))
+    };
+    for (status, task_state) in [(400, ""), (202, "failed")] {
+        let server = MockServer::start().await;
+        answer("POST", &format!("{API}uploads/"), 201, json!({ "pulp_href": upload })).mount(&server).await;
+        answer("PUT", &upload, 200, json!({})).mount(&server).await;
+        answer("POST", &files, status, json!({ "task": format!("{API}tasks/1/") })).mount(&server).await;
+        let task = json!({ "pulp_href": format!("{API}tasks/1/"), "state": task_state, "error": { "description": "boom" } });
+        answer("GET", &format!("{API}tasks/1/"), 200, task).mount(&server).await;
+        answer("DELETE", &upload, 204, json!({})).expect(1).mount(&server).await;
+        let c = client(&server, |_, s| s.upload_chunk_mb = 1);
+        let e = ops::upload(&c, RepoType::File, &file, None, None, true, &|_, _| {}, &no_progress).await.unwrap_err();
+        assert!(matches!(e, PulpError::Api { status: 400, .. } | PulpError::TaskFailed { .. }), "{e}");
+        server.verify().await;
+    }
+
+    let server = MockServer::start().await;
+    answer("POST", &files, 202, json!({ "task": format!("{API}tasks/1/") })).mount(&server).await;
+    let task = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [unit] });
+    answer("GET", &format!("{API}tasks/1/"), 200, task).mount(&server).await;
+    answer("GET", &unit, 200, json!({ "sha256": "other" })).mount(&server).await;
+    let e = ops::upload(&client(&server, |_, _| {}), RepoType::File, &file, None, None, true, &|_, _| {}, &no_progress).await.unwrap_err();
+    assert!(e.to_string().contains(&format!("digest mismatch for {unit}: local ")), "{e}");
+}
+
 /// A `.udeb` goes to `content/deb/installer_packages/`, any other file to `content/deb/generic_contents/` with its
 /// relative path (required there). Neither takes a release; the digest is checked on the unit that the task names.
 #[tokio::test]

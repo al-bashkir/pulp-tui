@@ -238,7 +238,20 @@ async fn upload_source(
         artifact(c, &dir.join(name), &sha256, progress, on).await?;
     }
     let sha256 = hex::encode(Sha256::digest(&dsc));
-    let mut body = json!({ "artifact": artifact(c, path, &sha256, progress, on).await? });
+    let dsc_artifact = artifact(c, path, &sha256, progress, on).await?;
+    let (content_href, task) = create_source(c, dsc_artifact, repository, overwrite, on).await?;
+    Ok(UploadResult { content_href, sha256, task })
+}
+
+/// The source package of the `.dsc` artifact `dsc`, optionally in `repository`, and the task that made it.
+async fn create_source(
+    c: &PulpClient,
+    dsc: String,
+    repository: Option<&str>,
+    overwrite: bool,
+    on: OnTask<'_>,
+) -> Result<(String, Option<Task>)> {
+    let mut body = json!({ "artifact": dsc });
     if let Some(r) = repository {
         body["repository"] = r.into();
     }
@@ -246,8 +259,7 @@ async fn upload_source(
         body["overwrite"] = false.into();
     }
     let task = ops::settle(c, c.post(&c.api(Upload::Source.endpoint()), &body).await?, on).await?;
-    let content_href = ops::created_href(None, task.as_ref(), "/content/deb/source_packages/")?;
-    Ok(UploadResult { content_href, sha256, task })
+    Ok((ops::created_href(None, task.as_ref(), "/content/deb/source_packages/")?, task))
 }
 
 /// The artifact of the local file `path`, whose sha256 must be `sha256`: the one Pulp has, else `path` uploaded.

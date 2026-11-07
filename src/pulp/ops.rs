@@ -794,59 +794,99 @@ pub async fn upload_fields(
 ) -> Result<UploadResult> {
     let io = |e: std::io::Error| PulpError::Config(format!("{}: {e}", path.display()));
     let size = tokio::fs::metadata(path).await.map_err(io)?.len();
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
-    let chunk = c.upload_chunk();
     let mut f = tokio::fs::File::open(path).await.map_err(io)?;
     let mut hasher = Sha256::new();
-
     let (m, upload_href) = if !chunked(c, size) {
         let mut buf = Vec::with_capacity(size as usize);
         f.read_to_end(&mut buf).await.map_err(io)?;
         hasher.update(&buf);
         progress(size, size);
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
         (c.post_form(&c.api(content), &fields, Some((file_name, buf))).await?, None)
     } else {
-        let up = c.post(&c.api("uploads/"), &json!({ "size": size })).await?;
-        let Mutation::Object(o) = up else { return Err(PulpError::Decode("upload create returned no object".into())) };
-        let href = o["pulp_href"].as_str().ok_or_else(|| PulpError::Decode("upload without href".into()))?.to_string();
-        let mut guard = DeleteOnDrop(Some((c.clone(), href.clone())));
-        let res = async {
-            let mut offset = 0u64;
-            let mut buf = vec![0u8; chunk];
-            loop {
-                let mut n = 0;
-                while n < chunk {
-                    let r = f.read(&mut buf[n..]).await.map_err(io)?;
-                    if r == 0 {
-                        break;
-                    }
-                    n += r;
-                }
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                c.put_chunk(&href, (offset, offset + n as u64 - 1, size), buf[..n].to_vec()).await?;
-                offset += n as u64;
-                progress(offset, size);
-            }
-            if content == ARTIFACTS {
-                return c.post(&format!("{href}commit/"), &json!({ "sha256": hex::encode(hasher.clone().finalize()) })).await;
-            }
-            fields.push(("upload", href.clone()));
-            c.post_form(&c.api(content), &fields, None).await
-        }
-        .await;
-        guard.0 = None;
-        match res {
-            Ok(m) => (m, Some(href)),
-            Err(e) => {
-                let _ = c.delete(&href).await;
-                return Err(e);
-            }
-        }
+        let (m, href) = post_chunked(c, content, &mut fields, (&mut f, size, path), &mut hasher, progress).await?;
+        (m, Some(href))
     };
-    let sha256 = hex::encode(hasher.finalize());
+    uploaded(c, m, upload_href, (content, hex::encode(hasher.finalize())), on).await
+}
+
+/// Send file `f` (`size` bytes, read from `path`) through the chunked upload API, then the POST that consumes the
+/// upload: the content form `fields` with `upload`, or for `ARTIFACTS` its `commit/`. A failed upload is deleted.
+async fn post_chunked(
+    c: &PulpClient,
+    content: &str,
+    fields: &mut Vec<(&str, String)>,
+    file: (&mut tokio::fs::File, u64, &Path),
+    hasher: &mut Sha256,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> Result<(Mutation, String)> {
+    let Mutation::Object(o) = c.post(&c.api("uploads/"), &json!({ "size": file.1 })).await? else {
+        return Err(PulpError::Decode("upload create returned no object".into()));
+    };
+    let href = o["pulp_href"].as_str().ok_or_else(|| PulpError::Decode("upload without href".into()))?.to_string();
+    let mut guard = DeleteOnDrop(Some((c.clone(), href.clone())));
+    let res = async {
+        put_chunks(c, &href, file, hasher, progress).await?;
+        if content == ARTIFACTS {
+            return c.post(&format!("{href}commit/"), &json!({ "sha256": hex::encode(hasher.clone().finalize()) })).await;
+        }
+        fields.push(("upload", href.clone()));
+        c.post_form(&c.api(content), fields, None).await
+    }
+    .await;
+    guard.0 = None;
+    match res {
+        Ok(m) => Ok((m, href)),
+        Err(e) => {
+            let _ = c.delete(&href).await;
+            Err(e)
+        }
+    }
+}
+
+/// PUT file `f` (`size` bytes, read from `path`) to upload `href` in chunks, and add them to `hasher`.
+async fn put_chunks(
+    c: &PulpClient,
+    href: &str,
+    (f, size, path): (&mut tokio::fs::File, u64, &Path),
+    hasher: &mut Sha256,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> Result<()> {
+    let mut buf = vec![0u8; c.upload_chunk()];
+    let mut offset = 0u64;
+    loop {
+        let n = read_chunk(f, &mut buf).await.map_err(|e| PulpError::Config(format!("{}: {e}", path.display())))?;
+        if n == 0 {
+            return Ok(());
+        }
+        hasher.update(&buf[..n]);
+        c.put_chunk(href, (offset, offset + n as u64 - 1, size), buf[..n].to_vec()).await?;
+        offset += n as u64;
+        progress(offset, size);
+    }
+}
+
+/// Fill `buf` from `f`; fewer bytes only at the end of the file.
+async fn read_chunk(f: &mut tokio::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match f.read(&mut buf[n..]).await? {
+            0 => break,
+            r => n += r,
+        }
+    }
+    Ok(n)
+}
+
+/// Wait for the upload mutation `m`; the unit it made under `content` must have the local digest `sha256`. When the
+/// task fails, a leftover chunked upload (`upload_href`) is deleted.
+async fn uploaded(
+    c: &PulpClient,
+    m: Mutation,
+    upload_href: Option<String>,
+    (content, sha256): (&str, String),
+    on: OnTask<'_>,
+) -> Result<UploadResult> {
     let obj = if let Mutation::Object(o) = &m { Some(o.clone()) } else { None };
     let task = match settle(c, m, on).await {
         Ok(t) => t,

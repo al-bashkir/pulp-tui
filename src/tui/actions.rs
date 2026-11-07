@@ -1541,26 +1541,11 @@ const DEB_KINDS: [&str; 5] = ["auto", "deb", "udeb", "dsc", "generic"];
 /// What the Deb upload form sends `path` as: its Kind, or the kind of its extension; another file needs a Kind. The
 /// fields of another kind, and a kind that the server cannot take, are refused.
 fn deb_upload(app: &App, f: &Form, path: &Path) -> Result<deb::Upload, String> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
-    let kind = match f.get("kind") {
-        "auto" => ext,
-        k => k,
-    };
-    let (distribution, component, rel) = (f.opt("distribution"), f.opt("component"), f.opt("relative_path"));
-    let up = match kind {
-        "deb" => deb::Upload::Package { distribution: distribution.map(Into::into), component: component.map(Into::into) },
-        "udeb" => deb::Upload::Installer,
-        "dsc" => deb::Upload::Source,
-        "generic" => {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            deb::Upload::Generic { relative_path: rel.map_or(name, Into::into) }
-        }
-        _ => return Err(format!("pick the Kind: {} is not a .deb, .udeb or .dsc file", path.display())),
-    };
-    if kind != "deb" && (distribution.is_some() || component.is_some()) {
+    let (kind, up) = deb_kind(f, path)?;
+    if kind != "deb" && f.opt("distribution").or(f.opt("component")).is_some() {
         return Err("Distribution and Component are for a .deb package".into());
     }
-    if kind != "generic" && rel.is_some() {
+    if kind != "generic" && f.opt("relative_path").is_some() {
         return Err("Relative path is for generic content".into());
     }
     // A source package is made from artifacts of its files.
@@ -1570,6 +1555,27 @@ fn deb_upload(app: &App, f: &Form, path: &Path) -> Result<deb::Upload, String> {
         Some(e) => Err(format!("not supported by this server: Deb {kind} upload ({e})")),
         None => Ok(up),
     }
+}
+
+/// The Kind of the Deb upload form (`auto`: the extension of `path`) and what it uploads `path` as.
+fn deb_kind<'a>(f: &'a Form, path: &'a Path) -> Result<(&'a str, deb::Upload), String> {
+    let kind = match f.get("kind") {
+        "auto" => path.extension().and_then(|e| e.to_str()).unwrap_or_default(),
+        k => k,
+    };
+    let up = match kind {
+        "deb" => {
+            deb::Upload::Package { distribution: f.opt("distribution").map(Into::into), component: f.opt("component").map(Into::into) }
+        }
+        "udeb" => deb::Upload::Installer,
+        "dsc" => deb::Upload::Source,
+        "generic" => {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            deb::Upload::Generic { relative_path: f.opt("relative_path").map_or(name, Into::into) }
+        }
+        _ => return Err(format!("pick the Kind: {} is not a .deb, .udeb or .dsc file", path.display())),
+    };
+    Ok((kind, up))
 }
 
 /// The upload form of type `t`; the Deb release, relative path and Overwrite fields when the server has them.
@@ -5406,6 +5412,14 @@ mod tests {
         for ctype in [0, 3, 4, 10] {
             assert!(!Kind::Content { version: format!("{repo}versions/1/"), ctype }.actions().contains(&Act::Create), "{ctype}");
         }
+        // Create of another type, or on an RPM version (its type 1 is advisories), does nothing.
+        let (mut app, _rx) = connected(&server).await;
+        let n = app.notices.len();
+        for (version, ctype) in [(format!("{repo}versions/1/"), 3), (format!("{API}repositories/rpm/rpm/r/versions/1/"), 1)] {
+            app.list.kind = Kind::Content { version, ctype };
+            run(&mut app, Act::Create, Value::Null);
+            assert!(app.modal.is_none() && app.jobs.is_empty() && app.notices.len() == n, "{ctype}");
+        }
 
         let server = wiremock::MockServer::start().await;
         let (mut app, mut rx) = deb_content_screen(&server, 2, json!({ "pulp_tui_cv": "web" })).await;
@@ -8784,6 +8798,12 @@ mod tests {
         caps.load_openapi(&json!({ "components": { "schemas": { "deb.Package": { "properties": { "file": {}, "repository": {} } } } } }));
         app.conn.as_mut().unwrap().caps = Arc::new(caps);
         assert_eq!(keys(&form(&mut app, RepoType::Deb).0), ["path", "kind"]);
+        // The release fields follow the package schema, the relative path the generic content schema.
+        let mut caps = plugins();
+        let props = json!({ "properties": { "distribution": {}, "component": {}, "overwrite": {} } });
+        caps.load_openapi(&json!({ "components": { "schemas": { "deb.Package": props } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        assert_eq!(keys(&form(&mut app, RepoType::Deb).0), ["path", "kind", "distribution", "component", "overwrite"]);
     }
 
     /// The Kind of a Deb upload follows the file name (`.deb`, `.udeb`); another file needs a Kind. A `.udeb` goes to
