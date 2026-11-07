@@ -738,7 +738,7 @@ impl CvService {
             bail!("version {} is being deleted; delete it again to finish", v.number);
         }
         self.alive()?;
-        self.store.finish_version(v.id, "publishing", None).await?;
+        self.store.start_publishing(v.id, self.token()).await?;
         let res = async {
             for mut vr in self.store.version_repos(v.id).await? {
                 self.publish_repo(&cv.name, &mut vr, log, on).await.with_context(|| format!("repository {}", vr.repo().repo_name))?;
@@ -757,13 +757,9 @@ impl CvService {
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                // Runs even when the lock is lost (it records why the workflow stopped), but then
-                // only over this workflow's own `publishing` state.
-                if self.alive().is_ok() {
-                    self.store.finish_version(v.id, "failed", Some(&msg)).await?;
-                } else {
-                    self.store.fail_publishing_version(v.id, &msg).await?;
-                }
+                // Runs even when the lock is lost (it records why the workflow stopped), but only over this
+                // workflow's own `publishing` state (by lock token).
+                self.store.fail_publishing_version(v.id, &msg, self.token()).await?;
                 self.audit("cv.publish.failed", &format!("{} version {}: {msg}", cv.name, v.number)).await;
                 Err(e)
             }
@@ -1140,8 +1136,9 @@ impl CvService {
         }
         let Mutation::Task(h) = submit.await? else { bail!("{what} did not return a task") };
         vr.pending_task = Some(h.clone());
-        // Saved even when the lock is lost: it records a task already sent, so Resume re-attaches.
-        self.store.save_version_repo(vr).await?;
+        // Saved even when the lock is lost: it records a task already sent, so Resume re-attaches. Only over this
+        // workflow's own version (by lock token): a takeover's rows stay.
+        self.store.save_own_version_repo(vr, self.token()).await?;
         self.alive()?;
         let task = ops::wait_task(&self.client, &h, on).await;
         if let Err(PulpError::TaskFailed { .. }) = &task {
@@ -1990,6 +1987,13 @@ mod tests {
         assert!(sent.is_empty(), "unexpected {method}: {sent:?}");
     }
 
+    /// `svc` with the lock of view `cv`, running the publish of version `vid` (as `resume` starts it).
+    async fn publishing(svc: CvService, cv: i64, vid: i64) -> CvService {
+        let svc = svc.locked(cv, "publish").await.unwrap();
+        svc.store.start_publishing(vid, svc.token()).await.unwrap();
+        svc
+    }
+
     async fn rpm_version(svc: &CvService) -> (i64, CvVersionRepo) {
         let cv = svc.store.create_cv("k", "web", "").await.unwrap();
         // RPM without filters: the copy is the first mutation (selection needs no content listing).
@@ -2011,7 +2015,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let svc = mock_service(&server).await;
         let (cv, mut vr) = rpm_version(&svc).await;
-        let svc = svc.locked(cv, "publish").await.unwrap();
+        let svc = publishing(svc, cv, vr.version_id).await;
         serve_owner(&server, DERIVED, svc.store.db_id()).await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/pulp/api/v3/rpm/copy/"))
@@ -2585,7 +2589,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let svc = mock_service(&server).await;
         let (cv, mut vr) = copied_deb_version(&server, &svc).await;
-        let svc = svc.locked(cv, "publish").await.unwrap();
+        let svc = publishing(svc, cv, vr.version_id).await;
         let pubs = "/pulp/api/v3/publications/deb/apt/";
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(pubs))
@@ -2629,7 +2633,7 @@ mod tests {
         serve_labels(&server, &vr.repo().repo_href, json!({})).await;
         let old = json!({ "count": 1, "next": null, "results": [{ "pulp_href": format!("{pubs}2/") }] });
         Mock::given(method("GET")).and(path(pubs)).respond_with(ResponseTemplate::new(200).set_body_json(old)).mount(&server).await;
-        let svc = svc.locked(cv, "publish").await.unwrap();
+        let svc = publishing(svc, cv, vr.version_id).await;
         let post = LoseLockOnPost(svc.lock.as_ref().unwrap().lost.clone());
         Mock::given(method("POST")).and(path(pubs)).respond_with(post).mount(&server).await;
         let res = svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await;
@@ -2666,7 +2670,7 @@ mod tests {
             let found: Vec<Value> = existing.iter().map(|p| json!({ "pulp_href": p })).collect();
             let page = json!({ "count": found.len(), "next": null, "results": found });
             Mock::given(method("GET")).and(path(pubs)).respond_with(ResponseTemplate::new(200).set_body_json(page)).mount(&server).await;
-            let svc = svc.locked(cv, "publish").await.unwrap();
+            let svc = publishing(svc, cv, vr.version_id).await;
             Mock::given(method("POST"))
                 .and(path(pubs))
                 .respond_with(LoseLockOnPost(svc.lock.as_ref().unwrap().lost.clone()))

@@ -122,6 +122,8 @@ const MIGRATIONS: &[&str] = &[
         SELECT env_id, cv_id, version_id, state, '', updated_at FROM bindings WHERE state != 'active';
      DELETE FROM bindings WHERE state != 'active';
      ALTER TABLE bindings DROP COLUMN state;",
+    // 8: the lock token of the publish workflow that runs a version: after a lost lock it writes only its own rows.
+    "ALTER TABLE cv_versions ADD COLUMN token TEXT NOT NULL DEFAULT '';",
 ];
 
 /// `MIGRATIONS` for PostgreSQL: every integer is BIGINT (sqlx `Any` reads SQLite integers as
@@ -214,6 +216,8 @@ pub const PG_MIGRATIONS: &[&str] = &[
         SELECT env_id, cv_id, version_id, state, '', updated_at FROM bindings WHERE state <> 'active';
      DELETE FROM bindings WHERE state <> 'active';
      ALTER TABLE bindings DROP COLUMN state;",
+    // 8: the lock token of the publish workflow that runs a version (see `MIGRATIONS`)
+    "ALTER TABLE cv_versions ADD COLUMN token TEXT NOT NULL DEFAULT '';",
 ];
 
 /// A Content View lock not renewed for this long is expired; the next operator takes it over.
@@ -962,15 +966,29 @@ impl Store {
         Ok(())
     }
 
-    /// `finish_version(id, "failed", error)` only while the version is `publishing`: a workflow that lost
-    /// its lock must not overwrite the result of the operator who took it over.
-    pub async fn fail_publishing_version(&self, id: i64, error: &str) -> Result<()> {
-        sqlx::query("UPDATE cv_versions SET state = 'failed', error = $2, finished_at = $3 WHERE id = $1 AND state = 'publishing'")
+    /// The publish workflow that holds lock `token` (`CvLock::token`) runs version `id` now.
+    pub async fn start_publishing(&self, id: i64, token: &str) -> Result<()> {
+        sqlx::query("UPDATE cv_versions SET state = 'publishing', error = NULL, finished_at = $3, token = $2 WHERE id = $1")
             .bind(id)
-            .bind(error)
+            .bind(token)
             .bind(now())
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// `finish_version(id, "failed", error)` only while the version is `publishing` by the workflow with lock `token`:
+    /// a workflow that lost its lock must not overwrite the result of the operator who took it over.
+    pub async fn fail_publishing_version(&self, id: i64, error: &str, token: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE cv_versions SET state = 'failed', error = $2, finished_at = $3 WHERE id = $1 AND state = 'publishing' AND token = $4",
+        )
+        .bind(id)
+        .bind(error)
+        .bind(now())
+        .bind(token)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1033,21 +1051,39 @@ impl Store {
 
     /// Persist a checkpoint after each workflow step (enables resume after a crash).
     pub async fn save_version_repo(&self, vr: &CvVersionRepo) -> Result<()> {
-        sqlx::query(
+        self.save_row(vr, None).await
+    }
+
+    /// `save_version_repo` only while the version is `publishing` by the workflow with lock `token`: the href of a task
+    /// just sent is recorded also after the lock was lost, but never over the rows of the operator who took over.
+    pub async fn save_own_version_repo(&self, vr: &CvVersionRepo, token: &str) -> Result<()> {
+        self.save_row(vr, Some(token)).await
+    }
+
+    async fn save_row(&self, vr: &CvVersionRepo, token: Option<&str>) -> Result<()> {
+        let own = if token.is_some() {
+            " AND EXISTS (SELECT 1 FROM cv_versions WHERE id = $1 AND state = 'publishing' AND token = $10)"
+        } else {
+            ""
+        };
+        let sql = format!(
             "UPDATE cv_version_repos SET source_version = $3, derived_repo = $4, derived_version = $5, publication = $6,
-                    pending_task = $7, content_count = $8, signing = $9 WHERE version_id = $1 AND repo_href = $2",
-        )
-        .bind(vr.version_id)
-        .bind(&vr.repo().repo_href)
-        .bind(&vr.source_version)
-        .bind(&vr.derived_repo)
-        .bind(&vr.derived_version)
-        .bind(&vr.publication)
-        .bind(&vr.pending_task)
-        .bind(vr.content_count)
-        .bind(&vr.signing)
-        .execute(&self.pool)
-        .await?;
+                    pending_task = $7, content_count = $8, signing = $9 WHERE version_id = $1 AND repo_href = $2{own}"
+        );
+        let mut q = sqlx::query(AssertSqlSafe(sql)) // `own` is a literal
+            .bind(vr.version_id)
+            .bind(&vr.repo().repo_href)
+            .bind(&vr.source_version)
+            .bind(&vr.derived_repo)
+            .bind(&vr.derived_version)
+            .bind(&vr.publication)
+            .bind(&vr.pending_task)
+            .bind(vr.content_count)
+            .bind(&vr.signing);
+        if let Some(t) = token {
+            q = q.bind(t);
+        }
+        q.execute(&self.pool).await?;
         Ok(())
     }
 
@@ -2731,16 +2767,30 @@ mod tests {
         let s = Store::open_in_memory().await.unwrap();
         let cv = s.create_cv("k", "web", "").await.unwrap();
         let lib = s.ensure_library("k").await.unwrap();
-        let (v1, v2) = (s.begin_version(cv, "", &[]).await.unwrap(), s.begin_version(cv, "", &[]).await.unwrap());
-        // Still publishing: the stop is recorded.
-        s.fail_publishing_version(v1.id, "lock lost").await.unwrap();
+        let os = repo("os", RepoType::Rpm);
+        let (v1, v2) = (s.begin_version(cv, "", std::slice::from_ref(&os)).await.unwrap(), s.begin_version(cv, "", &[]).await.unwrap());
+        // Still publishing by this workflow: the stop is recorded.
+        s.start_publishing(v1.id, "a").await.unwrap();
+        s.fail_publishing_version(v1.id, "lock lost", "a").await.unwrap();
         let v = s.version(v1.id).await.unwrap();
         assert_eq!((v.state.as_str(), v.error.as_deref()), ("failed", Some("lock lost")));
         // The new holder published it meanwhile: unchanged.
+        s.start_publishing(v2.id, "a").await.unwrap();
         s.finish_version(v2.id, "published", None).await.unwrap();
-        s.fail_publishing_version(v2.id, "lock lost").await.unwrap();
+        s.fail_publishing_version(v2.id, "lock lost", "a").await.unwrap();
         let v = s.version(v2.id).await.unwrap();
         assert_eq!((v.state.as_str(), v.error), ("published", None));
+        // The new holder resumed the same version (`publishing` again): neither the state nor a checkpoint changes.
+        s.start_publishing(v1.id, "a").await.unwrap();
+        s.start_publishing(v1.id, "b").await.unwrap();
+        let row = s.version_repos(v1.id).await.unwrap().remove(0);
+        let theirs = CvVersionRepo { pending_task: Some("/t/b/".into()), ..row.clone() };
+        s.save_own_version_repo(&theirs, "b").await.unwrap();
+        s.fail_publishing_version(v1.id, "lock lost", "a").await.unwrap();
+        s.save_own_version_repo(&CvVersionRepo { pending_task: Some("/t/a/".into()), ..row.clone() }, "a").await.unwrap();
+        let v = s.version(v1.id).await.unwrap();
+        assert_eq!((v.state.as_str(), v.error), ("publishing", None));
+        assert_eq!(s.version_repos(v1.id).await.unwrap(), [theirs]);
 
         // Still this promotion (its lock token): the final state is recorded.
         s.start_promotion(lib, cv, v1.id, "a").await.unwrap();

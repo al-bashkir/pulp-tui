@@ -394,6 +394,7 @@ PostgreSQL, so SQL must be portable. Store calls are `async` and run in jobs.
 | 5      | `cv_version_repos.signing` (also stops an older pulp-tui on Deb rows) |
 | 6      | `binding_repos.env_id` foreign key (drops orphan rows)                |
 | 7      | `promotions`; `bindings` keeps only served (active) rows, no `state`  |
+| 8      | `cv_versions.token` (lock token of the publish that runs it)          |
 
 `cv_components` has no cascade, so the database refuses to delete a view or version that a
 composite uses. `bindings.env_id`, `promotions.env_id` and `binding_repos.env_id` have no cascade either: the
@@ -420,11 +421,15 @@ client clock).
 * `CvService::alive()` runs `CvLock::check` before every Pulp mutation and store write,
   with no database round trip. It fails when the lock is lost, or when the last renewal is
   older than 90 s (TTL minus renew; Tokio timers stop while a computer sleeps).
-* After a lost lock, only three writes still happen: the href of a just-submitted task, the
-  `failed` state of the publish (`Store::fail_publishing_version`, only while
-  `publishing`), and the promotion result (`Store::finish_promotion`, only on the
-  `promotions` row that its lock token started). So they never overwrite an operator who took
-  over.
+* A workflow writes its lock token (`CvLock::token`) on the rows it starts: the version that
+  it publishes (`Store::start_publishing`, `cv_versions.token`) and its promotion
+  (`Store::start_promotion`, `promotions.token`). An operator who takes over and resumes or
+  promotes the same version writes their own token.
+* After a lost lock, only three writes still happen, each only while the row still has the
+  workflow's token: the href of a just-submitted task (`Store::save_own_version_repo`, also
+  only while `publishing`), the `failed` state of the publish
+  (`Store::fail_publishing_version`, only while `publishing`), and the promotion result
+  (`Store::finish_promotion`). So they never change a row of an operator who took over.
 * *Break lock* (`Store::break_lock`) deletes the row only if the holder is still the one
   shown. Drop releases by token; a crash leaves the row until it expires.
 * Locked: publish, resume, promote, rollback, unpromote, delete. Not locked: preview,

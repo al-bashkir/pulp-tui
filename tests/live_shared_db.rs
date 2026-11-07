@@ -266,6 +266,28 @@ async fn two_operators_share_state_and_locks() {
     assert!(!a.break_lock(cv, &shown).await.unwrap(), "already broken");
     drop(lock_b);
 
+    // B took over from A and resumed or re-promoted the same version: A's late writes after its lost lock change
+    // none of B's rows.
+    let os = repo("os", RepoType::Rpm);
+    let v = a.begin_version(cv, "", std::slice::from_ref(&os)).await.unwrap();
+    let lib = a.ensure_library("k").await.unwrap();
+    a.start_publishing(v.id, "ta").await.unwrap();
+    a.start_promotion(lib, cv, v.id, "ta").await.unwrap();
+    b.start_publishing(v.id, "tb").await.unwrap();
+    b.start_promotion(lib, cv, v.id, "tb").await.unwrap();
+    let row = b.version_repos(v.id).await.unwrap().remove(0);
+    let theirs = CvVersionRepo { pending_task: Some("/t/b/".into()), ..row.clone() };
+    b.save_own_version_repo(&theirs, "tb").await.unwrap();
+    a.fail_publishing_version(v.id, "lock lost", "ta").await.unwrap();
+    a.save_own_version_repo(&CvVersionRepo { pending_task: Some("/t/a/".into()), ..row }, "ta").await.unwrap();
+    a.finish_promotion(lib, cv, v.id, "failed", "ta").await.unwrap();
+    let seen = b.version(v.id).await.unwrap();
+    assert_eq!((seen.state.as_str(), seen.error), ("publishing", None));
+    assert_eq!(b.version_repos(v.id).await.unwrap(), [theirs]);
+    assert_eq!(b.binding(lib, cv).await.unwrap().unwrap().attempt.unwrap().state, "promoting");
+    b.finish_promotion(lib, cv, v.id, "active", "tb").await.unwrap();
+    assert_eq!(a.binding(lib, cv).await.unwrap().unwrap().active(), Some(v.id));
+
     // Eight simultaneous attempts from both connections: PostgreSQL lets exactly one win.
     let other = a.create_cv("k", "api", "").await.unwrap();
     let now = unix_now();
@@ -316,8 +338,9 @@ async fn store_methods_on_postgres() {
     st.save_version_repo(&vr).await.unwrap();
     assert_eq!(st.version_repos(v1.id).await.unwrap().iter().find(|r| r.repo().repo_name == "os"), Some(&vr));
     st.finish_version(v1.id, "published", None).await.unwrap();
-    st.fail_publishing_version(v2.id, "boom").await.unwrap();
-    st.fail_publishing_version(v1.id, "lost").await.unwrap(); // not publishing: unchanged
+    st.start_publishing(v2.id, "t").await.unwrap();
+    st.fail_publishing_version(v2.id, "boom", "t").await.unwrap();
+    st.fail_publishing_version(v1.id, "lost", "t").await.unwrap(); // not publishing: unchanged
     assert_eq!(st.version(v1.id).await.unwrap().state, "published");
     assert_eq!(st.version(v2.id).await.unwrap().error.as_deref(), Some("boom"));
     assert_eq!(st.protected_versions(k).await.unwrap(), vec!["/dr/versions/1/"]);
