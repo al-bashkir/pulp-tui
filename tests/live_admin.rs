@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use pulp_tui::config::Config;
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{PulpClient, RepoType};
+use pulp_tui::pulp::{Capabilities, PulpClient, RepoType};
 use pulp_tui::store::Store;
 use pulp_tui::tui::actions::run;
 use pulp_tui::tui::app::{App, Modal, Msg, NO_PROFILE, Screen};
@@ -759,26 +759,37 @@ async fn upstream_pulp_create_edit_and_delete_through_the_tui() {
         return;
     }
     let (c, name) = (client(), unique("admin-upstream"));
+    // pulpcore 3.63 has no policy: its replication deletes every local object of the domain that is not upstream.
+    let policy = Capabilities::detect(&c).await.unwrap().has_field("UpstreamPulp", "policy");
     let set = |u: &Value, k: &str| u["hidden_fields"].as_array().unwrap().iter().any(|h| h["name"] == k && h["is_set"] == true);
     let (mut app, mut rx) = app().await;
     open_list(&mut app, &mut rx, Kind::UpstreamPulps, &name).await;
     run(&mut app, Act::Create, Value::Null);
     fill(&mut app, &[("name", &name), ("base_url", "https://upstream.example.com"), ("username", "u"), ("password", "p")]);
+    if !policy {
+        let (lines, typed) = yes(&mut app);
+        assert_eq!(typed.as_deref(), Some(name.as_str()));
+        assert!(lines[0].contains("may DELETE every local repository"), "{lines:?}");
+    }
     settle(&mut app, &mut rx).await;
     shown(&app, &format!("create upstream {name}: done"));
     let u = row(&app, "name", &name).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
-    assert_eq!((u["policy"].as_str(), set(&u, "username"), set(&u, "password")), (Some("nodelete"), true, true));
+    assert_eq!((u["policy"].as_str(), set(&u, "username"), set(&u, "password")), (policy.then_some("nodelete"), true, true));
     let href = s(&u, "pulp_href");
 
     run(&mut app, Act::Edit, u);
-    fill(&mut app, &[("policy", "labeled"), ("clear_password", "true")]);
-    let (lines, typed) = yes(&mut app);
-    assert_eq!(typed.as_deref(), Some("labeled"));
-    assert!(lines[0].starts_with("!!! policy `labeled` may DELETE "), "{lines:?}");
+    if policy {
+        fill(&mut app, &[("policy", "labeled"), ("clear_password", "true")]);
+        let (lines, typed) = yes(&mut app);
+        assert_eq!(typed.as_deref(), Some("labeled"));
+        assert!(lines[0].starts_with("!!! policy `labeled` may DELETE "), "{lines:?}");
+    } else {
+        fill(&mut app, &[("clear_password", "true")]);
+    }
     settle(&mut app, &mut rx).await;
     shown(&app, &format!("update upstream {name}: done"));
     let u: Value = c.get(&href, &[]).await.unwrap();
-    assert_eq!((u["policy"].as_str(), set(&u, "username"), set(&u, "password")), (Some("labeled"), true, false));
+    assert_eq!((u["policy"].as_str(), set(&u, "username"), set(&u, "password")), (policy.then_some("labeled"), true, false));
 
     let r = row(&app, "name", &name).unwrap();
     run(&mut app, Act::Delete, r);
