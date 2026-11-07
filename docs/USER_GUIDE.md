@@ -549,7 +549,10 @@ retry, or roll back to the served version to clear the failed attempt.
 * **P** refuses a view that holds a snapshot repository. Remove it (**x**) and add its source. To
   use the content of another view, make a composite.
 * **v** versions. **i** full JSON.
-* **M** promotes a version to an environment, with a preview of every distribution.
+* **M** promotes a version to an environment, with a preview of every distribution. The preview
+  reads the distributions from Pulp. A distribution of the view that was renamed outside pulp-tui
+  shows with its real name: the promotion looks for the pulp-tui name and fails for it, so rename
+  it back first.
 * **b** rolls an environment back. After Library: only a version older than the newest bound one
   (served or attempted), or that one again (a retry). For a newer version, or an environment
   without a version, use Promote. In Library: any published version.

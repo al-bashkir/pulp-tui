@@ -387,6 +387,19 @@ async fn a_failed_promotion_keeps_the_served_version() {
         }
     };
     rename("-moved").await;
+    // The preview reads the distribution from Pulp: it names the renamed one and says the promotion fails.
+    let env = store.environments(&profile).await.unwrap().into_iter().find(|e| e.id == dev).unwrap();
+    let docs = store.version_repos(v2.id).await.unwrap().remove(0);
+    let line = svc.promote_target(&id, &env, docs.repo(), rows.iter().find(|b| b.repo_name == "docs")).await.unwrap();
+    let moved = pulp_tui::cv::distribution_name(&id, "Dev", "docs");
+    assert_eq!(
+        line,
+        format!(
+            "  docs (File): distribution {moved}-moved at /{} was renamed outside pulp-tui; the promotion looks for {moved} and fails: \
+             rename it back",
+            base_path(&id, "dev", "docs")
+        )
+    );
     let e = svc.promote(cv, v2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap_err().to_string();
     assert!(e.starts_with(&format!("{id} in Dev: failed: ")) && e.contains("is used by distribution"), "{e}");
     let b = store.binding(dev, cv).await.unwrap().unwrap();

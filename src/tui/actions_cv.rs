@@ -4,7 +4,7 @@ use super::actions::{ap, caps, confirm_mirror, sync_policies, unsupported};
 use super::app::{App, Ctx, Level, NO_PROFILE, unavailable};
 use super::form::{Field, FieldKind, Form, PickItem, Source};
 use super::kinds::{Act, Kind, s};
-use crate::cv::{Mode, check_repo_clash, distribution_name};
+use crate::cv::{Mode, check_repo_clash};
 use crate::filters::{format_rules, parse_rules};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, RepoType};
@@ -732,18 +732,12 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
             None => "nothing".into(),
         };
         let mut lines = vec![format!("{name}: {env} now serves {cur_num}; will serve v{}", v.number), String::new()];
-        let vrs = st.version_repos(vid).await?;
+        let (vrs, rows) = (st.version_repos(vid).await?, st.binding_repos(e.id, cv).await?);
         for vr in &vrs {
-            let r = vr.repo();
-            lines.push(format!(
-                "  {} ({}): distribution {} at /{}",
-                r.repo_name,
-                r.repo_type.label(),
-                distribution_name(&name, &env, &r.repo_name),
-                svc.served_path(&name, &e, r).await?
-            ));
+            let row = rows.iter().find(|b| b.repo_href == vr.repo().repo_href);
+            lines.push(svc.promote_target(&name, &e, vr.repo(), row).await?);
         }
-        for b in st.binding_repos(e.id, cv).await? {
+        for b in rows {
             if !vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) && b.publication.is_some() {
                 lines.push(format!("  {}: not part of v{} -> its distribution stops serving (kept for rollback)", b.repo_name, v.number));
             }
@@ -2094,6 +2088,49 @@ mod tests {
         svc.promote(web, v1.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap();
         assert_eq!(shown_envs(&st, web, v1.id).await, ("Library:v1".into(), "Library".into()));
         assert_eq!(shown_envs(&st, web, v2.id).await.1, "", "the failed attempt is gone after the rollback");
+    }
+
+    /// The distribution of `os` in Dev was renamed in Pulp: the preview names it as Pulp has it, not as derived.
+    #[tokio::test]
+    async fn the_promote_preview_shows_a_distribution_renamed_outside_pulp_tui() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        let dev = st.create_env("lab", "Dev", lib, false).await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = st.begin_version(web, "", &[cv_repo("os", "rpm", "1"), cv_repo("docs", "file", "2")]).await.unwrap();
+        st.finish_version(v.id, "published", None).await.unwrap();
+        st.promoted(lib, web, v.id, "active").await.unwrap();
+        let os = "/pulp/api/v3/distributions/rpm/rpm/7/";
+        let row = crate::store::BindingRepo {
+            env_id: dev,
+            cv_id: web,
+            repo_href: format!("{REPOS}rpm/rpm/1/"),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: os.into(),
+            base_path: "dev/web/os".into(),
+            publication: Some("/p/1/".into()),
+        };
+        st.save_binding_repo(&row).await.unwrap();
+        let none = json!({ "count": 0, "next": null, "results": [] });
+        for t in ["rpm/rpm", "file/file"] {
+            serve(&server, "GET", format!("/pulp/api/v3/distributions/{t}/"), 200, none.clone()).await;
+        }
+        let labels = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: "Dev" });
+        let renamed = json!({ "pulp_href": os, "name": "os-moved", "base_path": "custom/os", "pulp_labels": labels });
+        serve(&server, "GET", os.into(), 200, renamed).await;
+        promote_preview(&mut app, web, "web".into(), v.id, "Dev".into(), Mode::Promote);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(
+            confirm_lines(&mut app)[2..4],
+            [
+                "  docs (File): new distribution pulp-tui-cv-web-Dev-docs at /dev/web/docs",
+                "  os (RPM): distribution os-moved at /custom/os was renamed outside pulp-tui; the promotion looks for \
+                 pulp-tui-cv-web-Dev-os and fails: rename it back"
+            ]
+        );
     }
 
     fn confirm_lines(app: &mut App) -> Vec<String> {

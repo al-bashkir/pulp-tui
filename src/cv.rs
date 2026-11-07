@@ -1280,26 +1280,59 @@ impl CvService {
     /// servers use a `cv/` prefix, and an operator may move a distribution), a new one gets `base_path`.
     /// Refuses the distribution of another view or environment that has the same derived name.
     pub async fn served_path(&self, cv: &str, env: &Environment, repo: &CvRepo) -> Result<String> {
+        Ok(match self.named_distribution(cv, env, repo).await? {
+            Some(d) => d.base_path,
+            None => base_path(cv, &env.label, &repo.repo_name),
+        })
+    }
+
+    /// The distribution of the derived name of `repo` (view `cv`, `env`), which a promotion re-points. Refuses the
+    /// distribution of another view or environment that has the same derived name.
+    async fn named_distribution(&self, cv: &str, env: &Environment, repo: &CvRepo) -> Result<Option<Distribution>> {
         let coll = self.client.api(repo.repo_type.distributions());
         let name = distribution_name(cv, &env.name, &repo.repo_name);
-        Ok(match ops::find_by_name::<Distribution>(&self.client, &coll, &name).await? {
-            Some(d) => {
-                // The `-` join of view, environment and repository names can collide (`web`+`Library`+`b-c`,
-                // `web-Library`+`b`+`c`); the format stays. An unlabeled one is refused by `ops::ensure_distribution`.
-                let (lv, le) = (d.pulp_labels.get(LABEL_CV), d.pulp_labels.get(LABEL_ENV));
-                if let (Some(v), Some(e)) = (lv, le)
-                    && (v, e) != (&slug(cv), &slug(&env.name))
-                {
-                    bail!(
-                        "distribution {name} belongs to content view {v} in environment {e} (labels {LABEL_CV}={v}, {LABEL_ENV}={e}): \
-                         view {cv} in environment {} with repository {} derives the same name; refusing to modify it",
-                        env.name,
-                        repo.repo_name
-                    );
-                }
-                d.base_path
-            }
-            None => base_path(cv, &env.label, &repo.repo_name),
+        let Some(d) = ops::find_by_name::<Distribution>(&self.client, &coll, &name).await? else { return Ok(None) };
+        // The `-` join of view, environment and repository names can collide (`web`+`Library`+`b-c`,
+        // `web-Library`+`b`+`c`); the format stays. An unlabeled one is refused by `ops::ensure_distribution`.
+        let (lv, le) = (d.pulp_labels.get(LABEL_CV), d.pulp_labels.get(LABEL_ENV));
+        if let (Some(v), Some(e)) = (lv, le)
+            && (v, e) != (&slug(cv), &slug(&env.name))
+        {
+            bail!(
+                "distribution {name} belongs to content view {v} in environment {e} (labels {LABEL_CV}={v}, {LABEL_ENV}={e}): \
+                 view {cv} in environment {} with repository {} derives the same name; refusing to modify it",
+                env.name,
+                repo.repo_name
+            );
+        }
+        Ok(Some(d))
+    }
+
+    /// The preview line of the promotion of `repo` (view `cv`) to `env`, read from Pulp: the distribution of the derived
+    /// name, the one that `row` records when it still has this view's labels but another name (renamed outside
+    /// pulp-tui: the promotion looks for the derived name and fails on its base path), or a new one.
+    pub async fn promote_target(&self, cv: &str, env: &Environment, repo: &CvRepo, row: Option<&BindingRepo>) -> Result<String> {
+        let what = format!("  {} ({})", repo.repo_name, repo.repo_type.label());
+        let name = distribution_name(cv, &env.name, &repo.repo_name);
+        if let Some(d) = self.named_distribution(cv, env, repo).await? {
+            return Ok(format!("{what}: distribution {} at /{}", d.name, d.base_path));
+        }
+        let recorded = match row {
+            Some(b) => match self.client.get::<Distribution>(&b.distribution, &[]).await {
+                Ok(d) => Some(d),
+                Err(e) if e.is_not_found() => None,
+                Err(e) => return Err(e.into()),
+            },
+            None => None,
+        };
+        let ours =
+            |d: &Distribution| d.pulp_labels.get(LABEL_CV) == Some(&slug(cv)) && d.pulp_labels.get(LABEL_ENV) == Some(&slug(&env.name));
+        Ok(match recorded.filter(ours) {
+            Some(d) => format!(
+                "{what}: distribution {} at /{} was renamed outside pulp-tui; the promotion looks for {name} and fails: rename it back",
+                d.name, d.base_path
+            ),
+            None => format!("{what}: new distribution {name} at /{}", base_path(cv, &env.label, &repo.repo_name)),
         })
     }
 
