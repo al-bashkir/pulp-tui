@@ -2499,7 +2499,11 @@ fn version_action(app: &mut App, act: Act, item: Value) {
             ];
             ap(move |app| {
                 app.confirm_danger(format!("Delete version {number}"), lines, &id, move |app| {
-                    submit(app, format!("delete version {number}"), move |c| async move { Ok(c.delete(&href).await?) })
+                    let label = format!("delete version {number}");
+                    app.job(label.clone(), move |ctx| async move {
+                        let m = ctx.client.delete(&href).await?;
+                        ap(move |app| unmark_when_deleted(app, href, m, label))
+                    })
                 })
             })
         }),
@@ -5841,6 +5845,29 @@ mod tests {
         assert_eq!(typed.as_deref(), Some("r@v3"));
         assert_eq!(lines[0], "Delete repository version 3 (r@v3) and its 0 publication(s).");
         assert!(!lines.iter().any(|l| l.contains("stop serving") || l.contains("switch")), "{lines:?}");
+    }
+
+    /// A deleted version loses its mark when the delete task completes, so Compare uses existing versions only.
+    #[tokio::test]
+    async fn a_deleted_version_is_unmarked_when_its_task_completes() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/file/file/r/");
+        let v = |n: u32| format!("{repo}versions/{n}/");
+        for coll in ["publications/file/file/", "distributions/file/file/"] {
+            get(&server, &format!("{API}{coll}"), page(json!([]))).await;
+        }
+        answer(&server, "DELETE", &v(3), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        get(&server, &format!("{API}tasks/1/"), json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed" })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Versions(None);
+        app.list.marked = [v(3), v(4)].into();
+        version_action(&mut app, Act::Delete, json!({ "pulp_href": v(3), "number": 3 }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.list.marked, [v(4)].into());
     }
 
     #[tokio::test]
