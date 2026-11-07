@@ -1537,25 +1537,11 @@ impl Store {
     /// becomes latest: the versions of another database do not exist here. Components are added to the composites
     /// this call created, after all views exist, so the order of the file does not matter.
     pub async fn import(&self, profile: &str, ex: &Export) -> Result<(usize, usize, Vec<String>)> {
-        if !(1..=2).contains(&ex.format) {
-            bail!("unsupported export format {}", ex.format);
-        }
         check_import_entries(ex)?;
         let (existing, views) = (self.environments(profile).await?, self.content_views(profile).await?);
-        let ((label, protected), order) = self.import_env_plan(profile, ex, &existing).await?;
-        let mut ids: HashMap<&str, i64> = existing.iter().map(|e| (e.name.as_str(), e.id)).collect();
-        let mut warnings: Vec<String> = ex
-            .environments
-            .iter()
-            .filter(|e| e.name != LIBRARY && ids.contains_key(e.name.as_str()))
-            .map(|e| format!("environment {} exists; not changed", e.name))
-            .collect();
+        let (library, order) = self.import_env_plan(profile, ex, &existing).await?;
         let mut tx = self.pool.begin().await?;
-        ids.insert(LIBRARY, library_in(&mut tx, profile, &label, protected).await?);
-        for e in &order {
-            let id = insert_env_row(&mut tx, profile, &e.name, ids[e.prior.as_str()], e.protected, &export_label(e)).await?;
-            ids.insert(&e.name, id);
-        }
+        let mut warnings = import_envs(&mut tx, profile, ex, library, &order, &existing).await?;
         let (cvs, more) = import_views(&mut tx, profile, ex, &views).await?;
         warnings.extend(more);
         tx.commit().await?;
@@ -1933,8 +1919,33 @@ async fn copy_binding(c: &mut AnyConnection, b: &Binding, env_id: i64, cv_id: i6
     Ok(())
 }
 
-/// The checks of `Store::import` that need no database: names, labels, filter rules, a view in the file twice.
+/// `Store::import` of the environments on `c`: Library when it is missing (`library`: its label and flag), then each
+/// one of `order` after its prior. Returns a warning for each environment of the file that `existing` has.
+async fn import_envs(
+    c: &mut AnyConnection,
+    profile: &str,
+    ex: &Export,
+    (label, protected): (String, bool),
+    order: &[&ExportEnv],
+    existing: &[Environment],
+) -> Result<Vec<String>> {
+    let mut ids: HashMap<&str, i64> = existing.iter().map(|e| (e.name.as_str(), e.id)).collect();
+    let kept = ex.environments.iter().filter(|e| e.name != LIBRARY && ids.contains_key(e.name.as_str()));
+    let warnings = kept.map(|e| format!("environment {} exists; not changed", e.name)).collect();
+    ids.insert(LIBRARY, library_in(c, profile, &label, protected).await?);
+    for e in order {
+        let id = insert_env_row(c, profile, &e.name, ids[e.prior.as_str()], e.protected, &export_label(e)).await?;
+        ids.insert(&e.name, id);
+    }
+    Ok(warnings)
+}
+
+/// The checks of `Store::import` that need no database: the format, names, labels, filter rules, a view in the
+/// file twice.
 fn check_import_entries(ex: &Export) -> Result<()> {
+    if !(1..=2).contains(&ex.format) {
+        bail!("unsupported export format {}", ex.format);
+    }
     for v in &ex.content_views {
         check_import_view(v)?;
     }
@@ -3410,8 +3421,10 @@ mod tests {
         assert_eq!(dst.import("k", &old).await.unwrap(), (1, 0, vec![]));
         assert!(!dst.content_views("k").await.unwrap().iter().find(|v| v.name == "old").unwrap().composite);
 
-        let e = dst.import("k", &Export { format: 3, ..ex }).await.unwrap_err().to_string();
+        let e = dst.import("k", &Export { format: 3, ..ex.clone() }).await.unwrap_err().to_string();
         assert_eq!(e, "unsupported export format 3");
+        let e = dst.import("k", &Export { format: 0, ..ex }).await.unwrap_err().to_string();
+        assert_eq!(e, "unsupported export format 0", "formats start at 1");
     }
 
     #[tokio::test]
