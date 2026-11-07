@@ -272,7 +272,7 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl 
         let mut goes = vec![];
         for href in repos {
             let r: Value = ctx.client.get(&href, &[]).await?;
-            if latest_goes(&ctx, &r, 1).await? {
+            if latest_goes(&ctx, &r, 1).await?.is_some() {
                 goes.push(s(&r, "name"));
             }
         }
@@ -299,17 +299,16 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl 
 }
 
 /// pulpcore `Repository.cleanup_old_versions`: after each new version, Pulp keeps the newest `retain_repo_versions`
-/// versions that no distribution serves (`protected_versions`) and deletes the others. True when the next `versions`
-/// new versions make Pulp delete the current version of the repository `r`: retention `versions` or less and no
-/// distribution serves it.
-async fn latest_goes(ctx: &Ctx, r: &Value, versions: usize) -> anyhow::Result<bool> {
+/// versions that no distribution serves (`protected_versions`) and deletes the others. The retention when the next
+/// `versions` new versions make Pulp delete the current version of the repository `r`: retention `versions` or less
+/// and no distribution serves it.
+async fn latest_goes(ctx: &Ctx, r: &Value, versions: usize) -> anyhow::Result<Option<u64>> {
     // Version 0 is empty: its delete loses no content.
     let latest = r["latest_version_href"].as_str().filter(|v| version_number(v) > 0);
-    let Some(v) = latest.filter(|_| r["retain_repo_versions"].as_u64().is_some_and(|k| k as usize <= versions)) else {
-        return Ok(false);
-    };
+    let retain = r["retain_repo_versions"].as_u64().filter(|k| *k as usize <= versions);
+    let (Some(v), Some(k)) = (latest, retain) else { return Ok(None) };
     let t = RepoType::from_href(v).ok_or_else(|| anyhow!("unknown repository type: {v}"))?;
-    Ok(ops::version_protection(&ctx.client, &ctx.caps, t, v).await?.1.is_empty())
+    Ok(ops::version_protection(&ctx.client, &ctx.caps, t, v).await?.1.is_empty().then_some(k))
 }
 
 /// The confirm lines when the next `retain` new versions make Pulp delete the current version of `names` (`latest_goes`).
@@ -336,11 +335,11 @@ fn confirm_if_latest_goes(
         let r: Value = ctx.client.get(&repo, &[]).await?;
         let goes = latest_goes(&ctx, &r, 1).await?;
         ap(move |app| match goes {
-            true => {
+            Some(retain) => {
                 let name = s(&r, "name");
-                app.confirm_danger(title, goes_lines(&name, r["retain_repo_versions"].as_u64().unwrap_or(1), what), &name, go)
+                app.confirm_danger(title, goes_lines(&name, retain, what), &name, go)
             }
-            false => go(app),
+            None => go(app),
         })
     });
 }
@@ -1861,7 +1860,7 @@ fn prune_dry_run(app: &mut App, repos: Vec<String>, keep_days: u64) {
 async fn pruned_retention_lines(ctx: &Ctx, read: &[Value], dry: &[rpm::Pruned]) -> anyhow::Result<Vec<String>> {
     let mut goes = vec![];
     for r in read.iter().filter(|r| dry.iter().any(|p| p.repo == s(r, "name") && p.packages > 0)) {
-        if latest_goes(ctx, r, 1).await? {
+        if latest_goes(ctx, r, 1).await?.is_some() {
             goes.push(s(r, "name"));
         }
     }
@@ -2936,14 +2935,14 @@ fn remove_content(app: &mut App, t: RepoType, version: String, units: Vec<String
         let lines = remove_lines(&r, &version, units.len(), k, goes);
         ap(move |app| {
             let go = move |app: &mut App| remove_run(app, t, version, units, (latest, sent));
-            if goes { app.confirm_danger("Remove content", lines, &name, go) } else { app.confirm("Remove content", lines, go) }
+            if goes.is_some() { app.confirm_danger("Remove content", lines, &name, go) } else { app.confirm("Remove content", lines, go) }
         })
     });
 }
 
-/// The confirm lines of a Remove of `n` units in `k` batches from repository `r`, browsed at `version`; `goes`: Pulp
-/// then deletes the current version (`latest_goes`).
-fn remove_lines(r: &Value, version: &str, n: usize, k: usize, goes: bool) -> Vec<String> {
+/// The confirm lines of a Remove of `n` units in `k` batches from repository `r`, browsed at `version`; `goes`: the
+/// retention when Pulp then deletes the current version (`latest_goes`).
+fn remove_lines(r: &Value, version: &str, n: usize, k: usize, goes: Option<u64>) -> Vec<String> {
     let (name, latest) = (s(r, "name"), s(r, "latest_version_href"));
     let mut lines = vec![match k {
         1 => format!("Create a new version of {name} without {n} unit(s)."),
@@ -2953,10 +2952,9 @@ fn remove_lines(r: &Value, version: &str, n: usize, k: usize, goes: bool) -> Vec
         let (shown, now) = (version_number(version), version_number(&latest));
         lines.push(format!("NOTE: the units leave the LATEST version {now} of {name}, not the version {shown} shown here."));
     }
-    if goes {
-        lines.extend(goes_lines(&name, r["retain_repo_versions"].as_u64().unwrap_or(1), "The removed content"));
-    } else {
-        lines.push("The current and older versions are immutable and keep the content.".into());
+    match goes {
+        Some(retain) => lines.extend(goes_lines(&name, retain, "The removed content")),
+        None => lines.push("The current and older versions are immutable and keep the content.".into()),
     }
     lines
 }
@@ -6362,6 +6360,8 @@ mod tests {
         let dists = page(json!([
             { "pulp_href": "/d/1/", "name": "apt", "base_path": "apt", "publication": apt },
             { "pulp_href": "/d/2/", "name": "flat", "base_path": "flat", "base_url": "http://h/flat/", "publication": verbatim },
+            { "pulp_href": "/d/3/", "name": "other", "base_path": "other", "publication": format!("{API}publications/deb/apt/9/") },
+            { "pulp_href": "/d/4/", "name": "unbound", "base_path": "unbound" },
         ]));
         get(&server, &format!("{API}distributions/deb/apt/"), dists).await;
         let (mut app, mut rx) = connected(&server).await;
@@ -6372,6 +6372,7 @@ mod tests {
         assert_eq!(lines[0], "Deletes repository r with all 2 versions and 2 publications.");
         assert!(lines.contains(&"  flat (http://h/flat/)".to_string()), "{lines:?}");
         assert!(lines.contains(&"WARNING: 2 distribution(s) serve it and stop serving:".to_string()), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("other") || l.contains("unbound")), "{lines:?}");
     }
 
     /// A Content View snapshot repository, also one of another database, is never deleted from the Repositories screen.
@@ -7164,6 +7165,7 @@ mod tests {
             (json!({ "autopublish": true }), "mirror_content_only", None),
             (json!({ "retain_package_versions": 2 }), "mirror_complete", Some(retain)),
             (json!({ "retain_package_versions": 2 }), "mirror_content_only", Some(retain)),
+            (json!({ "retain_package_versions": 1 }), "mirror_content_only", Some(retain)),
             (json!({ "retain_package_versions": 0 }), "mirror_content_only", None),
         ] {
             let mut item = json!({ "pulp_href": format!("{API}repositories/rpm/rpm/r/"), "name": "os", "remote": null });
@@ -8289,13 +8291,17 @@ mod tests {
     async fn comps_replace_and_prune_confirms_warn_when_retention_deletes_the_current_version() {
         use crate::tui::app::Modal;
         use wiremock::matchers::{method, path};
-        let server = prune_server(&[("os", 2, Some(3), 0)]).await;
-        let os = format!("{API}repositories/rpm/rpm/os/");
-        let r = json!({ "pulp_href": os, "name": "os", "pulp_labels": {}, "latest_version_href": format!("{os}versions/2/"),
-            "retain_repo_versions": 1 });
-        // Before the repository answer of prune_server.
-        let answer = wiremock::ResponseTemplate::new(200).set_body_json(r);
-        wiremock::Mock::given(method("GET")).and(path(os.as_str())).respond_with(answer).with_priority(1).mount(&server).await;
+        // extras loses no package: its retention does not matter.
+        let server = prune_server(&[("extras", 0, None, 0), ("os", 1, Some(3), 0)]).await;
+        let href = |n: &str| format!("{API}repositories/rpm/rpm/{n}/");
+        let (os, extras) = (href("os"), href("extras"));
+        for (name, h) in [("os", &os), ("extras", &extras)] {
+            let r = json!({ "pulp_href": h, "name": name, "pulp_labels": {}, "latest_version_href": format!("{h}versions/2/"),
+                "retain_repo_versions": 1 });
+            // Before the repository answer of prune_server.
+            let answer = wiremock::ResponseTemplate::new(200).set_body_json(r);
+            wiremock::Mock::given(method("GET")).and(path(h.as_str())).respond_with(answer).with_priority(1).mount(&server).await;
+        }
         for coll in ["publications/rpm/rpm/", "distributions/rpm/rpm/"] {
             get(&server, &format!("{API}{coll}"), page(json!([]))).await;
         }
@@ -8317,11 +8323,12 @@ mod tests {
         assert!(lines.contains(&warning), "{lines:?}");
         assert!(posts_to(&server, &format!("{API}rpm/comps/")).await.is_empty(), "nothing sent before the confirm");
 
+        app.list.marked = [os.clone(), extras.clone()].into();
         run(&mut app, Act::PrunePackages, item);
         fill_and_submit(&mut app, &[]);
         settle(&mut app, &mut rx).await;
         let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text)) };
-        assert!(lines.contains(&warning), "{lines:?}");
+        assert!(lines.contains(&warning), "only os loses packages: {lines:?}");
         assert!(!lines.iter().any(|l| l.contains("older versions keep them")), "{lines:?}");
     }
 
