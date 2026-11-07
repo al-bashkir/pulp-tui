@@ -1094,15 +1094,17 @@ fn show_replication(app: &mut App, name: &str, res: anyhow::Result<Vec<String>>)
     }
 }
 
+const REPLICATE: &str = "pulpcore.app.tasks.replica.replicate_distributions";
+
 /// The five newest runs of the Upstream Pulp `href`.
 fn replication_history(app: &mut App, href: String, name: String) {
     app.job("replication history", move |ctx| async move {
         let c = &ctx.client;
-        // Each run's `replicate_distributions` reserves the Upstream Pulp: a stable link, unlike the group's
-        // description, which holds the name at the time of the run.
+        // A run's `replicate_distributions` reserves the Upstream Pulp (pulpcore 3.123; not 3.95): a stable link,
+        // unlike the group's description, which holds the name at the time of the run.
         let q = [
             ("reserved_resources", href.clone()),
-            ("name", "pulpcore.app.tasks.replica.replicate_distributions".into()),
+            ("name", REPLICATE.into()),
             ("ordering", "-pulp_created".into()),
             ("fields", "task_group".into()),
             ("limit", "5".into()),
@@ -1111,16 +1113,54 @@ fn replication_history(app: &mut App, href: String, name: String) {
         for g in c.list::<Value>(&c.api("tasks/"), &q).await?.results.iter().filter_map(|t| t["task_group"].as_str()) {
             groups.push(c.get::<Value>(g, &[]).await?);
         }
-        let mut lines = vec![];
-        for g in &groups {
-            lines.push(format!("{}  completed {} failed {} canceled {}", s(g, "pulp_href"), g["completed"], g["failed"], g["canceled"]));
-            lines.extend(g["tasks"].as_array().into_iter().flatten().map(|t| format!("    {:<10} {}", s(t, "state"), s(t, "name"))));
+        let by_name = groups.is_empty() && runs_reserve_no_upstream(c).await?;
+        if by_name {
+            groups = groups_named(c, &format!("Replication of {name}")).await?;
         }
-        if lines.is_empty() {
-            lines.push("no replication of this upstream found (purged tasks are gone)".into());
-        }
+        let lines = history_lines(&groups, by_name.then_some(name.as_str()));
         ap(move |app| app.text(format!("Replication history of {name}"), lines))
     });
+}
+
+/// The History text of the task `groups`; `by_name` is the name they were found by, if no task links them.
+fn history_lines(groups: &[Value], by_name: Option<&str>) -> Vec<String> {
+    let mut lines = vec![];
+    for g in groups {
+        lines.push(format!("{}  completed {} failed {} canceled {}", s(g, "pulp_href"), g["completed"], g["failed"], g["canceled"]));
+        lines.extend(g["tasks"].as_array().into_iter().flatten().map(|t| format!("    {:<10} {}", s(t, "state"), s(t, "name"))));
+    }
+    match by_name {
+        _ if lines.is_empty() => lines.push("no replication of this upstream found (purged tasks are gone)".into()),
+        Some(name) => lines.push(format!("(found by the name {name} at run time: this pulpcore does not link a run to its Upstream Pulp)")),
+        None => {}
+    }
+    lines
+}
+
+/// The newest replication run of this server reserves no Upstream Pulp (pulpcore 3.95 and older).
+async fn runs_reserve_no_upstream(c: &PulpClient) -> anyhow::Result<bool> {
+    let q = [
+        ("name", REPLICATE.into()),
+        ("ordering", "-pulp_created".into()),
+        ("fields", "reserved_resources_record".into()),
+        ("limit", "1".into()),
+    ];
+    let newest = c.list::<Value>(&c.api("tasks/"), &q).await?.results;
+    Ok(newest.first().is_some_and(|t| !t["reserved_resources_record"].to_string().contains("upstream")))
+}
+
+/// The five newest task groups with the description `want`. task-groups/ has no filters (newest first): read pages
+/// of 100 until five match, at most 20 pages.
+async fn groups_named(c: &PulpClient, want: &str) -> anyhow::Result<Vec<Value>> {
+    let (mut groups, mut next) = (vec![], Some(c.api("task-groups/?limit=100")));
+    for _ in 0..20 {
+        let Some(href) = next.take().filter(|_| groups.len() < 5) else { break };
+        let page = c.list::<Value>(&href, &[]).await?;
+        let room = 5 - groups.len();
+        groups.extend(page.results.into_iter().filter(|g| g["description"].as_str() == Some(want)).take(room));
+        next = page.next;
+    }
+    Ok(groups)
 }
 
 /// Delete the Upstream Pulp `href`: first what uses it, then the typed name.
@@ -1998,6 +2038,79 @@ mod tests {
                 "    failed     pulpcore.app.tasks.replica.replicate_distributions".to_string(),
             ]
         );
+        let reqs = server.received_requests().await.unwrap();
+        assert!(!reqs.iter().any(|r| r.url.path() == GROUPS), "no scan of task-groups/");
+    }
+
+    /// `tasks/` answers the query of reserved runs with none, and the newest run (`limit=1`) with `record`.
+    async fn no_reserved_runs(server: &MockServer, record: Value) {
+        use wiremock::matchers::query_param;
+        let tasks = |results: Value| ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": results }));
+        let at = || Mock::given(method("GET")).and(path("/pulp/api/v3/tasks/"));
+        at().and(query_param("reserved_resources", UP)).respond_with(tasks(json!([]))).mount(server).await;
+        at().and(query_param("limit", "1")).respond_with(tasks(json!([{ "reserved_resources_record": record }]))).mount(server).await;
+    }
+
+    #[tokio::test]
+    async fn replication_history_of_a_pulpcore_whose_runs_reserve_no_upstream_pages_task_groups_by_name() {
+        use wiremock::matchers::query_param;
+        const GROUPS: &str = "/pulp/api/v3/task-groups/";
+        let server = MockServer::start().await;
+        // pulpcore 3.95.3: a run reserves the domain's servers, not its Upstream Pulp.
+        no_reserved_runs(&server, json!(["pdrn:d:servers", "shared:prn:core.domain:d"])).await;
+        let g = |n: usize, d: &str| json!({ "pulp_href": format!("{GROUPS}{n}/"), "description": d, "completed": 1, "failed": 0, "canceled": 0, "tasks": [] });
+        let page = |results: Vec<Value>, next: Option<u32>| {
+            let next = next.map(|o| format!("{}{GROUPS}?limit=100&offset={o}", server.uri()));
+            ResponseTemplate::new(200).set_body_json(json!({ "count": 300, "next": next, "results": results }))
+        };
+        // task-groups/ has no filters and lists newest first; a busy server has other groups on page 1.
+        let at = |o: &str| Mock::given(method("GET")).and(path(GROUPS)).and(query_param("offset", o));
+        at("100").respond_with(page((100..104).map(|n| g(n, "Replication of up")).collect(), Some(200))).mount(&server).await;
+        at("200").respond_with(page((200..202).map(|n| g(n, "Replication of up")).collect(), Some(300))).mount(&server).await;
+        at("300").respond_with(page(vec![g(300, "Replication of up")], None)).mount(&server).await;
+        let first = (0..3).map(|n| g(n, "Replication of other")).collect();
+        Mock::given(method("GET")).and(path(GROUPS)).respond_with(page(first, Some(100))).mount(&server).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        super::upstream_action(&mut app, crate::tui::kinds::Act::ReplicationHistory, json!({ "pulp_href": UP, "name": "up" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no history: {:?}", notices(&app)) };
+        let rows: Vec<&String> = lines.iter().filter(|l| l.starts_with(GROUPS)).collect();
+        assert_eq!(rows.len(), 5, "the five newest replications of up: {lines:?}");
+        assert!(rows[0].starts_with(&format!("{GROUPS}100/")) && rows[4].starts_with(&format!("{GROUPS}200/")), "{lines:?}");
+        assert!(lines.last().unwrap().contains("by the name up"), "the match by name is said: {lines:?}");
+        let reqs = server.received_requests().await.unwrap();
+        assert!(!reqs.iter().any(|r| r.url.query().unwrap_or_default().contains("offset=300")), "five found: page 4 is not read");
+    }
+
+    #[tokio::test]
+    async fn replication_history_by_name_reads_at_most_twenty_pages_of_task_groups() {
+        const GROUPS: &str = "/pulp/api/v3/task-groups/";
+        let server = MockServer::start().await;
+        no_reserved_runs(&server, json!(["pdrn:d:servers"])).await;
+        let other = json!({ "pulp_href": format!("{GROUPS}1/"), "description": "Replication of other", "tasks": [] });
+        let next = format!("{}{GROUPS}?limit=100&offset=100", server.uri());
+        let endless = json!({ "count": 9999, "next": next, "results": [other] });
+        Mock::given(method("GET")).and(path(GROUPS)).respond_with(ResponseTemplate::new(200).set_body_json(endless)).mount(&server).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        super::upstream_action(&mut app, crate::tui::kinds::Act::ReplicationHistory, json!({ "pulp_href": UP, "name": "up" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no history: {:?}", notices(&app)) };
+        assert_eq!(lines, &["no replication of this upstream found (purged tasks are gone)"]);
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.iter().filter(|r| r.url.path() == GROUPS).count(), 20, "at most 2000 groups at 100 a page");
+    }
+
+    #[tokio::test]
+    async fn replication_history_of_a_never_run_upstream_matches_no_name_when_runs_reserve_their_upstream() {
+        const GROUPS: &str = "/pulp/api/v3/task-groups/";
+        let server = MockServer::start().await;
+        // pulpcore 3.123.1: a run of another Upstream Pulp reserves that one.
+        no_reserved_runs(&server, json!(["pdrn:d:servers", "shared:prn:core.upstreampulp:9"])).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        super::upstream_action(&mut app, crate::tui::kinds::Act::ReplicationHistory, json!({ "pulp_href": UP, "name": "up" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no history: {:?}", notices(&app)) };
+        assert_eq!(lines, &["no replication of this upstream found (purged tasks are gone)"]);
         let reqs = server.received_requests().await.unwrap();
         assert!(!reqs.iter().any(|r| r.url.path() == GROUPS), "no scan of task-groups/");
     }

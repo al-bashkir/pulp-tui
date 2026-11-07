@@ -679,6 +679,10 @@ Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
   the Upstream Pulp (`tasks/?reserved_resources=<upstream href>`; 3.123.1 dispatches it with
   `shared_resources=[server]`). The group description holds the name at run time, so it is
   no link after a rename. An unknown filter is a 400 in pulpcore, never a wider list.
+  3.63.36 and 3.95.3 reserve only `pdrn:<domain>:servers` (no Upstream Pulp), so there no task
+  links a run to its Upstream Pulp. When no run reserves the Upstream Pulp and the newest run of
+  the server reserves none, History pages through `task-groups/` for `Replication of <name>`
+  (five matches or 20 pages of 100) and says that it matched by name.
 * **Deb replica (fallback).** A structured APT publication serves each release of its
   release components under `dists/<release>/`, and a flat `/` as an ordinary release under
   `dists/flat-repo/` (pulp_deb 3.11.1 `_ReleaseHelper`); a simple one serves `dists/default/`
