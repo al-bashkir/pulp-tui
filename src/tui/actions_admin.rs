@@ -1184,7 +1184,7 @@ fn exporter_form(app: &mut App, fs: bool, edit: bool, item: &Value) {
     let caps = caps(app);
     if !fs {
         let repos: Vec<&str> = item["repositories"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-        let mut pick = Field::pick("repositories", "Repositories", Source::Repos(None)).multi().required().value(repos.join("\n"));
+        let mut pick = Field::pick("repositories", "Repositories", Source::ExportRepos).multi().required().value(repos.join("\n"));
         if !repos.is_empty() {
             pick.shown = format!("{} selected", repos.len());
         }
@@ -1363,7 +1363,7 @@ fn chosen_versions(text: &str, exporter: &str, repos: &[ExportRepo]) -> Result<V
 fn fs_export(app: &mut App, href: String, name: String, path: String) {
     let what = vec!["publication".to_string(), "repository version".to_string()];
     let mut fields = vec![
-        Field::pick("repo", "Repository", Source::Repos(None)).required(),
+        Field::pick("repo", "Repository", Source::ExportRepos).required(),
         Field::new("number", "Version number", FieldKind::Number).help("empty = latest"),
     ];
     if caps(app).is_none_or(|c| c.has_field("FilesystemExport", "start_repository_version")) {
@@ -1686,6 +1686,47 @@ mod tests {
         assert!(n.iter().any(|(l, t)| *l == Level::Warn && t.contains("replicate up") && t.contains("canceled 1")), "{n:?}");
         settle(&mut app, &mut rx).await;
         assert_eq!(store.tasks("lab", 10).await.unwrap()[0].state, "canceled", "stored final: not re-attached again");
+    }
+
+    /// Exporters take Content View snapshots: a published version is what goes to a disconnected server. They are marked.
+    #[tokio::test]
+    async fn exporters_pick_content_view_snapshots_marked_as_such() {
+        use crate::tui::kinds::Act;
+        use wiremock::matchers::query_param_is_missing;
+        let server = MockServer::start().await;
+        let rows = json!({ "count": 2, "next": null, "results": [
+            { "name": "os", "pulp_href": "/h/os/", "pulp_labels": {} },
+            { "name": "pulp-tui-cv-web-os", "pulp_href": "/h/snap/", "pulp_labels": { "pulp_tui_cv": "web", "pulp_tui_db": "x" } }] });
+        // Like Pulp: a `pulp_label_select=!pulp_tui_cv` query would not list the snapshot.
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
+            .and(query_param_is_missing("pulp_label_select"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(rows))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let caps = crate::pulp::Capabilities {
+            versions: [("rpm".to_string(), "3.39.5".to_string())].into(),
+            paths: ["repositories/rpm/rpm/".to_string()].into(),
+            ..Default::default()
+        };
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        let fs = json!({ "pulp_href": "/e/1/", "name": "fs", "path": "/exports/fs" });
+        for (kind, act, item, field) in
+            [(Kind::PulpExporters, Act::Create, Value::Null, "repositories"), (Kind::FsExporters, Act::Export, fs, "repo")]
+        {
+            app.list.kind = kind.clone();
+            super::exporter_action(&mut app, act, item);
+            let Some(Modal::Form { form, .. }) = &mut app.modal else { panic!("no form: {:?}", notices(&app)) };
+            form.focus = form.fields.iter().position(|f| f.key == field).unwrap();
+            app.handle_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter));
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no form: {:?}", notices(&app)) };
+            let shown: Vec<_> = form.visible().iter().map(|i| (i.label.clone(), i.value.clone())).collect();
+            let want = [("os", "/h/os/"), ("pulp-tui-cv-web-os (snapshot of Content View web)", "/h/snap/")];
+            assert_eq!(shown, want.map(|(l, v)| (l.to_string(), v.to_string())), "{kind:?}");
+            app.modal = None;
+        }
     }
 
     #[tokio::test]

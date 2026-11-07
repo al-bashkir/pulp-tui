@@ -23,11 +23,14 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
         Source::Repos(Some(t)) => vec![(t.repositories(), NAME_HREF, "name", "name", "")],
         // A server may lack one of the plugins: list only what it has installed (status, which needs no
         // OpenAPI) and what its API offers.
-        Source::Repos(None) => RepoType::ALL
-            .into_iter()
-            .filter(|t| ctx.caps.supports(t.feature()) && ctx.caps.has_endpoint(t.repositories()))
-            .map(|t| (t.repositories(), NAME_HREF, "name", "pulp_href", t.component()))
-            .collect(),
+        Source::Repos(None) | Source::ExportRepos => {
+            let fields = if *source == Source::ExportRepos { "name,pulp_href,pulp_labels" } else { NAME_HREF };
+            RepoType::ALL
+                .into_iter()
+                .filter(|t| ctx.caps.supports(t.feature()) && ctx.caps.has_endpoint(t.repositories()))
+                .map(|t| (t.repositories(), fields, "name", "pulp_href", t.component()))
+                .collect()
+        }
         Source::Remotes(t) => vec![(t.remotes(), NAME_HREF, "name", "name", "")],
         Source::SyncRemotes(t) => {
             sync_remotes(&ctx.caps, *t).into_iter().map(|(path, note)| (path, NAME_HREF, "name", "name", note)).collect()
@@ -50,9 +53,17 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
             query.push(("pulp_label_select", format!("!{}", crate::cv::LABEL_CV))); // a snapshot is never a source
         }
         let rows: Vec<Value> = ctx.client.list_all(&ctx.client.api(path), &query, CAP).await?;
-        out.extend(rows.iter().map(|r| PickItem { label: text(r, label), value: text(r, value), note: note.into() }));
+        out.extend(rows.iter().map(|r| PickItem { label: snapshot_marked(text(r, label), r), value: text(r, value), note: note.into() }));
     }
     Ok(out)
+}
+
+/// `label` of a Content View snapshot (a row read with its `pulp_labels`) names the view.
+fn snapshot_marked(label: String, row: &Value) -> String {
+    match row["pulp_labels"][crate::cv::LABEL_CV].as_str() {
+        Some(view) => format!("{label} (snapshot of Content View {view})"),
+        None => label,
+    }
 }
 
 /// Collections (and picker notes) of the remotes that a repository of `t` syncs from: the plugin's own, and its second

@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub enum Source {
     /// `None` = RPM, File and Deb repositories that can be Content View sources (no CV snapshots).
     Repos(Option<RepoType>),
+    /// RPM, File and Deb repositories to export: Content View snapshots too, marked. The value is the href.
+    ExportRepos,
     Remotes(RepoType),
     /// The remotes that a repository of the type syncs from: also its second remote type (ULN, Git). The value is the name.
     SyncRemotes(RepoType),

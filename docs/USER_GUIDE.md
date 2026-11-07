@@ -762,7 +762,8 @@ Native Upstream Pulp objects (tech preview).
 
 Disconnected export with the exporters of pulpcore. Pulp writes the files to a directory on its
 own disk, which must be in the server's `ALLOWED_EXPORT_PATHS` (empty by default). `t` toggles
-Pulp and filesystem exporters. **i** full JSON.
+Pulp and filesystem exporters. **i** full JSON. The repository pickers also list Content View
+snapshots, marked `(snapshot of Content View <view>)`: export a published version that way.
 
 Pulp exporters:
 

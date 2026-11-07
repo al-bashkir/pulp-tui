@@ -6,9 +6,13 @@
 mod common;
 
 use common::*;
+use crossterm::event::{KeyCode, KeyEvent};
 use pulp_tui::pulp::RepoType;
 use pulp_tui::pulp::client::Page;
 use pulp_tui::pulp::ops::{self, no_progress};
+use pulp_tui::tui::actions::run;
+use pulp_tui::tui::app::Modal;
+use pulp_tui::tui::kinds::{Act, Kind};
 use serde_json::{Value, json};
 
 /// In `ALLOWED_EXPORT_PATHS` and `ALLOWED_IMPORT_PATHS` of the test containers (tests/env/pulp-env.sh).
@@ -164,6 +168,41 @@ async fn pulp_import_of_the_export_tar_by_its_path() {
     let imports: Page<Value> = c.list(&format!("{importer}imports/"), &[]).await.unwrap();
     assert_eq!(imports.results[0]["params"]["path"].as_str(), Some(tar.as_str()));
     cleanup(&c, &[&importer, &exporter, &dst, &repo, &remote]).await;
+}
+
+/// A Content View snapshot (a repository with `pulp_tui_cv`) is offered, marked, by the exporter's repository picker,
+/// and the exporter made with it in the TUI exports it.
+#[tokio::test]
+async fn a_content_view_snapshot_can_be_exported() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = unique("it-export-snap");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &name, "file/PULP_MANIFEST", "mirror").await;
+    let m = c.patch(&repo, &json!({ "pulp_labels": { "pulp_tui_cv": "snapview", "pulp_tui_db": "it" } })).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::PulpExporters;
+    run(&mut app, Act::Create, Value::Null);
+    let Some(Modal::Form { form, .. }) = &mut app.modal else { panic!("no form: {:?}", texts(&app)) };
+    form.focus = form.fields.iter().position(|f| f.key == "repositories").unwrap();
+    app.handle_key(KeyEvent::from(KeyCode::Enter));
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no form: {:?}", texts(&app)) };
+    let offered = form.visible().iter().find(|i| i.value == repo).map(|i| i.label.clone());
+    assert_eq!(offered, Some(format!("{name} (snapshot of Content View snapview)")));
+
+    let dir = format!("{EXPORTS}/{name}");
+    fill(&mut app, &[("name", &name), ("path", &dir), ("repositories", &repo)]);
+    settle(&mut app, &mut rx).await;
+    let exporter: Value = ops::find_by_name(&c, &c.api("exporters/core/pulp/"), &name).await.unwrap().expect("exporter made");
+    let exporter = exporter["pulp_href"].as_str().unwrap().to_string();
+    let export = ops::create(&c, &format!("{exporter}exports/"), &json!({}), "/exports/", &no_progress).await.unwrap();
+    let e: Value = c.get(&export, &[]).await.unwrap();
+    assert_eq!(e["exported_resources"], json!([latest(&c, &repo).await]));
+    cleanup(&c, &[&exporter, &repo, &remote]).await;
 }
 
 #[tokio::test]
