@@ -6,7 +6,8 @@ use pulp_tui::config::{Config, Profile, Settings};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{Mutation, PulpClient, RepoType};
 use pulp_tui::store::Store;
-use pulp_tui::tui::app::{App, Modal, Msg, NO_PROFILE};
+use pulp_tui::tui::app::{App, Modal, Msg, NO_PROFILE, Screen};
+use pulp_tui::tui::kinds::Kind;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -111,6 +112,43 @@ pub fn texts(app: &App) -> Vec<String> {
 pub async fn settle_submitted(c: &PulpClient, app: &App) {
     let href = app.tasks.items.first().unwrap_or_else(|| panic!("no task: {:?}", texts(app))).href.clone();
     ops::settle(c, Mutation::Task(href), &no_progress).await.unwrap();
+}
+
+/// Let the jobs end (one submits a task), then poll the Task Center as the UI loop does until every tracked task is
+/// final, then let the jobs (the list reload that a finished task starts) end.
+pub async fn settle_tasks(app: &mut App, rx: &mut UnboundedReceiver<Msg>) {
+    use std::time::{Duration, Instant};
+    settle(app, rx).await;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while app.tasks.items.iter().any(|t| !t.is_final()) {
+        assert!(Instant::now() < deadline, "the tasks did not end: {:?}", texts(app));
+        app.tick();
+        if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+            app.handle_msg(m);
+        }
+    }
+    settle(app, rx).await;
+}
+
+/// Answer yes to the open confirmation; returns its lines and the typed name it asks for.
+pub fn yes(app: &mut App) -> (Vec<String>, Option<String>) {
+    let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(app)) };
+    yes(app);
+    (lines, typed)
+}
+
+/// Open list `kind` filtered by `filter` (as `/` does) and load it.
+pub async fn open_list(app: &mut App, rx: &mut UnboundedReceiver<Msg>, kind: Kind, filter: &str) {
+    app.open(Screen::List(kind));
+    app.list.filter = filter.into();
+    app.reload();
+    settle(app, rx).await;
+    assert_eq!(app.list.error, None);
+}
+
+/// The row of the open list whose `key` is `value`.
+pub fn row(app: &App, key: &str, value: &str) -> Option<Value> {
+    app.list.items.iter().find(|r| r[key] == value).cloned()
 }
 
 /// Set `values` in the open form and submit it.

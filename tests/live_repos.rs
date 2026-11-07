@@ -9,9 +9,10 @@ use pulp_tui::pulp::models::{Package, RepoVersion};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{Capabilities, Mutation, PulpClient, RepoType, file, rpm};
 use pulp_tui::tui::actions::run;
-use pulp_tui::tui::app::Modal;
-use pulp_tui::tui::kinds::{Act, Kind};
+use pulp_tui::tui::app::{App, Modal, Msg};
+use pulp_tui::tui::kinds::{Act, Kind, s, short};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn dist_url(c: &PulpClient, dist: &str) -> String {
     let d: Value = c.get(dist, &[]).await.unwrap();
@@ -809,4 +810,169 @@ async fn snapshot_repository_of_another_database_is_not_deleted_through_the_tui(
     assert!(app.modal.is_none() && texts(&app).last().unwrap().contains(&refused), "{:?}", texts(&app));
     assert!(c.get::<Value>(&repo, &[]).await.is_ok(), "the repository stays");
     cleanup(&c, &[&repo]).await;
+}
+
+/// A repository of type `t` synced from `path` (version 1), and version 2 without one unit of version 1.
+async fn two_versions(c: &PulpClient, t: RepoType, name: &str, path: &str) -> (String, String, [String; 2]) {
+    let url = format!("{}/{path}", upstream());
+    let mut body = json!({ "name": name, "url": url, "policy": "immediate" });
+    if t == RepoType::Deb {
+        body["distributions"] = "fixture".into();
+    }
+    let remote = create(c, t.remotes(), body, "/remotes/").await;
+    let repo = create(c, t.repositories(), json!({ "name": name, "remote": remote }), "/repositories/").await;
+    ops::settle(c, ops::sync(c, t, &repo, None, "additive").await.unwrap(), &no_progress).await.unwrap();
+    let v1 = latest(c, &repo).await;
+    let q = [("repository_version", v1.clone()), ("limit", "1".to_string())];
+    let unit = c.list::<Value>(&c.api(t.content()), &q).await.unwrap().results[0]["pulp_href"].clone();
+    let m = c.post(&format!("{repo}modify/"), &json!({ "remove_content_units": [unit] })).await.unwrap();
+    ops::settle(c, m, &no_progress).await.unwrap();
+    let v2 = latest(c, &repo).await;
+    assert!(v2.ends_with("/versions/2/"), "{v2}");
+    (repo, remote, [v1, v2])
+}
+
+/// Verify (V) on distribution `row`: the last line of the result.
+async fn tui_verify(app: &mut App, rx: &mut UnboundedReceiver<Msg>, row: Value) -> String {
+    run(app, Act::Verify, row);
+    settle(app, rx).await;
+    let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verify result: {:?}", texts(app)) };
+    lines.last().cloned().unwrap_or_default()
+}
+
+/// The Publications and Distributions screens of type `t` through the TUI, on a repository with versions 1 and 2
+/// (`path`: its fixture; `file`: a file that each publication serves):
+/// * Publications Create makes a publication of version 1;
+/// * Distributions Create pins one distribution to it (the form reuses it) and binds another to the repository;
+/// * Edit of the base path, then of the binding (version 2), each after the typed name; the old URL gets 404;
+/// * Rollback (b) back to version 1: the preview names the existing publication, the job re-points and verifies;
+/// * Publications Delete of the version 2 publication names the distribution that serves it and what it serves after;
+/// * Distributions Delete: the Task Center tracks each task to its end and the list reloads without the row.
+async fn publications_and_distributions_through_the_tui(t: RepoType, path: &str, file: &str) {
+    let (c, name) = (client(), unique(&format!("it-dist-{}", t.component())));
+    let (repo, remote, [v1, v2]) = two_versions(&c, t, &name, path).await;
+    let (pinned, follow) = (format!("{name}-pin"), format!("{name}-follow"));
+    let (mut app, mut rx) = app().await;
+
+    open_list(&mut app, &mut rx, Kind::Publications(t), "").await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("repo", &name), ("number", "1")]);
+    settle(&mut app, &mut rx).await;
+    let pubs = async |v: &str| -> Vec<String> {
+        let all: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository_version", v.to_string())], 100).await.unwrap();
+        all.iter().map(|p| p["pulp_href"].as_str().unwrap().to_string()).collect()
+    };
+    let p1 = pubs(&v1).await.pop().unwrap_or_else(|| panic!("no publication: {:?}", texts(&app)));
+    assert!(texts(&app).contains(&format!("publication {} of {}", short(&p1), short(&v1))), "{:?}", texts(&app));
+    assert!(row(&app, "pulp_href", &p1).is_some(), "the list reloads with it");
+
+    // Create: pinned to version 1, and following the repository.
+    open_list(&mut app, &mut rx, Kind::Distributions(t), &name).await;
+    for (dist, mode) in [(&pinned, "publication of a repository version"), (&follow, "follow repository latest")] {
+        run(&mut app, Act::Create, Value::Null);
+        fill(&mut app, &[("name", dist), ("base_path", dist), ("mode", mode), ("repo", &name), ("number", "1")]);
+        settle(&mut app, &mut rx).await;
+        assert!(texts(&app).contains(&format!("create distribution {dist}: done")), "{:?}", texts(&app));
+    }
+    let d = row(&app, "name", &pinned).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    assert_eq!((d["publication"].as_str(), &d["repository"]), (Some(p1.as_str()), &Value::Null), "pinned to the reused publication");
+    let f = row(&app, "name", &follow).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    assert_eq!((f["repository"].as_str(), &f["publication"]), (Some(repo.as_str()), &Value::Null));
+    let cols = Kind::Distributions(t).columns();
+    assert_eq!(((cols[2].get)(&d), (cols[2].get)(&f)), ("pinned".into(), "latest".into()));
+    assert!(tui_verify(&mut app, &mut rx, d.clone()).await.starts_with("OK: "), "the pinned distribution serves version 1");
+
+    // Edit the base path: the typed name, then the new path serves and the old one is gone.
+    let moved = format!("{pinned}-moved");
+    run(&mut app, Act::Edit, d.clone());
+    fill(&mut app, &[("base_path", &moved)]);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some(pinned.as_str()));
+    assert!(lines.contains(&format!("  base path:   {pinned} -> {moved}")), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).contains(&format!("update distribution {pinned}: done")), "{:?}", texts(&app));
+    let d = row(&app, "name", &pinned).unwrap();
+    assert_eq!(d["base_path"], moved.as_str(), "the list reloads with the new path");
+    let url = s(&d, "base_url");
+    assert_eq!(served(&c, &format!("{}{file}", url.replace(&moved, &pinned))).await.0, 404, "the old URL");
+    assert_eq!(served(&c, &format!("{url}{file}")).await.0, 200, "the new URL");
+
+    // Edit the binding: version 2, after the typed name.
+    run(&mut app, Act::Edit, d);
+    fill(&mut app, &[("repo", &name), ("number", "2")]);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some(pinned.as_str()));
+    assert!(lines.contains(&format!("  will serve:  a publication of version 2 of repository {name} (pinned)")), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    let p2 = pubs(&v2).await.pop().unwrap_or_else(|| panic!("no publication of version 2: {:?}", texts(&app)));
+    let d = row(&app, "name", &pinned).unwrap();
+    assert_eq!(d["publication"].as_str(), Some(p2.as_str()), "{:?}", texts(&app));
+    assert!(tui_verify(&mut app, &mut rx, d.clone()).await.starts_with("OK: "), "the pinned distribution serves version 2");
+
+    // Rollback (b) to version 1: the preview, then the job re-points and verifies what is served.
+    run(&mut app, Act::Rollback, d);
+    fill(&mut app, &[("repo", &name), ("number", "1")]);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed, None, "a plain confirmation on a profile that is not production");
+    assert!(lines[1].starts_with(&format!("  now serves:  {} (", short(&v2))), "{lines:?}");
+    assert_eq!(lines[2], format!("  will serve:  {} (pinned)", short(&v1)));
+    assert!(lines[3].starts_with(&format!("  publication: existing {} (", short(&p1))), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    let done = texts(&app).into_iter().find(|x| x.starts_with(&format!("{pinned} now serves {}: ", short(&v1))));
+    assert!(done.is_some(), "re-pointed and verified: {:?}", texts(&app));
+    assert_eq!(row(&app, "name", &pinned).unwrap()["publication"].as_str(), Some(p1.as_str()), "the list reloads");
+
+    // Delete the version 2 publication: the distribution that follows the repository then serves version 1.
+    open_list(&mut app, &mut rx, Kind::Publications(t), "").await;
+    let p = row(&app, "pulp_href", &p2).unwrap_or_else(|| panic!("{p2} not on the first page"));
+    run(&mut app, Act::Delete, p);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed, Some(short(&p2)));
+    let after = format!("then serves publication {} (version 1)", short(&p1));
+    assert!(lines[1] == "WARNING: 1 distribution(s) serve this publication now:" && lines[2].ends_with(&after), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).contains(&"delete publication: done".to_string()), "{:?}", texts(&app));
+    assert!(row(&app, "pulp_href", &p2).is_none(), "the list reloads without it");
+    assert!(c.get::<Value>(&p2, &[]).await.unwrap_err().is_not_found());
+    open_list(&mut app, &mut rx, Kind::Distributions(t), &name).await;
+    let f = row(&app, "name", &follow).unwrap();
+    assert!(tui_verify(&mut app, &mut rx, f).await.starts_with("OK: "), "the following distribution serves version 1");
+
+    // Delete both distributions: each a task that the Task Center follows to its end.
+    for dist in [&follow, &pinned] {
+        let d = row(&app, "name", dist).unwrap();
+        run(&mut app, Act::Delete, d.clone());
+        let (lines, typed) = yes(&mut app);
+        assert_eq!((typed.as_deref(), lines[0].clone()), (Some(dist.as_str()), format!("Delete distribution {dist}.")));
+        settle_tasks(&mut app, &mut rx).await;
+        assert!(texts(&app).contains(&format!("task completed: delete distribution {dist}")), "{:?}", texts(&app));
+        assert!(row(&app, "name", dist).is_none(), "the list reloads without it");
+        assert!(c.get::<Value>(&s(&d, "pulp_href"), &[]).await.unwrap_err().is_not_found());
+    }
+    cleanup(&c, &[&p1, &repo, &remote]).await;
+}
+
+#[tokio::test]
+async fn file_publications_and_distributions_through_the_tui() {
+    if live_enabled() {
+        publications_and_distributions_through_the_tui(RepoType::File, "file/PULP_MANIFEST", "PULP_MANIFEST").await;
+    }
+}
+
+#[tokio::test]
+async fn rpm_publications_and_distributions_through_the_tui() {
+    if live_enabled() {
+        publications_and_distributions_through_the_tui(RepoType::Rpm, "rpm/", "repodata/repomd.xml").await;
+    }
+}
+
+#[tokio::test]
+async fn deb_publications_and_distributions_through_the_tui() {
+    if live_enabled() {
+        publications_and_distributions_through_the_tui(RepoType::Deb, "deb/", "dists/fixture/Release").await;
+    }
 }
