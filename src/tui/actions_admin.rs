@@ -324,7 +324,9 @@ fn member_action(app: &mut App, act: Act, item: Value, group: String, name: Stri
             },
         ),
         Act::Delete => {
-            let (href, user) = (s(&item, "pulp_href"), s(&item, "username"));
+            // The row's pulp_href is the user itself; a DELETE to it deletes the account.
+            let id = s(&item, "pulp_href").trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_string();
+            let (href, user) = (format!("{group}users/{id}/"), s(&item, "username"));
             let mut lines = vec![format!("Remove {user} from group {name}.")];
             if me(app).as_deref() == Some(user.as_str()) {
                 lines.push("WARNING: this is YOUR account; you may lose permissions.".into());
@@ -3367,5 +3369,26 @@ mod tests {
             ]
         );
         assert!(sent(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_member_deletes_the_membership_not_the_user() {
+        let server = MockServer::start().await;
+        let (group, user) = ("/pulp/api/v3/groups/3/", "/pulp/api/v3/users/6/");
+        Mock::given(method("DELETE"))
+            .and(path(format!("{group}users/6/")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE")).and(path(user)).respond_with(ResponseTemplate::new(204)).expect(0).mount(&server).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let item = json!({ "pulp_href": user, "username": "ann" });
+        super::member_action(&mut app, crate::tui::kinds::Act::Delete, item, group.into(), "ops".into());
+        let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirmation") };
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert!(notices(&app).iter().any(|(l, t)| *l == Level::Ok && t.contains("remove ann from ops")), "{:?}", notices(&app));
+        server.verify().await;
     }
 }

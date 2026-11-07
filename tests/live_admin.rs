@@ -31,6 +31,35 @@ async fn group_rename() {
     cleanup(&c, &[&href]).await;
 }
 
+/// Add a member to a group, then Remove member: the membership goes, the user account stays.
+#[tokio::test]
+async fn group_member_add_and_remove_keeps_the_user() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = unique("admin-member");
+    let user = create(&c, "users/", json!({ "username": name }), "/users/").await;
+    let group = create(&c, "groups/", json!({ "name": name }), "/groups/").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::GroupUsers { group: group.clone(), name: name.clone() };
+    let members = async || {
+        let p: pulp_tui::pulp::client::Page<Value> = c.list(&format!("{group}users/"), &[]).await.unwrap();
+        p.results.iter().filter_map(|u| u["username"].as_str().map(String::from)).collect::<Vec<_>>()
+    };
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("username", &name)]);
+    settle(&mut app, &mut rx).await;
+    assert_eq!(members().await, std::slice::from_ref(&name), "{:?}", texts(&app));
+    run(&mut app, Act::Delete, json!({ "pulp_href": user, "username": name }));
+    yes(&mut app);
+    settle(&mut app, &mut rx).await;
+    assert!(members().await.is_empty(), "{:?}", texts(&app));
+    let kept: Value = c.get(&user, &[]).await.unwrap_or_else(|e| panic!("the user is gone: {e}"));
+    assert_eq!(kept["username"], name.as_str());
+    cleanup(&c, &[&group, &user]).await;
+}
+
 /// A new File repository and the completed task of an empty `modify/` on it (the task reserves the repository).
 async fn repo_with_task(c: &PulpClient, prefix: &str) -> (String, pulp_tui::pulp::models::Task) {
     let repo = create(c, RepoType::File.repositories(), json!({ "name": unique(prefix) }), "/repositories/").await;
