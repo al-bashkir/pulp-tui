@@ -301,9 +301,13 @@ pub struct Form {
     pub editing: bool,
     /// Char index of the edit cursor in the focused field.
     pub cursor: usize,
-    /// `Enter` moved onto a field that is not text: plain characters (typed ahead) do nothing until another key.
-    hold: bool,
+    /// `Enter` moved onto a field that is not text: plain characters (typed ahead) do nothing until this time; each
+    /// one moves it on by `HOLD`, so only a pause or another key ends it.
+    hold: Option<std::time::Instant>,
 }
+
+/// A pause in typing this long ends the typed-ahead text after `Enter` (`Form::hold`).
+const HOLD: std::time::Duration = std::time::Duration::from_millis(300);
 
 pub enum FormEvent {
     None,
@@ -337,7 +341,7 @@ impl Form {
             picker: None,
             editing,
             cursor,
-            hold: false,
+            hold: None,
         }
     }
     pub fn note(mut self, n: impl Into<String>) -> Self {
@@ -450,7 +454,7 @@ impl Form {
 
     /// Enter while editing: submit on the last field, else go to the next one. Text typed ahead must not become
     /// move-mode commands there: a text field is edited at once; on another field plain characters do nothing
-    /// until a key that is not text (`hold`).
+    /// until a pause in typing or a key that is not text (`hold`).
     fn advance(&mut self) -> FormEvent {
         if self.focus + 1 == self.fields.len() {
             self.editing = false;
@@ -459,7 +463,7 @@ impl Form {
         self.focus += 1;
         let f = &self.fields[self.focus];
         self.editing = f.kind.is_text();
-        self.hold = !self.editing;
+        self.hold = (!self.editing).then(|| std::time::Instant::now() + HOLD);
         self.cursor = f.value.chars().count();
         FormEvent::None
     }
@@ -606,10 +610,12 @@ impl Form {
         if ctrl && k.code == KeyCode::Char('s') {
             return Some(FormEvent::Submit);
         }
-        if self.hold && matches!(k.code, KeyCode::Char(_)) && !ctrl {
+        let now = std::time::Instant::now();
+        if self.hold.is_some_and(|end| now < end) && matches!(k.code, KeyCode::Char(_)) && !ctrl {
+            self.hold = Some(now + HOLD);
             return Some(FormEvent::None);
         }
-        self.hold = false;
+        self.hold = None;
         self.pick_field_key(k)
     }
 
@@ -785,6 +791,25 @@ mod tests {
         f.handle_key(ch(' '));
         assert_eq!((f.get("policy"), f.get("tls_validation"), f.focus), ("streamed", "false", 3));
         assert_eq!(f.get("url"), "https://h/");
+    }
+
+    #[test]
+    fn a_key_after_a_pause_acts_and_a_typing_burst_stays_held() {
+        let pause = || std::thread::sleep(HOLD * 2 / 3);
+        let mut f = remote_form();
+        f.focus = 1;
+        f.handle_key(ch('i'));
+        f.handle_key(key(KeyCode::Enter));
+        // Typing that goes on longer than HOLD, with no pause of HOLD, is still typed ahead.
+        for c in "jlj".chars() {
+            pause();
+            f.handle_key(ch(c));
+        }
+        assert_eq!((f.get("policy"), f.focus), ("immediate", 2));
+        // After a pause the operator sees the choice: `l` changes it.
+        std::thread::sleep(HOLD + HOLD / 2);
+        f.handle_key(ch('l'));
+        assert_eq!(f.get("policy"), "on_demand");
     }
 
     #[test]
