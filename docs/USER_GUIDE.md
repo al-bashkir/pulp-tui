@@ -529,6 +529,11 @@ the distributions that use it. **i** full JSON.
 Managed by pulp-tui, not by Pulp (see [ARCHITECTURE.md](ARCHITECTURE.md)). Columns: composite,
 repositories, latest version, environments with bound versions and states.
 
+The *environments* column shows the version that each environment serves. A promotion that did not
+complete shows after it: `Dev:v1 (v2 failed)` means that Dev still serves v1 and the promotion of
+v2 failed. `Dev:- (v1 failed)` means that the first promotion into Dev failed. Promote again to
+retry, or roll back to the served version to clear the failed attempt.
+
 * **a** adds repositories: a multi-select picker of RPM, File and Deb repositories, and filter
   rules. The rules apply to each selected repository, so a mix of types needs empty rules.
 * **F** edits the filter rules of one repository. **x** removes a repository; published versions
@@ -545,9 +550,9 @@ repositories, latest version, environments with bound versions and states.
   use the content of another view, make a composite.
 * **v** versions. **i** full JSON.
 * **M** promotes a version to an environment, with a preview of every distribution.
-* **b** rolls an environment back. After Library: only a version older than the active one, or the
-  active one again (a retry). For a newer version, or an environment without a version, use
-  Promote. In Library: any published version.
+* **b** rolls an environment back. After Library: only a version older than the newest bound one
+  (served or attempted), or that one again (a retry). For a newer version, or an environment
+  without a version, use Promote. In Library: any published version.
 * **u** unpromotes: it deletes the distributions of the view in the environment (the dialog lists
   the paths; type the view name) and removes the binding, so you can delete the version. Versions
   and snapshots stay. Refused while a later environment on the path has the view: go back along
@@ -650,20 +655,24 @@ A composite view joins other Content Views (its **components**). Example: `rocky
   `interrupted` Library step, it runs the Library step and auto publish again.
 * **W** watches the task of the copy step or the publication step. Other steps show their tasks
   only in the session that runs the publish.
-* **d** deletes. Refused while the version is bound or a composite uses it. The confirm lists each
+* The *environments* column names each environment that serves the version, and an attempted
+  promotion that did not complete with its state, for example `Dev (failed)`.
+* **d** deletes. Refused while an environment serves the version, while a promotion of it did not
+  complete (`bound to Dev (promotion failed)`), or while a composite uses it. The confirm lists each
   publication and snapshot version that it deletes, and each one that it keeps (still served by an
   environment) with the reason.
 * **i** details: source versions, snapshot versions, publications, unit counts, component
   versions.
 
-A `publishing` version, or a `promoting` binding, shows as `interrupted` when nobody holds a live
+A `publishing` version, or a `promoting` promotion, shows as `interrupted` when nobody holds a live
 lock on the view (the client quit, crashed or ran Connect). Press **R** for a version. Promote or
-roll back again for a binding.
+roll back again for a promotion.
 
 ### Lifecycle Environments
 
 Library exists by default. With a shared database, all operators see the same environments. The
-*bound views* column shows a binding that is not active, for example `web:v2 (partial)`.
+*bound views* column shows the served version of each view and a promotion that did not complete,
+for example `web:v1 (v2 partial)`.
 
 * **c** creates an environment after an existing one. Paths can branch.
 * **L** toggles protection. To change what a protected environment serves, you type its name
@@ -1089,7 +1098,8 @@ database of `lab`. `--from <profile>` reads the database of another profile inst
   operator takes it. After a crash, the lock stays until it expires.
 * A workflow that loses its lock stops before its next change: `lock on web lost: <reason>`. It
   also stops when its own lock was not renewed for 90 s (for example after sleep). A stopped
-  publish continues with *Resume*. A stopped promotion is `partial` or `failed`: promote again.
+  publish continues with *Resume*. A stopped promotion is `partial` or `failed` and the
+  environment keeps its served version: promote again, or roll back.
 * **Break lock** (**U** on Content Views) removes the lock that the dialog shows. Use it only when
   the session of the holder is dead. Its workflow stops within 30 s. The audit log records it.
 

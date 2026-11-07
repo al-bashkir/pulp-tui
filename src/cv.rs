@@ -18,8 +18,8 @@ use crate::pulp::models::{DebPackage, Distribution, Package, Publication, RepoVe
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Capabilities, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::{
-    BindingRepo, Component, ContentView, CvRepo, CvVersion, CvVersionRepo, Environment, Export, LIBRARY, LOCK_RENEW_SECS, LOCK_TTL_SECS,
-    LockHolder, Store, UsedVersion, validate_label,
+    Binding, BindingRepo, Component, ContentView, CvRepo, CvVersion, CvVersionRepo, Environment, Export, LIBRARY, LOCK_RENEW_SECS,
+    LOCK_TTL_SECS, LockHolder, Store, UsedVersion, validate_label,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -72,6 +72,16 @@ pub fn unix_now() -> i64 {
 /// `Store::lock_live`) is `interrupted`: the client that ran it ended (quit, crash, Connect), so nothing continues it.
 pub fn shown_state(state: &str, running: bool) -> &str {
     if !running && matches!(state, "publishing" | "promoting") { "interrupted" } else { state }
+}
+
+/// How binding `b` shows: the served version (`none` when there is none), then a promotion that has not completed,
+/// as in `v1 (v2 failed)`. `number` gives the number of a version id.
+pub fn binding_text(b: &Binding, number: impl Fn(i64) -> i64, running: bool, none: &str) -> String {
+    let served = b.served.map_or_else(|| none.to_string(), |s| format!("v{}", number(s)));
+    match &b.attempt {
+        Some(a) => format!("{served} (v{} {})", number(a.version_id), shown_state(&a.state, running)),
+        None => served,
+    }
 }
 
 fn conflict(name: &str, h: &LockHolder) -> String {
@@ -127,6 +137,11 @@ impl CvLock {
             bail!("lock on {} lost: not renewed for {n} s", self.name);
         }
         Ok(())
+    }
+
+    /// Identifies this acquisition: rows that a workflow starts carry it, so a later write can tell its own rows.
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     #[cfg(test)]
@@ -391,6 +406,11 @@ impl CvService {
     /// Called before every Pulp mutation and checkpoint/binding write of a workflow.
     fn alive(&self) -> Result<()> {
         self.lock.as_ref().map_or(Ok(()), |l| l.check())
+    }
+
+    /// The token of the lock this workflow holds (`CvLock::token`); "" without one.
+    fn token(&self) -> &str {
+        self.lock.as_ref().map_or("", |l| l.token())
     }
 
     /// Why the object at `href` is not ours: another pulp-tui database owns it (database ID label), or it lacks
@@ -755,11 +775,12 @@ impl CvService {
         Ok(self.store.environments(&self.scope).await?.iter().any(|e| e.name == LIBRARY && e.protected))
     }
 
-    /// Whether the Library step of published `v` stopped: its Library binding is still `promoting`. Under the view's
-    /// lock, such a row is an interrupted one.
+    /// Whether the Library step of published `v` stopped: its promotion to Library is still `promoting`. Under the
+    /// view's lock, such a row is an interrupted one.
     pub async fn library_interrupted(&self, v: &CvVersion) -> Result<bool> {
         let Some(lib) = self.store.environments(&self.scope).await?.into_iter().find(|e| e.name == LIBRARY) else { return Ok(false) };
-        Ok(self.store.binding(lib.id, v.cv_id).await?.is_some_and(|b| b.version_id == v.id && b.state == "promoting"))
+        let b = self.store.binding(lib.id, v.cv_id).await?;
+        Ok(b.and_then(|b| b.attempt).is_some_and(|a| a.version_id == v.id && a.state == "promoting"))
     }
 
     /// `bind_library`, with an error as the note: the version stays published, so auto publish still runs.
@@ -1136,12 +1157,21 @@ impl CvService {
     /// Why Promote refuses version `v` in `env`: an environment after another takes only the version active there.
     pub async fn promote_refusal(&self, v: &CvVersion, env: &Environment) -> Result<Option<String>> {
         let Some(prior) = env.prior_id else { return Ok(None) };
-        if self.store.binding(prior, v.cv_id).await?.is_some_and(|b| b.version_id == v.id && b.state == "active") {
+        if self.store.binding(prior, v.cv_id).await?.and_then(|b| b.active()) == Some(v.id) {
             return Ok(None);
         }
         let envs = self.store.environments(&self.scope).await?;
         let pname = envs.iter().find(|e| e.id == prior).map_or("?", |e| e.name.as_str());
         Ok(Some(format!("version {} is not active in {pname}; promote it there first (or use rollback)", v.number)))
+    }
+
+    /// The highest version number bound in `env_id` (served or attempted): `rollback_refusal` takes it.
+    pub async fn bound_number(&self, env_id: i64, cv_id: i64) -> Result<Option<i64>> {
+        let mut n = None;
+        for id in self.store.binding(env_id, cv_id).await?.iter().flat_map(Binding::versions) {
+            n = n.max(Some(self.store.version(id).await?.number));
+        }
+        Ok(n)
     }
 
     /// Bind `version_id` to `env_id`. Re-points stable distributions; repositories that
@@ -1159,17 +1189,14 @@ impl CvService {
         {
             bail!(why);
         }
-        if mode == Mode::Rollback && env.prior_id.is_some() {
-            let active = match self.store.binding(env_id, cv_id).await? {
-                Some(b) => Some(self.store.version(b.version_id).await?.number),
-                None => None,
-            };
-            if let Some(why) = rollback_refusal(&env.name, v.number, active) {
-                bail!(why);
-            }
+        if mode == Mode::Rollback
+            && env.prior_id.is_some()
+            && let Some(why) = rollback_refusal(&env.name, v.number, self.bound_number(env_id, cv_id).await?)
+        {
+            bail!(why);
         }
         self.alive()?;
-        self.store.set_binding(env_id, cv_id, version_id, "promoting").await?;
+        self.store.start_promotion(env_id, cv_id, version_id, self.token()).await?;
         log(format!("{} v{} -> {}", cv.name, v.number, env.name));
         let mut errors = vec![];
         let vrs = self.store.version_repos(version_id).await?;
@@ -1193,13 +1220,9 @@ impl CvService {
         } else {
             "failed"
         };
-        // Runs even when the lock is lost (it records the partial state; a retry is idempotent), but
-        // then only over this promotion's own `promoting` row.
-        if self.alive().is_ok() {
-            self.store.set_binding(env_id, cv_id, version_id, state).await?;
-        } else {
-            self.store.finish_promoting_binding(env_id, cv_id, version_id, state).await?;
-        }
+        // Runs even when the lock is lost (it records the partial state; a retry is idempotent), but only over this
+        // promotion's own row (by lock token).
+        self.store.finish_promotion(env_id, cv_id, version_id, state, self.token()).await?;
         let what = if mode == Mode::Rollback && env.name != LIBRARY { "cv.rollback" } else { "cv.promote" };
         self.audit(what, &format!("{} v{} -> {}: {state} {}", cv.name, v.number, env.name, errors.join("; "))).await;
         if errors.is_empty() {
@@ -1423,11 +1446,14 @@ impl CvService {
     pub async fn verify(&self, cv_id: i64, env_id: i64) -> Result<Vec<String>> {
         let Some(b) = self.store.binding(env_id, cv_id).await? else { return Ok(vec!["not bound".into()]) };
         let mut issues = vec![];
-        if b.state != "active" {
+        if let Some(a) = &b.attempt {
             let running = self.store.lock_live(cv_id, unix_now()).await?;
-            issues.push(format!("binding state is {}", shown_state(&b.state, running)));
+            let n = self.store.version(a.version_id).await?.number;
+            issues.push(format!("promotion of v{n} is {}", shown_state(&a.state, running)));
         }
-        let vrs = self.store.version_repos(b.version_id).await?;
+        // The served version; with none yet, the attempted one.
+        let Some(target) = b.versions().next() else { return Ok(issues) };
+        let vrs = self.store.version_repos(target).await?;
         for br in self.store.binding_repos(env_id, cv_id).await? {
             let vr = vrs.iter().find(|vr| vr.repo().repo_href == br.repo_href);
             issues.extend(self.verify_repo(&br, vr).await);
@@ -2933,7 +2959,7 @@ mod tests {
         svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap();
         let rows = svc.store.binding_repos(lib, cv).await.unwrap();
         assert_eq!((rows.len(), rows[0].publication.as_deref()), (1, None), "the distribution is kept, it serves nothing");
-        assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().state, "active");
+        assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().active(), Some(v.id));
         // A rerun sends nothing: the row serves nothing now.
         svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap();
     }
@@ -2970,7 +2996,7 @@ mod tests {
         serve_owner(&server, DIST, "other").await;
         let e = svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap_err();
         assert!(e.to_string().starts_with("web in Library: partial: unbind old"), "{e}");
-        assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().state, "partial", "os is served: not failed");
+        assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().attempt.unwrap().state, "partial", "os is served: not failed");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3088,15 +3114,15 @@ mod tests {
         let svc = mock_service(&server).await;
         // Library -> Dev -> Test, the view in all three; later Test only gets it back (a rollback there), not Dev.
         let (dev, cv) = web_in_dev(&svc).await;
-        let (lib, v) = (svc.store.ensure_library("k").await.unwrap(), svc.store.binding(dev, cv).await.unwrap().unwrap().version_id);
+        let (lib, v) = (svc.store.ensure_library("k").await.unwrap(), svc.store.binding(dev, cv).await.unwrap().unwrap().served.unwrap());
         let test = svc.store.create_env("k", "Test", dev, false).await.unwrap();
-        svc.store.set_binding(lib, cv, v, "active").await.unwrap();
-        svc.store.set_binding(test, cv, v, "active").await.unwrap();
+        svc.store.promoted(lib, cv, v, "active").await.unwrap();
+        svc.store.promoted(test, cv, v, "active").await.unwrap();
         let e = svc.unpromote(cv, dev, &|_| {}, &ops::no_progress).await.unwrap_err();
         assert_eq!(e.to_string(), "web is still in Test; unpromote it there first");
         svc.store.delete_binding(test, cv).await.unwrap();
         svc.unpromote(cv, dev, &|_| {}, &ops::no_progress).await.unwrap();
-        svc.store.set_binding(test, cv, v, "active").await.unwrap();
+        svc.store.promoted(test, cv, v, "active").await.unwrap();
         let e = svc.unpromote(cv, lib, &|_| {}, &ops::no_progress).await.unwrap_err();
         assert_eq!(e.to_string(), "web is still in Test; unpromote it there first");
         assert!(svc.store.binding(lib, cv).await.unwrap().is_some());
@@ -3112,7 +3138,7 @@ mod tests {
         let cv = svc.store.create_cv("k", "web", "").await.unwrap();
         let v = svc.store.begin_version(cv, "", &[]).await.unwrap();
         svc.store.finish_version(v.id, "published", None).await.unwrap();
-        svc.store.set_binding(dev, cv, v.id, "active").await.unwrap();
+        svc.store.promoted(dev, cv, v.id, "active").await.unwrap();
         (dev, cv)
     }
 
@@ -3220,10 +3246,10 @@ mod tests {
         let relabel = |_: String| {
             tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(svc.store.set_env_label(dev, "qa"))).unwrap()
         };
-        svc.store.set_binding(lib, cv, v.id, "active").await.unwrap();
+        svc.store.promoted(lib, cv, v.id, "active").await.unwrap();
         let e = svc.promote(cv, v.id, dev, Mode::Promote, &relabel, &ops::no_progress).await.unwrap_err();
         assert!(e.to_string().ends_with("partial: Dev was relabeled qa during the promotion; edit Dev again with label qa"), "{e}");
-        assert_eq!(svc.store.binding(dev, cv).await.unwrap().unwrap().state, "partial");
+        assert_eq!(svc.store.binding(dev, cv).await.unwrap().unwrap().attempt.unwrap().state, "partial");
         let moves: Vec<_> = svc.relabel_impact(dev, "qa").await.unwrap().into_iter().map(|(b, new)| (b.base_path, new)).collect();
         assert_eq!(moves, [("dev/web/os".to_string(), "qa/web/os".to_string())], "a rerun of the relabel moves the row");
     }
@@ -3244,9 +3270,9 @@ mod tests {
         let rollback = |n: usize, env: i64| svc.promote(cv, v[n].id, env, Mode::Rollback, &|_| {}, &ops::no_progress);
         let refused = async |n, env| rollback(n, env).await.unwrap_err().to_string();
         assert_eq!(refused(2, test).await, "no version is active in Test; use Promote", "rollback is not a first promotion");
-        svc.store.set_binding(test, cv, v[1].id, "active").await.unwrap();
+        svc.store.promoted(test, cv, v[1].id, "active").await.unwrap();
         assert_eq!(refused(2, test).await, "v3 is newer than the active v2 in Test; use Promote", "it would skip the path");
-        assert_eq!(svc.store.binding(test, cv).await.unwrap().unwrap().version_id, v[1].id);
+        assert_eq!(svc.store.binding(test, cv).await.unwrap().unwrap().active(), Some(v[1].id));
         assert!(server.received_requests().await.unwrap().is_empty(), "refused before any request");
 
         // Older, the active version again (a retry), and Library (any published version) go on.
@@ -3261,8 +3287,7 @@ mod tests {
         Mock::given(method("GET")).and(path("/pulp/api/v3/tasks/1/")).respond_with(ok(done)).mount(&server).await;
         for (n, env) in [(0, test), (0, test), (2, lib), (0, lib)] {
             rollback(n, env).await.unwrap();
-            let b = svc.store.binding(env, cv).await.unwrap().unwrap();
-            assert_eq!((b.version_id, b.state.as_str()), (v[n].id, "active"));
+            assert_eq!(svc.store.binding(env, cv).await.unwrap().unwrap().active(), Some(v[n].id));
         }
     }
 
@@ -3378,9 +3403,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [d] })))
             .mount(&server)
             .await;
-        svc.store.set_binding(lib, cv, v.id, "promoting").await.unwrap(); // an interrupted promotion
+        svc.store.promoted(lib, cv, v.id, "promoting").await.unwrap(); // an interrupted promotion
         svc.promote(cv, v.id, lib, Mode::Promote, &|_| {}, &ops::no_progress).await.unwrap();
-        assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().state, "active", "promote again recovers it");
+        assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().active(), Some(v.id), "promote again recovers it");
         assert_none(&server, "PATCH").await;
         assert_none(&server, "POST").await;
         assert_eq!(svc.store.binding_repos(lib, cv).await.unwrap()[0].base_path, "custom/os");
@@ -3461,7 +3486,7 @@ mod tests {
         assert_eq!(svc.store.version_components(v.id).await.unwrap().iter().map(|u| u.name.as_str()).collect::<Vec<_>>(), ["os"]);
         assert_eq!(svc.store.version_repos(v1.id).await.unwrap(), own, "the component version is not changed");
         let lib = svc.store.ensure_library("k").await.unwrap();
-        assert_eq!(svc.store.binding(lib, c).await.unwrap().unwrap().state, "active");
+        assert_eq!(svc.store.binding(lib, c).await.unwrap().unwrap().active(), Some(v.id));
         let served = svc.store.binding_repos(lib, c).await.unwrap();
         assert_eq!((served[0].distribution.as_str(), served[0].base_path.as_str()), (DIST, "library/rocky9/os"));
     }
@@ -3770,12 +3795,12 @@ mod tests {
         let v2 = s.begin_version(web, "", &[]).await.unwrap();
         assert_eq!(svc.resume(v2.id, &|_| {}, &ops::no_progress).await.unwrap().1, None, "the newest version goes to Library");
         let lib = s.ensure_library("k").await.unwrap();
-        assert_eq!(s.binding(lib, web).await.unwrap().unwrap().version_id, v2.id);
+        assert_eq!(s.binding(lib, web).await.unwrap().unwrap().active(), Some(v2.id));
 
         let (v1, note) = svc.resume(v1.id, &|_| {}, &ops::no_progress).await.unwrap();
         assert_eq!(v1.state, "published");
         assert_eq!(note.as_deref(), Some("Library not changed: v2 is newer (use Rollback to serve v1)"));
-        assert_eq!(s.binding(lib, web).await.unwrap().unwrap().version_id, v2.id, "Library keeps the newer v2");
+        assert_eq!(s.binding(lib, web).await.unwrap().unwrap().active(), Some(v2.id), "Library keeps the newer v2");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3800,7 +3825,7 @@ mod tests {
         s.save_version_repo(&row).await.unwrap();
         s.finish_version(v.id, "published", None).await.unwrap();
         let lib = s.ensure_library("k").await.unwrap();
-        s.set_binding(lib, cv, v.id, "active").await.unwrap();
+        s.promoted(lib, cv, v.id, "active").await.unwrap();
         let b = BindingRepo {
             env_id: lib,
             cv_id: cv,
@@ -3859,7 +3884,7 @@ mod tests {
         }
         s.finish_version(v.id, "published", None).await.unwrap();
         let lib = s.ensure_library("k").await.unwrap();
-        s.set_binding(lib, cv, v.id, "partial").await.unwrap();
+        s.promoted(lib, cv, v.id, "partial").await.unwrap();
         for n in ["a", "b", "c", "d", "e"] {
             let b = BindingRepo {
                 env_id: lib,
@@ -3889,7 +3914,7 @@ mod tests {
         assert_eq!(
             svc.verify(cv, lib).await.unwrap(),
             [
-                "binding state is partial".to_string(),
+                "promotion of v1 is partial".to_string(),
                 format!("a: distribution {}: not found [404]", h("distributions", "a")),
                 format!("b: distribution serves /other/, expected {}", h("publications", "b")),
                 "c: publication: not found [404]".into(),

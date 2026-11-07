@@ -1034,14 +1034,6 @@ fn sum_counts(v: &Value) -> String {
     v.as_object().map(|m| m.values().filter_map(|x| x["count"].as_u64()).sum::<u64>().to_string()).unwrap_or_default()
 }
 
-/// ` (state)` after a binding that is not `active`.
-fn binding_note(state: &str, running: bool) -> String {
-    match crate::cv::shown_state(state, running) {
-        "active" => String::new(),
-        s => format!(" ({s})"),
-    }
-}
-
 /// Load one page of a screen. API screens query Pulp; Content View screens read the CV store
 /// (`cv`: the store or why it is unavailable) under `scope`; `profile` marks the active server.
 #[allow(clippy::too_many_arguments)]
@@ -1120,11 +1112,8 @@ pub async fn load(
                     .iter()
                     .filter_map(|b| {
                         let e = envs.iter().find(|e| e.id == b.env_id)?;
-                        let st = binding_note(&b.state, running);
-                        Some((
-                            envs.iter().position(|x| x.id == e.id),
-                            format!("{}:v{}{st}", e.name, numbers.get(&b.version_id).copied().unwrap_or(0)),
-                        ))
+                        let text = crate::cv::binding_text(b, |id| numbers.get(&id).copied().unwrap_or(0), running, "-");
+                        Some((envs.iter().position(|x| x.id == e.id), format!("{}:{text}", e.name)))
                     })
                     .collect::<std::collections::BTreeMap<_, _>>()
                     .into_values()
@@ -1170,10 +1159,16 @@ pub async fn load(
             let mut out = vec![];
             for v in store.versions(*cv).await? {
                 let state = crate::cv::shown_state(&v.state, running);
+                // Served, or the attempt of a promotion that has not completed (`Dev (failed)`).
                 let in_envs: Vec<String> = bindings
                     .iter()
-                    .filter(|b| b.version_id == v.id)
-                    .filter_map(|b| envs.iter().find(|e| e.id == b.env_id).map(|e| e.name.clone()))
+                    .filter_map(|b| {
+                        let e = envs.iter().find(|e| e.id == b.env_id)?;
+                        match &b.attempt {
+                            Some(a) if a.version_id == v.id => Some(format!("{} ({})", e.name, crate::cv::shown_state(&a.state, running))),
+                            _ => (b.served == Some(v.id)).then(|| e.name.clone()),
+                        }
+                    })
                     .collect();
                 let repos: Vec<Value> = store
                     .version_repos(v.id)
@@ -1207,9 +1202,8 @@ pub async fn load(
                 let numbers: std::collections::HashMap<i64, i64> = store.versions(cv.id).await?.iter().map(|v| (v.id, v.number)).collect();
                 let running = store.lock_live(cv.id, crate::cv::unix_now()).await?;
                 for b in store.bindings_for_cv(cv.id).await? {
-                    if let Some(n) = numbers.get(&b.version_id) {
-                        bound.entry(b.env_id).or_default().push(format!("{}:v{n}{}", cv.name, binding_note(&b.state, running)));
-                    }
+                    let text = crate::cv::binding_text(&b, |id| numbers.get(&id).copied().unwrap_or(0), running, "-");
+                    bound.entry(b.env_id).or_default().push(format!("{}:{text}", cv.name));
                 }
             }
             envs.iter()
@@ -1368,12 +1362,16 @@ mod tests {
             st.begin_version(os, "", &[]).await.unwrap(),
             st.begin_version(web, "", &[]).await.unwrap(),
         );
-        st.set_binding(lib, os, o2.id, "active").await.unwrap();
-        st.set_binding(dev, os, o1.id, "active").await.unwrap();
-        st.set_binding(lib, web, w1.id, "partial").await.unwrap();
+        st.promoted(lib, os, o2.id, "active").await.unwrap();
+        st.promoted(dev, os, o1.id, "active").await.unwrap();
+        st.promoted(lib, web, w1.id, "partial").await.unwrap();
+        st.promoted(dev, os, o2.id, "failed").await.unwrap(); // Dev still serves o1
         let (rows, _) = load(&Kind::Environments, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap();
         let bound: Vec<(String, String)> = rows.iter().map(|r| (s(r, "name"), s(r, "bound"))).collect();
-        assert_eq!(bound, [("Library".to_string(), "os:v2, web:v1 (partial)".to_string()), ("Dev".to_string(), "os:v1".to_string())]);
+        assert_eq!(
+            bound,
+            [("Library".to_string(), "os:v2, web:- (v1 partial)".to_string()), ("Dev".to_string(), "os:v1 (v2 failed)".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -1402,12 +1400,12 @@ mod tests {
         let lib = st.ensure_library("lab").await.unwrap();
         let cv = st.create_cv("lab", "os", "").await.unwrap();
         let v = st.begin_version(cv, "", &[]).await.unwrap();
-        st.set_binding(lib, cv, v.id, "promoting").await.unwrap();
+        st.promoted(lib, cv, v.id, "promoting").await.unwrap();
         let bound = async |k: Kind| s(&load(&k, None, Ok(&st), "lab", "lab", &cfg, 0, "").await.unwrap().0[0], "bound");
         let both = async || (bound(Kind::ContentViews).await, bound(Kind::Environments).await);
-        assert_eq!(both().await, ("Library:v1 (interrupted)".into(), "os:v1 (interrupted)".into()), "quit, crash or Connect");
+        assert_eq!(both().await, ("Library:- (v1 interrupted)".into(), "os:- (v1 interrupted)".into()), "quit, crash or Connect");
         st.try_lock(cv, "a@h", "t1", "promote to Library", crate::cv::unix_now()).await.unwrap().unwrap();
-        assert_eq!(both().await, ("Library:v1 (promoting)".into(), "os:v1 (promoting)".into()), "the promotion still runs");
+        assert_eq!(both().await, ("Library:- (v1 promoting)".into(), "os:- (v1 promoting)".into()), "the promotion still runs");
     }
 
     #[tokio::test]

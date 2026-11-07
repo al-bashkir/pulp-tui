@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions, AnyRow};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{AnyConnection, AnyPool, AssertSqlSafe, ConnectOptions, Connection, Executor, Row};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -109,6 +109,19 @@ const MIGRATIONS: &[&str] = &[
         WHERE env_id IN (SELECT id FROM environments) AND cv_id IN (SELECT id FROM content_views);
      DROP TABLE binding_repos;
      ALTER TABLE binding_repos_new RENAME TO binding_repos;",
+    // 7: a promotion that has not completed goes in `promotions`; `bindings` keeps the version that Pulp serves (the last
+    // completed one), so a failed promotion cannot lose it. An old row that was not active never recorded the version
+    // before it: it becomes the attempt only.
+    "CREATE TABLE promotions(
+        env_id INTEGER NOT NULL REFERENCES environments(id),
+        cv_id INTEGER NOT NULL REFERENCES content_views(id) ON DELETE CASCADE,
+        version_id INTEGER NOT NULL REFERENCES cv_versions(id),
+        state TEXT NOT NULL CHECK (state IN ('promoting', 'partial', 'failed')),
+        token TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(env_id, cv_id));
+     INSERT INTO promotions(env_id, cv_id, version_id, state, token, updated_at)
+        SELECT env_id, cv_id, version_id, state, '', updated_at FROM bindings WHERE state != 'active';
+     DELETE FROM bindings WHERE state != 'active';
+     ALTER TABLE bindings DROP COLUMN state;",
 ];
 
 /// `MIGRATIONS` for PostgreSQL: every integer is BIGINT (sqlx `Any` reads SQLite integers as
@@ -190,6 +203,17 @@ pub const PG_MIGRATIONS: &[&str] = &[
     // 6: served rows need their environment (see `MIGRATIONS`); rows of an environment that no longer exists are dropped.
     "DELETE FROM binding_repos WHERE env_id NOT IN (SELECT id FROM environments);
      ALTER TABLE binding_repos ADD FOREIGN KEY (env_id) REFERENCES environments(id);",
+    // 7: promotions that have not completed (see `MIGRATIONS`)
+    "CREATE TABLE promotions(
+        env_id BIGINT NOT NULL REFERENCES environments(id),
+        cv_id BIGINT NOT NULL REFERENCES content_views(id) ON DELETE CASCADE,
+        version_id BIGINT NOT NULL REFERENCES cv_versions(id),
+        state TEXT NOT NULL CHECK (state IN ('promoting', 'partial', 'failed')),
+        token TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(env_id, cv_id));
+     INSERT INTO promotions(env_id, cv_id, version_id, state, token, updated_at)
+        SELECT env_id, cv_id, version_id, state, '', updated_at FROM bindings WHERE state <> 'active';
+     DELETE FROM bindings WHERE state <> 'active';
+     ALTER TABLE bindings DROP COLUMN state;",
 ];
 
 /// A Content View lock not renewed for this long is expired; the next operator takes it over.
@@ -311,14 +335,35 @@ pub struct Environment {
     pub label: String,
 }
 
+/// A view in an environment. `served` is the version of the last promotion there that completed: Pulp serves it
+/// (during a `partial` or interrupted `attempt`, some repositories can serve the attempt's version). Two tables, so
+/// a promotion that starts or fails cannot overwrite the served version. At least one of the two is set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
     pub env_id: i64,
     pub cv_id: i64,
+    pub served: Option<i64>,
+    pub attempt: Option<Attempt>,
+}
+
+/// A promotion that has not completed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attempt {
     pub version_id: i64,
-    /// promoting | active | partial | failed
+    /// promoting | partial | failed
     pub state: String,
-    pub updated_at: String,
+}
+
+impl Binding {
+    /// The version active here: served, with no promotion pending.
+    pub fn active(&self) -> Option<i64> {
+        self.served.filter(|_| self.attempt.is_none())
+    }
+
+    /// The versions bound here: served, then the attempt.
+    pub fn versions(&self) -> impl Iterator<Item = i64> + '_ {
+        self.served.into_iter().chain(self.attempt.as_ref().map(|a| a.version_id))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -658,6 +703,7 @@ impl Store {
     pub async fn delete_cv(&self, id: i64) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM bindings WHERE cv_id = $1").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM promotions WHERE cv_id = $1").bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM content_views WHERE id = $1").bind(id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
@@ -1091,7 +1137,8 @@ impl Store {
     /// Ids of the views with a binding or served rows in the environment, ascending.
     pub async fn env_cv_ids(&self, env_id: i64) -> Result<Vec<i64>> {
         Ok(sqlx::query_scalar(
-            "SELECT cv_id FROM bindings WHERE env_id = $1 UNION SELECT cv_id FROM binding_repos WHERE env_id = $1 ORDER BY cv_id",
+            "SELECT cv_id FROM bindings WHERE env_id = $1 UNION SELECT cv_id FROM promotions WHERE env_id = $1
+             UNION SELECT cv_id FROM binding_repos WHERE env_id = $1 ORDER BY cv_id",
         )
         .bind(env_id)
         .fetch_all(&self.pool)
@@ -1100,10 +1147,13 @@ impl Store {
 
     /// Ids of the environments with a binding or served rows of the view.
     pub async fn cv_env_ids(&self, cv_id: i64) -> Result<Vec<i64>> {
-        Ok(sqlx::query_scalar("SELECT env_id FROM bindings WHERE cv_id = $1 UNION SELECT env_id FROM binding_repos WHERE cv_id = $1")
-            .bind(cv_id)
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(sqlx::query_scalar(
+            "SELECT env_id FROM bindings WHERE cv_id = $1 UNION SELECT env_id FROM promotions WHERE cv_id = $1
+             UNION SELECT env_id FROM binding_repos WHERE cv_id = $1",
+        )
+        .bind(cv_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn set_env_protected(&self, id: i64, protected: bool) -> Result<()> {
@@ -1123,7 +1173,8 @@ impl Store {
         };
         sqlx::query(lock).bind(id).execute(&mut *tx).await?;
         let used: i64 = sqlx::query_scalar(
-            "SELECT (SELECT COUNT(*) FROM bindings WHERE env_id = $1) + (SELECT COUNT(*) FROM environments WHERE prior_id = $1)",
+            "SELECT (SELECT COUNT(*) FROM bindings WHERE env_id = $1) + (SELECT COUNT(*) FROM promotions WHERE env_id = $1)
+                + (SELECT COUNT(*) FROM environments WHERE prior_id = $1)",
         )
         .bind(id)
         .fetch_one(&mut *tx)
@@ -1164,57 +1215,95 @@ impl Store {
     }
 
     pub async fn binding(&self, env_id: i64, cv_id: i64) -> Result<Option<Binding>> {
-        let r = sqlx::query("SELECT env_id, cv_id, version_id, state, updated_at FROM bindings WHERE env_id = $1 AND cv_id = $2")
-            .bind(env_id)
-            .bind(cv_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        r.as_ref().map(binding_row).transpose()
+        Ok(self.bindings_for_cv(cv_id).await?.into_iter().find(|b| b.env_id == env_id))
     }
 
+    /// The bindings of view `cv_id`, by environment id.
     pub async fn bindings_for_cv(&self, cv_id: i64) -> Result<Vec<Binding>> {
-        let rows = sqlx::query("SELECT env_id, cv_id, version_id, state, updated_at FROM bindings WHERE cv_id = $1")
-            .bind(cv_id)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(binding_row).collect()
+        let served = sqlx::query("SELECT env_id, version_id FROM bindings WHERE cv_id = $1").bind(cv_id).fetch_all(&self.pool).await?;
+        let attempts =
+            sqlx::query("SELECT env_id, version_id, state FROM promotions WHERE cv_id = $1").bind(cv_id).fetch_all(&self.pool).await?;
+        let mut out = BTreeMap::new();
+        let empty = |env_id| Binding { env_id, cv_id, served: None, attempt: None };
+        for r in &served {
+            let env_id: i64 = r.try_get(0)?;
+            out.entry(env_id).or_insert_with(|| empty(env_id)).served = Some(r.try_get(1)?);
+        }
+        for r in &attempts {
+            let env_id: i64 = r.try_get(0)?;
+            let attempt = Some(Attempt { version_id: r.try_get(1)?, state: r.try_get(2)? });
+            out.entry(env_id).or_insert_with(|| empty(env_id)).attempt = attempt;
+        }
+        Ok(out.into_values().collect())
     }
 
-    pub async fn set_binding(&self, env_id: i64, cv_id: i64, version_id: i64, state: &str) -> Result<()> {
+    /// Record that the promotion of `version_id` holding lock `token` starts. The served version stays.
+    pub async fn start_promotion(&self, env_id: i64, cv_id: i64, version_id: i64, token: &str) -> Result<()> {
         sqlx::query(
-            "INSERT INTO bindings(env_id, cv_id, version_id, state, updated_at) VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(env_id, cv_id) DO UPDATE SET version_id = excluded.version_id, state = excluded.state, updated_at = excluded.updated_at",
+            "INSERT INTO promotions(env_id, cv_id, version_id, state, token, updated_at) VALUES ($1, $2, $3, 'promoting', $4, $5)
+             ON CONFLICT(env_id, cv_id) DO UPDATE SET version_id = excluded.version_id, state = excluded.state,
+                token = excluded.token, updated_at = excluded.updated_at",
         )
         .bind(env_id)
         .bind(cv_id)
         .bind(version_id)
-        .bind(state)
+        .bind(token)
         .bind(now())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// End the promotion that `start_promotion` recorded with the same lock `token`: `active` makes its version the
+    /// served one; `partial` and `failed` keep it as the attempt. A row that another lock holder started since is not
+    /// changed: a workflow that lost its lock never overwrites the operator who took it over.
+    pub async fn finish_promotion(&self, env_id: i64, cv_id: i64, version_id: i64, state: &str, token: &str) -> Result<()> {
+        if state != "active" {
+            sqlx::query(
+                "UPDATE promotions SET state = $5, updated_at = $6 WHERE env_id = $1 AND cv_id = $2 AND version_id = $3 AND token = $4",
+            )
+            .bind(env_id)
+            .bind(cv_id)
+            .bind(version_id)
+            .bind(token)
+            .bind(state)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        let ours = sqlx::query("DELETE FROM promotions WHERE env_id = $1 AND cv_id = $2 AND version_id = $3 AND token = $4")
+            .bind(env_id)
+            .bind(cv_id)
+            .bind(version_id)
+            .bind(token)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            == 1;
+        if ours {
+            sqlx::query(
+                "INSERT INTO bindings(env_id, cv_id, version_id, updated_at) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT(env_id, cv_id) DO UPDATE SET version_id = excluded.version_id, updated_at = excluded.updated_at",
+            )
+            .bind(env_id)
+            .bind(cv_id)
+            .bind(version_id)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
     /// Forget view `cv_id` in environment `env_id`: its served rows, then its binding.
     pub async fn delete_binding(&self, env_id: i64, cv_id: i64) -> Result<()> {
-        for sql in ["DELETE FROM binding_repos WHERE env_id = $1 AND cv_id = $2", "DELETE FROM bindings WHERE env_id = $1 AND cv_id = $2"] {
-            sqlx::query(sql).bind(env_id).bind(cv_id).execute(&self.pool).await?;
+        for t in ["binding_repos", "promotions", "bindings"] {
+            let sql = format!("DELETE FROM {t} WHERE env_id = $1 AND cv_id = $2");
+            sqlx::query(AssertSqlSafe(sql)).bind(env_id).bind(cv_id).execute(&self.pool).await?; // `t` is a literal
         }
-        Ok(())
-    }
-
-    /// `set_binding` only while the binding is still this promotion's `promoting` row (see `fail_publishing_version`).
-    pub async fn finish_promoting_binding(&self, env_id: i64, cv_id: i64, version_id: i64, state: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE bindings SET state = $4, updated_at = $5 WHERE env_id = $1 AND cv_id = $2 AND version_id = $3 AND state = 'promoting'",
-        )
-        .bind(env_id)
-        .bind(cv_id)
-        .bind(version_id)
-        .bind(state)
-        .bind(now())
-        .execute(&self.pool)
-        .await?;
         Ok(())
     }
 
@@ -1273,12 +1362,19 @@ impl Store {
         Ok(())
     }
 
-    /// Versions currently bound to any environment (cannot be deleted).
+    /// The environments where version `version_id` is served, or promoted without completing (`Dev (promotion failed)`):
+    /// it cannot be deleted.
     pub async fn version_in_use(&self, version_id: i64) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar("SELECT e.name FROM bindings b JOIN environments e ON e.id = b.env_id WHERE b.version_id = $1")
-            .bind(version_id)
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(sqlx::query_scalar(
+            "SELECT e.name FROM bindings b JOIN environments e ON e.id = b.env_id WHERE b.version_id = $1
+             UNION SELECT e.name || ' (promotion ' || p.state || ')' FROM promotions p JOIN environments e ON e.id = p.env_id
+             WHERE p.version_id = $1
+               AND NOT EXISTS (SELECT 1 FROM bindings b WHERE b.env_id = p.env_id AND b.cv_id = p.cv_id AND b.version_id = $1)
+             ORDER BY 1",
+        )
+        .bind(version_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     // ---- Content View locks (times are client unix seconds) ----------------------------
@@ -1706,19 +1802,35 @@ impl Store {
             report.bindings += bindings.len();
             for b in &bindings {
                 let env_id = env_ids.get(&b.env_id).copied().context("a binding points at an environment outside the path")?;
-                let version_id = versions
-                    .iter()
-                    .find(|x| x.id == b.version_id)
-                    .map(|x| version_ids[&x.id])
-                    .context("a binding points at a version of another view")?;
-                sqlx::query("INSERT INTO bindings(env_id, cv_id, version_id, state, updated_at) VALUES ($1, $2, $3, $4, $5)")
+                let version = |id: i64| {
+                    versions
+                        .iter()
+                        .find(|x| x.id == id)
+                        .map(|x| version_ids[&x.id])
+                        .context("a binding points at a version of another view")
+                };
+                if let Some(served) = b.served {
+                    sqlx::query("INSERT INTO bindings(env_id, cv_id, version_id, updated_at) VALUES ($1, $2, $3, $4)")
+                        .bind(env_id)
+                        .bind(cv_id)
+                        .bind(version(served)?)
+                        .bind(now())
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                if let Some(a) = &b.attempt {
+                    // No lock token: the promotion's workflow ran against the source database.
+                    sqlx::query(
+                        "INSERT INTO promotions(env_id, cv_id, version_id, state, token, updated_at) VALUES ($1, $2, $3, $4, '', $5)",
+                    )
                     .bind(env_id)
                     .bind(cv_id)
-                    .bind(version_id)
-                    .bind(&b.state)
-                    .bind(&b.updated_at)
+                    .bind(version(a.version_id)?)
+                    .bind(&a.state)
+                    .bind(now())
                     .execute(&mut *tx)
                     .await?;
+                }
                 for r in src.binding_repos(b.env_id, v.id).await? {
                     sqlx::query(
                         "INSERT INTO binding_repos(env_id, cv_id, repo_href, repo_name, repo_type, distribution, base_path, publication)
@@ -1907,10 +2019,6 @@ fn version_row(r: &AnyRow) -> Result<CvVersion> {
     })
 }
 
-fn binding_row(r: &AnyRow) -> Result<Binding> {
-    Ok(Binding { env_id: r.try_get(0)?, cv_id: r.try_get(1)?, version_id: r.try_get(2)?, state: r.try_get(3)?, updated_at: r.try_get(4)? })
-}
-
 fn binding_repo_row(r: &AnyRow) -> Result<BindingRepo> {
     Ok(BindingRepo {
         env_id: r.try_get(0)?,
@@ -1991,6 +2099,18 @@ pub fn rfc3339(secs: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + (m <= 2) as i64;
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+#[cfg(test)]
+impl Store {
+    /// Test shortcut: a promotion of `version_id` to `env_id` that ended `state` (`promoting`: it still runs).
+    pub async fn promoted(&self, env_id: i64, cv_id: i64, version_id: i64, state: &str) -> Result<()> {
+        self.start_promotion(env_id, cv_id, version_id, "t").await?;
+        if state == "promoting" {
+            return Ok(());
+        }
+        self.finish_promotion(env_id, cv_id, version_id, state, "t").await
+    }
 }
 
 #[cfg(test)]
@@ -2076,9 +2196,9 @@ mod tests {
         let qa = s.create_env("lab", "QA", lib, false).await.unwrap();
         let order: Vec<_> = s.environments("lab").await.unwrap().into_iter().map(|e| e.name).collect();
         assert_eq!(order, ["Library", "Dev", "Prod", "QA"]);
-        s.set_binding(dev, cv, v1.id, "active").await.unwrap();
+        s.promoted(dev, cv, v1.id, "active").await.unwrap();
         assert_eq!(s.version_in_use(v1.id).await.unwrap(), vec!["Dev"]);
-        s.set_binding(dev, cv, v2.id, "active").await.unwrap();
+        s.promoted(dev, cv, v2.id, "active").await.unwrap();
         assert!(s.version_in_use(v1.id).await.unwrap().is_empty());
         assert!(s.delete_env(dev).await.is_err()); // bound + has successor
         s.delete_env(qa).await.unwrap();
@@ -2117,13 +2237,15 @@ mod tests {
         };
         s.save_binding_repo(&row).await.unwrap(); // served rows without a binding: Dev can be deleted
         let mut promotion = s.pool.begin().await.unwrap();
-        sqlx::query("INSERT INTO bindings(env_id, cv_id, version_id, state, updated_at) VALUES ($1, $2, $3, 'promoting', 't')")
-            .bind(dev)
-            .bind(cv)
-            .bind(v.id)
-            .execute(&mut *promotion)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO promotions(env_id, cv_id, version_id, state, token, updated_at) VALUES ($1, $2, $3, 'promoting', 't', 't')",
+        )
+        .bind(dev)
+        .bind(cv)
+        .bind(v.id)
+        .execute(&mut *promotion)
+        .await
+        .unwrap();
         let del = tokio::spawn({
             let s = s.clone();
             async move { s.delete_env(dev).await }
@@ -2279,6 +2401,31 @@ mod tests {
         assert!(s.binding_repos(7, 1).await.unwrap().is_empty(), "environment 7 does not exist");
     }
 
+    /// Schema 7: an active binding stays served; any other one becomes the attempt (the version before it is unknown).
+    #[tokio::test]
+    async fn migration_7_moves_unfinished_bindings_to_promotions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pulp-tui.db");
+        {
+            let s = Store::open_at_version(&path, 6).await.unwrap();
+            sqlx::raw_sql(
+                "INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'old', 'web', 't');
+                 INSERT INTO cv_versions(id, cv_id, number, state, created_at) VALUES (1, 1, 1, 'published', 't'), (2, 1, 2, 'published', 't');
+                 INSERT INTO environments(id, profile, name, prior_id) VALUES (1, 'old', 'Library', NULL), (2, 'old', 'Dev', 1);
+                 INSERT INTO bindings VALUES (1, 1, 2, 'active', 't'), (2, 1, 2, 'failed', 't');",
+            )
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let s = Store::open(&path).await.unwrap();
+        let attempt = Some(Attempt { version_id: 2, state: "failed".into() });
+        assert_eq!(
+            s.bindings_for_cv(1).await.unwrap(),
+            [Binding { env_id: 1, cv_id: 1, served: Some(2), attempt: None }, Binding { env_id: 2, cv_id: 1, served: None, attempt }]
+        );
+    }
+
     /// A served row needs its environment, and the database refuses to drop an environment that still has one.
     #[tokio::test]
     async fn served_rows_need_their_environment() {
@@ -2350,7 +2497,7 @@ mod tests {
             (s.create_cv("k", "a", "").await.unwrap(), s.create_cv("k", "b", "").await.unwrap(), s.create_cv("k", "c", "").await.unwrap());
         assert!(s.env_cv_ids(dev).await.unwrap().is_empty());
         let v = s.begin_version(c, "", &[]).await.unwrap();
-        s.set_binding(dev, c, v.id, "active").await.unwrap(); // a binding, no served rows
+        s.promoted(dev, c, v.id, "active").await.unwrap(); // a binding, no served rows
         let row = BindingRepo {
             env_id: dev,
             cv_id: a,
@@ -2595,17 +2742,70 @@ mod tests {
         let v = s.version(v2.id).await.unwrap();
         assert_eq!((v.state.as_str(), v.error), ("published", None));
 
-        // Still this promotion: the final state is recorded.
-        s.set_binding(lib, cv, v1.id, "promoting").await.unwrap();
-        s.finish_promoting_binding(lib, cv, v1.id, "partial").await.unwrap();
-        assert_eq!(s.binding(lib, cv).await.unwrap().unwrap().state, "partial");
-        // The new holder finished the same or another version meanwhile: unchanged.
-        for (vid, state) in [(v1.id, "active"), (v2.id, "active"), (v2.id, "promoting")] {
-            s.set_binding(lib, cv, vid, state).await.unwrap();
-            s.finish_promoting_binding(lib, cv, v1.id, "partial").await.unwrap();
+        // Still this promotion (its lock token): the final state is recorded.
+        s.start_promotion(lib, cv, v1.id, "a").await.unwrap();
+        s.finish_promotion(lib, cv, v1.id, "partial", "a").await.unwrap();
+        assert_eq!(s.binding(lib, cv).await.unwrap().unwrap().attempt, Some(Attempt { version_id: v1.id, state: "partial".into() }));
+        // The new holder promotes the same version, or finished it: unchanged.
+        s.start_promotion(lib, cv, v1.id, "b").await.unwrap();
+        for state in ["partial", "active"] {
+            s.finish_promotion(lib, cv, v1.id, state, "a").await.unwrap();
             let b = s.binding(lib, cv).await.unwrap().unwrap();
-            assert_eq!((b.version_id, b.state.as_str()), (vid, state));
+            assert_eq!((b.served, b.attempt), (None, Some(Attempt { version_id: v1.id, state: "promoting".into() })));
         }
+        s.finish_promotion(lib, cv, v1.id, "active", "b").await.unwrap();
+        s.finish_promotion(lib, cv, v1.id, "failed", "a").await.unwrap();
+        assert_eq!(s.binding(lib, cv).await.unwrap().unwrap(), Binding { env_id: lib, cv_id: cv, served: Some(v1.id), attempt: None });
+    }
+
+    #[tokio::test]
+    async fn a_failed_promotion_keeps_the_served_version() {
+        let s = Store::open_in_memory().await.unwrap();
+        let cv = s.create_cv("lab", "web", "").await.unwrap();
+        let (v1, v2) = (s.begin_version(cv, "", &[]).await.unwrap(), s.begin_version(cv, "", &[]).await.unwrap());
+        let dev = s.create_env("lab", "Dev", s.ensure_library("lab").await.unwrap(), false).await.unwrap();
+        s.promoted(dev, cv, v1.id, "active").await.unwrap();
+        s.start_promotion(dev, cv, v2.id, "t").await.unwrap();
+        let attempt = |state: &str| Some(Attempt { version_id: v2.id, state: state.into() });
+        assert_eq!(
+            s.binding(dev, cv).await.unwrap().unwrap(),
+            Binding { env_id: dev, cv_id: cv, served: Some(v1.id), attempt: attempt("promoting") }
+        );
+        s.finish_promotion(dev, cv, v2.id, "failed", "t").await.unwrap();
+        let b = s.binding(dev, cv).await.unwrap().unwrap();
+        assert_eq!((b.served, b.attempt.clone(), b.active()), (Some(v1.id), attempt("failed"), None));
+        // Neither can be deleted; Dev cannot either.
+        assert_eq!(s.version_in_use(v1.id).await.unwrap(), ["Dev"]);
+        assert_eq!(s.version_in_use(v2.id).await.unwrap(), ["Dev (promotion failed)"]);
+        assert_eq!(s.cv_env_ids(cv).await.unwrap(), [dev]);
+        assert!(s.delete_env(dev).await.unwrap_err().to_string().contains("in use"));
+        // A failed retry of the served version: it shows once.
+        s.promoted(dev, cv, v1.id, "partial").await.unwrap();
+        assert_eq!(s.version_in_use(v1.id).await.unwrap(), ["Dev"]);
+        assert!(s.version_in_use(v2.id).await.unwrap().is_empty());
+        s.promoted(dev, cv, v2.id, "active").await.unwrap();
+        assert_eq!(s.binding(dev, cv).await.unwrap().unwrap().active(), Some(v2.id));
+        assert!(s.version_in_use(v1.id).await.unwrap().is_empty());
+        // The attempt alone (a first promotion that failed) still shows the view in Dev; unpromote forgets both.
+        let dev2 = s.create_env("lab", "Dev2", s.ensure_library("lab").await.unwrap(), false).await.unwrap();
+        s.promoted(dev2, cv, v1.id, "failed").await.unwrap();
+        assert_eq!(s.env_cv_ids(dev2).await.unwrap(), [cv]);
+        s.delete_binding(dev2, cv).await.unwrap();
+        assert!(s.binding(dev2, cv).await.unwrap().is_none());
+        s.delete_env(dev2).await.unwrap();
+        s.delete_cv(cv).await.unwrap();
+    }
+
+    /// The database refuses an attempt state that is not one of a promotion that has not completed.
+    #[tokio::test]
+    async fn an_active_attempt_cannot_be_written() {
+        let s = Store::open_in_memory().await.unwrap();
+        let cv = s.create_cv("lab", "web", "").await.unwrap();
+        let v = s.begin_version(cv, "", &[]).await.unwrap();
+        let lib = s.ensure_library("lab").await.unwrap();
+        s.start_promotion(lib, cv, v.id, "t").await.unwrap();
+        let e = sqlx::query("UPDATE promotions SET state = 'active'").execute(&s.pool).await.unwrap_err();
+        assert!(e.to_string().contains("CHECK"), "{e}");
     }
 
     #[tokio::test]
@@ -2695,7 +2895,7 @@ mod tests {
         src.set_cv_repo(cv, &repo).await.unwrap();
         let v = src.begin_version(cv, "n", std::slice::from_ref(&repo)).await.unwrap();
         src.finish_version(v.id, "published", None).await.unwrap();
-        src.set_binding(dev, cv, v.id, "active").await.unwrap();
+        src.promoted(dev, cv, v.id, "active").await.unwrap();
         src.audit("lab", "", "cv.promote", "web v1 -> Dev").await.unwrap();
 
         let dst = Store::open_in_memory().await.unwrap();
@@ -2708,7 +2908,7 @@ mod tests {
         let dev2 = envs.iter().find(|e| e.name == "Dev").unwrap();
         assert!(dev2.protected);
         let b = dst.binding(dev2.id, cvs[0].id).await.unwrap().unwrap();
-        assert_eq!(dst.version(b.version_id).await.unwrap().number, 1);
+        assert_eq!(dst.version(b.served.unwrap()).await.unwrap().number, 1);
         assert_eq!(dst.audit_log(k, 5).await.unwrap()[0].actor, "copied");
         assert_eq!(dst.aliases().await.unwrap(), vec![src.db_id().to_string()]);
     }
@@ -2742,7 +2942,7 @@ mod tests {
         };
         src.save_version_repo(&vr).await.unwrap();
         for (env, ver) in [(dev, v1.id), (prod, v2.id)] {
-            src.set_binding(env, cv, ver, "active").await.unwrap();
+            src.promoted(env, cv, ver, "active").await.unwrap();
             let b = BindingRepo {
                 env_id: env,
                 cv_id: cv,
@@ -2755,6 +2955,7 @@ mod tests {
             };
             src.save_binding_repo(&b).await.unwrap();
         }
+        src.promoted(dev, cv, v2.id, "failed").await.unwrap(); // Dev keeps serving v1
         src.audit("lab", "ann@h", "cv.create", "web").await.unwrap();
         src.audit("lab", "", "cv.publish", "web v1").await.unwrap();
 
@@ -2762,7 +2963,7 @@ mod tests {
         // Rows in the target shift every id: a copy that kept source ids would point at the wrong rows.
         let other = dst.create_cv("x", "pad", "").await.unwrap();
         let pad = dst.begin_version(other, "", &[]).await.unwrap();
-        dst.set_binding(dst.ensure_library("x").await.unwrap(), other, pad.id, "active").await.unwrap();
+        dst.promoted(dst.ensure_library("x").await.unwrap(), other, pad.id, "active").await.unwrap();
         let r = dst.copy_from(&src, "lab", "k").await.unwrap();
         assert_eq!((r.views, r.versions, r.environments, r.bindings, r.audit), (1, 2, 2, 2, 2));
 
@@ -2794,8 +2995,9 @@ mod tests {
         );
         assert_eq!((envs[1].prior_id, envs[2].prior_id), (Some(envs[0].id), Some(envs[1].id)));
         let b = dst.binding(envs[2].id, cv2.id).await.unwrap().unwrap();
-        assert_eq!((b.version_id, b.state), (n2.id, "active".to_string()));
-        assert_eq!(dst.binding(envs[1].id, cv2.id).await.unwrap().unwrap().version_id, n1.id);
+        assert_eq!(b.active(), Some(n2.id));
+        let b = dst.binding(envs[1].id, cv2.id).await.unwrap().unwrap();
+        assert_eq!((b.served, b.attempt), (Some(n1.id), Some(Attempt { version_id: n2.id, state: "failed".into() })));
         let brs = dst.binding_repos(envs[2].id, cv2.id).await.unwrap();
         assert_eq!((brs.len(), brs[0].cv_id, brs[0].base_path.as_str()), (1, cv2.id, format!("cv/{prod}/os").as_str()));
         let log = dst.audit_log("k", 5).await.unwrap();

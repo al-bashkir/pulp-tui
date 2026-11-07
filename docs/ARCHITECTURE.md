@@ -197,7 +197,7 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
 * Publish makes the version active in Library (`bind_library`). Resume does so only for
   the newest published version; Library keeps a newer one.
 * A failed Library step is a warning; the version stays published and auto publish runs.
-* A stop in this step leaves the binding `(version, promoting)`; under the view's lock such
+* A stop in this step leaves the promotion `(version, promoting)`; under the view's lock such
   a row is an interrupted one (`CvService::library_interrupted`). Resume of that version
   runs the step again; Resume of another published version refuses.
 * Not covered: a stop between `published` and the `promoting` row. Library then serves
@@ -209,11 +209,20 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
   environment. Each distribution is re-pointed to the version's publication. Bound
   repositories that the version lacks get `publication: null`; the distribution stays.
 * **Rollback** promotes an earlier version without the prior-environment check. After
-  Library, `promote` accepts only a lower number than the bound one, or the bound one (a
-  retry or drift repair); `cv::rollback_refusal` refuses the rest before any request. In
-  Library any published version is accepted. Newer versions are never deleted.
-* **Result**: Pulp has no multi-object transaction. A promotion stores `partial` (some
-  repositories failed) or `failed` (all), with per-repository rows. Retry is idempotent.
+  Library, `promote` accepts only a lower number than the highest bound one (served or
+  attempted, `CvService::bound_number`), or that one (a retry or drift repair);
+  `cv::rollback_refusal` refuses the rest before any request. In Library any published
+  version is accepted. Newer versions are never deleted.
+* **Binding** (`store::Binding`): two tables, so the version that Pulp serves is never lost.
+  `bindings` holds the served version: only a promotion that completed writes it
+  (`Store::finish_promotion` with `active`). `promotions` holds a promotion that has not
+  completed: `promoting`, `partial` (some repositories failed) or `failed` (all); a `CHECK`
+  refuses any other state. `Store::start_promotion` writes only `promotions`. Pulp has no
+  multi-object transaction, so the per-repository rows (`binding_repos`) record what each
+  distribution serves. Retry is idempotent.
+* A version is in use (`Store::version_in_use`, delete refused) while it is served or
+  attempted. The screens show `Dev:v1 (v2 failed)`; verify checks the served version and
+  reports the attempt. A rollback to the served version clears the attempt.
 * **Unpromote** deletes the view's own distributions in one environment, then the served
   rows, then the binding (last, so a rerun finishes). It is refused while a later
   environment on the path has the view.
@@ -384,9 +393,10 @@ PostgreSQL, so SQL must be portable. Store calls are `async` and run in jobs.
 | 4      | composites, `cv_components`, `cv_version_components`, `borrowed` rows |
 | 5      | `cv_version_repos.signing` (also stops an older pulp-tui on Deb rows) |
 | 6      | `binding_repos.env_id` foreign key (drops orphan rows)                |
+| 7      | `promotions`; `bindings` keeps only served (active) rows, no `state`  |
 
 `cv_components` has no cascade, so the database refuses to delete a view or version that a
-composite uses. `bindings.env_id` and `binding_repos.env_id` have no cascade either: the
+composite uses. `bindings.env_id`, `promotions.env_id` and `binding_repos.env_id` have no cascade either: the
 database refuses to delete an environment that still has them. SQLite cannot add a constraint,
 so migration 6 rebuilds `binding_repos`. Every SQLite connection sets `PRAGMA foreign_keys=ON`.
 
@@ -412,8 +422,9 @@ client clock).
   older than 90 s (TTL minus renew; Tokio timers stop while a computer sleeps).
 * After a lost lock, only three writes still happen: the href of a just-submitted task, the
   `failed` state of the publish (`Store::fail_publishing_version`, only while
-  `publishing`), and the promotion result (`Store::finish_promoting_binding`, only on its
-  own `promoting` row). So they never overwrite an operator who took over.
+  `publishing`), and the promotion result (`Store::finish_promotion`, only on the
+  `promotions` row that its lock token started). So they never overwrite an operator who took
+  over.
 * *Break lock* (`Store::break_lock`) deletes the row only if the holder is still the one
   shown. Drop releases by token; a crash leaves the row until it expires.
 * Locked: publish, resume, promote, rollback, unpromote, delete. Not locked: preview,

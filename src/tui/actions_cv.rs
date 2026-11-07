@@ -8,7 +8,7 @@ use crate::cv::{Mode, check_repo_clash, distribution_name};
 use crate::filters::{format_rules, parse_rules};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, RepoType};
-use crate::store::{Component, CvRepo, CvVersion, LIBRARY, Store};
+use crate::store::{Binding, Component, CvRepo, CvVersion, LIBRARY, Store};
 use anyhow::{anyhow, bail};
 use futures::future::join_all;
 use serde_json::Value;
@@ -593,15 +593,15 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
         }
         Act::CvDrift => app.job(format!("verify {name}"), move |ctx| async move {
             let (svc, mut lines, mut hints) = (ctx.cv()?, vec![], vec![]);
-            let running = svc.store.lock_live(id, crate::cv::unix_now()).await?;
             for e in svc.store.environments(&svc.scope).await? {
                 if let Some(b) = svc.store.binding(e.id, id).await? {
-                    let v = svc.store.version(b.version_id).await?;
+                    // The version that `verify` checks: the served one, else the attempted one.
+                    let v = svc.store.version(b.versions().next().unwrap_or_default()).await?;
                     let (n, issues) = (v.number, svc.verify(id, e.id).await?);
                     lines.push(format!(
-                        "{}: v{n} ({}) {}",
+                        "{}: {} {}",
                         e.name,
-                        crate::cv::shown_state(&b.state, running),
+                        shown_binding(&svc.store, &b).await?,
                         if issues.is_empty() { "OK - served content matches" } else { "DRIFT" }
                     ));
                     if !issues.is_empty() {
@@ -705,6 +705,13 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
     }
 }
 
+/// `cv::binding_text` of `b`, read from the store.
+async fn shown_binding(st: &Store, b: &Binding) -> anyhow::Result<String> {
+    let running = st.lock_live(b.cv_id, crate::cv::unix_now()).await?;
+    let numbers: std::collections::HashMap<i64, i64> = st.versions(b.cv_id).await?.iter().map(|v| (v.id, v.number)).collect();
+    Ok(crate::cv::binding_text(b, |id| numbers.get(&id).copied().unwrap_or_default(), running, "nothing"))
+}
+
 /// Show the exact distribution changes of a promotion/rollback, then run it.
 fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, mode: Mode) {
     app.job(format!("preview {name} -> {env}"), move |ctx| async move {
@@ -713,22 +720,15 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
         let envs = st.environments(&svc.scope).await?;
         let e = envs.into_iter().find(|e| e.name == env).ok_or_else(|| anyhow!("unknown environment {env}"))?;
         let v = st.version(vid).await?;
-        let current = st.binding(e.id, cv).await?;
         // The rule of `CvService::promote`, before a preview that the operator would confirm in vain.
-        if mode == Mode::Rollback && e.prior_id.is_some() {
-            let active = match &current {
-                Some(b) => Some(st.version(b.version_id).await?.number),
-                None => None,
-            };
-            if let Some(why) = crate::cv::rollback_refusal(&env, v.number, active) {
-                return ap(move |app| app.error(why));
-            }
+        if mode == Mode::Rollback
+            && e.prior_id.is_some()
+            && let Some(why) = crate::cv::rollback_refusal(&env, v.number, svc.bound_number(e.id, cv).await?)
+        {
+            return ap(move |app| app.error(why));
         }
-        let cur_num = match &current {
-            Some(b) => {
-                let running = st.lock_live(cv, crate::cv::unix_now()).await?;
-                format!("v{} ({})", st.version(b.version_id).await?.number, crate::cv::shown_state(&b.state, running))
-            }
+        let cur_num = match st.binding(e.id, cv).await? {
+            Some(b) => shown_binding(st, &b).await?,
             None => "nothing".into(),
         };
         let mut lines = vec![format!("{name}: {env} now serves {cur_num}; will serve v{}", v.number), String::new()];
@@ -1705,7 +1705,7 @@ mod tests {
         st.finish_version(v1.id, "failed", Some("copy failed")).await.unwrap();
         let v2 = publish_empty(&st, web).await;
         let lib = st.ensure_library("lab").await.unwrap();
-        st.set_binding(lib, web, v2.id, "active").await.unwrap();
+        st.promoted(lib, web, v2.id, "active").await.unwrap();
         let c = st.create_composite("lab", "rocky9", "").await.unwrap();
         st.set_component(c, web, None).await.unwrap();
         st.set_auto_publish(c, true).await.unwrap();
@@ -1714,7 +1714,7 @@ mod tests {
         version_action(&mut app, "lab", web, "web".into(), Act::Resume, item);
         drain(&mut app, &mut rx).await;
         assert_eq!(last_notice(&app), (Level::Warn, "web v1 published; Library not changed: v2 is newer (use Rollback to serve v1)"));
-        assert_eq!(st.binding(lib, web).await.unwrap().unwrap().version_id, v2.id);
+        assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v2.id));
         assert!(st.versions(c).await.unwrap().is_empty(), "composites follow v2: nothing new to auto publish");
     }
 
@@ -2025,7 +2025,7 @@ mod tests {
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let v = publish_empty(&st, web).await;
         let lib = st.ensure_library("lab").await.unwrap();
-        st.set_binding(lib, web, v.id, "promoting").await.unwrap(); // the client stopped in the Library step
+        st.promoted(lib, web, v.id, "promoting").await.unwrap(); // the client stopped in the Library step
         let c = st.create_composite("lab", "rocky9", "").await.unwrap();
         st.set_component(c, web, None).await.unwrap();
         st.set_auto_publish(c, true).await.unwrap();
@@ -2034,14 +2034,51 @@ mod tests {
         version_action(&mut app, "lab", web, "web".into(), Act::Resume, item.clone());
         drain(&mut app, &mut rx).await;
         assert_eq!(last_notice(&app), (Level::Ok, "web v1 published; auto publish: rocky9 v1 published"));
-        let b = st.binding(lib, web).await.unwrap().unwrap();
-        assert_eq!((b.version_id, b.state.as_str()), (v.id, "active"));
+        assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v.id));
         assert_eq!(st.versions(c).await.unwrap().len(), 1);
         // Library is active now: nothing is left to do.
         version_action(&mut app, "lab", web, "web".into(), Act::Resume, item);
         drain(&mut app, &mut rx).await;
         assert_eq!(last_notice(&app), (Level::Info, "version is already published"));
         assert_eq!(st.versions(c).await.unwrap().len(), 1, "no second composite version");
+    }
+
+    /// The "environments" cell of view `cv` on the Content Views screen, and the one of version `v` on its Versions screen.
+    async fn shown_envs(st: &Store, cv: i64, v: i64) -> (String, String) {
+        let cfg = &Config::default();
+        let load = |k: Kind| async move { super::super::kinds::load(&k, None, Ok(st), "lab", "lab", cfg, 0, "").await.unwrap().0 };
+        let views = load(Kind::ContentViews).await;
+        let versions = load(Kind::CvVersions { cv, name: String::new() }).await;
+        let version = versions.iter().find(|x| x["id"] == v).unwrap();
+        (s(&views[0], "bound"), s(version, "environments"))
+    }
+
+    #[tokio::test]
+    async fn a_failed_promotion_keeps_the_served_version_bound() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let svc = crate::cv::CvService { client: client(&server), store: st.clone(), scope: "lab".into(), actor: "t".into(), lock: None };
+        let lib = st.ensure_library("lab").await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v1 = publish_empty(&st, web).await;
+        svc.promote(web, v1.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap();
+        // v2 cannot be served: its only repository has no publication, so every repository fails.
+        let v2 = st.begin_version(web, "", &[cv_repo("os", "rpm", "1")]).await.unwrap();
+        st.finish_version(v2.id, "published", None).await.unwrap();
+        let e = svc.promote(web, v2.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert!(e.to_string().starts_with("web in Library: failed"), "{e}");
+        assert_eq!(shown_envs(&st, web, v1.id).await, ("Library:v1 (v2 failed)".into(), "Library".into()));
+        assert_eq!(shown_envs(&st, web, v2.id).await.1, "Library (failed)");
+        // The served v1 is the rollback target: its delete is refused before the typed confirmation.
+        let row = json!({ "id": v1.id, "number": 1, "state": "published" });
+        version_action(&mut app, "lab", web, "web".into(), Act::Delete, row);
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no delete confirmation");
+        assert_eq!(last_notice(&app), (Level::Error, "read what deleting web v1 removes: version 1 is bound to Library"));
+        svc.promote(web, v1.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap();
+        assert_eq!(shown_envs(&st, web, v1.id).await, ("Library:v1".into(), "Library".into()));
+        assert_eq!(shown_envs(&st, web, v2.id).await.1, "", "the failed attempt is gone after the rollback");
     }
 
     fn confirm_lines(app: &mut App) -> Vec<String> {
@@ -2059,14 +2096,14 @@ mod tests {
         let dev = st.create_env("lab", "Dev", st.ensure_library("lab").await.unwrap(), false).await.unwrap();
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let v = publish_empty(&st, web).await;
-        st.set_binding(dev, web, v.id, "promoting").await.unwrap(); // no live lock: the client that ran it ended
+        st.promoted(dev, web, v.id, "promoting").await.unwrap(); // no live lock: the client that ran it ended
         promote_preview(&mut app, web, "web".into(), v.id, "Dev".into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
-        assert_eq!(confirm_lines(&mut app)[0], "web: Dev now serves v1 (interrupted); will serve v1");
+        assert_eq!(confirm_lines(&mut app)[0], "web: Dev now serves nothing (v1 interrupted); will serve v1");
         cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
         drain(&mut app, &mut rx).await;
         let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
-        assert_eq!(lines[..2], ["Dev: v1 (interrupted) DRIFT", "    binding state is interrupted"]);
+        assert_eq!(lines[..2], ["Dev: nothing (v1 interrupted) DRIFT", "    promotion of v1 is interrupted"]);
     }
 
     #[tokio::test]
@@ -2080,14 +2117,14 @@ mod tests {
         let prod = st.create_env("lab", "Prod", test, false).await.unwrap();
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let (v1, v2) = (publish_empty(&st, web).await, publish_empty(&st, web).await);
-        st.set_binding(lib, web, v2.id, "active").await.unwrap();
-        st.set_binding(dev, web, v2.id, "partial").await.unwrap(); // Library has v2 active: Promote works
-        st.set_binding(test, web, v2.id, "partial").await.unwrap(); // Dev has v2, but not active: refused
-        st.set_binding(prod, web, v1.id, "partial").await.unwrap(); // Test moved on to v2: Promote of v1 is refused
+        st.promoted(lib, web, v2.id, "active").await.unwrap();
+        st.promoted(dev, web, v2.id, "partial").await.unwrap(); // Library has v2 active: Promote works
+        st.promoted(test, web, v2.id, "partial").await.unwrap(); // Dev has v2, but not active: refused
+        st.promoted(prod, web, v1.id, "partial").await.unwrap(); // Test moved on to v2: Promote of v1 is refused
         cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
         drain(&mut app, &mut rx).await;
         let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
-        assert_eq!(lines[0], "Library: v2 (active) OK - served content matches");
+        assert_eq!(lines[0], "Library: v2 OK - served content matches");
         assert_eq!(
             lines[lines.len() - 4..],
             [
@@ -2111,14 +2148,14 @@ mod tests {
         drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none(), "no preview to confirm");
         assert_eq!(last_notice(&app), (Level::Error, "no version is active in Dev; use Promote"));
-        st.set_binding(dev, web, v1.id, "active").await.unwrap();
+        st.promoted(dev, web, v1.id, "active").await.unwrap();
         promote_preview(&mut app, web, "web".into(), v2.id, "Dev".into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none(), "no preview to confirm");
         assert_eq!(last_notice(&app), (Level::Error, "v2 is newer than the active v1 in Dev; use Promote"));
         promote_preview(&mut app, web, "web".into(), v1.id, "Dev".into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
-        assert_eq!(confirm_lines(&mut app)[0], "web: Dev now serves v1 (active); will serve v1", "the active version again: a retry");
+        assert_eq!(confirm_lines(&mut app)[0], "web: Dev now serves v1; will serve v1", "the active version again: a retry");
     }
 
     #[tokio::test]
@@ -2130,7 +2167,7 @@ mod tests {
         let prod = st.create_env("lab", "Prod", lib, true).await.unwrap();
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let v = publish_empty(&st, web).await;
-        st.set_binding(prod, web, v.id, "active").await.unwrap();
+        st.promoted(prod, web, v.id, "active").await.unwrap();
         let row = crate::store::BindingRepo {
             env_id: prod,
             cv_id: web,
@@ -2256,7 +2293,7 @@ mod tests {
         serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/".into(), 200, json!({ "count": 1, "next": null, "results": [d] })).await;
         let item = json!({ "id": v1.id, "number": v1.number, "state": "published", "components": [] });
         let lib = st.ensure_library("lab").await.unwrap();
-        st.set_binding(lib, web, v1.id, "active").await.unwrap();
+        st.promoted(lib, web, v1.id, "active").await.unwrap();
         version_action(&mut app, "lab", web, "web".into(), Act::Delete, item.clone());
         drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none(), "refused: no confirmation");
@@ -2358,7 +2395,7 @@ mod tests {
         let dev = st.create_env("lab", "Dev", lib, false).await.unwrap();
         st.create_env("lab", "Prod", dev, false).await.unwrap();
         let v = publish_empty(&st, web).await;
-        st.set_binding(dev, web, v.id, "active").await.unwrap();
+        st.promoted(dev, web, v.id, "active").await.unwrap();
         let qa = st.create_env("lab", "QA", lib, false).await.unwrap();
         let dist = "/pulp/api/v3/distributions/rpm/rpm/1/";
         let row = crate::store::BindingRepo {

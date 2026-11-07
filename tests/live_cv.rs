@@ -13,6 +13,7 @@ use pulp_tui::pulp::models::{RepoVersion, Task};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{Capabilities, Mutation, RepoType};
 use pulp_tui::store::{CvRepo, Export, Store};
+use pulp_tui::tui::kinds::Kind;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -88,7 +89,7 @@ async fn content_view_lifecycle() {
     ops::settle(&c, m, &no_progress).await.unwrap();
     let (v2, _) = svc.publish(cv, "upstream update", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(v2.number, 2);
-    assert_eq!(store.binding(lib, cv).await.unwrap().unwrap().version_id, v2.id);
+    assert_eq!(store.binding(lib, cv).await.unwrap().unwrap().active(), Some(v2.id));
     svc.promote(cv, v2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
     assert!(svc.verify(cv, dev).await.unwrap().is_empty());
     let cmp = svc.compare_versions(v1.id, v2.id).await.unwrap().join("\n");
@@ -96,14 +97,14 @@ async fn content_view_lifecycle() {
 
     // Rollback Dev to v1: bindings change, history stays, served content is v1 again.
     svc.promote(cv, v1.id, dev, Mode::Rollback, &quiet, &no_progress).await.unwrap();
-    assert_eq!(store.binding(dev, cv).await.unwrap().unwrap().version_id, v1.id);
+    assert_eq!(store.binding(dev, cv).await.unwrap().unwrap().active(), Some(v1.id));
     assert!(svc.verify(cv, dev).await.unwrap().is_empty());
     assert_eq!(store.version(v2.id).await.unwrap().state, "published");
     // Rollback goes back only: v2 again, or v1 into empty Prod, would skip the path (CV-5).
     let refused = async |v: i64, env| svc.promote(cv, v, env, Mode::Rollback, &quiet, &no_progress).await.unwrap_err().to_string();
     assert_eq!(refused(v2.id, dev).await, "v2 is newer than the active v1 in Dev; use Promote");
     assert_eq!(refused(v1.id, prod).await, "no version is active in Prod; use Promote");
-    assert_eq!(store.binding(dev, cv).await.unwrap().unwrap().version_id, v1.id);
+    assert_eq!(store.binding(dev, cv).await.unwrap().unwrap().active(), Some(v1.id));
 
     // Retention protection: referenced snapshots are listed; bound versions cannot be deleted.
     let protected = store.protected_versions(&profile).await.unwrap();
@@ -130,11 +131,11 @@ async fn content_view_lifecycle() {
     .await;
     let err = svc.promote(cv, v3.id, qa, Mode::Promote, &quiet, &no_progress).await.unwrap_err();
     assert!(err.to_string().contains("partial"), "{err}");
-    assert_eq!(store.binding(qa, cv).await.unwrap().unwrap().state, "partial");
+    assert_eq!(store.binding(qa, cv).await.unwrap().unwrap().attempt.unwrap().state, "partial");
     assert!(!svc.verify(cv, qa).await.unwrap().is_empty());
     cleanup(&c, &[&blocker]).await;
     svc.promote(cv, v3.id, qa, Mode::Promote, &quiet, &no_progress).await.unwrap(); // idempotent retry
-    assert_eq!(store.binding(qa, cv).await.unwrap().unwrap().state, "active");
+    assert_eq!(store.binding(qa, cv).await.unwrap().unwrap().attempt, None);
     assert!(svc.verify(cv, qa).await.unwrap().is_empty());
 
     // Resume: the copy task was submitted, then the client "crashed" before waiting.
@@ -286,7 +287,7 @@ async fn resume_of_an_older_version_keeps_library_on_the_newer_one() {
     assert_eq!(v1.state, "published");
     assert_eq!(note.as_deref(), Some("Library not changed: v2 is newer (use Rollback to serve v1)"));
     let lib = store.ensure_library(&profile).await.unwrap();
-    assert_eq!(store.binding(lib, cv).await.unwrap().unwrap().version_id, v2.id);
+    assert_eq!(store.binding(lib, cv).await.unwrap().unwrap().active(), Some(v2.id));
     let (r1, r2) = (store.version_repos(v1.id).await.unwrap(), store.version_repos(v2.id).await.unwrap());
     assert_ne!(r1[0].publication, r2[0].publication, "the versions differ");
     // The distribution in Pulp serves the publication of v2.
@@ -348,6 +349,64 @@ async fn unpromote_goes_back_along_the_path() {
 
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &[&repo, &remote]).await;
+}
+
+/// A promotion that fails for every repository keeps the version that Pulp still serves bound: the list shows it with
+/// the failed attempt, it cannot be deleted, and a rollback to it works.
+#[tokio::test]
+async fn a_failed_promotion_keeps_the_served_version() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvff");
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
+    let cv = store.create_cv(&profile, &id, "").await.unwrap();
+    let mut sources = vec![];
+    for name in ["docs", "more"] {
+        let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-{name}"), "file/PULP_MANIFEST", "mirror").await;
+        let r = CvRepo { repo_href: repo.clone(), repo_name: name.into(), repo_type: RepoType::File, filters: vec![] };
+        store.set_cv_repo(cv, &r).await.unwrap();
+        sources.extend([repo, remote]);
+    }
+    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let lib = store.ensure_library(&profile).await.unwrap();
+    let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
+    svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    let (v2, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+
+    // Renamed outside pulp-tui: the promotion finds no distribution of its name, and their base paths are taken.
+    let rows = store.binding_repos(dev, cv).await.unwrap();
+    let rename = async |suffix: &str| {
+        for b in &rows {
+            let name = format!("{}{suffix}", pulp_tui::cv::distribution_name(&id, "Dev", &b.repo_name));
+            let m = c.patch(&b.distribution, &json!({ "name": name })).await.unwrap();
+            ops::settle(&c, m, &no_progress).await.unwrap();
+        }
+    };
+    rename("-moved").await;
+    let e = svc.promote(cv, v2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap_err().to_string();
+    assert!(e.starts_with(&format!("{id} in Dev: failed: ")) && e.contains("is used by distribution"), "{e}");
+    let b = store.binding(dev, cv).await.unwrap().unwrap();
+    assert_eq!((b.served, b.attempt.map(|a| (a.version_id, a.state))), (Some(v1.id), Some((v2.id, "failed".to_string()))));
+    let cfg = pulp_tui::config::Config::default();
+    let list = pulp_tui::tui::kinds::load(&Kind::ContentViews, None, Ok(&*store), &profile, &profile, &cfg, 0, &id).await.unwrap().0;
+    assert_eq!(list[0]["bound"], "Library:v2  Dev:v1 (v2 failed)");
+    // Pulp still serves v1 in Dev: only the failed attempt is reported.
+    assert_eq!(svc.verify(cv, dev).await.unwrap(), ["promotion of v2 is failed"]);
+    let e = svc.delete_version(v1.id, &quiet, &no_progress).await.unwrap_err().to_string();
+    assert_eq!(e, "version 1 is bound to Dev");
+    assert_eq!(store.version(v1.id).await.unwrap().state, "published", "the rollback target stays");
+
+    rename("").await;
+    svc.promote(cv, v1.id, dev, Mode::Rollback, &quiet, &no_progress).await.unwrap();
+    assert_eq!(store.binding(dev, cv).await.unwrap().unwrap().active(), Some(v1.id));
+    assert!(svc.verify(cv, dev).await.unwrap().is_empty());
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
 }
 
 /// Two databases (stores with different ids) share one Pulp and one Content View name.
@@ -471,7 +530,7 @@ async fn composite_content_view_rocky9() {
     assert!(cmp.contains(&format!("{extras_name}: v1 -> v2")) && cmp.contains("+ fixture-gamma-0.5-1.noarch"), "{cmp}");
 
     // Auto publish never promotes: Dev still serves v1 until v2 is promoted there, then it serves the extras of v2.
-    assert_eq!(store.binding(dev, comp).await.unwrap().unwrap().version_id, c1.id);
+    assert_eq!(store.binding(dev, comp).await.unwrap().unwrap().active(), Some(c1.id));
     svc.promote(comp, c2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
     assert_eq!(svc.verify(comp, dev).await.unwrap(), Vec::<String>::new());
     let extras_v2_pub = store.version_repos(extras_v2.id).await.unwrap().remove(0).publication;

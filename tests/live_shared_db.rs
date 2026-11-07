@@ -197,6 +197,36 @@ async fn postgres_served_rows_need_their_environment() {
     s.drop_schema().await;
 }
 
+/// Migration 7 on a schema 6 database: an active binding stays served, any other one becomes the attempt only.
+#[tokio::test]
+async fn postgres_migration_7_moves_unfinished_bindings_to_promotions() {
+    if !live_enabled() {
+        return;
+    }
+    let s = Schema::new().await;
+    {
+        let mut c = sqlx::AnyConnection::connect(&s.connect()).await.unwrap();
+        for m in &PG_MIGRATIONS[..6] {
+            c.execute(sqlx::raw_sql(*m)).await.unwrap();
+        }
+        c.execute(sqlx::raw_sql(
+            "INSERT INTO schema_version(version) VALUES (6);
+             INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'k', 'web', 't');
+             INSERT INTO cv_versions(id, cv_id, number, state, created_at) VALUES (1, 1, 1, 'published', 't'), (2, 1, 2, 'published', 't');
+             INSERT INTO environments(id, profile, name, prior_id, label) VALUES (1, 'k', 'Library', NULL, 'library'), (2, 'k', 'Dev', 1, 'dev');
+             INSERT INTO bindings VALUES (1, 1, 2, 'active', 't'), (2, 1, 2, 'partial', 't');",
+        ))
+        .await
+        .unwrap();
+    }
+    assert_eq!(s.migrate().await, (6, PG_MIGRATIONS.len() as i64));
+    let st = s.open().await;
+    let shown: Vec<_> = st.bindings_for_cv(1).await.unwrap().into_iter().map(|b| (b.served, b.attempt.map(|a| a.state))).collect();
+    assert_eq!(shown, [(Some(2), None), (None, Some("partial".to_string()))]);
+    assert_eq!(st.version_in_use(2).await.unwrap(), ["Dev (promotion partial)", "Library"]);
+    s.drop_schema().await;
+}
+
 #[tokio::test]
 async fn two_operators_share_state_and_locks() {
     if !live_enabled() {
@@ -300,14 +330,23 @@ async fn store_methods_on_postgres() {
     let qa = st.create_env(k, "QA", lib, false).await.unwrap();
     let names: Vec<_> = st.environments(k).await.unwrap().into_iter().map(|e| e.name).collect();
     assert_eq!(names, ["Library", "Dev", "Prod", "QA"]);
-    st.set_binding(dev, cv, v1.id, "active").await.unwrap();
-    st.set_binding(prod, cv, v1.id, "promoting").await.unwrap();
-    st.finish_promoting_binding(prod, cv, v1.id, "partial").await.unwrap();
-    st.finish_promoting_binding(dev, cv, v1.id, "failed").await.unwrap(); // not promoting: unchanged
-    assert_eq!(st.binding(dev, cv).await.unwrap().unwrap().state, "active");
-    let mut in_use = st.version_in_use(v1.id).await.unwrap();
-    in_use.sort();
-    assert_eq!(in_use, ["Dev", "Prod"]);
+    st.start_promotion(dev, cv, v1.id, "t1").await.unwrap();
+    st.finish_promotion(dev, cv, v1.id, "active", "t1").await.unwrap();
+    st.start_promotion(prod, cv, v1.id, "t2").await.unwrap();
+    st.finish_promotion(prod, cv, v1.id, "partial", "t2").await.unwrap();
+    st.finish_promotion(dev, cv, v1.id, "failed", "t1").await.unwrap(); // finished already: unchanged
+    assert_eq!(st.binding(dev, cv).await.unwrap().unwrap().active(), Some(v1.id));
+    // A failed promotion of v2 keeps v1 served in Dev; both stay in use.
+    st.start_promotion(dev, cv, v2.id, "t3").await.unwrap();
+    st.finish_promotion(dev, cv, v2.id, "failed", "t3").await.unwrap();
+    let b = st.binding(dev, cv).await.unwrap().unwrap();
+    assert_eq!((b.served, b.attempt.map(|a| (a.version_id, a.state))), (Some(v1.id), Some((v2.id, "failed".to_string()))));
+    assert_eq!(st.version_in_use(v1.id).await.unwrap(), ["Dev", "Prod (promotion partial)"]);
+    assert_eq!(st.version_in_use(v2.id).await.unwrap(), ["Dev (promotion failed)"]);
+    // PostgreSQL refuses an attempt state that is not one of an unfinished promotion too.
+    st.start_promotion(dev, cv, v2.id, "t3").await.unwrap();
+    let e = st.finish_promotion(dev, cv, v2.id, "done", "t3").await.unwrap_err();
+    assert!(format!("{e:#}").contains("check"), "{e:#}");
     let br = BindingRepo {
         env_id: dev,
         cv_id: cv,
@@ -321,7 +360,7 @@ async fn store_methods_on_postgres() {
     st.save_binding_repo(&br).await.unwrap();
     st.save_binding_repo(&BindingRepo { publication: None, ..br.clone() }).await.unwrap(); // upsert
     assert_eq!(st.binding_repos(dev, cv).await.unwrap(), vec![BindingRepo { publication: None, ..br }]);
-    assert_eq!(st.binding(prod, cv).await.unwrap().unwrap().state, "partial");
+    assert_eq!(st.binding(prod, cv).await.unwrap().unwrap().attempt.unwrap().state, "partial");
     assert_eq!(st.bindings_for_cv(cv).await.unwrap().len(), 2);
     assert!(st.delete_env(dev).await.is_err(), "bound and has a successor");
     st.delete_env(qa).await.unwrap();
@@ -359,7 +398,8 @@ async fn store_methods_on_postgres() {
     local.set_cv_repo(lcv, &lrepo).await.unwrap();
     let lv = local.begin_version(lcv, "n", std::slice::from_ref(&lrepo)).await.unwrap();
     local.finish_version(lv.id, "published", None).await.unwrap();
-    local.set_binding(ldev, lcv, lv.id, "active").await.unwrap();
+    local.start_promotion(ldev, lcv, lv.id, "t").await.unwrap();
+    local.finish_promotion(ldev, lcv, lv.id, "active", "t").await.unwrap();
     local.audit("lab", "", "cv.promote", "web v1 -> Dev").await.unwrap();
     let k2 = "https://copied/pulp/#default";
     let r = st.copy_from(&local, "lab", k2).await.unwrap();
@@ -369,7 +409,7 @@ async fn store_methods_on_postgres() {
     let dev2 = st.environments(k2).await.unwrap().into_iter().find(|e| e.name == "Dev").unwrap();
     assert!(dev2.protected);
     let b = st.binding(dev2.id, copied.id).await.unwrap().unwrap();
-    assert_eq!(st.version(b.version_id).await.unwrap().number, 1);
+    assert_eq!(st.version(b.served.unwrap()).await.unwrap().number, 1);
     assert_eq!(st.audit_log(k2, 5).await.unwrap()[0].actor, "copied");
     assert_eq!(st.aliases().await.unwrap(), vec![local.db_id().to_string()]);
     let e = st.copy_from(&local, "lab", k2).await.unwrap_err().to_string();
