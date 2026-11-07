@@ -3387,7 +3387,7 @@ fn task_action(app: &mut App, act: Act, item: Value) {
                 format!("Delete the record of task {name} ({href}, {state}) on Pulp."),
                 "What the task made stays; its state, progress and error are gone.".into(),
             ];
-            app.confirm("Delete server task", lines, move |app| {
+            app.confirm_danger("Delete server task", lines, &short(&href), move |app| {
                 submit(app, format!("delete task {name}"), move |c| async move { Ok(c.delete(&href).await?) })
             });
         }
@@ -6375,8 +6375,9 @@ mod tests {
             assert_eq!(e, format!("task sync is {state}: only a finished task can be deleted (cancel it first)"));
         }
         run(&mut app, Act::Delete, json!({ "pulp_href": task, "name": "sync", "state": "failed" }));
-        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
         assert_eq!(lines[0], format!("Delete the record of task sync ({task}, failed) on Pulp."));
+        assert_eq!(typed.as_deref(), Some("5"), "the operator types the task id, as for other server records");
         yes(&mut app);
         settle(&mut app, &mut rx).await;
         assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("delete task sync: done"));

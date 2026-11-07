@@ -849,8 +849,8 @@ Server tasks:
 * **F** filters on the server: state, name contains, resource href (the tasks that locked an
   object), started at or after (`2026-11-01` or `2026-11-01T08:00:00Z`). The title shows the
   filters.
-* **d** deletes the record of a finished task (what the task made stays). Cancel an unfinished
-  task first.
+* **d** deletes the record of a finished task (what the task made stays); type its id. Cancel an
+  unfinished task first.
 * **P** purges finished tasks of the whole server: *Finished before* (`2026-10-01`) and states
   (`completed`, `failed`, `canceled`, `skipped`; default `completed`). pulp-tui counts the tasks
   first, then you type the profile name.
