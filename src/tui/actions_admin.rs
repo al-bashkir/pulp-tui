@@ -847,6 +847,21 @@ fn deletion_warning(policy: &str) -> Option<String> {
     Some(format!("!!! policy {name} may DELETE {what} !!!"))
 }
 
+/// Upstream Pulp fields that the form never pre-fills (write-only, or a PEM file path to read): empty = unchanged.
+const CREDENTIALS: [(&str, &str); 5] = [
+    ("username", "username"),
+    ("password", "password"),
+    ("ca_cert", "CA cert"),
+    ("client_cert", "client cert"),
+    ("client_key", "client key"),
+];
+
+/// Whether `upstream` has a value for `key`: a readable one, or a write-only one that `hidden_fields` marks set.
+fn is_set(upstream: &Value, key: &str) -> bool {
+    upstream[key].as_str().is_some_and(|s| !s.is_empty())
+        || upstream["hidden_fields"].as_array().into_iter().flatten().any(|h| h["name"] == key && h["is_set"] == true)
+}
+
 fn upstream_action(app: &mut App, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
@@ -878,6 +893,12 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                     "true"
                 }),
             ];
+            // Empty means unchanged, so a stored credential is removed only with its own checkbox (sends null).
+            let tls = fields.len() - 1;
+            let clear = |(k, label): &(&str, &str)| {
+                Field::new(&format!("clear_{k}"), &format!("Clear {label}"), FieldKind::Bool).help("removes the stored value (sends null)")
+            };
+            fields.splice(tls..tls, CREDENTIALS.iter().filter(|(k, _)| edit && is_set(&v, k)).map(clear));
             if has("q_select") {
                 fields.push(
                     Field::text("q_select", "Distribution filter (q)")
@@ -941,12 +962,19 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                 let mut files = vec![];
                 for fld in &f.fields {
                     let val = fld.value.trim().to_string();
-                    let write_only = matches!(fld.key.as_str(), "username" | "password" | "ca_cert" | "client_cert" | "client_key");
+                    let write_only = CREDENTIALS.iter().any(|(k, _)| *k == fld.key);
                     if (write_only || !edit) && val.is_empty() || edit && !write_only && !fld.changed() {
                         continue;
                     }
                     match (fld.key.as_str(), &fld.kind) {
                         ("ca_cert" | "client_cert" | "client_key", _) => files.push((fld.key.clone(), val)),
+                        // After the credential fields: a checked clear wins over a typed value.
+                        (k, _) if k.starts_with("clear_") && val == "true" => {
+                            let k = &k["clear_".len()..];
+                            b[k] = Value::Null;
+                            files.retain(|(f, _)| f != k);
+                        }
+                        (k, _) if k.starts_with("clear_") => {}
                         (_, FieldKind::Bool) => b[fld.key.as_str()] = (val == "true").into(),
                         _ if val.is_empty() => b[fld.key.as_str()] = Value::Null,
                         (_, FieldKind::Number) => {
@@ -958,21 +986,18 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                         _ => b[fld.key.as_str()] = val.into(),
                     }
                 }
-                let href = href.clone();
+                let (href, label) = (href.clone(), format!("{} upstream {}", if edit { "update" } else { "create" }, f.get("name")));
                 let go = move |app: &mut App| {
-                    submit(
-                        app,
-                        format!("{} upstream {}", if edit { "update" } else { "create" }, b["name"].as_str().unwrap_or("")),
-                        move |c| async move {
-                            for (k, path) in files {
-                                b[k.as_str()] = tokio::fs::read_to_string(&path).await.with_context(|| format!("read {path}"))?.into();
-                            }
-                            Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api("upstream-pulps/"), &b).await? })
-                        },
-                    )
+                    submit(app, label, move |c| async move {
+                        for (k, path) in files {
+                            b[k.as_str()] = tokio::fs::read_to_string(&path).await.with_context(|| format!("read {path}"))?.into();
+                        }
+                        Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api("upstream-pulps/"), &b).await? })
+                    })
                 };
                 let policy = f.get("policy");
-                match deletion_warning(policy) {
+                // An edit that keeps the stored policy was confirmed when that policy was set.
+                match deletion_warning(policy).filter(|_| !edit || f.changed("policy")) {
                     // An empty policy is no word to type: the Upstream name instead.
                     Some(w) => app.confirm_danger(
                         "Destructive replication policy",
@@ -1057,12 +1082,33 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
             ap(move |app| app.text(format!("Replication history of {name}"), lines))
         }),
         Act::FallbackReplicate => fallback(app),
-        Act::Delete => app.confirm_danger(
-            format!("Delete upstream {name}"),
-            vec!["Only the upstream definition is removed; replicated content stays.".into()],
-            &name.clone(),
-            move |app| submit(app, format!("delete upstream {name}"), move |c| async move { Ok(c.delete(&href).await?) }),
-        ),
+        Act::Delete => app.job(format!("impact of deleting upstream {name}"), move |ctx| async move {
+            let c = &ctx.client;
+            // pulpcore labels what a replication creates with `UpstreamPulp=<pk>`; its tasks reserve the Upstream Pulp.
+            let pk = href.trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_string();
+            let label = [("pulp_label_select", format!("UpstreamPulp={pk}")), ("limit", "1".into())];
+            let mut n = vec![];
+            for p in ["repositories/", "remotes/", "distributions/"] {
+                n.push(c.list::<Value>(&c.api(p), &label).await?.count);
+            }
+            let q = [("reserved_resources", href.clone()), ("state__in", "waiting,running".into()), ("limit", "1".into())];
+            let busy = c.list::<Value>(&c.api("tasks/"), &q).await?.count;
+            let mut lines = vec![
+                format!("Delete the Upstream Pulp definition {name}."),
+                format!(
+                    "Its replications labelled {} repositories, {} remotes and {} distributions (UpstreamPulp={pk}): they stay.",
+                    n[0], n[1], n[2]
+                ),
+            ];
+            if busy > 0 {
+                lines.push(format!("{busy} replication task(s) of it are waiting or running: they fail without it."));
+            }
+            ap(move |app| {
+                app.confirm_danger(format!("Delete upstream {name}"), lines, &name.clone(), move |app| {
+                    submit(app, format!("delete upstream {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+                })
+            })
+        }),
         _ => {}
     }
 }
@@ -1745,6 +1791,87 @@ mod tests {
         form.fields.iter_mut().find(|f| f.key == "base_url").unwrap().value = "https://upstream.example.com".into();
         assert_eq!(submit(&mut app, &form), Ok(()));
         assert_eq!(app.jobs.len(), 1, "the create is sent");
+    }
+
+    /// Delete loads what uses the Upstream Pulp (the objects its replications labelled, its running tasks), then asks
+    /// for the typed name.
+    #[tokio::test]
+    async fn upstream_delete_shows_what_uses_it_and_asks_for_the_name() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        let count = |n: u64| json!({ "count": n, "next": null, "results": [] });
+        for (p, n) in [("repositories/", 2), ("remotes/", 2), ("distributions/", 3), ("tasks/", 1)] {
+            serve(&server, "GET", &format!("/pulp/api/v3/{p}"), 200, count(n)).await;
+        }
+        serve(&server, "DELETE", UP, 204, Value::Null).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::UpstreamPulps;
+        super::run(&mut app, Act::Delete, json!({ "pulp_href": UP, "name": "up" }));
+        assert!(app.modal.is_none() && sent(&server).await.is_empty(), "the impact first");
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed: Some(typed), on_yes: Some(yes), .. }) = app.modal.take() else {
+            panic!("no confirm: {:?}", notices(&app))
+        };
+        assert_eq!(typed, "up");
+        assert_eq!(
+            lines,
+            [
+                "Delete the Upstream Pulp definition up.",
+                "Its replications labelled 2 repositories, 2 remotes and 3 distributions (UpstreamPulp=1): they stay.",
+                "1 replication task(s) of it are waiting or running: they fail without it.",
+            ]
+        );
+        let reqs = server.received_requests().await.unwrap();
+        let asked: Vec<_> = reqs.iter().filter(|r| r.method.as_str() == "GET").filter_map(|r| r.url.query().map(str::to_string)).collect();
+        assert!(asked.iter().any(|q| q.contains("pulp_label_select=UpstreamPulp%3D1")), "{asked:?}");
+        assert!(asked.iter().any(|q| q.contains("reserved_resources=%2Fpulp%2Fapi%2Fv3%2Fupstream-pulps%2F1%2F")), "{asked:?}");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(sent(&server).await, [("DELETE".into(), UP.into(), Value::Null)]);
+    }
+
+    /// Edit: the label names the upstream, a stored destructive policy asks again only when it changes, and set
+    /// write-only credentials can be cleared.
+    #[tokio::test]
+    async fn upstream_edit_confirms_only_a_policy_change_and_clears_credentials() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        serve(&server, "PATCH", UP, 200, json!({ "pulp_href": UP })).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::UpstreamPulps;
+        let item = json!({ "pulp_href": UP, "name": "up", "base_url": "https://upstream.example.com/", "api_root": "pulp/",
+            "policy": "all", "ca_cert": "PEM", "client_cert": null, "tls_validation": true,
+            "hidden_fields": [{ "name": "client_key", "is_set": false }, { "name": "username", "is_set": true }, { "name": "password", "is_set": true }] });
+        let (mut f, mut submit) = open_form(&mut app, Act::Edit, item);
+        let clear: Vec<_> = f.fields.iter().filter(|x| x.key.starts_with("clear_")).map(|x| x.key.as_str()).collect();
+        assert_eq!(clear, ["clear_username", "clear_password", "clear_ca_cert"], "only what is set");
+
+        set(&mut f, "tls_validation", "false");
+        submit(&mut app, &f).unwrap();
+        assert!(app.modal.is_none(), "the stored policy `all` is not asked again");
+        settle(&mut app, &mut rx).await;
+        assert!(notices(&app).iter().any(|(l, t)| *l == Level::Ok && t == "update upstream up: done"), "{:?}", notices(&app));
+
+        set(&mut f, "clear_password", "true");
+        set(&mut f, "clear_ca_cert", "true");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+
+        set(&mut f, "policy", "labeled");
+        submit(&mut app, &f).unwrap();
+        let Some(Modal::Confirm { typed: Some(typed), on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed, "labeled");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let bodies: Vec<Value> = sent(&server).await.into_iter().map(|(_, _, b)| b).collect();
+        assert_eq!(
+            bodies,
+            [
+                json!({ "tls_validation": false }),
+                json!({ "tls_validation": false, "password": null, "ca_cert": null }),
+                json!({ "tls_validation": false, "password": null, "ca_cert": null, "policy": "labeled" }),
+            ]
+        );
     }
 
     #[tokio::test]

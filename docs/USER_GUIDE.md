@@ -733,10 +733,13 @@ Native Upstream Pulp objects (tech preview).
 * **H** shows the 5 newest replication task groups of this upstream.
 * **c** / **e** / **d** create / edit / delete, **i** full JSON. Fields:
   * upstream base URL (as *this* Pulp server reaches it), API root (`pulp/`), domain,
-    credentials, CA and client certificates, TLS validation;
+    credentials, CA and client certificates, TLS validation. Edit never shows them: empty
+    keeps the stored value, and **Clear …** (shown for each stored one) removes it;
   * distribution filter (`q_select`, for example `name__startswith="rhel9"`);
   * deletion policy: `nodelete` (default), `labeled` or `all`; every policy but `nodelete`
-    may delete local objects and needs a typed confirmation, also on Replicate;
+    may delete local objects and needs a typed confirmation when you set it, and on Replicate;
+* **d** shows how many repositories, remotes and distributions its replications labelled
+  (they stay) and its waiting or running tasks, then asks for the name.
   * **Replica download policy** (`immediate`, `on_demand` or `streamed`), concurrency, max
     retries, timeouts. Pulp copies them to the replica remotes.
 * **F** fallback: sync from another profile. Choose types (RPM and File, RPM, File, or Deb), a name

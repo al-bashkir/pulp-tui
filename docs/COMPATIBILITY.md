@@ -665,6 +665,10 @@ Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
 * **Replica bindings.** Native replication pins distributions with `repository_version`;
   pulpcore 3.95.3 does not pin (`repository`, `publication: null`). pulp-tui shows both as
   pinned and re-points them.
+* **Upstream Pulp fields** (3.123.1): `username`, `password` and `client_key` are write-only
+  (`hidden_fields`); `ca_cert` and `client_cert` are readable. Each accepts `null`, which
+  removes the stored value. Replication labels what it creates `UpstreamPulp=<upstream pk>`;
+  a delete of the Upstream Pulp keeps those objects.
 * **Group end.** On 3.63, `replicate_distributions` sets `all_tasks_dispatched`; on 3.123 it
   stays false, and from 3.95 the group ends with `finalize_replication` or a failed or
   canceled task. See `docs/ARCHITECTURE.md`.

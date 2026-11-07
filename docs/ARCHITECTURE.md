@@ -309,8 +309,8 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
   Upstream Pulp, starts `replicate/` and follows the task group. Only an all-completed group
   is a success; the result title names any other outcome (`FAILED`, `CANCELED`, `SKIPPED`).
   Pulp owns the deletion policy; the form puts
-  `nodelete` first. Every other policy may delete local objects, so saving or replicating
-  with it needs typed confirmation.
+  `nodelete` first. Every other policy may delete local objects, so setting it (create, or
+  an edit that changes the policy) or replicating with it needs typed confirmation.
 * **Fallback** (`src/replication.rs`): content sync only, RPM, File and Deb. Per upstream
   distribution it creates or updates a remote (the served URL), a repository and a
   pinned distribution with the same name and path, labeled
