@@ -4,6 +4,7 @@
 mod common;
 
 use common::*;
+use pulp_tui::config::Profile;
 use pulp_tui::pulp::models::{Distribution, TaskGroup};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{Capabilities, Feature, PulpClient, RepoType};
@@ -11,9 +12,10 @@ use pulp_tui::replication::{self, PlanAction};
 use pulp_tui::repo_export;
 use pulp_tui::store::Store;
 use pulp_tui::tui::actions::run;
-use pulp_tui::tui::app::Modal;
+use pulp_tui::tui::app::{App, Modal, Msg};
 use pulp_tui::tui::kinds::{Act, Kind};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 fn upstream_client() -> PulpClient {
     client_for(&std::env::var("PULP_TUI_TEST_UPSTREAM_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into()), "pulp2")
@@ -431,4 +433,134 @@ async fn repo_definitions_move_between_servers() {
     let (created, kept, notes) = repo_export::import(&down, &caps, &ex).await.unwrap();
     assert_eq!((created, kept), (0, 6 + git));
     assert!(notes.is_empty(), "a rerun finds nothing different: {notes:?}");
+}
+
+/// Profile `pulp2` (the upstream) next to `pulp1` in the TUI `app`, as the Servers screen adds it.
+fn add_upstream_profile(app: &mut App) {
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::write(dir.join("pw"), std::env::var("PULP_TUI_TEST_PASSWORD").unwrap_or_else(|_| "password".into())).unwrap();
+    let url = std::env::var("PULP_TUI_TEST_UPSTREAM_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into());
+    let secret = Some(format!("file:{}", dir.join("pw").display()));
+    app.cfg.profiles.insert("pulp2".into(), Profile { url, username: Some("admin".into()), secret, ..Default::default() });
+}
+
+/// Best-effort removal of the distribution, repository and remote of type `t` named `name` on `c`: the objects that a
+/// replication makes for an upstream distribution, or the upstream objects that the tests make with one name.
+async fn cleanup_named(c: &PulpClient, t: RepoType, name: &str) {
+    for collection in [t.distributions(), t.repositories(), t.remotes()] {
+        if let Ok(Some(v)) = ops::find_by_name::<Value>(c, &c.api(collection), name).await {
+            cleanup(c, &[v["pulp_href"].as_str().unwrap_or_default()]).await;
+        }
+    }
+}
+
+/// Fallback replication (F on Upstream Pulps) through the TUI from the profile pulp2, of `types` (the form's choice), of
+/// the upstream distributions whose name contains `prefix`: the dry run has one CREATE line for each of `want`; Yes
+/// replicates them; the result view has one completed line for each.
+async fn tui_fallback(app: &mut App, rx: &mut UnboundedReceiver<Msg>, types: &str, prefix: &str, want: &[&str]) {
+    app.list.kind = Kind::UpstreamPulps;
+    run(app, Act::FallbackReplicate, Value::Null);
+    fill(app, &[("source", "pulp2"), ("types", types), ("filter", prefix)]);
+    settle(app, rx).await; // the dry run
+    let (lines, typed) = yes(app);
+    assert_eq!((typed, lines[0].as_str()), (None, "Dry run: pulp2 -> pulp1 (additive)"));
+    let creates: Vec<&String> = lines.iter().filter(|l| l.starts_with("CREATE ")).collect();
+    let planned = |n: &&str| creates.iter().any(|l| l.contains(&format!(" {n} -> /")));
+    assert!(creates.len() == want.len() && want.iter().all(planned), "{lines:?}");
+    settle(app, rx).await;
+    shown(app, "fallback replication completed");
+    let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no result: {:?}", texts(app)) };
+    assert_eq!(title, "Fallback replication result");
+    assert!(lines.len() == want.len() && lines.iter().all(|l| l.starts_with("completed")), "{lines:?}");
+}
+
+/// Fallback replication through the TUI of an RPM and a File distribution of pulp2: each replica on pulp1 serves the
+/// upstream content.
+#[tokio::test]
+async fn fallback_replication_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (dst, up) = (client(), upstream_client());
+    let prefix = unique("fbtui");
+    upstream_content(&up, &prefix).await;
+    let (os, docs) = (format!("{prefix}-os"), format!("{prefix}-docs"));
+    let (mut app, mut rx) = app().await;
+    add_upstream_profile(&mut app);
+    tui_fallback(&mut app, &mut rx, "rpm+file", &prefix, &[&os, &docs]).await;
+    assert!(downstream_has(&dst, &os, "fixture-beta-2.0-1.noarch").await);
+    let d: Distribution = ops::find_by_name(&dst, &dst.api(RepoType::File.distributions()), &docs).await.unwrap().unwrap();
+    assert_eq!(served(&dst, &format!("{}docs/readme.txt", d.base_url.unwrap())).await, (200, b"readme v1\n".to_vec()));
+    for (t, name) in [(RepoType::Rpm, &os), (RepoType::File, &docs)] {
+        cleanup_named(&dst, t, name).await;
+        cleanup_named(&up, t, name).await;
+    }
+}
+
+/// Fallback replication through the TUI of a Deb distribution of pulp2 (types: deb): the replica on pulp1 serves the
+/// release of the upstream publication.
+#[tokio::test]
+async fn deb_fallback_replication_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (dst, up, t) = (client(), upstream_client(), RepoType::Deb);
+    let prefix = unique("fbdebtui");
+    let (repo, _) = synced_repo(&up, t, &prefix, "deb/", "mirror").await;
+    let p = ops::create_publication(&up, t, &latest(&up, &repo).await, &json!({}), &no_progress).await.unwrap();
+    let apt = format!("{prefix}-apt");
+    ops::ensure_distribution(&up, t, &apt, &format!("{prefix}/apt"), Some(&p), &json!({}), None, &no_progress).await.unwrap();
+    let (mut app, mut rx) = app().await;
+    add_upstream_profile(&mut app);
+    tui_fallback(&mut app, &mut rx, "deb", &prefix, &[&apt]).await;
+    let d: Distribution = ops::find_by_name(&dst, &dst.api(t.distributions()), &apt).await.unwrap().unwrap();
+    assert_eq!(served(&dst, &format!("{}dists/fixture/Release", d.base_url.unwrap())).await.0, 200);
+    cleanup_named(&dst, t, &apt).await;
+    cleanup_named(&up, t, &apt).await;
+    cleanup_named(&up, t, &prefix).await;
+}
+
+/// Replicate (R on Upstream Pulps) through the TUI: the confirmation names the filter (policy nodelete: no typed name);
+/// the Task Center row of the task group ends completed; the result view; pulp1 serves the upstream RPM and File
+/// content; History (H) lists the run.
+#[tokio::test]
+async fn native_replication_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (dst, up) = (client(), upstream_client());
+    let caps = Capabilities::detect(&dst).await.unwrap();
+    if !caps.supports(Feature::NativeReplication) {
+        eprintln!("native replication unsupported by this server; skipping");
+        return;
+    }
+    let prefix = unique("nattui");
+    upstream_content(&up, &prefix).await;
+    let upstream_href = upstream_pulp(&dst, &caps, &prefix).await;
+    let (os, docs) = (format!("{prefix}-os"), format!("{prefix}-docs"));
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::UpstreamPulps;
+    let item: Value = dst.get(&upstream_href, &[]).await.unwrap();
+    run(&mut app, Act::Replicate, item.clone());
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.is_none(), caps.supports(Feature::ReplicationPolicy), "nodelete asks no typed name: {lines:?}");
+    assert!(lines.contains(&format!("Distribution filter: name__startswith=\"{prefix}\"")), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no result: {:?}", texts(&app)) };
+    assert_eq!(title, format!("Replication of {prefix}"), "{lines:?}");
+    let group = app.tasks.items[0].clone();
+    assert!(group.state == "completed" && group.is_final(), "{group:?}");
+    assert!(downstream_has(&dst, &os, "fixture-alpha-1.0-1.noarch").await);
+    let d: Distribution = ops::find_by_name(&dst, &dst.api(RepoType::File.distributions()), &docs).await.unwrap().unwrap();
+    assert_eq!(served(&dst, &format!("{}docs/readme.txt", d.base_url.unwrap())).await.0, 200);
+
+    run(&mut app, Act::ReplicationHistory, item);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no history: {:?}", texts(&app)) };
+    assert!(lines[0].starts_with(&format!("{}  completed ", group.href)), "{lines:?}");
+    cleanup(&dst, &[&upstream_href]).await;
+    for (t, name) in [(RepoType::Rpm, &os), (RepoType::File, &docs)] {
+        cleanup_named(&dst, t, name).await;
+        cleanup_named(&up, t, name).await;
+    }
 }
