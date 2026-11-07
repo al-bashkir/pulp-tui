@@ -50,6 +50,27 @@ impl FieldKind {
     fn is_text(&self) -> bool {
         matches!(self, FieldKind::Text | FieldKind::Secret | FieldKind::Number | FieldKind::Decimal)
     }
+
+    /// Whether edit mode types `c` into `value` at `cursor`: a number takes digits, and `-` only in front; a decimal
+    /// digits and one point; other fields anything.
+    fn takes(&self, c: char, value: &str, cursor: usize) -> bool {
+        match self {
+            FieldKind::Number => c.is_ascii_digit() || c == '-' && cursor == 0 && !value.starts_with('-'),
+            FieldKind::Decimal => c.is_ascii_digit() || c == '.' && !value.contains('.'),
+            _ => true,
+        }
+    }
+}
+
+/// Move mode: j k h l are the arrow keys.
+fn arrow(code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Char('j') => KeyCode::Down,
+        KeyCode::Char('k') => KeyCode::Up,
+        KeyCode::Char('h') => KeyCode::Left,
+        KeyCode::Char('l') => KeyCode::Right,
+        c => c,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -237,6 +258,16 @@ impl Field {
     }
     pub fn changed(&self) -> bool {
         self.value != self.initial
+    }
+    /// Take the previous (`back`) or next choice of a choice field; other fields stay.
+    fn choose(&mut self, back: bool) {
+        let FieldKind::Choice(c) = &self.kind else { return };
+        if c.is_empty() {
+            return;
+        }
+        let i = c.iter().position(|x| *x == self.value).unwrap_or(0);
+        let j = if back { (i + c.len() - 1) % c.len() } else { (i + 1) % c.len() };
+        self.value = c[j].clone();
     }
     pub fn display(&self) -> String {
         match self.kind {
@@ -548,71 +579,74 @@ impl Form {
     }
 
     pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
-        let n = self.fields.len();
-        if n == 0 {
-            return match k.code {
-                KeyCode::Esc => FormEvent::Cancel,
-                _ => FormEvent::Submit,
-            };
-        }
-        if self.picker.is_some() {
-            return self.picker_key(k);
-        }
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        if self.hold && matches!(k.code, KeyCode::Char(_)) && !ctrl {
-            return FormEvent::None;
-        }
-        self.hold = false;
-        if let Some(ev) = self.pick_field_key(k) {
+        if let Some(ev) = self.early_key(k) {
             return ev;
         }
-        // Move mode: j k h l are the arrow keys.
-        let code = match k.code {
-            KeyCode::Char('j') if !ctrl && !self.editing => KeyCode::Down,
-            KeyCode::Char('k') if !ctrl && !self.editing => KeyCode::Up,
-            KeyCode::Char('h') if !ctrl && !self.editing => KeyCode::Left,
-            KeyCode::Char('l') if !ctrl && !self.editing => KeyCode::Right,
-            c => c,
-        };
-        let (next, prev) = ((self.focus + 1) % n, (self.focus + n - 1) % n);
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let code = if ctrl || self.editing { k.code } else { arrow(k.code) };
+        let n = self.fields.len();
+        match code {
+            KeyCode::Tab | KeyCode::Down => self.go_to((self.focus + 1) % n),
+            KeyCode::BackTab | KeyCode::Up => self.go_to((self.focus + n - 1) % n),
+            _ if self.editing => self.edit_key(k, ctrl),
+            _ => self.move_mode_key(code, ctrl),
+        }
+    }
+
+    /// Keys taken before the field's own: an empty form, an open picker, Ctrl-S, text typed ahead after Enter
+    /// (`hold`), a closed pick field.
+    fn early_key(&mut self, k: KeyEvent) -> Option<FormEvent> {
+        if self.fields.is_empty() {
+            return Some(if k.code == KeyCode::Esc { FormEvent::Cancel } else { FormEvent::Submit });
+        }
+        if self.picker.is_some() {
+            return Some(self.picker_key(k));
+        }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && k.code == KeyCode::Char('s') {
+            return Some(FormEvent::Submit);
+        }
+        if self.hold && matches!(k.code, KeyCode::Char(_)) && !ctrl {
+            return Some(FormEvent::None);
+        }
+        self.hold = false;
+        self.pick_field_key(k)
+    }
+
+    fn go_to(&mut self, field: usize) -> FormEvent {
+        (self.focus, self.editing) = (field, false);
+        FormEvent::None
+    }
+
+    /// Edit mode: Esc stops editing, Enter goes on, other keys edit the line (a number field takes only what
+    /// `FieldKind::takes` allows).
+    fn edit_key(&mut self, k: KeyEvent, ctrl: bool) -> FormEvent {
         let f = &mut self.fields[self.focus];
-        let text = f.kind.is_text();
-        match (self.editing, code) {
-            (_, KeyCode::Char('s')) if ctrl => return FormEvent::Submit,
-            (_, KeyCode::Tab | KeyCode::Down) => (self.focus, self.editing) = (next, false),
-            (_, KeyCode::BackTab | KeyCode::Up) => (self.focus, self.editing) = (prev, false),
-            (false, KeyCode::Esc) => return FormEvent::Cancel,
-            (true, KeyCode::Esc) => self.editing = false,
-            (true, KeyCode::Enter) => return self.advance(),
-            // A number takes digits, and `-` only in front.
-            (true, KeyCode::Char(c))
-                if !ctrl
-                    && f.kind == FieldKind::Number
-                    && !c.is_ascii_digit()
-                    && !(c == '-' && self.cursor == 0 && !f.value.starts_with('-')) => {}
-            // A decimal takes digits and one point.
-            (true, KeyCode::Char(c))
-                if !ctrl && f.kind == FieldKind::Decimal && !c.is_ascii_digit() && !(c == '.' && !f.value.contains('.')) => {}
-            (true, _) => {
+        match k.code {
+            KeyCode::Esc => self.editing = false,
+            KeyCode::Enter => return self.advance(),
+            KeyCode::Char(c) if !ctrl && !f.kind.takes(c, &f.value, self.cursor) => {}
+            _ => {
                 edit_line(&mut f.value, &mut self.cursor, k);
             }
-            (false, KeyCode::Enter | KeyCode::Char('i')) if text && !ctrl => {
+        }
+        FormEvent::None
+    }
+
+    /// Move mode: Esc cancels; Enter or `i` edits a text field, Enter elsewhere goes on; Space toggles a checkbox;
+    /// ← → and Space change a choice.
+    fn move_mode_key(&mut self, code: KeyCode, ctrl: bool) -> FormEvent {
+        let n = self.fields.len();
+        let f = &mut self.fields[self.focus];
+        match code {
+            KeyCode::Esc => return FormEvent::Cancel,
+            KeyCode::Enter | KeyCode::Char('i') if f.kind.is_text() && !ctrl => {
                 self.editing = true;
                 self.cursor = f.value.chars().count();
             }
-            (false, KeyCode::Enter) => self.focus = next,
-            (false, KeyCode::Char(' ')) if f.kind == FieldKind::Bool => {
-                f.value = if f.value == "true" { "false".into() } else { "true".into() }
-            }
-            (false, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) if matches!(f.kind, FieldKind::Choice(_)) => {
-                if let FieldKind::Choice(c) = &f.kind
-                    && !c.is_empty()
-                {
-                    let i = c.iter().position(|x| *x == f.value).unwrap_or(0);
-                    let j = if code == KeyCode::Left { (i + c.len() - 1) % c.len() } else { (i + 1) % c.len() };
-                    f.value = c[j].clone();
-                }
-            }
+            KeyCode::Enter => self.focus = (self.focus + 1) % n,
+            KeyCode::Char(' ') if f.kind == FieldKind::Bool => f.value = (f.value != "true").to_string(),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => f.choose(code == KeyCode::Left),
             _ => {}
         }
         FormEvent::None
