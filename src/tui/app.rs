@@ -1265,19 +1265,22 @@ impl App {
         }
     }
 
+    /// Each handler takes only its own keys. No action uses a list key (`kinds` test
+    /// `action_keys_are_unique_per_screen_and_avoid_list_keys`), so every other character goes to the actions.
     fn list_key(&mut self, k: KeyEvent) {
         let code = list_code(k);
-        let done = self.move_in_list(code) || self.page_key(code) || self.list_command(code);
-        if !done
-            && let KeyCode::Char(c) = code
+        self.move_in_list(code);
+        self.page_key(code);
+        self.list_command(code);
+        if let KeyCode::Char(c) = code
             && !k.modifiers.contains(KeyModifiers::CONTROL)
         {
             self.action_key(c);
         }
     }
 
-    /// j k, PgDn PgUp (Ctrl-D Ctrl-U), g G: move the selection; h: go to the screen list. False for another key.
-    fn move_in_list(&mut self, code: KeyCode) -> bool {
+    /// j k, PgDn PgUp (Ctrl-D Ctrl-U), g G: move the selection; h: go to the screen list.
+    fn move_in_list(&mut self, code: KeyCode) {
         let (s, last) = (self.list.selected, self.list.items.len().saturating_sub(1));
         self.list.selected = match code {
             KeyCode::Down | KeyCode::Char('j') => (s + 1).min(last),
@@ -1290,34 +1293,31 @@ impl App {
                 self.focus = Focus::Nav;
                 s
             }
-            _ => return false,
+            _ => s,
         };
-        true
     }
 
-    /// n p: the next or previous page of the server's list; r: reload; /: search. False for another key.
-    fn page_key(&mut self, code: KeyCode) -> bool {
+    /// n p: the next or previous page of the server's list; r: reload; /: search.
+    fn page_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('n') if self.list.offset + PAGE < self.list.count => self.turn_page(self.list.offset + PAGE),
             KeyCode::Char('p') if self.list.offset > 0 => self.turn_page(self.list.offset.saturating_sub(PAGE)),
             KeyCode::Char('r') => self.reload(),
             KeyCode::Char('/') => self.search(),
-            _ => return false,
+            _ => {}
         }
-        true
     }
 
-    /// s S: sort; Space: mark; t: the other type of the screen; Esc; Enter: the action menu. False for another key.
-    fn list_command(&mut self, code: KeyCode) -> bool {
+    /// s S: sort; Space: mark; t: the other type of the screen; Esc; Enter: the action menu.
+    fn list_command(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char(c @ ('s' | 'S')) => self.cycle_sort(c == 'S'),
             KeyCode::Char(' ') => self.toggle_mark(),
             KeyCode::Char('t') => self.toggle_type(),
             KeyCode::Esc => self.list_escape(),
             KeyCode::Enter => self.open_menu(),
-            _ => return false,
+            _ => {}
         }
-        true
     }
 
     fn turn_page(&mut self, offset: u64) {
@@ -1341,7 +1341,7 @@ impl App {
 
     /// s: sort by the next column; S (`reverse`): reverse the order.
     fn cycle_sort(&mut self, reverse: bool) {
-        let ncols = self.list.kind.columns().len().max(1);
+        let ncols = self.list.kind.columns().len();
         self.list.sort = Some(match (self.list.sort, reverse) {
             (Some((c, d)), true) => (c, !d),
             (Some((c, _)), false) => ((c + 1) % ncols, false),
@@ -1884,7 +1884,6 @@ mod tests {
     async fn list_keys_move_page_sort_mark_and_go_back() {
         let mut app = app_on(Kind::PulpExporters).await;
         app.list.items = (0..3).map(|i| serde_json::json!({ "pulp_href": format!("/e/{i}/"), "name": format!("e{i}") })).collect();
-        app.list.count = 250;
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         let moves = [
             (ch('j'), 1),
@@ -1910,17 +1909,25 @@ mod tests {
         app.handle_key(ch('k'));
         app.handle_key(ch(' '));
         assert_eq!((app.list.marked.iter().map(String::as_str).collect::<Vec<_>>(), app.list.selected), (vec!["/e/0/"], 2));
+        app.handle_key(ch(' '));
+        assert_eq!((app.list.marked.len(), app.list.selected), (2, 2), "the last row stays selected");
         // Sort: next column, then the same column reversed.
         for (k, sort) in [(ch('s'), (0, false)), (ch('s'), (1, false)), (ch('S'), (1, true))] {
             app.handle_key(k);
             assert_eq!(app.list.sort, Some(sort));
         }
-        // Pages of the server's list: n while there is a next page, p back; a new page starts at its first row.
-        for (k, offset, at) in [(ch('n'), 100, 0), (ch('n'), 200, 0), (ch('n'), 200, 2), (ch('p'), 100, 0), (ch('r'), 100, 2)] {
+        // Pages of the server's list (300 rows): n while there is a next page, p back; a new page starts at its
+        // first row.
+        app.list.count = 300;
+        let pages = [(ch('n'), 100, 0), (ch('n'), 200, 0), (ch('n'), 200, 2), (ch('p'), 100, 0), (ch('p'), 0, 0), (ch('p'), 0, 2)];
+        for (k, offset, at) in pages.into_iter().chain([(ch('r'), 0, 2)]) {
             app.list.selected = 2;
             app.handle_key(k);
             assert_eq!((app.list.offset, app.list.selected), (offset, at), "{k:?}");
         }
+        app.list.offset = 1;
+        app.handle_key(ch('p'));
+        assert_eq!(app.list.offset, 0, "p from any offset goes back to the first page");
         app.handle_key(ch('/'));
         assert!(matches!(app.modal.take(), Some(Modal::Input { .. })), "search");
         app.handle_key(key(KeyCode::Esc));
@@ -1964,6 +1971,9 @@ mod tests {
         app.handle_key(ch('c'));
         assert!(app.modal.is_none() && app.jobs.is_empty());
         assert_eq!(app.notices.back().map(|n| (n.level, n.text.as_str())), Some((Level::Error, why)));
+        let shown = app.notices.len();
+        app.handle_key(ch('z'));
+        assert_eq!(app.notices.len(), shown, "a key that is no action of the screen says nothing");
         // Upstream Pulps without native replication keep the fallback, which the message names.
         app.open(Screen::List(Kind::UpstreamPulps));
         settle(&mut app, &mut rx).await;

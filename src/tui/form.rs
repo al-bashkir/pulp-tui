@@ -728,6 +728,9 @@ mod tests {
         f.focus = 1;
         assert!(matches!(f.handle_key(key(KeyCode::Enter)), FormEvent::None));
         assert_eq!(f.focus, 0);
+        let mut f = Form::new("t", vec![Field::new("b", "B", FieldKind::Bool), Field::text("a", "A")]);
+        f.handle_key(key(KeyCode::Enter));
+        assert_eq!((f.focus, f.editing), (1, false), "Enter on a checkbox goes to the next field");
     }
 
     /// The fields of a new RPM remote. Runtime (audit F15): Name `x2`, Enter, then fast `jl j ` moved, changed the
@@ -796,6 +799,10 @@ mod tests {
             })
             .collect();
         assert_eq!(seen, ["b", "c", "b", "c", "a", "c"]);
+        // A stored value that is not a choice (an edit form of an older server) counts as the first one.
+        f.fields[0].value = "gone".into();
+        f.handle_key(ch('l'));
+        assert_eq!(f.get("c"), "b");
     }
 
     #[test]

@@ -448,17 +448,17 @@ impl TaskGroup {
         let last = |n: &str| ["finalize_replication", "importer.pulp_import", "prune.prune_packages"].iter().any(|s| n.ends_with(s));
         let finalized = self.tasks.iter().any(|t| t["name"].as_str().is_some_and(last) && t["state"] == "completed");
         let refresh = self.description.starts_with("Refreshing ") && self.description.to_lowercase().contains("alternate content source");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         self.active() == 0
             && self.done() > 0
-            && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh || self.idle_long())
+            && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh || self.idle_long(now))
     }
-    /// The newest `finished_at` (Pulp's UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`) is older than `IDLE_FINAL_SECS` by the
-    /// client clock; the same format compares as text.
-    fn idle_long(&self) -> bool {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    /// The newest `finished_at` (Pulp's UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`) is `IDLE_FINAL_SECS` or more before
+    /// `now` (seconds since the epoch, client clock); the same format compares as text.
+    fn idle_long(&self, now: u64) -> bool {
         let cutoff = crate::store::rfc3339(now.saturating_sub(IDLE_FINAL_SECS));
         let newest = self.tasks.iter().filter_map(|t| t["finished_at"].as_str()?.get(..19)).max();
-        newest.is_some_and(|f| f < &cutoff[..19])
+        newest.is_some_and(|f| f <= &cutoff[..19])
     }
     /// How a final group ended: a failed task fails it; a canceled or skipped task is not a success either.
     pub fn outcome(&self) -> &'static str {
@@ -898,5 +898,18 @@ mod tests {
         assert_eq!(state(recent), (false, "waiting".into()), "the newest task ended just now: more may come");
         let busy = group(json!([{ "state": "completed", "finished_at": long_ago }, { "state": "running" }]));
         assert_eq!(state(busy), (false, "running".into()));
+        // The rule starts at exactly IDLE_FINAL_SECS: 2026-01-01T00:20:00Z is 1_767_226_800.
+        let ended = group(json!([{ "state": "completed", "finished_at": "2026-01-01T00:10:00.900000Z" }]));
+        assert!(ended.idle_long(1_767_226_800) && !ended.idle_long(1_767_226_799));
+    }
+
+    /// No group is final before a task of it ended; a failed or canceled task ends it also without the flag.
+    #[test]
+    fn a_group_ends_with_a_failure_and_never_before_a_task_ended() {
+        let group = |g: Value| -> TaskGroup { serde_json::from_value(g).unwrap() };
+        let empty = group(serde_json::json!({ "pulp_href": "/g/5/", "all_tasks_dispatched": true }));
+        assert_eq!((empty.is_final(), empty.as_task().state.as_str()), (false, "waiting"));
+        let both = group(serde_json::json!({ "pulp_href": "/g/5/", "failed": 1, "canceled": 1, "tasks": [{}, {}] }));
+        assert_eq!((both.is_final(), both.as_task().state.as_str()), (true, "failed"));
     }
 }
