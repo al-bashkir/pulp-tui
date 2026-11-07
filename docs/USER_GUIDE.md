@@ -1271,4 +1271,6 @@ pulp-tui --profile new import-repos repos.json
   * distributions, publications and content.
 * `import-repos` never changes an existing object. It keeps it and prints the differences, for
   example `warning: RPM repository os exists; kept (differs: description)`. A field that the
-  target does not have is left out with a warning. You can run the import again after an error.
+  target does not have is left out with a warning. When Pulp refuses a create, the import goes on
+  with the others and then fails with a list of every object not created (a repository waits for
+  its refused remote). Run it again after the fix: it creates only what is missing.

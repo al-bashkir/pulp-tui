@@ -221,26 +221,37 @@ pub async fn plan(c: &PulpClient, caps: &Capabilities, ex: &ServerExport) -> Res
     run(c, caps, ex, false).await
 }
 
+/// A create that Pulp refuses does not stop the others: the error names every object not created, and a rerun
+/// creates only those.
 async fn run(c: &PulpClient, caps: &Capabilities, ex: &ServerExport, apply: bool) -> Result<(usize, usize, Vec<String>)> {
     check(caps, ex)?;
-    let (mut created, mut kept, mut notes) = (0, 0, vec![]);
+    let (mut created, mut kept, mut notes, mut failed) = (0, 0, vec![], vec![]);
     for t in ex.remotes.iter().chain(&ex.alt_remotes).chain(&ex.repositories).map(|e| e.repo_type).collect::<BTreeSet<_>>() {
-        let (cr, kp, n) = import_type(c, caps, t, ex, apply).await?;
+        let (cr, kp, n, f) = import_type(c, caps, t, ex, apply).await?;
         (created, kept) = (created + cr, kept + kp);
         notes.extend(n);
+        failed.extend(f);
+    }
+    if !failed.is_empty() {
+        let head = format!("{} not created (created {created}, kept {kept}; a rerun creates only what is missing):", failed.len());
+        let lines =
+            [vec![head], failed.iter().map(|f| format!("  {f}")).collect(), notes.iter().map(|n| format!("warning: {n}")).collect()];
+        bail!("{}", lines.concat().join("\n"));
     }
     Ok((created, kept, notes))
 }
 
-/// `import` (or with `apply` false, `plan`) for the entries of one plugin type.
+/// `import` (or with `apply` false, `plan`) for the entries of one plugin type: created, kept, notes, failures.
 async fn import_type(
     c: &PulpClient,
     caps: &Capabilities,
     t: RepoType,
     ex: &ServerExport,
     apply: bool,
-) -> Result<(usize, usize, Vec<String>)> {
-    let (mut created, mut kept, mut notes) = (0, 0, vec![]);
+) -> Result<(usize, usize, Vec<String>, Vec<String>)> {
+    let (mut created, mut kept, mut notes, mut failed) = (0, 0, vec![], vec![]);
+    // Remotes of the file that Pulp refused: a repository of one waits, created without it a rerun would keep it so.
+    let mut refused = BTreeSet::new();
     // Remote href -> name: the server's remotes (both types) and the ones this import creates.
     let mut remotes = BTreeMap::new();
     let alt = t.alt_remote().filter(|(_, _, schema)| caps.schemas.contains_key(*schema));
@@ -261,6 +272,10 @@ async fn import_type(
                 notes.extend(kept_note(e, &entry(t, o, &writable, &remotes, c.api_prefix()).0.fields).map(|n| format!("{label} {n}")));
                 continue;
             }
+            if let Some(r) = e.fields.get("remote").and_then(Value::as_str).filter(|r| refused.contains(*r)) {
+                failed.push(format!("{label}: not created: its remote {r} was not created"));
+                continue;
+            }
             let (body, left_out) = create_body(e, &writable, &remotes);
             // A ULN remote needs its username and password, which no export has.
             let required = caps.required.get(schema).into_iter().flatten().map(String::as_str);
@@ -273,7 +288,16 @@ async fn import_type(
                 continue;
             }
             let href = if apply {
-                ops::create(c, &c.api(collection), &body, collection, &no_progress).await?
+                match ops::create(c, &c.api(collection), &body, collection, &no_progress).await {
+                    Ok(h) => h,
+                    Err(err) => {
+                        failed.push(format!("{label}: {err:#}"));
+                        if what != "repository" {
+                            refused.insert(e.name.clone());
+                        }
+                        continue;
+                    }
+                }
             } else {
                 notes.push(format!("{label}: create"));
                 format!("new:{}", e.name) // a repository of the file finds this remote by name
@@ -285,7 +309,7 @@ async fn import_type(
             notes.extend(left_out.into_iter().map(|n| format!("{label}: {n}")));
         }
     }
-    Ok((created, kept, notes))
+    Ok((created, kept, notes, failed))
 }
 
 #[cfg(test)]
@@ -549,6 +573,54 @@ mod tests {
                 json!({ "name": "app", "description": "d", "remote": remote_href(5), "pulp_labels": {} }),
             ]
         );
+    }
+
+    /// A refused create does not stop the import: the rest is created, every failure is reported, and a repository
+    /// whose remote failed waits (created without it, a rerun would keep it so). A rerun creates only what is missing.
+    #[tokio::test]
+    async fn import_goes_on_after_a_failed_create_and_reports_every_failure() {
+        use wiremock::matchers::body_partial_json;
+        let ex = ServerExport {
+            format: 1,
+            remotes: vec![rpm("os", json!({ "url": "https://m/os/" })), rpm("epel", json!({ "url": "https://m/epel/" }))],
+            alt_remotes: vec![],
+            repositories: vec![rpm("app", json!({ "remote": "os" })), rpm("tools", json!({ "remote": "epel" }))],
+        };
+        let post = |coll: &str, name: &str, status: u16, body: Value| {
+            Mock::given(method("POST"))
+                .and(path(format!("{API}{coll}")))
+                .and(body_partial_json(json!({ "name": name })))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        };
+        let server = MockServer::start().await;
+        serve(&server, "remotes/rpm/rpm/", json!([])).await;
+        serve(&server, "repositories/rpm/rpm/", json!([])).await;
+        post("remotes/rpm/rpm/", "os", 400, json!({ "url": ["bad"] })).mount(&server).await;
+        post("remotes/rpm/rpm/", "epel", 201, json!({ "pulp_href": remote_href(2) })).mount(&server).await;
+        post("repositories/rpm/rpm/", "tools", 201, json!({ "pulp_href": "/r/2/" })).mount(&server).await;
+        let e = import(&client(&server), &caps(), &ex).await.unwrap_err().to_string();
+        let lines: Vec<&str> = e.lines().collect();
+        assert_eq!(lines[0], "2 not created (created 2, kept 0; a rerun creates only what is missing):", "{e}");
+        assert!(lines[1].starts_with("  RPM remote os: ") && lines[1].contains("bad"), "{e}");
+        assert_eq!(lines[2], "  RPM repository app: not created: its remote os was not created", "{e}");
+        let posted: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| r.body_json::<Value>().unwrap()["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(posted, ["os", "epel", "tools"]);
+
+        // The rerun, once the server takes `os`: it creates os and app, and keeps the rest.
+        let rerun = MockServer::start().await;
+        serve(&rerun, "remotes/rpm/rpm/", json!([{ "pulp_href": remote_href(2), "name": "epel", "url": "https://m/epel/" }])).await;
+        serve(&rerun, "repositories/rpm/rpm/", json!([{ "pulp_href": "/r/2/", "name": "tools", "remote": remote_href(2) }])).await;
+        post("remotes/rpm/rpm/", "os", 201, json!({ "pulp_href": remote_href(3) })).mount(&rerun).await;
+        post("repositories/rpm/rpm/", "app", 201, json!({ "pulp_href": "/r/3/" })).mount(&rerun).await;
+        let (created, kept, _) = import(&client(&rerun), &caps(), &ex).await.unwrap();
+        assert_eq!((created, kept), (2, 2));
     }
 
     #[tokio::test]
