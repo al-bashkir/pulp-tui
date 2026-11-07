@@ -19,32 +19,10 @@ fn text(v: &Value, k: &str) -> String {
 
 /// Options of a picker. `role` is the current value of the form's `role` field (used by `RoleObjects` only).
 pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Result<Vec<PickItem>> {
-    let specs: Vec<Spec> = match source {
-        Source::Repos(Some(t)) => vec![(t.repositories(), NAME_HREF, "name", "name", "")],
-        // A server may lack one of the plugins: list only what it has installed (status, which needs no
-        // OpenAPI) and what its API offers.
-        Source::Repos(None) | Source::ExportRepos => {
-            let fields = if *source == Source::ExportRepos { "name,pulp_href,pulp_labels" } else { NAME_HREF };
-            RepoType::ALL
-                .into_iter()
-                .filter(|t| ctx.caps.supports(t.feature()) && ctx.caps.has_endpoint(t.repositories()))
-                .map(|t| (t.repositories(), fields, "name", "pulp_href", t.component()))
-                .collect()
-        }
-        Source::Remotes(t) => vec![(t.remotes(), NAME_HREF, "name", "name", "")],
-        Source::SyncRemotes(t) => {
-            sync_remotes(&ctx.caps, *t).into_iter().map(|(path, note)| (path, NAME_HREF, "name", "name", note)).collect()
-        }
-        Source::Distributions(t) => vec![(t.distributions(), NAME_HREF, "name", "name", "")],
-        Source::ContentGuards => vec![("contentguards/", NAME_HREF, "name", "pulp_href", "")],
-        Source::SigningServices => vec![("signing-services/", NAME_HREF, "name", "pulp_href", "")],
-        Source::Roles => vec![("roles/", "name", "name", "name", "")],
-        Source::Users => vec![("users/", "username", "username", "username", "")],
-        Source::Groups => vec![("groups/", "name", "name", "name", "")],
-        // The role form shows a Domain field only when the server has domains enabled.
-        Source::Domains => vec![("domains/", NAME_HREF, "name", "pulp_href", "")],
+    let specs = match source {
         Source::RoleObjects => return role_objects(ctx, role).await,
         Source::ContentViews => return content_views(ctx).await,
+        _ => plugin_specs(&ctx.caps, source).unwrap_or_else(|| core_specs(source)),
     };
     let mut out = vec![];
     for (path, fields, label, value, note) in specs {
@@ -56,6 +34,46 @@ pub async fn load_options(ctx: &Ctx, source: &Source, role: &str) -> anyhow::Res
         out.extend(rows.iter().map(|r| PickItem { label: snapshot_marked(text(r, label), r), value: text(r, value), note: note.into() }));
     }
     Ok(out)
+}
+
+/// The collections of a source of plugin objects; None for another source.
+fn plugin_specs(caps: &Capabilities, source: &Source) -> Option<Vec<Spec>> {
+    // A server may lack one of the plugins: list only what it has installed (status, which needs no OpenAPI) and
+    // what its API offers.
+    let repos = |fields| {
+        let present = RepoType::ALL.into_iter().filter(|t| caps.supports(t.feature()) && caps.has_endpoint(t.repositories()));
+        present.map(|t| (t.repositories(), fields, "name", "pulp_href", t.component())).collect()
+    };
+    Some(match source {
+        Source::Repos(Some(t)) => vec![(t.repositories(), NAME_HREF, "name", "name", "")],
+        Source::Repos(None) => repos(NAME_HREF),
+        Source::ExportRepos => repos("name,pulp_href,pulp_labels"),
+        Source::Remotes(t) => vec![(t.remotes(), NAME_HREF, "name", "name", "")],
+        Source::SyncRemotes(t) => sync_remotes(caps, *t).into_iter().map(|(path, note)| (path, NAME_HREF, "name", "name", note)).collect(),
+        Source::Distributions(t) => vec![(t.distributions(), NAME_HREF, "name", "name", "")],
+        _ => return None,
+    })
+}
+
+/// The collection of a source of pulpcore objects.
+fn core_specs(source: &Source) -> Vec<Spec> {
+    match source {
+        Source::ContentGuards => vec![("contentguards/", NAME_HREF, "name", "pulp_href", "")],
+        Source::SigningServices => vec![("signing-services/", NAME_HREF, "name", "pulp_href", "")],
+        Source::Roles => vec![("roles/", "name", "name", "name", "")],
+        Source::Users => vec![("users/", "username", "username", "username", "")],
+        Source::Groups => vec![("groups/", "name", "name", "name", "")],
+        // The role form shows a Domain field only when the server has domains enabled.
+        Source::Domains => vec![("domains/", NAME_HREF, "name", "pulp_href", "")],
+        // No `_`: a new source is a compile error here.
+        Source::Repos(_)
+        | Source::ExportRepos
+        | Source::Remotes(_)
+        | Source::SyncRemotes(_)
+        | Source::Distributions(_)
+        | Source::RoleObjects
+        | Source::ContentViews => vec![],
+    }
 }
 
 /// `label` of a Content View snapshot (a row read with its `pulp_labels`) names the view.
@@ -233,6 +251,37 @@ mod tests {
             .await;
         let items = load_options(&ctx, &Source::Domains, "").await.unwrap();
         assert_eq!(items.iter().map(|i| (i.label.as_str(), i.value.as_str())).collect::<Vec<_>>(), [("d1", "/h/d1/")]);
+    }
+
+    /// Each picker asks its collection and shows the label and value that its form sends.
+    #[tokio::test]
+    async fn each_picker_lists_its_collection() {
+        let server = MockServer::start().await;
+        let page = json!({ "count": 1, "next": null, "results": [{ "name": "n", "username": "u", "pulp_href": "/h/1/" }] });
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(page)).mount(&server).await;
+        let ctx = ctx_for(&server, Capabilities::default()).await;
+        let t = RepoType::Rpm;
+        let mut seen = server.received_requests().await.unwrap().len();
+        for (source, paths, shown) in [
+            (Source::Repos(Some(t)), vec!["repositories/rpm/rpm/"], ("n", "n")),
+            (Source::Remotes(t), vec!["remotes/rpm/rpm/"], ("n", "n")),
+            (Source::SyncRemotes(t), vec!["remotes/rpm/rpm/", "remotes/rpm/uln/"], ("n", "n")),
+            (Source::Distributions(t), vec!["distributions/rpm/rpm/"], ("n", "n")),
+            (Source::ContentGuards, vec!["contentguards/"], ("n", "/h/1/")),
+            (Source::SigningServices, vec!["signing-services/"], ("n", "/h/1/")),
+            (Source::Roles, vec!["roles/"], ("n", "n")),
+            (Source::Users, vec!["users/"], ("u", "u")),
+            (Source::Groups, vec!["groups/"], ("n", "n")),
+            (Source::Domains, vec!["domains/"], ("n", "/h/1/")),
+        ] {
+            let items = load_options(&ctx, &source, "").await.unwrap();
+            let reqs = server.received_requests().await.unwrap();
+            let asked: Vec<&str> = reqs[seen..].iter().map(|r| r.url.path().trim_start_matches("/pulp/api/v3/")).collect();
+            seen = reqs.len();
+            assert_eq!(asked, paths, "{source:?}");
+            assert_eq!(items.len(), paths.len(), "{source:?}");
+            assert!(items.iter().all(|i| (i.label.as_str(), i.value.as_str()) == shown), "{source:?}: {items:?}");
+        }
     }
 
     #[tokio::test]
