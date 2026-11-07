@@ -977,6 +977,87 @@ async fn deb_publications_and_distributions_through_the_tui() {
     }
 }
 
+/// Repositories Delete through the TUI for File and RPM: one repository (the impact names the distribution that
+/// follows it and the Content View that uses it as a source; Pulp then unbinds the distribution), then two marked
+/// ones with one typed confirmation; the Task Center follows each task, the marks go, the list reloads without them.
+#[tokio::test]
+async fn repository_delete_single_and_marked_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let (mut app, mut rx) = app().await;
+    let (st, scope) = (app.cv_store.clone().unwrap(), app.conn.as_ref().unwrap().scope.clone());
+    for t in [RepoType::File, RepoType::Rpm] {
+        let name = unique(&format!("it-repodel-{}", t.component()));
+        let mut repos = vec![];
+        for n in ["a", "b", "c"] {
+            repos.push(create(&c, t.repositories(), json!({ "name": format!("{name}-{n}") }), "/repositories/").await);
+        }
+        let (a, b, cc) = (format!("{name}-a"), format!("{name}-b"), format!("{name}-c"));
+        let dist = create(&c, t.distributions(), json!({ "name": a, "base_path": a, "repository": repos[0] }), "/distributions/").await;
+        let cv = st.create_cv(&scope, &name, "").await.unwrap();
+        st.set_cv_repo(cv, &pulp_tui::store::CvRepo { repo_href: repos[0].clone(), repo_name: a.clone(), repo_type: t, filters: vec![] })
+            .await
+            .unwrap();
+        open_list(&mut app, &mut rx, Kind::Repos(t, false), &name).await;
+        assert_eq!(app.list.items.len(), 3, "{:?}", app.list.error);
+
+        let r = row(&app, "name", &a).unwrap();
+        run(&mut app, Act::Delete, r);
+        settle(&mut app, &mut rx).await; // the impact is read before the confirmation
+        let (lines, typed) = yes(&mut app);
+        assert_eq!(typed.as_deref(), Some(a.as_str()));
+        assert_eq!(lines[0], format!("Deletes repository {a} with all 1 versions and 0 publications."));
+        assert!(lines[1] == "WARNING: 1 distribution(s) serve it and stop serving:" && lines[2].contains(&a), "{lines:?}");
+        assert_eq!(lines.last().unwrap(), &format!("WARNING: Content View(s) {name} use it as a source; their next publish fails."));
+        settle_tasks(&mut app, &mut rx).await;
+        shown(&app, &format!("task completed: delete repository {a}"));
+        assert!(row(&app, "name", &a).is_none(), "the list reloads without it");
+        assert!(c.get::<Value>(&repos[0], &[]).await.unwrap_err().is_not_found());
+        assert_eq!(c.get::<Value>(&dist, &[]).await.unwrap()["repository"], Value::Null, "Pulp unbinds the distribution");
+
+        app.list.marked = [repos[1].clone(), repos[2].clone()].into();
+        let r = row(&app, "name", &b).unwrap();
+        run(&mut app, Act::Delete, r);
+        settle(&mut app, &mut rx).await;
+        let (lines, typed) = yes(&mut app);
+        assert_eq!(typed.as_deref(), Some("delete 2 repositories"));
+        for n in [&b, &cc] {
+            assert!(lines.contains(&format!("Deletes repository {n} with all 1 versions and 0 publications.")), "{lines:?}");
+        }
+        settle_tasks(&mut app, &mut rx).await;
+        for (n, href) in [(&b, &repos[1]), (&cc, &repos[2])] {
+            shown(&app, &format!("task completed: delete {n}"));
+            assert!(c.get::<Value>(href, &[]).await.unwrap_err().is_not_found());
+        }
+        assert!(app.list.marked.is_empty() && app.list.items.is_empty(), "unmarked, and the list reloads without them");
+        cleanup(&c, &[&dist]).await;
+    }
+}
+
+/// Sync history (H) of a repository synced twice: the newest task first, and the version that each sync made.
+#[tokio::test]
+async fn sync_history_lists_the_syncs_of_a_repository() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::File, unique("it-history"));
+    let (repo, remote) = synced_repo(&c, t, &name, "file/PULP_MANIFEST", "additive").await;
+    ops::settle(&c, ops::sync(&c, t, &repo, None, "additive").await.unwrap(), &no_progress).await.unwrap();
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Repos(t, false), &name).await;
+    let r = row(&app, "name", &name).unwrap();
+    run(&mut app, Act::SyncHistory, r);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no history: {:?}", texts(&app)) };
+    assert_eq!((title, lines.len()), (format!("Sync history of {name} (2 tasks)"), 2), "{lines:?}");
+    assert!(lines.iter().all(|l| l[19..].starts_with("  completed ")), "{lines:?}");
+    let v1 = short(&format!("{repo}versions/1/"));
+    assert!(!lines[0].contains(" -> ") && lines[1].ends_with(&format!(" -> {v1}")), "the second sync made no version: {lines:?}");
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
 /// The Remotes screens through the TUI for File, RPM, Deb and File Git: Create, Edit (a task: labels, and the
 /// policy where the type has one), Delete: the impact names the repository that uses the remote as its default,
 /// the typed name, the task; Pulp then unsets the repository's remote.
