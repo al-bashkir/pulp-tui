@@ -12,7 +12,10 @@ use pulp_tui::config::{AuthMethod, Config, DATABASE_KEYRING_USER, Database, Prof
 use pulp_tui::cv::CvLock;
 use pulp_tui::pulp::RepoType;
 use pulp_tui::store::{BindingRepo, CvRepo, CvVersion, CvVersionRepo, NotMigrated, PG_MIGRATIONS, Store};
-use pulp_tui::tui::app::{App, NO_PROFILE};
+use pulp_tui::tui::actions::run;
+use pulp_tui::tui::app::{App, Modal, NO_PROFILE};
+use pulp_tui::tui::kinds::{Act, Kind};
+use serde_json::json;
 use sqlx::{AssertSqlSafe, Connection, Executor};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -627,4 +630,72 @@ async fn profile_database_next_to_a_local_profile() {
     assert!(local.aliases().await.unwrap().is_empty());
     assert_eq!(local.content_views("lab").await.unwrap().len(), 1, "the source is only read");
     s.drop_schema().await;
+}
+
+/// The Content View database through the TUI (Servers screen), on fresh PostgreSQL schemas, with a config file:
+/// * Edit of a local profile with a view to a new database: the offer to copy, then (the schema is empty) the offer
+///   to migrate; Yes migrates, copies the view and saves the profile in the file;
+/// * Connect to a profile whose database is not migrated: the offer; Yes migrates, and the Content View screens work.
+#[tokio::test]
+async fn database_migrate_and_copy_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (s, s2, n) = (Schema::new().await, Schema::new().await, PG_MIGRATIONS.len() as i64);
+    let dir = tempfile::tempdir().unwrap();
+    let pw = dir.path().join("pw");
+    std::fs::write(&pw, std::env::var("PULP_TUI_TEST_PASSWORD").unwrap_or_else(|_| "password".into())).unwrap();
+    let url = std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+    let pulp1 = Profile { url, username: Some("admin".into()), secret: Some(format!("file:{}", pw.display())), ..Default::default() };
+    let mut cfg = Config::default();
+    cfg.profiles.insert("lab".into(), pulp1.clone());
+    cfg.profiles.insert("prod".into(), Profile { database: Some(s2.db.clone()), ..pulp1 });
+    let path = dir.path().join("config.toml");
+    cfg.save(&path).unwrap();
+    let local = Arc::new(Store::open_in_memory().await.unwrap());
+    local.create_cv("lab", "web", "from the file").await.unwrap();
+    let mut app = App::new(cfg, path.clone(), local.clone(), Err(NO_PROFILE.into()));
+    let mut rx = app.rx.take().unwrap();
+    app.list.kind = Kind::Profiles;
+
+    // Edit lab to the database of schema s: copy and switch; the empty schema is migrated first.
+    run(&mut app, Act::Edit, json!({ "name": "lab" }));
+    fill(&mut app, &[("database", &s.db.url), ("db_secret", s.db.secret.as_deref().unwrap())]);
+    settle(&mut app, &mut rx).await; // the old database is counted before the offer
+    let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no copy offer: {:?}", texts(&app)) };
+    let counted = "1 Content View(s), 0 version(s), 0 environment(s) of this server in the old database.".to_string();
+    assert!(form.title == "Database of lab changes" && form.notes.contains(&counted), "{:?}", form.notes);
+    assert_eq!(app.cfg.profiles["lab"].database, None, "nothing is saved before the choice");
+    fill(&mut app, &[("choice", "copy and switch")]);
+    settle(&mut app, &mut rx).await; // opening the new database finds no schema
+    assert!(
+        texts(&app).iter().any(|t| t.starts_with("profile lab not changed: ") && t.contains("database not migrated")),
+        "{:?}",
+        texts(&app)
+    );
+    let (lines, typed) = yes(&mut app);
+    assert_eq!((typed, &lines[..2]), (None, &[format!("Database: {}", s.display()), format!("Schema: empty -> {n}")][..]));
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("{}: schema 0 -> {n}", s.display()));
+    let copied = format!("copied 1 content view(s), 0 version(s), 0 environment(s) into {}; profile lab saved ", s.display());
+    assert!(texts(&app).iter().any(|t| t.starts_with(&copied)), "{:?}", texts(&app));
+    assert_eq!(Config::load(&path).unwrap().profiles["lab"].database, Some(s.db.clone()), "saved in the file");
+    let key = app.cfg.profiles["lab"].server_key();
+    let views: Vec<String> = s.open().await.content_views(&key).await.unwrap().into_iter().map(|v| v.name).collect();
+    assert_eq!(views, ["web"]);
+    assert_eq!(local.content_views("lab").await.unwrap().len(), 1, "the old database is only read");
+
+    // Connect to prod, whose database is not migrated: the offer; then the Content View screens work.
+    app.connect("prod");
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!((typed, lines[0].clone()), (None, format!("Database: {}", s2.display())));
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("{}: schema 0 -> {n}", s2.display()));
+    assert!(app.conn.is_some() && app.cv_store.as_ref().is_ok_and(|st| st.external), "{:?}", texts(&app));
+    assert_eq!(s2.open().await.schema_version().await.unwrap(), n);
+    open_list(&mut app, &mut rx, Kind::Environments, "").await;
+    assert!(row(&app, "name", "Library").is_some(), "{:?}", app.list.items);
+    s.drop_schema().await;
+    s2.drop_schema().await;
 }
