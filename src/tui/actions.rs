@@ -5,7 +5,7 @@ use super::app::{App, Apply, Ctx, Level, Screen, item_key};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, s, short};
 use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile};
-use crate::filters::{Selector, filter_help, parse_rules};
+use crate::filters::{FilterRule, Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
 use crate::pulp::models::{Distribution, RepoVersion, TASK_FINAL_STATES, Task, TaskGroup};
 use crate::pulp::ops::{self, repo_of_version, version_number};
@@ -1183,14 +1183,32 @@ fn sync_options(f: &Form) -> Value {
     b
 }
 
+/// A sync of repository `repo` that Pulp answers with HTTP 400 (pulpcore and pulp_rpm `sync()`): say it before any
+/// request. `picked`: the form names a remote.
+fn sync_refusal(repo: &Value, policy: &str, options: &Value, picked: bool) -> Result<(), String> {
+    let mirror = matches!(policy, "mirror_complete" | "mirror_content_only");
+    if policy == "mirror_complete" && options.get("skip_types").is_some() {
+        return Err("Pulp refuses skip types with mirror_complete: clear the Skip fields or choose another sync policy".into());
+    }
+    if policy == "mirror_complete" && repo["autopublish"] == true {
+        return Err("Pulp refuses mirror_complete with autopublish: turn autopublish off (Edit) or choose another sync policy".into());
+    }
+    if mirror && repo["retain_package_versions"].as_u64().unwrap_or(0) > 0 {
+        return Err("Pulp refuses mirror policies with retain_package_versions above 0: set it to 0 (Edit) or choose additive".into());
+    }
+    if !picked && !repo["remote"].is_string() {
+        return Err(format!("{} has no default remote: pick a remote, or set the default remote with Edit", s(repo, "name")));
+    }
+    Ok(())
+}
+
 fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Value) {
     let caps = caps(app);
     let policies = sync_policies(caps.as_deref(), t);
     let default = item["remote"].as_str().map(str::to_string);
     let note = if default.is_some() { "repository has a default remote" } else { "repository has NO default remote: pick one" };
     let label = format!("remote of {name}");
-    let (autopublish, retain) = (item["autopublish"] == true, item["retain_package_versions"].as_u64().unwrap_or(0));
-    let (own, remotes) = (default.clone(), sync_remote_paths(app, t));
+    let (own, remotes, row) = (default.clone(), sync_remote_paths(app, t), item.clone());
     let open = move |app: &mut App, current: String| {
         let mut fields = vec![
             Field::pick("remote", "Remote", Source::SyncRemotes(t)).help("empty = the repository's default remote").value(current),
@@ -1203,23 +1221,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
             let (policy, own, remotes) = (f.get("policy").to_string(), own.clone(), remotes.clone());
             let (href, name, options) = (href.clone(), name.clone(), sync_options(f));
             let repos = vec![href.clone()];
-            // pulp_rpm sync() answers HTTP 400 to these pairs; say it before any request.
-            if policy == "mirror_complete" && options.get("skip_types").is_some() {
-                return Err("Pulp refuses skip types with mirror_complete: clear the Skip fields or choose another sync policy".into());
-            }
-            if policy == "mirror_complete" && autopublish {
-                return Err(
-                    "Pulp refuses mirror_complete with autopublish: turn autopublish off (Edit) or choose another sync policy".into()
-                );
-            }
-            if matches!(policy.as_str(), "mirror_complete" | "mirror_content_only") && retain > 0 {
-                return Err(
-                    "Pulp refuses mirror policies with retain_package_versions above 0: set it to 0 (Edit) or choose additive".into()
-                );
-            }
-            if remote.is_none() && own.is_none() {
-                return Err(format!("{name} has no default remote: pick a remote, or set the default remote with Edit"));
-            }
+            sync_refusal(&row, &policy, &options, remote.is_some())?;
             let go = move |app: &mut App| {
                 submit(app, format!("sync {name} ({policy})"), move |c| async move {
                     let r = match remote {
@@ -1245,10 +1247,9 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
     }
 }
 
-/// Confirmation lines for deleting repository `href`. Refuses one with Content View snapshots.
-async fn repo_delete_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str) -> anyhow::Result<Vec<String>> {
-    let c = &ctx.client;
-    // Fails closed: without the Content View store the snapshot check cannot run.
+/// The Content Views (of the local store) that use repository `href` as a source. Refuses one with Content View
+/// snapshots; fails closed: without the Content View store the snapshot check cannot run.
+async fn cv_sources(ctx: &Ctx, href: &str, name: &str) -> anyhow::Result<Vec<String>> {
     let st = ctx.cv()?.store;
     let protected = st.protected_versions(&ctx.scope).await?.iter().filter(|v| v.starts_with(href)).count();
     if protected > 0 {
@@ -1260,6 +1261,13 @@ async fn repo_delete_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str) -> a
             sources.push(cv.name);
         }
     }
+    Ok(sources)
+}
+
+/// Confirmation lines for deleting repository `href`. Refuses one with Content View snapshots.
+async fn repo_delete_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str) -> anyhow::Result<Vec<String>> {
+    let c = &ctx.client;
+    let sources = cv_sources(ctx, href, name).await?;
     // Deb: Pulp deletes the verbatim publications with the repository too.
     let pubs = ops::publications_where(c, &ctx.caps, t, ("repository", href)).await?;
     let versions: Page<Value> = c.list(&format!("{href}versions/"), &[("limit", "1".into())]).await?;
@@ -1308,13 +1316,15 @@ async fn remote_delete_impact(ctx: &Ctx, t: RepoType, alt: bool, href: &str, nam
 
 /// Pulp fails the delete task of a remote that an ACS uses (ProtectedError): refuse before any request.
 fn refuse_acs_users(acs: &[String]) -> anyhow::Result<()> {
-    if acs.is_empty() {
+    refuse_any(acs, "Pulp does not delete a remote that an alternate content source uses", "delete those ACS or change their remote first")
+}
+
+/// "refused: {why}: {names}; {fix}" when `names` is not empty.
+fn refuse_any(names: &[String], why: &str, fix: &str) -> anyhow::Result<()> {
+    if names.is_empty() {
         return Ok(());
     }
-    bail!(
-        "refused: Pulp does not delete a remote that an alternate content source uses: {}; delete those ACS or change their remote first",
-        acs.join(", ")
-    )
+    bail!("refused: {why}: {}; {fix}", names.join(", "))
 }
 
 fn distribution_delete_lines(item: &Value) -> Vec<String> {
@@ -1323,92 +1333,104 @@ fn distribution_delete_lines(item: &Value) -> Vec<String> {
 
 /// Delete the marked repositories, remotes or distributions: one impact report, one typed confirmation.
 fn delete_marked(app: &mut App, kind: Kind) {
-    let (t, what) = match kind {
-        Kind::Repos(t, _) => (t, "repositories"),
-        Kind::Remotes(t, _) => (t, "remotes"),
-        Kind::Distributions(t) => (t, "distributions"),
-        _ => return,
+    let what = match kind {
+        Kind::Repos(..) => "repositories",
+        Kind::Remotes(..) => "remotes",
+        _ => "distributions",
     };
     let hrefs: Vec<String> = app.list.marked.iter().cloned().collect();
     let n = hrefs.len();
     app.job(format!("impact of deleting {n} {what}"), move |ctx| async move {
-        let c = &ctx.client;
         let mut lines = vec![format!("Deletes {n} {what}:"), String::new()];
         let (mut targets, mut owned, mut acs) = (vec![], vec![], vec![]);
         for href in hrefs {
             // Marks can be on other pages: fetch each object.
-            let item: Value = c.get(&href, &[]).await?;
-            let name = s(&item, "name");
-            lines.extend(match kind {
-                Kind::Repos(..) => match snapshot_refusal(&item) {
-                    Some(e) => bail!(e),
-                    None => repo_delete_impact(&ctx, t, &href, &name).await?,
-                },
-                Kind::Remotes(_, alt) => {
-                    let (l, users) = remote_delete_impact(&ctx, t, alt, &href, &name).await?;
-                    acs.extend(users);
-                    l
-                }
-                _ => {
-                    owned.extend(cv_owner(&item).map(|cv| format!("{name} (view {cv})")));
-                    distribution_delete_lines(&item)
-                }
-            });
+            let item: Value = ctx.client.get(&href, &[]).await?;
+            lines.extend(marked_impact(&ctx, &kind, &href, &item, &mut acs, &mut owned).await?);
             lines.push(String::new());
-            targets.push((href, name));
+            targets.push((href, s(&item, "name")));
         }
-        if !owned.is_empty() {
-            bail!(
-                "refused: marked distributions belong to Content Views: {}; unmark them (unpromote a view to delete its distributions)",
-                owned.join(", ")
-            );
-        }
+        // Only unpromote deletes the distributions of a Content View.
+        let fix = "unmark them (unpromote a view to delete its distributions)";
+        refuse_any(&owned, "marked distributions belong to Content Views", fix)?;
         refuse_acs_users(&acs)?;
         ap(move |app| {
             let typed = format!("delete {n} {what}");
-            app.confirm_danger(format!("Delete {n} {what}"), lines, &typed.clone(), move |app| {
-                app.job(typed, move |ctx| async move {
-                    let (mut done, mut failed) = (vec![], vec![]);
-                    for (href, name) in targets {
-                        // One failure does not stop the others; each is reported.
-                        match ctx.client.delete(&href).await {
-                            Ok(m) => done.push((href, m, format!("delete {name}"))),
-                            Err(e) => failed.push(format!("{name}: {e}")),
-                        }
-                    }
-                    ap(move |app| {
-                        for (href, m, label) in done {
-                            unmark_when_deleted(app, href, m, label);
-                        }
-                        if !failed.is_empty() {
-                            app.error(format!("delete failed (still marked): {}", failed.join("; ")));
-                        }
-                    })
-                })
-            });
+            app.confirm_danger(format!("Delete {n} {what}"), lines, &typed.clone(), move |app| delete_targets(app, typed, targets));
         })
     });
+}
+
+/// The impact lines of deleting the marked `item` (at `href`) of a `kind` list. A snapshot repository is refused at
+/// once; `acs` gets the ACS that use a remote, `owned` a distribution that a Content View owns.
+async fn marked_impact(
+    ctx: &Ctx,
+    kind: &Kind,
+    href: &str,
+    item: &Value,
+    acs: &mut Vec<String>,
+    owned: &mut Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+    let name = s(item, "name");
+    match *kind {
+        Kind::Repos(t, _) => match snapshot_refusal(item) {
+            Some(e) => bail!(e),
+            None => repo_delete_impact(ctx, t, href, &name).await,
+        },
+        Kind::Remotes(t, alt) => {
+            let (lines, users) = remote_delete_impact(ctx, t, alt, href, &name).await?;
+            acs.extend(users);
+            Ok(lines)
+        }
+        _ => {
+            owned.extend(cv_owner(item).map(|cv| format!("{name} (view {cv})")));
+            Ok(distribution_delete_lines(item))
+        }
+    }
+}
+
+/// Delete `targets` (href, name) after the confirm. One failure does not stop the others; each is reported.
+fn delete_targets(app: &mut App, label: String, targets: Vec<(String, String)>) {
+    app.job(label, move |ctx| async move {
+        let (mut done, mut failed) = (vec![], vec![]);
+        for (href, name) in targets {
+            match ctx.client.delete(&href).await {
+                Ok(m) => done.push((href, m, format!("delete {name}"))),
+                Err(e) => failed.push(format!("{name}: {e}")),
+            }
+        }
+        ap(move |app| {
+            for (href, m, label) in done {
+                unmark_when_deleted(app, href, m, label);
+            }
+            if !failed.is_empty() {
+                app.error(format!("delete failed (still marked): {}", failed.join("; ")));
+            }
+        })
+    });
+}
+
+/// The repository actions that change or delete the repository: refused on a snapshot repository.
+fn changes_repository(act: Act) -> bool {
+    matches!(
+        act,
+        Act::Sync
+            | Act::Upload
+            | Act::UploadComps
+            | Act::UploadAdvisory
+            | Act::CreateModule
+            | Act::CopyContent
+            | Act::Reclaim
+            | Act::Edit
+            | Act::Delete
+    )
 }
 
 fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
-    if let Some(e) = snapshot_refusal(&item)
-        && matches!(
-            act,
-            Act::Sync
-                | Act::Upload
-                | Act::UploadComps
-                | Act::UploadAdvisory
-                | Act::CreateModule
-                | Act::CopyContent
-                | Act::Reclaim
-                | Act::Edit
-                | Act::Delete
-        )
-    {
-        app.error(e);
-        return;
+    if let Some(e) = snapshot_refusal(&item).filter(|_| changes_repository(act)) {
+        return app.error(e);
     }
     match act {
         Act::Versions => {
@@ -1420,153 +1442,14 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
             None => app.error("repository has no versions"),
         },
         Act::Create | Act::Edit => repo_edit(app, t, act == Act::Edit, item),
-        Act::Delete => {
-            app.job(format!("impact of deleting {name}"), move |ctx| async move {
-                let lines = repo_delete_impact(&ctx, t, &href, &name).await?;
-                ap(move |app| {
-                    app.confirm_danger(format!("Delete repository {name}"), lines, &name.clone(), move |app| {
-                        submit(app, format!("delete repository {name}"), move |c| async move { Ok(c.delete(&href).await?) })
-                    });
-                })
-            });
-        }
+        Act::Delete => repo_delete(app, t, href, name),
         Act::Sync => repo_sync(app, t, href, name, &item),
-        Act::SyncHistory => app.job(format!("sync history {name}"), move |ctx| async move {
-            let c = &ctx.client;
-            let q = [
-                ("reserved_resources", href.clone()),
-                ("name__contains", "sync".to_string()),
-                ("ordering", "-pulp_created".into()),
-                ("limit", "50".into()),
-            ];
-            let p: Page<Task> = c.list(&c.api("tasks/"), &q).await?;
-            let lines: Vec<String> = p
-                .results
-                .iter()
-                .map(|t| {
-                    let created = t.created_matching("/versions/").map(|v| format!(" -> {}", short(&v))).unwrap_or_default();
-                    let err = t.error_message().map(|e| format!("  error: {e}")).unwrap_or_default();
-                    format!(
-                        "{}  {:<10} {}{created}{err}",
-                        t.pulp_created.as_deref().unwrap_or("").get(..19).unwrap_or(""),
-                        t.state,
-                        t.pulp_href
-                    )
-                })
-                .collect();
-            ap(move |app| app.text(format!("Sync history of {name} ({} tasks)", p.count), lines))
-        }),
-        Act::Upload => {
-            let mut fields = vec![Field::text("path", "Local file path").required()];
-            match t {
-                RepoType::Rpm => {}
-                RepoType::File => fields.push(Field::text("relative_path", "Relative path in repository").help("default: file name")),
-                // The release whose indices list the package; older pulp_deb has no such fields.
-                RepoType::Deb => fields.extend(
-                    [
-                        ("distribution", "Distribution", "empty = pulp (server default)"),
-                        ("component", "Component", "empty = upload (server default)"),
-                    ]
-                    .into_iter()
-                    .filter(|(k, ..)| caps(app).is_none_or(|c| c.has_field("deb.Package", k)))
-                    .map(|(k, label, help)| Field::text(k, label).help(help)),
-                ),
-            }
-            let schema = match t {
-                RepoType::Rpm => "rpm.Package",
-                RepoType::File => "file.FileContent",
-                RepoType::Deb => "deb.Package",
-            };
-            if caps(app).is_none_or(|c| c.has_field(schema, "overwrite")) {
-                let help = "off = fail when the repository has other content with the same key (File: relative path)";
-                fields.push(Field::new("overwrite", "Overwrite", FieldKind::Bool).value("true").help(help));
-            }
-            app.form(
-                Form::new(format!("Upload to {name}"), fields)
-                    .note("Large files use the chunked upload API; the server digest is verified."),
-                move |app, f| {
-                    let path = std::path::PathBuf::from(f.get("path"));
-                    if !path.is_file() {
-                        return Err(format!("{} is not a readable file", path.display()));
-                    }
-                    let [rel, dist, comp] = ["relative_path", "distribution", "component"].map(|k| f.opt(k).map(str::to_string));
-                    // Without the field (an older server) nothing is sent.
-                    let (href, overwrite) = (href.clone(), f.get("overwrite") != "false");
-                    app.job(format!("upload {}", path.display()), move |ctx| async move {
-                        if ops::chunked(&ctx.client, tokio::fs::metadata(&path).await?.len()) {
-                            ctx.caps.require(Feature::ChunkedUpload)?;
-                        }
-                        let p2 = ctx.clone();
-                        let progress = move |d: u64, total: u64| {
-                            p2.progress(format!("{:.1}/{:.1} MiB", d as f64 / 1048576.0, total as f64 / 1048576.0))
-                        };
-                        let (c, on) = (&ctx.client, ctx.on_task());
-                        let r = match t {
-                            RepoType::Deb => {
-                                deb::upload(c, &path, Some(&href), dist.as_deref(), comp.as_deref(), overwrite, &progress, &on).await?
-                            }
-                            RepoType::Rpm | RepoType::File => {
-                                ops::upload(c, t, &path, rel.as_deref(), Some(&href), overwrite, &progress, &on).await?
-                            }
-                        };
-                        let version = r.task.as_ref().and_then(|t| t.created_matching("/versions/"));
-                        let version = version.map(|v| format!(": new version {}", version_number(&v))).unwrap_or_default();
-                        ap(move |app| {
-                            app.ok(format!(
-                                "uploaded {} (sha256 {}…) as {}{version}",
-                                path.display(),
-                                &r.sha256[..12],
-                                short(&r.content_href)
-                            ));
-                            app.reload();
-                        })
-                    });
-                    Ok(())
-                },
-            );
-        }
+        Act::SyncHistory => sync_history(app, href, name),
+        Act::Upload => repo_upload(app, t, href, name),
         Act::Reclaim => reclaim(app, href),
         Act::PrunePackages => prune_packages(app, href),
         Act::CreateModule => module_create(app, href, name),
-        Act::UploadComps | Act::UploadAdvisory => {
-            let comps = act == Act::UploadComps;
-            let (what, ep) = if comps { ("comps.xml", rpm::COMPS) } else { ("advisory", rpm::ADVISORIES) };
-            if caps(app).is_some_and(|c| !c.has_operation(ep, "post")) {
-                return app.error(format!("not supported by this server: {what} upload ({ep})"));
-            }
-            let mut fields = vec![Field::text("path", "Local file path").required()];
-            if comps {
-                fields.push(Field::new("replace", "Replace", FieldKind::Bool).help("on = first remove the comps units the repository has"));
-            }
-            let note = if comps {
-                "Adds the package groups, categories, environments and langpacks of the file."
-            } else {
-                "One advisory as JSON (updateinfo fields): id, issued and updated are required, and each package needs sum_type."
-            };
-            app.form(Form::new(format!("Upload {what} to {name}"), fields).note(note), move |app, f| {
-                let path = std::path::PathBuf::from(f.get("path"));
-                if !path.is_file() {
-                    return Err(format!("{} is not a readable file", path.display()));
-                }
-                let (repo, replace, label) = (href.clone(), f.bool("replace"), format!("upload {what} to {name}"));
-                let go = move |app: &mut App| {
-                    app.job(label.clone(), move |ctx| async move {
-                        let c = &ctx.client;
-                        let m = if comps {
-                            rpm::upload_comps(c, &path, &repo, replace).await?
-                        } else {
-                            rpm::upload_advisory(c, &path, &repo).await?
-                        };
-                        ap(move |app| follow(app, m, label.clone(), move |app, t| new_version(app, &label, &t)))
-                    })
-                };
-                match replace {
-                    true => confirm_if_latest_goes(app, href.clone(), "Replace comps", "The replaced comps units", go),
-                    false => go(app),
-                }
-                Ok(())
-            });
-        }
+        Act::UploadComps | Act::UploadAdvisory => upload_rpm_metadata(app, act == Act::UploadComps, href, name),
         Act::Publish => match item["latest_version_href"].as_str() {
             None => app.error("repository has no versions"),
             Some(v) => {
@@ -1577,107 +1460,277 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
         Act::Distribute => {
             distribute_form(app, t, name.clone(), item["latest_version_href"].as_str().map(str::to_string), Some(href), None)
         }
-        Act::CopyContent => {
-            // File copies through modify/.
-            let api = match t {
-                RepoType::Rpm => Some(Feature::RpmCopy),
-                RepoType::Deb => Some(Feature::DebCopy),
-                RepoType::File => None,
-            };
-            if api.is_some_and(|f| unsupported(app, f)) {
-                return;
-            }
-            let mut fields = vec![
-                Field::pick("source", "Source repository", Source::Repos(Some(t))).required(),
-                Field::text("filters", "Filter rules").help(filter_help(t)),
-            ];
-            match t {
-                RepoType::Rpm => fields.push(Field::new("deps", "Copy dependencies", FieldKind::Bool).value("true")),
-                RepoType::File | RepoType::Deb => {}
-            }
-            app.form(
-                Form::new(format!("Copy content into {name}"), fields)
-                    .note("Creates a new version of the target; source and older versions are unchanged."),
-                move |app, f| {
-                    let rules = parse_rules(f.get("filters"), t)?;
-                    let (source, deps) = (f.get("source").to_string(), f.bool("deps"));
-                    let (href, name) = (href.clone(), name.clone());
-                    app.job(format!("preview copy {source} -> {name}"), move |ctx| async move {
-                        let c = &ctx.client;
-                        let src: Value = ops::find_by_name(c, &c.api(t.repositories()), &source)
-                            .await?
-                            .ok_or_else(|| anyhow!("no repository {source}"))?;
-                        let sv = src["latest_version_href"].as_str().ok_or_else(|| anyhow!("{source} has no versions"))?.to_string();
-                        let sel = Selector::new(&rules);
-                        let mut meta = vec![];
-                        let units: Option<Vec<String>> = match (t, rules.is_empty()) {
-                            (RepoType::Rpm, true) => None,
-                            (RepoType::Rpm, false) => {
-                                let pkgs = rpm::packages_in(c, &sv).await?;
-                                let chosen: Vec<_> = pkgs.iter().filter(|p| sel.package(p)).collect();
-                                meta = crate::cv::rpm_metadata(c, &sv, &pkgs, &chosen).await?;
-                                Some(chosen.into_iter().map(|p| p.pulp_href.clone()).collect())
-                            }
-                            (RepoType::File, _) => {
-                                Some(file::files_in(c, &sv).await?.into_iter().filter(|x| sel.file(x)).map(|x| x.pulp_href).collect())
-                            }
-                            (RepoType::Deb, true) => None,
-                            (RepoType::Deb, false) => Some(
-                                deb::packages_in(c, &sv).await?.into_iter().filter(|p| sel.deb_package(p)).map(|p| p.pulp_href).collect(),
-                            ),
-                        };
-                        // pulp_rpm and pulp_deb copy nothing for `content: []`, and an empty modify/ makes no version.
-                        if units.as_ref().is_some_and(Vec::is_empty) && meta.is_empty() {
-                            let text = format!("copy {source} -> {name}: the filter selects no unit of {}; nothing sent", short(&sv));
-                            return ap(move |app| app.notify(Level::Warn, text));
-                        }
-                        let what = units.as_ref().map(|u| format!("{} unit(s)", u.len())).unwrap_or("all content".into());
-                        let mut lines = vec![format!("Copy {what} from {} into {name}.", short(&sv))];
-                        if !meta.is_empty() {
-                            lines.push(format!(
-                                "Then add {} unit(s) as a Content View filter takes them: each advisory whose packages are all chosen, \
-                                 and comps, modules and other metadata as they are (no dependency solving for these).",
-                                meta.len()
-                            ));
-                        }
-                        lines.push(if deps { "RPM dependencies are copied too.".into() } else { String::new() });
-                        ap(move |app| {
-                            app.confirm("Confirm copy", lines, move |app| {
-                                let label = format!("copy {source} -> {name}");
-                                app.job(label.clone(), move |ctx| async move {
-                                    // (units, through modify/): the RPM metadata goes after the packages, through modify/.
-                                    let mut batches: Vec<(Option<Vec<String>>, bool)> = match units {
-                                        None => vec![(None, false)],
-                                        // No package chosen: only the metadata batches go.
-                                        Some(u) => ops::batches(&u)
-                                            .into_iter()
-                                            .filter(|b| !b.is_empty())
-                                            .map(|b| (Some(b.to_vec()), false))
-                                            .collect(),
-                                    };
-                                    if !meta.is_empty() {
-                                        batches.extend(ops::batches(&meta).into_iter().map(|b| (Some(b.to_vec()), true)));
-                                    }
-                                    let (c, sv, href) = (&ctx.client, &sv, &href);
-                                    let (_, m) = one_by_one(&ctx, batches, move |(units, modify)| async move {
-                                        match t {
-                                            RepoType::Rpm if !modify => rpm::copy(c, sv, href, None, units, deps).await,
-                                            RepoType::Rpm | RepoType::File => ops::add_content(c, href, units.unwrap_or_default()).await,
-                                            RepoType::Deb => deb::copy(c, sv, href, None, units).await,
-                                        }
-                                    })
-                                    .await?;
-                                    ap(move |app| submitted(app, m, &label))
-                                })
-                            })
-                        })
-                    });
-                    Ok(())
-                },
-            );
-        }
+        Act::CopyContent => copy_content(app, t, href, name),
         _ => {}
     }
+}
+
+fn repo_delete(app: &mut App, t: RepoType, href: String, name: String) {
+    app.job(format!("impact of deleting {name}"), move |ctx| async move {
+        let lines = repo_delete_impact(&ctx, t, &href, &name).await?;
+        ap(move |app| {
+            app.confirm_danger(format!("Delete repository {name}"), lines, &name.clone(), move |app| {
+                submit(app, format!("delete repository {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+            });
+        })
+    });
+}
+
+fn sync_history(app: &mut App, href: String, name: String) {
+    app.job(format!("sync history {name}"), move |ctx| async move {
+        let c = &ctx.client;
+        let q = [
+            ("reserved_resources", href.clone()),
+            ("name__contains", "sync".to_string()),
+            ("ordering", "-pulp_created".into()),
+            ("limit", "50".into()),
+        ];
+        let p: Page<Task> = c.list(&c.api("tasks/"), &q).await?;
+        let lines: Vec<String> = p
+            .results
+            .iter()
+            .map(|t| {
+                let created = t.created_matching("/versions/").map(|v| format!(" -> {}", short(&v))).unwrap_or_default();
+                let err = t.error_message().map(|e| format!("  error: {e}")).unwrap_or_default();
+                format!(
+                    "{}  {:<10} {}{created}{err}",
+                    t.pulp_created.as_deref().unwrap_or("").get(..19).unwrap_or(""),
+                    t.state,
+                    t.pulp_href
+                )
+            })
+            .collect();
+        ap(move |app| app.text(format!("Sync history of {name} ({} tasks)", p.count), lines))
+    });
+}
+
+fn repo_upload(app: &mut App, t: RepoType, href: String, name: String) {
+    let form = Form::new(format!("Upload to {name}"), upload_fields(app, t))
+        .note("Large files use the chunked upload API; the server digest is verified.");
+    app.form(form, move |app, f| {
+        let path = std::path::PathBuf::from(f.get("path"));
+        if !path.is_file() {
+            return Err(format!("{} is not a readable file", path.display()));
+        }
+        let fields = ["relative_path", "distribution", "component"].map(|k| f.opt(k).map(str::to_string));
+        // Without the field (an older server) nothing is sent.
+        upload_file(app, t, href.clone(), path, fields, f.get("overwrite") != "false");
+        Ok(())
+    });
+}
+
+/// The upload form of type `t`; the Deb release and Overwrite fields when the server has them.
+fn upload_fields(app: &App, t: RepoType) -> Vec<Field> {
+    let mut fields = vec![Field::text("path", "Local file path").required()];
+    match t {
+        RepoType::Rpm => {}
+        RepoType::File => fields.push(Field::text("relative_path", "Relative path in repository").help("default: file name")),
+        // The release whose indices list the package; older pulp_deb has no such fields.
+        RepoType::Deb => fields.extend(
+            [
+                ("distribution", "Distribution", "empty = pulp (server default)"),
+                ("component", "Component", "empty = upload (server default)"),
+            ]
+            .into_iter()
+            .filter(|(k, ..)| caps(app).is_none_or(|c| c.has_field("deb.Package", k)))
+            .map(|(k, label, help)| Field::text(k, label).help(help)),
+        ),
+    }
+    let schema = match t {
+        RepoType::Rpm => "rpm.Package",
+        RepoType::File => "file.FileContent",
+        RepoType::Deb => "deb.Package",
+    };
+    if caps(app).is_none_or(|c| c.has_field(schema, "overwrite")) {
+        let help = "off = fail when the repository has other content with the same key (File: relative path)";
+        fields.push(Field::new("overwrite", "Overwrite", FieldKind::Bool).value("true").help(help));
+    }
+    fields
+}
+
+/// Upload `path` to repository `href`; `[relative_path, distribution, component]` as the form has them.
+fn upload_file(
+    app: &mut App,
+    t: RepoType,
+    href: String,
+    path: std::path::PathBuf,
+    [rel, dist, comp]: [Option<String>; 3],
+    overwrite: bool,
+) {
+    app.job(format!("upload {}", path.display()), move |ctx| async move {
+        if ops::chunked(&ctx.client, tokio::fs::metadata(&path).await?.len()) {
+            ctx.caps.require(Feature::ChunkedUpload)?;
+        }
+        let p2 = ctx.clone();
+        let progress = move |d: u64, total: u64| p2.progress(format!("{:.1}/{:.1} MiB", d as f64 / 1048576.0, total as f64 / 1048576.0));
+        let (c, on) = (&ctx.client, ctx.on_task());
+        let r = match t {
+            RepoType::Deb => deb::upload(c, &path, Some(&href), dist.as_deref(), comp.as_deref(), overwrite, &progress, &on).await?,
+            RepoType::Rpm | RepoType::File => ops::upload(c, t, &path, rel.as_deref(), Some(&href), overwrite, &progress, &on).await?,
+        };
+        let version = r.task.as_ref().and_then(|t| t.created_matching("/versions/"));
+        let version = version.map(|v| format!(": new version {}", version_number(&v))).unwrap_or_default();
+        ap(move |app| {
+            app.ok(format!("uploaded {} (sha256 {}…) as {}{version}", path.display(), &r.sha256[..12], short(&r.content_href)));
+            app.reload();
+        })
+    });
+}
+
+/// Upload a comps.xml (`comps`) or an advisory to repository `href`.
+fn upload_rpm_metadata(app: &mut App, comps: bool, href: String, name: String) {
+    let (what, ep, note) = if comps {
+        ("comps.xml", rpm::COMPS, "Adds the package groups, categories, environments and langpacks of the file.")
+    } else {
+        (
+            "advisory",
+            rpm::ADVISORIES,
+            "One advisory as JSON (updateinfo fields): id, issued and updated are required, and each package needs sum_type.",
+        )
+    };
+    if caps(app).is_some_and(|c| !c.has_operation(ep, "post")) {
+        return app.error(format!("not supported by this server: {what} upload ({ep})"));
+    }
+    let mut fields = vec![Field::text("path", "Local file path").required()];
+    if comps {
+        fields.push(Field::new("replace", "Replace", FieldKind::Bool).help("on = first remove the comps units the repository has"));
+    }
+    app.form(Form::new(format!("Upload {what} to {name}"), fields).note(note), move |app, f| {
+        let path = std::path::PathBuf::from(f.get("path"));
+        if !path.is_file() {
+            return Err(format!("{} is not a readable file", path.display()));
+        }
+        send_rpm_metadata(app, (comps, f.bool("replace")), href.clone(), format!("upload {what} to {name}"), path);
+        Ok(())
+    });
+}
+
+/// Upload `path` to `repo`: a comps.xml (with Replace: after the retention check, `confirm_if_latest_goes`), or an
+/// advisory.
+fn send_rpm_metadata(app: &mut App, (comps, replace): (bool, bool), repo: String, label: String, path: std::path::PathBuf) {
+    let href = repo.clone();
+    let go = move |app: &mut App| {
+        app.job(label.clone(), move |ctx| async move {
+            let c = &ctx.client;
+            let m = if comps { rpm::upload_comps(c, &path, &repo, replace).await? } else { rpm::upload_advisory(c, &path, &repo).await? };
+            ap(move |app| follow(app, m, label.clone(), move |app, t| new_version(app, &label, &t)))
+        })
+    };
+    match replace {
+        true => confirm_if_latest_goes(app, href, "Replace comps", "The replaced comps units", go),
+        false => go(app),
+    }
+}
+
+/// Copy content from another repository into `href`, with the filter rules of Content Views: a preview, then the
+/// copy after the confirm.
+fn copy_content(app: &mut App, t: RepoType, href: String, name: String) {
+    // File copies through modify/.
+    let api = match t {
+        RepoType::Rpm => Some(Feature::RpmCopy),
+        RepoType::Deb => Some(Feature::DebCopy),
+        RepoType::File => None,
+    };
+    if api.is_some_and(|f| unsupported(app, f)) {
+        return;
+    }
+    let mut fields = vec![
+        Field::pick("source", "Source repository", Source::Repos(Some(t))).required(),
+        Field::text("filters", "Filter rules").help(filter_help(t)),
+    ];
+    match t {
+        RepoType::Rpm => fields.push(Field::new("deps", "Copy dependencies", FieldKind::Bool).value("true")),
+        RepoType::File | RepoType::Deb => {}
+    }
+    let form = Form::new(format!("Copy content into {name}"), fields)
+        .note("Creates a new version of the target; source and older versions are unchanged.");
+    app.form(form, move |app, f| {
+        let rules = parse_rules(f.get("filters"), t)?;
+        copy_preview(app, t, (href.clone(), name.clone()), f.get("source").to_string(), rules, f.bool("deps"));
+        Ok(())
+    });
+}
+
+/// The units that a copy takes from version `sv` (`None`: all content), and for RPM with rules the metadata that a
+/// Content View filter takes with the chosen packages.
+async fn copy_selection(c: &PulpClient, t: RepoType, sv: &str, rules: &[FilterRule]) -> anyhow::Result<(Option<Vec<String>>, Vec<String>)> {
+    let sel = Selector::new(rules);
+    Ok(match (t, rules.is_empty()) {
+        (RepoType::Rpm | RepoType::Deb, true) => (None, vec![]),
+        (RepoType::Rpm, false) => {
+            let pkgs = rpm::packages_in(c, sv).await?;
+            let chosen: Vec<_> = pkgs.iter().filter(|p| sel.package(p)).collect();
+            let meta = crate::cv::rpm_metadata(c, sv, &pkgs, &chosen).await?;
+            (Some(chosen.into_iter().map(|p| p.pulp_href.clone()).collect()), meta)
+        }
+        (RepoType::File, _) => {
+            (Some(file::files_in(c, sv).await?.into_iter().filter(|x| sel.file(x)).map(|x| x.pulp_href).collect()), vec![])
+        }
+        (RepoType::Deb, false) => {
+            (Some(deb::packages_in(c, sv).await?.into_iter().filter(|p| sel.deb_package(p)).map(|p| p.pulp_href).collect()), vec![])
+        }
+    })
+}
+
+/// Preview the copy of `source` into the repository `(href, name)`, then the copy after the confirm.
+fn copy_preview(app: &mut App, t: RepoType, (href, name): (String, String), source: String, rules: Vec<FilterRule>, deps: bool) {
+    app.job(format!("preview copy {source} -> {name}"), move |ctx| async move {
+        let c = &ctx.client;
+        let src: Value = ops::find_by_name(c, &c.api(t.repositories()), &source).await?.ok_or_else(|| anyhow!("no repository {source}"))?;
+        let sv = src["latest_version_href"].as_str().ok_or_else(|| anyhow!("{source} has no versions"))?.to_string();
+        let (units, meta) = copy_selection(c, t, &sv, &rules).await?;
+        // pulp_rpm and pulp_deb copy nothing for `content: []`, and an empty modify/ makes no version.
+        if units.as_ref().is_some_and(Vec::is_empty) && meta.is_empty() {
+            let text = format!("copy {source} -> {name}: the filter selects no unit of {}; nothing sent", short(&sv));
+            return ap(move |app| app.notify(Level::Warn, text));
+        }
+        let what = units.as_ref().map(|u| format!("{} unit(s)", u.len())).unwrap_or("all content".into());
+        let mut lines = vec![format!("Copy {what} from {} into {name}.", short(&sv))];
+        if !meta.is_empty() {
+            lines.push(format!(
+                "Then add {} unit(s) as a Content View filter takes them: each advisory whose packages are all chosen, \
+                 and comps, modules and other metadata as they are (no dependency solving for these).",
+                meta.len()
+            ));
+        }
+        lines.push(if deps { "RPM dependencies are copied too.".into() } else { String::new() });
+        let label = format!("copy {source} -> {name}");
+        ap(move |app| app.confirm("Confirm copy", lines, move |app| copy_run(app, t, href, label, sv, (units, meta), deps)))
+    });
+}
+
+/// Copy `units` (`None`: all content) of version `sv` into `href`, then add `meta` with `modify/`: one batch after
+/// the other.
+fn copy_run(
+    app: &mut App,
+    t: RepoType,
+    href: String,
+    label: String,
+    sv: String,
+    (units, meta): (Option<Vec<String>>, Vec<String>),
+    deps: bool,
+) {
+    app.job(label.clone(), move |ctx| async move {
+        // (units, through modify/): the RPM metadata goes after the packages, through modify/.
+        let mut batches: Vec<(Option<Vec<String>>, bool)> = match units {
+            None => vec![(None, false)],
+            // No package chosen: only the metadata batches go.
+            Some(u) => ops::batches(&u).into_iter().filter(|b| !b.is_empty()).map(|b| (Some(b.to_vec()), false)).collect(),
+        };
+        if !meta.is_empty() {
+            batches.extend(ops::batches(&meta).into_iter().map(|b| (Some(b.to_vec()), true)));
+        }
+        let (c, sv, href) = (&ctx.client, &sv, &href);
+        let (_, m) = one_by_one(&ctx, batches, move |(units, modify)| async move {
+            match t {
+                RepoType::Rpm if !modify => rpm::copy(c, sv, href, None, units, deps).await,
+                RepoType::Rpm | RepoType::File => ops::add_content(c, href, units.unwrap_or_default()).await,
+                RepoType::Deb => deb::copy(c, sv, href, None, units).await,
+            }
+        })
+        .await?;
+        ap(move |app| submitted(app, m, &label))
+    });
 }
 
 /// Reclaim the disk space of `repo`: ask which versions keep their files, load the impact (its versions, its remote
@@ -1767,70 +1820,84 @@ fn prune_packages(app: &mut App, repo: String) {
     let days = Field::new("keep_days", "Keep days", FieldKind::Number).value("14").help(help);
     app.form(Form::new("Prune old packages", vec![days]), move |app, f| {
         let keep_days: u64 = f.get("keep_days").trim().parse().map_err(|_| "Keep days must be a whole number from 0".to_string())?;
-        let repos = repos.clone();
-        app.job("prune dry run", move |ctx| async move {
-            let c = &ctx.client;
-            let (mut names, mut read) = (vec![], vec![]);
-            for h in &repos {
-                // Marks can be on other pages: read each repository.
-                let r: Value = c.get(h, &[("fields", "name,pulp_labels,latest_version_href,retain_repo_versions".into())]).await?;
-                if let Some(e) = snapshot_refusal(&r) {
-                    bail!(e);
-                }
-                names.push(s(&r, "name"));
-                read.push(r);
-            }
-            let dry = rpm::prune(c, &repos, keep_days, true, &group_progress(&ctx)).await?;
-            if dry.iter().all(|p| p.packages == 0) {
-                let text = format!("prune dry run: no package of {} is old enough to go (keep {keep_days} days)", names.join(", "));
-                return ap(move |app| app.ok(text));
-            }
-            let mut lines = vec![format!("Pulp removes these packages from the latest version (keep {keep_days} days):")];
-            lines.extend(dry.iter().map(|p| format!("  {}: {} package(s)", p.repo, p.packages)));
-            lines.push("Each is an older version (same name and arch) of a package that the repository has. The new".into());
-            let mut goes = vec![];
-            for r in read.iter().filter(|r| dry.iter().any(|p| p.repo == s(r, "name") && p.packages > 0)) {
-                if latest_goes(&ctx, r, 1).await? {
-                    goes.push(s(r, "name"));
-                }
-            }
-            if goes.is_empty() {
-                lines.push("latest version lacks them; older versions keep them. Pulp names them only in its debug log.".into());
-            } else {
-                lines.push("latest version lacks them. Pulp names them only in its debug log.".into());
-                lines.extend(goes_lines(&goes.join(", "), 1, "The pruned packages"));
-            }
-            let (title, typed) = match names.as_slice() {
-                [one] => (format!("Prune old packages of {one}"), one.clone()),
-                _ => (format!("Prune old packages of {} repositories", names.len()), format!("prune {} repositories", names.len())),
-            };
-            ap(move |app| {
-                app.confirm_danger(title, lines, &typed, move |app| {
-                    app.job("prune old packages", move |ctx| async move {
-                        let done = rpm::prune(&ctx.client, &repos, keep_days, false, &group_progress(&ctx)).await?;
-                        let lines = done.iter().map(|p| match &p.version {
-                            Some(v) if p.not_removed > 0 => format!(
-                                "{}: new version {} still has {} of the {} package(s) that Pulp marked removed \
-                                 (pulp_rpm bug, fixed in 3.35.0 and in 3.32.15, 3.29.13, 3.27.14): upgrade pulp_rpm",
-                                p.repo,
-                                version_number(v),
-                                p.not_removed,
-                                p.packages
-                            ),
-                            Some(v) => format!("{}: removed {} package(s): new version {}", p.repo, p.packages, version_number(v)),
-                            None => format!("{}: nothing removed (no new version)", p.repo),
-                        });
-                        let lines = lines.collect();
-                        ap(move |app| {
-                            app.text(format!("Prune old packages (keep {keep_days} days)"), lines);
-                            app.reload();
-                        })
-                    })
-                })
-            })
-        });
+        prune_dry_run(app, repos.clone(), keep_days);
         Ok(())
     });
+}
+
+/// The prune dry run of `repos`, then the typed confirm of the run with what each repository loses.
+fn prune_dry_run(app: &mut App, repos: Vec<String>, keep_days: u64) {
+    app.job("prune dry run", move |ctx| async move {
+        let c = &ctx.client;
+        let mut read = vec![];
+        for h in &repos {
+            // Marks can be on other pages: read each repository.
+            let r: Value = c.get(h, &[("fields", "name,pulp_labels,latest_version_href,retain_repo_versions".into())]).await?;
+            if let Some(e) = snapshot_refusal(&r) {
+                bail!(e);
+            }
+            read.push(r);
+        }
+        let names: Vec<String> = read.iter().map(|r| s(r, "name")).collect();
+        let dry = rpm::prune(c, &repos, keep_days, true, &group_progress(&ctx)).await?;
+        if dry.iter().all(|p| p.packages == 0) {
+            let text = format!("prune dry run: no package of {} is old enough to go (keep {keep_days} days)", names.join(", "));
+            return ap(move |app| app.ok(text));
+        }
+        let mut lines = vec![format!("Pulp removes these packages from the latest version (keep {keep_days} days):")];
+        lines.extend(dry.iter().map(|p| format!("  {}: {} package(s)", p.repo, p.packages)));
+        lines.push("Each is an older version (same name and arch) of a package that the repository has. The new".into());
+        lines.extend(pruned_retention_lines(&ctx, &read, &dry).await?);
+        let (title, typed) = match names.as_slice() {
+            [one] => (format!("Prune old packages of {one}"), one.clone()),
+            _ => (format!("Prune old packages of {} repositories", names.len()), format!("prune {} repositories", names.len())),
+        };
+        ap(move |app| app.confirm_danger(title, lines, &typed, move |app| prune_run(app, repos, keep_days)))
+    });
+}
+
+/// Whether older versions keep the pruned packages: not when Pulp then deletes the current version of a repository
+/// that loses packages (`latest_goes`).
+async fn pruned_retention_lines(ctx: &Ctx, read: &[Value], dry: &[rpm::Pruned]) -> anyhow::Result<Vec<String>> {
+    let mut goes = vec![];
+    for r in read.iter().filter(|r| dry.iter().any(|p| p.repo == s(r, "name") && p.packages > 0)) {
+        if latest_goes(ctx, r, 1).await? {
+            goes.push(s(r, "name"));
+        }
+    }
+    if goes.is_empty() {
+        return Ok(vec!["latest version lacks them; older versions keep them. Pulp names them only in its debug log.".into()]);
+    }
+    let mut lines = vec!["latest version lacks them. Pulp names them only in its debug log.".to_string()];
+    lines.extend(goes_lines(&goes.join(", "), 1, "The pruned packages"));
+    Ok(lines)
+}
+
+/// Prune `repos` and show what each lost.
+fn prune_run(app: &mut App, repos: Vec<String>, keep_days: u64) {
+    app.job("prune old packages", move |ctx| async move {
+        let done = rpm::prune(&ctx.client, &repos, keep_days, false, &group_progress(&ctx)).await?;
+        let lines = done.iter().map(pruned_line).collect();
+        ap(move |app| {
+            app.text(format!("Prune old packages (keep {keep_days} days)"), lines);
+            app.reload();
+        })
+    });
+}
+
+fn pruned_line(p: &rpm::Pruned) -> String {
+    match &p.version {
+        Some(v) if p.not_removed > 0 => format!(
+            "{}: new version {} still has {} of the {} package(s) that Pulp marked removed \
+             (pulp_rpm bug, fixed in 3.35.0 and in 3.32.15, 3.29.13, 3.27.14): upgrade pulp_rpm",
+            p.repo,
+            version_number(v),
+            p.not_removed,
+            p.packages
+        ),
+        Some(v) => format!("{}: removed {} package(s): new version {}", p.repo, p.packages, version_number(v)),
+        None => format!("{}: nothing removed (no new version)", p.repo),
+    }
 }
 
 /// The optional signing service of a Deb publication; `None` for other types and when the server's Deb
@@ -2473,55 +2540,60 @@ fn version_action(app: &mut App, act: Act, item: Value) {
         Act::Restore => restore_preview(app, t, href, number),
         Act::Repair => repair(app, t, href, number),
         Act::Scan if t == RepoType::Rpm => scan(app, href, number),
-        Act::Compare => {
-            let marked: Vec<String> = app.list.marked.iter().filter(|m| **m != href).cloned().collect();
-            let [other] = marked.as_slice() else {
-                app.error("mark exactly one other version with Space, then compare");
-                return;
-            };
-            if RepoType::from_href(other) != Some(t) {
-                app.error("compare needs two versions of one repository type");
-                return;
-            }
-            let other = other.clone();
-            app.job("compare versions", move |ctx| async move {
-                // Always show older -> newer.
-                let (a, b) = if version_number(&other) <= version_number(&href) { (other, href) } else { (href, other) };
-                let lines = compare_versions(&ctx.client, &ctx.caps, t, &a, &b).await?;
-                ap(move |app| app.text("Version comparison", lines))
-            });
-        }
-        Act::Delete => app.job(format!("impact of deleting version {number}"), move |ctx| async move {
-            let c = &ctx.client;
-            // Fails closed: without the Content View store the snapshot check cannot run.
-            if ctx.cv()?.store.protected_versions(&ctx.scope).await?.contains(&href) {
-                bail!("refused: this version is a snapshot of a Content View version (delete the CV version instead)");
-            }
-            let (pubs, by) = ops::version_protection(c, &ctx.caps, t, &href).await?;
-            let id = short(&href);
-            if !by.is_empty() {
-                // Pulp refuses the delete (HTTP 400): no typed confirm.
-                let mut lines = vec![format!("Pulp refuses to delete version {number} ({id}): these distributions use it.")];
-                lines.extend(by.iter().map(|(d, why)| format!("  {} ({}): {why}", d.name, d.base_url.as_deref().unwrap_or(&d.base_path))));
-                lines.push("First re-point them to another version (Rollback or Distribute), or edit or delete them.".into());
-                return ap(move |app| app.text(format!("Cannot delete version {number}"), lines));
-            }
-            let lines = vec![
-                format!("Delete repository version {number} ({id}) and its {} publication(s).", pubs.len()),
-                "No distribution uses it. Deleting versions is never needed for rollback: re-point a distribution instead.".into(),
-            ];
-            ap(move |app| {
-                app.confirm_danger(format!("Delete version {number}"), lines, &id, move |app| {
-                    let label = format!("delete version {number}");
-                    app.job(label.clone(), move |ctx| async move {
-                        let m = ctx.client.delete(&href).await?;
-                        ap(move |app| unmark_when_deleted(app, href, m, label))
-                    })
-                })
-            })
-        }),
+        Act::Compare => version_compare(app, t, href),
+        Act::Delete => version_delete(app, t, href, number),
         _ => {}
     }
+}
+
+/// Compare version `href` with the one other marked version, older -> newer.
+fn version_compare(app: &mut App, t: RepoType, href: String) {
+    let marked: Vec<String> = app.list.marked.iter().filter(|m| **m != href).cloned().collect();
+    let [other] = marked.as_slice() else {
+        return app.error("mark exactly one other version with Space, then compare");
+    };
+    if RepoType::from_href(other) != Some(t) {
+        return app.error("compare needs two versions of one repository type");
+    }
+    let other = other.clone();
+    app.job("compare versions", move |ctx| async move {
+        let (a, b) = if version_number(&other) <= version_number(&href) { (other, href) } else { (href, other) };
+        let lines = compare_versions(&ctx.client, &ctx.caps, t, &a, &b).await?;
+        ap(move |app| app.text("Version comparison", lines))
+    });
+}
+
+/// Delete version `href` after the typed confirm. A version that a distribution uses is explained, not sent: Pulp
+/// refuses it (HTTP 400).
+fn version_delete(app: &mut App, t: RepoType, href: String, number: String) {
+    app.job(format!("impact of deleting version {number}"), move |ctx| async move {
+        // Fails closed: without the Content View store the snapshot check cannot run.
+        if ctx.cv()?.store.protected_versions(&ctx.scope).await?.contains(&href) {
+            bail!("refused: this version is a snapshot of a Content View version (delete the CV version instead)");
+        }
+        let (pubs, by) = ops::version_protection(&ctx.client, &ctx.caps, t, &href).await?;
+        let id = short(&href);
+        if !by.is_empty() {
+            let mut lines = vec![format!("Pulp refuses to delete version {number} ({id}): these distributions use it.")];
+            lines.extend(by.iter().map(|(d, why)| format!("  {} ({}): {why}", d.name, d.base_url.as_deref().unwrap_or(&d.base_path))));
+            lines.push("First re-point them to another version (Rollback or Distribute), or edit or delete them.".into());
+            return ap(move |app| app.text(format!("Cannot delete version {number}"), lines));
+        }
+        let lines = vec![
+            format!("Delete repository version {number} ({id}) and its {} publication(s).", pubs.len()),
+            "No distribution uses it. Deleting versions is never needed for rollback: re-point a distribution instead.".into(),
+        ];
+        let label = format!("delete version {number}");
+        ap(move |app| app.confirm_danger(format!("Delete version {number}"), lines, &id, move |app| delete_and_unmark(app, href, label)))
+    });
+}
+
+/// Delete `href`; its mark goes when the delete completes (`unmark_when_deleted`).
+fn delete_and_unmark(app: &mut App, href: String, label: String) {
+    app.job(label.clone(), move |ctx| async move {
+        let m = ctx.client.delete(&href).await?;
+        ap(move |app| unmark_when_deleted(app, href, m, label))
+    });
 }
 
 /// Orphan cleanup of the whole server. The count and the request use the protection time the operator gives:
@@ -2842,102 +2914,124 @@ fn content_action(app: &mut App, version: String, act: Act) {
     {
         units.push(item_key(v));
     }
-    let repo = repo_of_version(&version);
     match act {
-        Act::RemoveContent => app.job(format!("read repository {}", short(&repo)), move |ctx| async move {
-            // The retention of the repository decides whether older versions keep the content.
-            let r: Value = ctx.client.get(&repo, &[]).await?;
-            let latest = s(&r, "latest_version_href");
-            // What the run sends: one version per batch. The run reuses it while the latest version stays the same.
-            let sent = remove_units(&ctx.client, t, &latest, units.clone()).await?;
-            let k = ops::batches(&sent).len();
-            let (goes, name) = (latest_goes(&ctx, &r, k).await?, s(&r, "name"));
-            let mut lines = vec![match k {
-                1 => format!("Create a new version of {name} without {} unit(s).", units.len()),
-                k => format!(
-                    "Create {k} new versions of {name} without {} unit(s), one per batch (Pulp limits the size of a request).",
-                    units.len()
-                ),
-            }];
-            if latest != version {
-                let (shown, now) = (version_number(&version), version_number(&latest));
-                lines.push(format!("NOTE: the units leave the LATEST version {now} of {name}, not the version {shown} shown here."));
-            }
-            if goes {
-                lines.extend(goes_lines(&name, r["retain_repo_versions"].as_u64().unwrap_or(1), "The removed content"));
-            } else {
-                lines.push("The current and older versions are immutable and keep the content.".into());
-            }
-            ap(move |app| {
-                let go = move |app: &mut App| {
-                    let (n, label) = (units.len(), format!("remove {} unit(s)", units.len()));
-                    app.job(label.clone(), move |ctx| async move {
-                        let c = &ctx.client;
-                        let r: Value = c.get(&repo, &[]).await?;
-                        if let Some(e) = snapshot_refusal(&r) {
-                            bail!(e);
-                        }
-                        let now = s(&r, "latest_version_href");
-                        let units = if now == latest { sent } else { remove_units(c, t, &now, units).await? };
-                        let (mut made, m) = one_by_one(&ctx, ops::batches(&units), |b| ops::remove_content(c, &repo, b.to_vec())).await?;
-                        // Only a success shows the new version (without marks): on a failure the operator keeps them.
-                        ap(move |app| {
-                            follow(app, m, label, move |app, t| {
-                                made.push(t.created_matching("/versions/"));
-                                content_removed(app, &version, n, &made)
-                            })
-                        })
-                    });
-                };
-                if goes { app.confirm_danger("Remove content", lines, &name, go) } else { app.confirm("Remove content", lines, go) }
-            })
-        }),
-        Act::AddToRepo => {
-            if t == RepoType::Deb && unsupported(app, Feature::DebCopy) {
-                return;
-            }
-            let form = Form::new(
-                format!("Add {} unit(s) to another {} repository", units.len(), t.label()),
-                vec![Field::pick("target", "Target repository", Source::Repos(Some(t))).required()],
-            );
-            app.form(form, move |app, f| {
-                let (target, units, kind, version) = (f.get("target").to_string(), units.clone(), app.list.kind.clone(), version.clone());
-                let (n, label) = (units.len(), format!("add {} unit(s) to {target}", units.len()));
-                app.job(label.clone(), move |ctx| async move {
-                    let c = &ctx.client;
-                    let r: Value =
-                        ops::find_by_name(c, &c.api(t.repositories()), &target).await?.ok_or_else(|| anyhow!("no repository {target}"))?;
-                    if let Some(e) = snapshot_refusal(&r) {
-                        bail!(e);
-                    }
-                    let dest = s(&r, "pulp_href");
-                    let (dest, version) = (&dest, &version);
-                    let (_, m) = one_by_one(&ctx, ops::batches(&units), move |b| async move {
-                        match t {
-                            RepoType::Rpm | RepoType::File => ops::add_content(c, dest, b.to_vec()).await,
-                            // modify/ adds no release component records, so apt would not see the packages.
-                            RepoType::Deb => deb::copy(c, version, dest, None, Some(b.to_vec())).await,
-                        }
-                    })
-                    .await?;
-                    ap(move |app| {
-                        follow(app, m, label, move |app, t| {
-                            // Only after success: on a failure the operator keeps the marks.
-                            if app.list.kind == kind {
-                                app.list.marked.clear();
-                            }
-                            let v = t
-                                .created_matching("/versions/")
-                                .map_or("no new version (it has them already)".into(), |v| format!("version {}", version_number(&v)));
-                            app.ok(format!("added {n} unit(s) to {target}: {v}"));
-                        })
-                    })
-                });
-                Ok(())
-            });
-        }
+        Act::RemoveContent => remove_content(app, t, version, units),
+        Act::AddToRepo => add_to_repo(app, t, version, units),
         _ => {}
     }
+}
+
+/// Remove `units` from the latest version of the repository of `version` (the browsed one): the confirm says how
+/// many versions that makes and whether Pulp then deletes the current version.
+fn remove_content(app: &mut App, t: RepoType, version: String, units: Vec<String>) {
+    let repo = repo_of_version(&version);
+    app.job(format!("read repository {}", short(&repo)), move |ctx| async move {
+        // The retention of the repository decides whether older versions keep the content.
+        let r: Value = ctx.client.get(&repo, &[]).await?;
+        let latest = s(&r, "latest_version_href");
+        // What the run sends: one version per batch. The run reuses it while the latest version stays the same.
+        let sent = remove_units(&ctx.client, t, &latest, units.clone()).await?;
+        let k = ops::batches(&sent).len();
+        let (goes, name) = (latest_goes(&ctx, &r, k).await?, s(&r, "name"));
+        let lines = remove_lines(&r, &version, units.len(), k, goes);
+        ap(move |app| {
+            let go = move |app: &mut App| remove_run(app, t, version, units, (latest, sent));
+            if goes { app.confirm_danger("Remove content", lines, &name, go) } else { app.confirm("Remove content", lines, go) }
+        })
+    });
+}
+
+/// The confirm lines of a Remove of `n` units in `k` batches from repository `r`, browsed at `version`; `goes`: Pulp
+/// then deletes the current version (`latest_goes`).
+fn remove_lines(r: &Value, version: &str, n: usize, k: usize, goes: bool) -> Vec<String> {
+    let (name, latest) = (s(r, "name"), s(r, "latest_version_href"));
+    let mut lines = vec![match k {
+        1 => format!("Create a new version of {name} without {n} unit(s)."),
+        k => format!("Create {k} new versions of {name} without {n} unit(s), one per batch (Pulp limits the size of a request)."),
+    }];
+    if latest != version {
+        let (shown, now) = (version_number(version), version_number(&latest));
+        lines.push(format!("NOTE: the units leave the LATEST version {now} of {name}, not the version {shown} shown here."));
+    }
+    if goes {
+        lines.extend(goes_lines(&name, r["retain_repo_versions"].as_u64().unwrap_or(1), "The removed content"));
+    } else {
+        lines.push("The current and older versions are immutable and keep the content.".into());
+    }
+    lines
+}
+
+/// Send the Remove after the confirm: `sent` (the units for the `latest` version of the confirm) while the latest
+/// version is the same, else the units again for the new latest version.
+fn remove_run(app: &mut App, t: RepoType, version: String, units: Vec<String>, (latest, sent): (String, Vec<String>)) {
+    let (n, label, repo) = (units.len(), format!("remove {} unit(s)", units.len()), repo_of_version(&version));
+    app.job(label.clone(), move |ctx| async move {
+        let c = &ctx.client;
+        let r: Value = c.get(&repo, &[]).await?;
+        if let Some(e) = snapshot_refusal(&r) {
+            bail!(e);
+        }
+        let now = s(&r, "latest_version_href");
+        let units = if now == latest { sent } else { remove_units(c, t, &now, units).await? };
+        let (mut made, m) = one_by_one(&ctx, ops::batches(&units), |b| ops::remove_content(c, &repo, b.to_vec())).await?;
+        // Only a success shows the new version (without marks): on a failure the operator keeps them.
+        ap(move |app| {
+            follow(app, m, label, move |app, t| {
+                made.push(t.created_matching("/versions/"));
+                content_removed(app, &version, n, &made)
+            })
+        })
+    });
+}
+
+/// Add `units` of `version` to another repository of type `t`.
+fn add_to_repo(app: &mut App, t: RepoType, version: String, units: Vec<String>) {
+    if t == RepoType::Deb && unsupported(app, Feature::DebCopy) {
+        return;
+    }
+    let form = Form::new(
+        format!("Add {} unit(s) to another {} repository", units.len(), t.label()),
+        vec![Field::pick("target", "Target repository", Source::Repos(Some(t))).required()],
+    );
+    app.form(form, move |app, f| {
+        add_run(app, t, version.clone(), f.get("target").to_string(), units.clone());
+        Ok(())
+    });
+}
+
+/// Add `units` of `version` to repository `target` (a name), one batch after the other.
+fn add_run(app: &mut App, t: RepoType, version: String, target: String, units: Vec<String>) {
+    let kind = app.list.kind.clone();
+    let (n, label) = (units.len(), format!("add {} unit(s) to {target}", units.len()));
+    app.job(label.clone(), move |ctx| async move {
+        let c = &ctx.client;
+        let r: Value = ops::find_by_name(c, &c.api(t.repositories()), &target).await?.ok_or_else(|| anyhow!("no repository {target}"))?;
+        if let Some(e) = snapshot_refusal(&r) {
+            bail!(e);
+        }
+        let dest = s(&r, "pulp_href");
+        let (dest, version) = (&dest, &version);
+        let (_, m) = one_by_one(&ctx, ops::batches(&units), move |b| async move {
+            match t {
+                RepoType::Rpm | RepoType::File => ops::add_content(c, dest, b.to_vec()).await,
+                // modify/ adds no release component records, so apt would not see the packages.
+                RepoType::Deb => deb::copy(c, version, dest, None, Some(b.to_vec())).await,
+            }
+        })
+        .await?;
+        ap(move |app| {
+            follow(app, m, label, move |app, t| {
+                // Only after success: on a failure the operator keeps the marks.
+                if app.list.kind == kind {
+                    app.list.marked.clear();
+                }
+                let v = t
+                    .created_matching("/versions/")
+                    .map_or("no new version (it has them already)".into(), |v| format!("version {}", version_number(&v)));
+                app.ok(format!("added {n} unit(s) to {target}: {v}"));
+            })
+        })
+    });
 }
 
 // ---- publications and distributions --------------------------------------------------------
@@ -3051,30 +3145,35 @@ const DIST_FLAGS: [(&str, &str, &str); 3] = [
 fn distribution_action(app: &mut App, t: RepoType, act: Act, item: Value) {
     let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
     match act {
-        Act::CopyUrl => match s(&item, "base_url") {
-            url if url.is_empty() => app.error(format!("distribution {name} has no base_url: nothing copied")),
-            url => {
-                copy_to_clipboard(&url);
-                app.ok(format!("copied {url}"));
-            }
-        },
+        Act::CopyUrl => copy_url(app, &name, s(&item, "base_url")),
         Act::Verify => distribution_verify(app, t, href, name),
         Act::Rollback => repoint_form(app, t, name),
         Act::Create => distribution_form(app, t, None),
         Act::Edit => distribution_form(app, t, Some(item)),
-        Act::Delete => {
-            // The view still records the binding: only unpromote deletes its distributions.
-            let env = item["pulp_labels"].get(crate::cv::LABEL_ENV).and_then(Value::as_str).unwrap_or("?");
-            if let Err(e) = cv_distribution_refusal(&item, &format!("unpromote the view from environment {env}")) {
-                return app.error(e.to_string());
-            }
-            let lines = distribution_delete_lines(&item);
-            app.confirm_danger(format!("Delete distribution {name}"), lines, &name.clone(), move |app| {
-                submit(app, format!("delete distribution {name}"), move |c| async move { Ok(c.delete(&href).await?) })
-            });
-        }
+        Act::Delete => distribution_delete(app, item),
         _ => {}
     }
+}
+
+fn copy_url(app: &mut App, name: &str, url: String) {
+    if url.is_empty() {
+        return app.error(format!("distribution {name} has no base_url: nothing copied"));
+    }
+    copy_to_clipboard(&url);
+    app.ok(format!("copied {url}"));
+}
+
+fn distribution_delete(app: &mut App, item: Value) {
+    let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
+    // The view still records the binding: only unpromote deletes its distributions.
+    let env = item["pulp_labels"].get(crate::cv::LABEL_ENV).and_then(Value::as_str).unwrap_or("?");
+    if let Err(e) = cv_distribution_refusal(&item, &format!("unpromote the view from environment {env}")) {
+        return app.error(e.to_string());
+    }
+    let lines = distribution_delete_lines(&item);
+    app.confirm_danger(format!("Delete distribution {name}"), lines, &name.clone(), move |app| {
+        submit(app, format!("delete distribution {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+    });
 }
 
 /// Compare what distribution `href` serves with the repository version of that publication.
@@ -3166,24 +3265,30 @@ fn distribution_form(app: &mut App, t: RepoType, current: Option<Value>) {
         if let Some(cv) = &owner {
             owner_refusal(cv, &serve, f, &b, &owned_labels)?;
         }
-        let current = v.clone();
         let label = format!("{} distribution {}", if edit { "update" } else { "create" }, f.get("name"));
-        let (will, path) = (serve_line(&serve), b["base_path"].as_str().map(str::to_string));
-        let go = move |app: &mut App| {
-            app.job(label.clone(), move |ctx| async move {
-                save_distribution(&ctx, t, edit.then_some(&current), b, serve).await?;
-                ap(move |app| {
-                    app.ok(format!("{label}: done"));
-                    app.reload();
-                })
-            })
-        };
-        match edit && (will.is_some() || path.is_some()) {
-            true => distribution_edit_confirm(app, t, v.clone(), will, path, go),
-            false => go(app),
-        }
+        distribution_save(app, t, edit.then(|| v.clone()), b, serve, label);
         Ok(())
     });
+}
+
+/// Save the distribution form: at once, or after `distribution_edit_confirm` when the edit of `current` changes what
+/// its clients get (the binding or the base path).
+fn distribution_save(app: &mut App, t: RepoType, current: Option<Value>, b: Value, serve: Serve, label: String) {
+    let (will, path) = (serve_line(&serve), b["base_path"].as_str().map(str::to_string));
+    let edited = current.clone().filter(|_| will.is_some() || path.is_some());
+    let go = move |app: &mut App| {
+        app.job(label.clone(), move |ctx| async move {
+            save_distribution(&ctx, t, current.as_ref(), b, serve).await?;
+            ap(move |app| {
+                app.ok(format!("{label}: done"));
+                app.reload();
+            })
+        })
+    };
+    match edited {
+        Some(d) => distribution_edit_confirm(app, t, d, will, path, go),
+        None => go(app),
+    }
 }
 
 /// What a distribution serves after the form saves `serve`; `None`: the binding stays.
@@ -3355,77 +3460,82 @@ fn task_action(app: &mut App, act: Act, item: Value) {
             app.ok("tracking task");
         }
         Act::WatchTask => app.watch_task(&href, &label, serde_json::from_value(item).ok()),
-        Act::Filter => {
-            let Kind::ServerTasks(q) = app.list.kind.clone() else { return };
-            let get = |k: &str| q.iter().find(|(p, _)| *p == k).map(|(_, v)| v.clone()).unwrap_or_default();
-            let states = ["", "waiting", "running", "completed", "failed", "canceled", "canceling", "skipped"];
-            let fields = vec![
-                Field::new("state", "State", FieldKind::Choice(states.map(String::from).to_vec())).value(get("state")),
-                Field::text("name", "Name contains").value(app.list.filter.clone()),
-                Field::text("reserved_resources", "Resource href")
-                    .value(get("reserved_resources"))
-                    .help("tasks that locked it, e.g. a repository"),
-                Field::text("started_at__gte", "Started at or after")
-                    .value(get("started_at__gte"))
-                    .help("2026-11-01 or 2026-11-01T08:00:00Z"),
-            ];
-            app.form(Form::new("Filter server tasks", fields).note("An empty field does not filter."), |app, f| {
-                let q = ["state", "reserved_resources", "started_at__gte"].into_iter().filter_map(|k| f.opt(k).map(|v| (k, v.to_string())));
-                let k = Kind::ServerTasks(q.collect());
-                (app.list.kind, app.screen) = (k.clone(), Screen::List(k));
-                (app.list.filter, app.list.offset, app.list.selected) = (f.get("name").to_string(), 0, 0);
-                app.reload();
-                Ok(())
-            });
-        }
-        Act::Delete if !unsupported(app, Feature::TaskDelete) => {
-            let (name, state) = (s(&item, "name"), s(&item, "state"));
-            if !TASK_FINAL_STATES.contains(&state.as_str()) {
-                return app.error(format!("task {name} is {state}: only a finished task can be deleted (cancel it first)"));
-            }
-            let lines = vec![
-                format!("Delete the record of task {name} ({href}, {state}) on Pulp."),
-                "What the task made stays; its state, progress and error are gone.".into(),
-            ];
-            app.confirm_danger("Delete server task", lines, &short(&href), move |app| {
-                submit(app, format!("delete task {name}"), move |c| async move { Ok(c.delete(&href).await?) })
-            });
-        }
-        Act::PurgeTasks if !unsupported(app, Feature::TaskPurge) => {
-            let fields = vec![
-                Field::text("finished_before", "Finished before").required().help("2026-10-01 or 2026-10-01T08:00:00"),
-                Field::text("states", "States").required().value("completed").help("comma separated: completed, failed, canceled, skipped"),
-            ];
-            app.form(Form::new("Purge finished tasks", fields), |app, f| {
-                let before = f.get("finished_before").to_string();
-                let states: Vec<String> = f.get("states").split(',').map(str::trim).filter(|v| !v.is_empty()).map(String::from).collect();
-                if let Some(bad) = states.iter().find(|v| !TASK_FINAL_STATES.contains(&v.as_str())) {
-                    return Err(format!("{bad} is not a final state ({})", TASK_FINAL_STATES.join(", ")));
-                }
-                purge_tasks(app, before, states);
-                Ok(())
-            });
-        }
-        Act::CancelTask => {
-            let note = [
-                "This is a server-side cancellation (not just closing the client).".to_string(),
-                "Pulp decides the final state; work already done may remain (e.g. downloaded artifacts).".into(),
-            ];
-            if !href.contains("/task-groups/") {
-                let lines = [vec![format!("Ask Pulp to cancel task {href}.")], note.to_vec()].concat();
-                app.confirm("Cancel server task", lines, move |app| cancel_task(app, href));
-            } else if !unsupported(app, Feature::TaskGroupCancel) {
-                app.job("read task group", move |ctx| async move {
-                    let g: TaskGroup = ctx.client.get(&href, &[]).await?;
-                    let (active, all) = (g.active(), g.tasks.len());
-                    let head =
-                        format!("Ask Pulp to cancel the whole task group {}: {active} of {all} task(s) are not finished.", g.description);
-                    let lines = [vec![head], note.to_vec()].concat();
-                    ap(move |app| app.confirm("Cancel task group", lines, move |app| cancel_task(app, href)))
-                });
-            }
-        }
+        Act::Filter => server_task_filter(app),
+        Act::Delete if !unsupported(app, Feature::TaskDelete) => server_task_delete(app, &item),
+        Act::PurgeTasks if !unsupported(app, Feature::TaskPurge) => purge_form(app),
+        Act::CancelTask => cancel_confirm(app, href),
         _ => {}
+    }
+}
+
+fn server_task_filter(app: &mut App) {
+    let Kind::ServerTasks(q) = app.list.kind.clone() else { return };
+    let get = |k: &str| q.iter().find(|(p, _)| *p == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    let states = ["", "waiting", "running", "completed", "failed", "canceled", "canceling", "skipped"];
+    let fields = vec![
+        Field::new("state", "State", FieldKind::Choice(states.map(String::from).to_vec())).value(get("state")),
+        Field::text("name", "Name contains").value(app.list.filter.clone()),
+        Field::text("reserved_resources", "Resource href").value(get("reserved_resources")).help("tasks that locked it, e.g. a repository"),
+        Field::text("started_at__gte", "Started at or after").value(get("started_at__gte")).help("2026-11-01 or 2026-11-01T08:00:00Z"),
+    ];
+    app.form(Form::new("Filter server tasks", fields).note("An empty field does not filter."), |app, f| {
+        let q = ["state", "reserved_resources", "started_at__gte"].into_iter().filter_map(|k| f.opt(k).map(|v| (k, v.to_string())));
+        let k = Kind::ServerTasks(q.collect());
+        (app.list.kind, app.screen) = (k.clone(), Screen::List(k));
+        (app.list.filter, app.list.offset, app.list.selected) = (f.get("name").to_string(), 0, 0);
+        app.reload();
+        Ok(())
+    });
+}
+
+/// Delete the record of the finished server task `item` after the typed task id, as for other server records.
+fn server_task_delete(app: &mut App, item: &Value) {
+    let (href, name, state) = (s(item, "pulp_href"), s(item, "name"), s(item, "state"));
+    if !TASK_FINAL_STATES.contains(&state.as_str()) {
+        return app.error(format!("task {name} is {state}: only a finished task can be deleted (cancel it first)"));
+    }
+    let lines = vec![
+        format!("Delete the record of task {name} ({href}, {state}) on Pulp."),
+        "What the task made stays; its state, progress and error are gone.".into(),
+    ];
+    app.confirm_danger("Delete server task", lines, &short(&href), move |app| {
+        submit(app, format!("delete task {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+    });
+}
+
+fn purge_form(app: &mut App) {
+    let fields = vec![
+        Field::text("finished_before", "Finished before").required().help("2026-10-01 or 2026-10-01T08:00:00"),
+        Field::text("states", "States").required().value("completed").help("comma separated: completed, failed, canceled, skipped"),
+    ];
+    app.form(Form::new("Purge finished tasks", fields), |app, f| {
+        let before = f.get("finished_before").to_string();
+        let states: Vec<String> = f.get("states").split(',').map(str::trim).filter(|v| !v.is_empty()).map(String::from).collect();
+        if let Some(bad) = states.iter().find(|v| !TASK_FINAL_STATES.contains(&v.as_str())) {
+            return Err(format!("{bad} is not a final state ({})", TASK_FINAL_STATES.join(", ")));
+        }
+        purge_tasks(app, before, states);
+        Ok(())
+    });
+}
+
+/// Ask Pulp to cancel task (or task group) `href` after the confirm.
+fn cancel_confirm(app: &mut App, href: String) {
+    let note = [
+        "This is a server-side cancellation (not just closing the client).".to_string(),
+        "Pulp decides the final state; work already done may remain (e.g. downloaded artifacts).".into(),
+    ];
+    if !href.contains("/task-groups/") {
+        let lines = [vec![format!("Ask Pulp to cancel task {href}.")], note.to_vec()].concat();
+        app.confirm("Cancel server task", lines, move |app| cancel_task(app, href));
+    } else if !unsupported(app, Feature::TaskGroupCancel) {
+        app.job("read task group", move |ctx| async move {
+            let g: TaskGroup = ctx.client.get(&href, &[]).await?;
+            let (active, all) = (g.active(), g.tasks.len());
+            let head = format!("Ask Pulp to cancel the whole task group {}: {active} of {all} task(s) are not finished.", g.description);
+            let lines = [vec![head], note.to_vec()].concat();
+            ap(move |app| app.confirm("Cancel task group", lines, move |app| cancel_task(app, href)))
+        });
     }
 }
 
