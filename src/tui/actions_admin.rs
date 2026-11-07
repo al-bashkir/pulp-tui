@@ -5,7 +5,7 @@ use super::app::{App, Level};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, guard_type, s, short};
 use crate::pulp::client::Page;
-use crate::pulp::{PulpClient, PulpError, RepoType, ops};
+use crate::pulp::{Capabilities, PulpClient, PulpError, RepoType, ops};
 use crate::replication::{self, PlanAction};
 use anyhow::{Context, bail};
 use futures::future::try_join_all;
@@ -339,44 +339,41 @@ fn member_action(app: &mut App, act: Act, item: Value, group: String, name: Stri
     }
 }
 
+/// Create starts from the selected role's permissions only: its name would be a duplicate (400).
+fn role_form(app: &mut App, edit: bool, item: &Value) {
+    let href = s(item, "pulp_href");
+    let perms =
+        item["permissions"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default();
+    let own = |k: &str| if edit { s(item, k) } else { String::new() };
+    let form = Form::new(
+        if edit { format!("Edit role {}", s(item, "name")) } else { "New role".into() },
+        vec![
+            Field::text("name", "Name").required().value(own("name")),
+            Field::text("description", "Description").value(own("description")),
+            Field::text("permissions", "Permissions (comma separated)")
+                .required()
+                .value(perms)
+                .help("e.g. rpm.view_rpmrepository,rpm.sync_rpmrepository"),
+        ],
+    );
+    app.form(form, move |app, f| {
+        let perms: Vec<&str> = f.get("permissions").split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+        let b = json!({ "name": f.get("name"), "description": f.get("description"), "permissions": perms });
+        let href = href.clone();
+        submit(app, format!("{} role {}", if edit { "update" } else { "create" }, f.get("name")), move |c| async move {
+            Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api("roles/"), &b).await? })
+        });
+        Ok(())
+    });
+}
+
 fn role_action(app: &mut App, act: Act, item: Value) {
     let href = s(&item, "pulp_href");
     let name = s(&item, "name");
     let locked = item["locked"] == true;
     match act {
-        Act::Create | Act::Edit => {
-            if act == Act::Edit && locked {
-                app.error("system-defined (locked) roles cannot be edited; create a custom role instead");
-                return;
-            }
-            let edit = act == Act::Edit;
-            let perms = item["permissions"]
-                .as_array()
-                .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
-                .unwrap_or_default();
-            // Create starts from the selected role's permissions only: its name would be a duplicate (400).
-            let own = |k: &str| if edit { s(&item, k) } else { String::new() };
-            let form = Form::new(
-                if edit { format!("Edit role {name}") } else { "New role".into() },
-                vec![
-                    Field::text("name", "Name").required().value(own("name")),
-                    Field::text("description", "Description").value(own("description")),
-                    Field::text("permissions", "Permissions (comma separated)")
-                        .required()
-                        .value(perms)
-                        .help("e.g. rpm.view_rpmrepository,rpm.sync_rpmrepository"),
-                ],
-            );
-            app.form(form, move |app, f| {
-                let perms: Vec<&str> = f.get("permissions").split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
-                let b = json!({ "name": f.get("name"), "description": f.get("description"), "permissions": perms });
-                let href = href.clone();
-                submit(app, format!("{} role {}", if edit { "update" } else { "create" }, f.get("name")), move |c| async move {
-                    Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api("roles/"), &b).await? })
-                });
-                Ok(())
-            });
-        }
+        Act::Edit if locked => app.error("system-defined (locked) roles cannot be edited; create a custom role instead"),
+        Act::Create | Act::Edit => role_form(app, act == Act::Edit, &item),
         Act::Delete => {
             if locked {
                 app.error("system-defined (locked) roles cannot be deleted");
@@ -865,255 +862,296 @@ fn is_set(upstream: &Value, key: &str) -> bool {
 }
 
 fn upstream_action(app: &mut App, act: Act, item: Value) {
-    let href = s(&item, "pulp_href");
-    let name = s(&item, "name");
-    let caps = caps(app);
-    let dst_origin = app.profile.as_ref().and_then(|p| app.cfg.profiles.get(p)).map(|p| p.origin()).unwrap_or_default();
+    let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
     match act {
-        Act::Create | Act::Edit => {
-            let edit = act == Act::Edit;
-            let v = if edit { item.clone() } else { Value::Null };
-            let has = |f: &str| caps.as_ref().is_none_or(|c| c.has_field("UpstreamPulp", f));
-            let mut fields = vec![
-                Field::text("name", "Name").required().value(s(&v, "name")),
-                Field::text("base_url", "Upstream base URL")
-                    .required()
-                    .value(s(&v, "base_url"))
-                    .help("as reachable from THIS Pulp server, e.g. https://upstream.example.com"),
-                Field::text("api_root", "Upstream API root")
-                    .value(if edit { s(&v, "api_root") } else { "pulp/".into() })
-                    .help("relative, with trailing slash: pulp/"),
-                Field::text("domain", "Upstream domain").value(s(&v, "domain")),
-                Field::text("username", "Username").help("write-only; empty = unchanged"),
-                Field::new("password", "Password", FieldKind::Secret),
-                Field::text("ca_cert", "CA cert (PEM file path)"),
-                Field::text("client_cert", "Client cert (PEM file path)"),
-                Field::text("client_key", "Client key (PEM file path)"),
-                Field::new("tls_validation", "Validate TLS", FieldKind::Bool).value(if v["tls_validation"] == false {
-                    "false"
-                } else {
-                    "true"
-                }),
-            ];
-            // Empty means unchanged, so a stored credential is removed only with its own checkbox (sends null).
-            let tls = fields.len() - 1;
-            let clear = |(k, label): &(&str, &str)| {
-                Field::new(&format!("clear_{k}"), &format!("Clear {label}"), FieldKind::Bool).help("removes the stored value (sends null)")
-            };
-            fields.splice(tls..tls, CREDENTIALS.iter().filter(|(k, _)| edit && is_set(&v, k)).map(clear));
-            if has("q_select") {
-                fields.push(
-                    Field::text("q_select", "Distribution filter (q)")
-                        .value(s(&v, "q_select"))
-                        .help(r#"e.g. name__startswith="rhel9" or pulp_label_select="env=prod""#),
-                );
-            } else if has("pulp_label_select") {
-                fields.push(Field::text("pulp_label_select", "Label selector").value(s(&v, "pulp_label_select")));
-            }
-            if has("policy") {
-                let mut policies = caps
-                    .as_ref()
-                    .and_then(|c| c.field_enum("UpstreamPulp", "policy").map(|e| e.to_vec()))
-                    .unwrap_or_else(|| vec!["nodelete".into(), "labeled".into(), "all".into()]);
-                policies.sort_by_key(|p| p != "nodelete"); // non-destructive default first
-                fields.push(Field::new("policy", "Deletion policy", FieldKind::Choice(policies)).value(if edit {
-                    s(&v, "policy")
-                } else {
-                    "nodelete".into()
-                }));
-            }
-            // pulpcore copies these to the remotes that replication creates (`_build_remote_settings`).
-            if has("remote_policy") {
-                let mut p = caps
-                    .as_ref()
-                    .and_then(|c| c.field_enum("UpstreamPulp", "remote_policy").map(<[String]>::to_vec))
-                    .unwrap_or_else(|| ["immediate", "on_demand", "streamed"].map(String::from).to_vec());
-                p.insert(0, String::new());
-                let help = "of the remotes that replication creates; empty = server default (immediate)";
-                fields.push(
-                    Field::new("remote_policy", "Replica download policy", FieldKind::Choice(p)).value(s(&v, "remote_policy")).help(help),
-                );
-            }
-            let number = |k: &str, label: &str, kind: FieldKind, value: String| {
-                Field::new(k, label, kind).value(value).help("for the replica remotes; empty = server default")
-            };
-            for (k, label) in [("download_concurrency", "Download concurrency"), ("max_retries", "Max retries")] {
-                fields.extend(has(k).then(|| number(k, label, FieldKind::Number, s(&v, k))));
-            }
-            for (k, label) in [
-                ("total_timeout", "Total timeout (s)"),
-                ("connect_timeout", "Connect timeout (s)"),
-                ("sock_connect_timeout", "Socket connect timeout (s)"),
-                ("sock_read_timeout", "Socket read timeout (s)"),
-            ] {
-                // Floats on the server: shown as stored (3600.0 as `3600`, 2.5 as `2.5`).
-                let stored = v[k].as_f64().map(|x| x.to_string()).unwrap_or_default();
-                fields.extend(has(k).then(|| number(k, label, FieldKind::Decimal, stored)));
-            }
-            let form = Form::new(
-                if edit { format!("Edit upstream {name}") } else { "New Upstream Pulp (native replication, tech preview)".into() },
-                fields,
-            )
-            .note("nodelete: never delete local objects. labeled: may delete objects created by earlier replications.")
-            .note("all: replication manages ALL local objects of the domain and may DELETE unrelated local repositories.");
-            app.form(form, move |app, f| {
-                // Replication talks to the upstream API over HTTP.
-                let origin = url_with_scheme(f.get("base_url"), &["http", "https"])?.origin().ascii_serialization();
-                replication::guard_self(&origin, &dst_origin).map_err(|e| e.to_string())?;
-                let mut b = json!({});
-                let mut files = vec![];
-                for fld in &f.fields {
-                    let val = fld.value.trim().to_string();
-                    let write_only = CREDENTIALS.iter().any(|(k, _)| *k == fld.key);
-                    if (write_only || !edit) && val.is_empty() || edit && !write_only && !fld.changed() {
-                        continue;
-                    }
-                    match (fld.key.as_str(), &fld.kind) {
-                        ("ca_cert" | "client_cert" | "client_key", _) => files.push((fld.key.clone(), val)),
-                        // After the credential fields: a checked clear wins over a typed value.
-                        (k, _) if k.starts_with("clear_") && val == "true" => {
-                            let k = &k["clear_".len()..];
-                            b[k] = Value::Null;
-                            files.retain(|(f, _)| f != k);
-                        }
-                        (k, _) if k.starts_with("clear_") => {}
-                        (_, FieldKind::Bool) => b[fld.key.as_str()] = (val == "true").into(),
-                        _ if val.is_empty() => b[fld.key.as_str()] = Value::Null,
-                        (_, FieldKind::Number) => {
-                            b[fld.key.as_str()] = val.parse::<i64>().map_err(|_| format!("{} must be a number", fld.label))?.into()
-                        }
-                        (_, FieldKind::Decimal) => {
-                            b[fld.key.as_str()] = val.parse::<f64>().map_err(|_| format!("{} must be a number", fld.label))?.into()
-                        }
-                        _ => b[fld.key.as_str()] = val.into(),
-                    }
-                }
-                let (href, label) = (href.clone(), format!("{} upstream {}", if edit { "update" } else { "create" }, f.get("name")));
-                let go = move |app: &mut App| {
-                    submit(app, label, move |c| async move {
-                        for (k, path) in files {
-                            b[k.as_str()] = tokio::fs::read_to_string(&path).await.with_context(|| format!("read {path}"))?.into();
-                        }
-                        Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api("upstream-pulps/"), &b).await? })
-                    })
-                };
-                let policy = f.get("policy");
-                // An edit that keeps the stored policy was confirmed when that policy was set.
-                match deletion_warning(policy).filter(|_| !edit || f.changed("policy")) {
-                    // An empty policy is no word to type: the Upstream name instead.
-                    Some(w) => app.confirm_danger(
-                        "Destructive replication policy",
-                        vec![w],
-                        if policy.is_empty() { f.get("name") } else { policy },
-                        go,
-                    ),
-                    None => go(app),
-                }
-                Ok(())
-            });
-        }
-        Act::Replicate => {
-            // Also here: an Upstream Pulp made with another tool never passed the check of the form.
-            let origin = url::Url::parse(&s(&item, "base_url")).map(|u| u.origin().ascii_serialization()).unwrap_or_default();
-            if let Err(e) = replication::guard_self(&origin, &dst_origin) {
-                return app.error(e.to_string());
-            }
-            let policy = s(&item, "policy");
-            let mut lines = vec![
-                format!("Replicate from {} into this server ({dst_origin}).", s(&item, "base_url")),
-                format!(
-                    "Distribution filter: {}",
-                    if s(&item, "q_select").is_empty() { "ALL upstream distributions".into() } else { s(&item, "q_select") }
-                ),
-                format!("Deletion policy: {}", if policy.is_empty() { "server default".to_string() } else { policy.clone() }),
-                "Pulp creates/updates repositories, remotes and distributions with the upstream names.".into(),
-                "This is a technology preview of pulpcore; check the compatibility notes.".into(),
-            ];
-            let go = move |app: &mut App| {
-                app.job(format!("replicate {name}"), move |ctx| async move {
-                    let res = replication::replicate_native(&ctx.client, &href, &group_progress(&ctx)).await;
-                    ap(move |app| match res {
-                        Ok(lines) => app.text(format!("Replication of {name}"), lines),
-                        Err(e) => {
-                            let outcome = match e.downcast_ref() {
-                                Some(PulpError::TaskFailed { state, .. }) => state.to_uppercase(),
-                                _ => "FAILED".into(),
-                            };
-                            app.text(format!("Replication of {name} {outcome}"), format!("{e:#}").lines().map(str::to_string).collect())
-                        }
-                    })
-                });
-            };
-            if let Some(w) = deletion_warning(&policy) {
-                lines.insert(0, w);
-                app.confirm_danger(format!("Replicate {}", s(&item, "name")), lines, &s(&item, "name"), go);
-            } else {
-                app.confirm(format!("Replicate {}", s(&item, "name")), lines, go);
-            }
-        }
-        Act::ReplicationHistory => app.job("replication history", move |ctx| async move {
-            let c = &ctx.client;
-            // Each run's `replicate_distributions` reserves the Upstream Pulp: a stable link, unlike the group's
-            // description, which holds the name at the time of the run.
-            let q = [
-                ("reserved_resources", href.clone()),
-                ("name", "pulpcore.app.tasks.replica.replicate_distributions".into()),
-                ("ordering", "-pulp_created".into()),
-                ("fields", "task_group".into()),
-                ("limit", "5".into()),
-            ];
-            let mut groups = vec![];
-            for g in c.list::<Value>(&c.api("tasks/"), &q).await?.results.iter().filter_map(|t| t["task_group"].as_str()) {
-                groups.push(c.get::<Value>(g, &[]).await?);
-            }
-            let mut lines = vec![];
-            for g in &groups {
-                lines.push(format!(
-                    "{}  completed {} failed {} canceled {}",
-                    s(g, "pulp_href"),
-                    g["completed"],
-                    g["failed"],
-                    g["canceled"]
-                ));
-                for t in g["tasks"].as_array().into_iter().flatten() {
-                    lines.push(format!("    {:<10} {}", s(t, "state"), s(t, "name")));
-                }
-            }
-            if lines.is_empty() {
-                lines.push("no replication of this upstream found (purged tasks are gone)".into());
-            }
-            ap(move |app| app.text(format!("Replication history of {name}"), lines))
-        }),
+        Act::Create | Act::Edit => upstream_form(app, act == Act::Edit, &item),
+        Act::Replicate => replicate(app, &item),
+        Act::ReplicationHistory => replication_history(app, href, name),
         Act::FallbackReplicate => fallback(app),
-        Act::Delete => app.job(format!("impact of deleting upstream {name}"), move |ctx| async move {
-            let c = &ctx.client;
-            // pulpcore labels what a replication creates with `UpstreamPulp=<pk>`; its tasks reserve the Upstream Pulp.
-            let pk = href.trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_string();
-            let label = [("pulp_label_select", format!("UpstreamPulp={pk}")), ("limit", "1".into())];
-            let mut n = vec![];
-            for p in ["repositories/", "remotes/", "distributions/"] {
-                n.push(c.list::<Value>(&c.api(p), &label).await?.count);
-            }
-            let q = [("reserved_resources", href.clone()), ("state__in", "waiting,running".into()), ("limit", "1".into())];
-            let busy = c.list::<Value>(&c.api("tasks/"), &q).await?.count;
-            let mut lines = vec![
-                format!("Delete the Upstream Pulp definition {name}."),
-                format!(
-                    "Its replications labelled {} repositories, {} remotes and {} distributions (UpstreamPulp={pk}): they stay.",
-                    n[0], n[1], n[2]
-                ),
-            ];
-            if busy > 0 {
-                lines.push(format!("{busy} replication task(s) of it are waiting or running: they fail without it."));
-            }
-            ap(move |app| {
-                app.confirm_danger(format!("Delete upstream {name}"), lines, &name.clone(), move |app| {
-                    submit(app, format!("delete upstream {name}"), move |c| async move { Ok(c.delete(&href).await?) })
-                })
-            })
-        }),
+        Act::Delete => upstream_delete(app, href, name),
         _ => {}
     }
+}
+
+/// The origin of this client's profile: the destination of a replication.
+fn dst_origin(app: &App) -> String {
+    app.profile.as_ref().and_then(|p| app.cfg.profiles.get(p)).map(|p| p.origin()).unwrap_or_default()
+}
+
+/// The connection fields of the Upstream Pulp form (`v`: the stored object, Null for a new one).
+fn upstream_connection_fields(edit: bool, v: &Value) -> Vec<Field> {
+    let mut fields = vec![
+        Field::text("name", "Name").required().value(s(v, "name")),
+        Field::text("base_url", "Upstream base URL")
+            .required()
+            .value(s(v, "base_url"))
+            .help("as reachable from THIS Pulp server, e.g. https://upstream.example.com"),
+        Field::text("api_root", "Upstream API root")
+            .value(if edit { s(v, "api_root") } else { "pulp/".into() })
+            .help("relative, with trailing slash: pulp/"),
+        Field::text("domain", "Upstream domain").value(s(v, "domain")),
+        Field::text("username", "Username").help("write-only; empty = unchanged"),
+        Field::new("password", "Password", FieldKind::Secret),
+        Field::text("ca_cert", "CA cert (PEM file path)"),
+        Field::text("client_cert", "Client cert (PEM file path)"),
+        Field::text("client_key", "Client key (PEM file path)"),
+        Field::new("tls_validation", "Validate TLS", FieldKind::Bool).value(if v["tls_validation"] == false { "false" } else { "true" }),
+    ];
+    // Empty means unchanged, so a stored credential is removed only with its own checkbox (sends null).
+    let tls = fields.len() - 1;
+    let clear = |(k, label): &(&str, &str)| {
+        Field::new(&format!("clear_{k}"), &format!("Clear {label}"), FieldKind::Bool).help("removes the stored value (sends null)")
+    };
+    fields.splice(tls..tls, CREDENTIALS.iter().filter(|(k, _)| edit && is_set(v, k)).map(clear));
+    fields
+}
+
+/// The replication fields of the Upstream Pulp form that the server's schema has.
+fn upstream_replication_fields(caps: Option<&Capabilities>, edit: bool, v: &Value) -> Vec<Field> {
+    let has = |f: &str| caps.is_none_or(|c| c.has_field("UpstreamPulp", f));
+    let mut fields = vec![];
+    if has("q_select") {
+        fields.push(
+            Field::text("q_select", "Distribution filter (q)")
+                .value(s(v, "q_select"))
+                .help(r#"e.g. name__startswith="rhel9" or pulp_label_select="env=prod""#),
+        );
+    } else if has("pulp_label_select") {
+        fields.push(Field::text("pulp_label_select", "Label selector").value(s(v, "pulp_label_select")));
+    }
+    if has("policy") {
+        let mut policies = caps
+            .as_ref()
+            .and_then(|c| c.field_enum("UpstreamPulp", "policy").map(|e| e.to_vec()))
+            .unwrap_or_else(|| vec!["nodelete".into(), "labeled".into(), "all".into()]);
+        policies.sort_by_key(|p| p != "nodelete"); // non-destructive default first
+        fields.push(Field::new("policy", "Deletion policy", FieldKind::Choice(policies)).value(if edit {
+            s(v, "policy")
+        } else {
+            "nodelete".into()
+        }));
+    }
+    // pulpcore copies these to the remotes that replication creates (`_build_remote_settings`).
+    if has("remote_policy") {
+        let mut p = caps
+            .as_ref()
+            .and_then(|c| c.field_enum("UpstreamPulp", "remote_policy").map(<[String]>::to_vec))
+            .unwrap_or_else(|| ["immediate", "on_demand", "streamed"].map(String::from).to_vec());
+        p.insert(0, String::new());
+        let help = "of the remotes that replication creates; empty = server default (immediate)";
+        fields.push(Field::new("remote_policy", "Replica download policy", FieldKind::Choice(p)).value(s(v, "remote_policy")).help(help));
+    }
+    let number = |k: &str, label: &str, kind: FieldKind, value: String| {
+        Field::new(k, label, kind).value(value).help("for the replica remotes; empty = server default")
+    };
+    for (k, label) in [("download_concurrency", "Download concurrency"), ("max_retries", "Max retries")] {
+        fields.extend(has(k).then(|| number(k, label, FieldKind::Number, s(v, k))));
+    }
+    for (k, label) in [
+        ("total_timeout", "Total timeout (s)"),
+        ("connect_timeout", "Connect timeout (s)"),
+        ("sock_connect_timeout", "Socket connect timeout (s)"),
+        ("sock_read_timeout", "Socket read timeout (s)"),
+    ] {
+        // Floats on the server: shown as stored (3600.0 as `3600`, 2.5 as `2.5`).
+        let stored = v[k].as_f64().map(|x| x.to_string()).unwrap_or_default();
+        fields.extend(has(k).then(|| number(k, label, FieldKind::Decimal, stored)));
+    }
+    fields
+}
+
+fn upstream_form(app: &mut App, edit: bool, item: &Value) {
+    let v = if edit { item.clone() } else { Value::Null };
+    let mut fields = upstream_connection_fields(edit, &v);
+    fields.extend(upstream_replication_fields(caps(app).as_deref(), edit, &v));
+    let (href, name, dst_origin) = (s(item, "pulp_href"), s(item, "name"), dst_origin(app));
+    let form = Form::new(
+        if edit { format!("Edit upstream {name}") } else { "New Upstream Pulp (native replication, tech preview)".into() },
+        fields,
+    )
+    .note("nodelete: never delete local objects. labeled: may delete objects created by earlier replications.")
+    .note("all: replication manages ALL local objects of the domain and may DELETE unrelated local repositories.");
+    app.form(form, move |app, f| {
+        // Replication talks to the upstream API over HTTP.
+        let origin = url_with_scheme(f.get("base_url"), &["http", "https"])?.origin().ascii_serialization();
+        replication::guard_self(&origin, &dst_origin).map_err(|e| e.to_string())?;
+        let (b, files) = upstream_body(f, edit)?;
+        save_upstream(app, f, edit, href.clone(), b, files);
+        Ok(())
+    });
+}
+
+/// Whether the form leaves `fld` out: an edit sends only changed fields, a new object only set ones, and an empty
+/// credential keeps the stored one.
+fn left_out(fld: &Field, edit: bool) -> bool {
+    let write_only = CREDENTIALS.iter().any(|(k, _)| *k == fld.key);
+    (write_only || !edit) && fld.value.trim().is_empty() || edit && !write_only && !fld.changed()
+}
+
+/// The body of the Upstream Pulp form, and the PEM files (field, path) that the job reads into it.
+fn upstream_body(f: &Form, edit: bool) -> Result<(Value, Vec<(String, String)>), String> {
+    let (mut b, mut files) = (json!({}), vec![]);
+    for fld in f.fields.iter().filter(|fld| !left_out(fld, edit)) {
+        let val = fld.value.trim();
+        match fld.key.as_str() {
+            "ca_cert" | "client_cert" | "client_key" => files.push((fld.key.clone(), val.to_string())),
+            // After the credential fields: a checked clear wins over a typed value.
+            k if k.starts_with("clear_") => {
+                let k = &k["clear_".len()..];
+                if val == "true" {
+                    b[k] = Value::Null;
+                    files.retain(|(f, _)| f != k);
+                }
+            }
+            k => b[k] = json_value(fld, val)?,
+        }
+    }
+    Ok((b, files))
+}
+
+/// A form value as Pulp takes it: a bool, null for empty, a number, else the text.
+fn json_value(fld: &Field, val: &str) -> Result<Value, String> {
+    let nan = || format!("{} must be a number", fld.label);
+    Ok(match fld.kind {
+        FieldKind::Bool => (val == "true").into(),
+        _ if val.is_empty() => Value::Null,
+        FieldKind::Number => val.parse::<i64>().map_err(|_| nan())?.into(),
+        FieldKind::Decimal => val.parse::<f64>().map_err(|_| nan())?.into(),
+        _ => val.into(),
+    })
+}
+
+/// Send the Upstream Pulp form. Setting a destructive policy needs its typed word first; an edit that keeps the
+/// stored policy was confirmed when that policy was set.
+fn save_upstream(app: &mut App, f: &Form, edit: bool, href: String, b: Value, files: Vec<(String, String)>) {
+    let label = format!("{} upstream {}", if edit { "update" } else { "create" }, f.get("name"));
+    let go = move |app: &mut App| send_upstream(app, label, edit, href, b, files);
+    let policy = f.get("policy");
+    match deletion_warning(policy).filter(|_| !edit || f.changed("policy")) {
+        // An empty policy is no word to type: the Upstream name instead.
+        Some(w) => {
+            app.confirm_danger("Destructive replication policy", vec![w], if policy.is_empty() { f.get("name") } else { policy }, go)
+        }
+        None => go(app),
+    }
+}
+
+/// Read the PEM `files` into `b`, then create the Upstream Pulp or PATCH `href`.
+fn send_upstream(app: &mut App, label: String, edit: bool, href: String, mut b: Value, files: Vec<(String, String)>) {
+    submit(app, label, move |c| async move {
+        for (k, path) in files {
+            b[k.as_str()] = tokio::fs::read_to_string(&path).await.with_context(|| format!("read {path}"))?.into();
+        }
+        Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api("upstream-pulps/"), &b).await? })
+    })
+}
+
+/// Confirm and start a native replication from the Upstream Pulp `item`.
+fn replicate(app: &mut App, item: &Value) {
+    let (href, name, dst_origin) = (s(item, "pulp_href"), s(item, "name"), dst_origin(app));
+    // Also here: an Upstream Pulp made with another tool never passed the check of the form.
+    let origin = url::Url::parse(&s(item, "base_url")).map(|u| u.origin().ascii_serialization()).unwrap_or_default();
+    if let Err(e) = replication::guard_self(&origin, &dst_origin) {
+        return app.error(e.to_string());
+    }
+    let policy = s(item, "policy");
+    let mut lines = vec![
+        format!("Replicate from {} into this server ({dst_origin}).", s(item, "base_url")),
+        format!(
+            "Distribution filter: {}",
+            if s(item, "q_select").is_empty() { "ALL upstream distributions".into() } else { s(item, "q_select") }
+        ),
+        format!("Deletion policy: {}", if policy.is_empty() { "server default".to_string() } else { policy.clone() }),
+        "Pulp creates/updates repositories, remotes and distributions with the upstream names.".into(),
+        "This is a technology preview of pulpcore; check the compatibility notes.".into(),
+    ];
+    let title = format!("Replicate {name}");
+    let go = move |app: &mut App| {
+        app.job(format!("replicate {name}"), move |ctx| async move {
+            let res = replication::replicate_native(&ctx.client, &href, &group_progress(&ctx)).await;
+            ap(move |app| show_replication(app, &name, res))
+        });
+    };
+    if let Some(w) = deletion_warning(&policy) {
+        lines.insert(0, w);
+        app.confirm_danger(title, lines, &s(item, "name"), go);
+    } else {
+        app.confirm(title, lines, go);
+    }
+}
+
+/// The result view of a replication: its title names any outcome but completed.
+fn show_replication(app: &mut App, name: &str, res: anyhow::Result<Vec<String>>) {
+    match res {
+        Ok(lines) => app.text(format!("Replication of {name}"), lines),
+        Err(e) => {
+            let outcome = match e.downcast_ref() {
+                Some(PulpError::TaskFailed { state, .. }) => state.to_uppercase(),
+                _ => "FAILED".into(),
+            };
+            app.text(format!("Replication of {name} {outcome}"), format!("{e:#}").lines().map(str::to_string).collect())
+        }
+    }
+}
+
+/// The five newest runs of the Upstream Pulp `href`.
+fn replication_history(app: &mut App, href: String, name: String) {
+    app.job("replication history", move |ctx| async move {
+        let c = &ctx.client;
+        // Each run's `replicate_distributions` reserves the Upstream Pulp: a stable link, unlike the group's
+        // description, which holds the name at the time of the run.
+        let q = [
+            ("reserved_resources", href.clone()),
+            ("name", "pulpcore.app.tasks.replica.replicate_distributions".into()),
+            ("ordering", "-pulp_created".into()),
+            ("fields", "task_group".into()),
+            ("limit", "5".into()),
+        ];
+        let mut groups = vec![];
+        for g in c.list::<Value>(&c.api("tasks/"), &q).await?.results.iter().filter_map(|t| t["task_group"].as_str()) {
+            groups.push(c.get::<Value>(g, &[]).await?);
+        }
+        let mut lines = vec![];
+        for g in &groups {
+            lines.push(format!("{}  completed {} failed {} canceled {}", s(g, "pulp_href"), g["completed"], g["failed"], g["canceled"]));
+            lines.extend(g["tasks"].as_array().into_iter().flatten().map(|t| format!("    {:<10} {}", s(t, "state"), s(t, "name"))));
+        }
+        if lines.is_empty() {
+            lines.push("no replication of this upstream found (purged tasks are gone)".into());
+        }
+        ap(move |app| app.text(format!("Replication history of {name}"), lines))
+    });
+}
+
+/// Delete the Upstream Pulp `href`: first what uses it, then the typed name.
+fn upstream_delete(app: &mut App, href: String, name: String) {
+    app.job(format!("impact of deleting upstream {name}"), move |ctx| async move {
+        let c = &ctx.client;
+        // pulpcore labels what a replication creates with `UpstreamPulp=<pk>`; its tasks reserve the Upstream Pulp.
+        let pk = href.trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_string();
+        let label = [("pulp_label_select", format!("UpstreamPulp={pk}")), ("limit", "1".into())];
+        let mut n = vec![];
+        for p in ["repositories/", "remotes/", "distributions/"] {
+            n.push(c.list::<Value>(&c.api(p), &label).await?.count);
+        }
+        let q = [("reserved_resources", href.clone()), ("state__in", "waiting,running".into()), ("limit", "1".into())];
+        let busy = c.list::<Value>(&c.api("tasks/"), &q).await?.count;
+        let mut lines = vec![
+            format!("Delete the Upstream Pulp definition {name}."),
+            format!(
+                "Its replications labelled {} repositories, {} remotes and {} distributions (UpstreamPulp={pk}): they stay.",
+                n[0], n[1], n[2]
+            ),
+        ];
+        if busy > 0 {
+            lines.push(format!("{busy} replication task(s) of it are waiting or running: they fail without it."));
+        }
+        ap(move |app| {
+            app.confirm_danger(format!("Delete upstream {name}"), lines, &name.clone(), move |app| {
+                submit(app, format!("delete upstream {name}"), move |c| async move { Ok(c.delete(&href).await?) })
+            })
+        })
+    });
 }
 
 /// The types a "Types" choice of the fallback form selects. Deb is a choice of its own: the default must not need pulp_deb.
@@ -1226,26 +1264,7 @@ fn exporter_action(app: &mut App, act: Act, item: Value) {
 /// A Pulp exporter has repositories; a filesystem exporter (`fs`) has a method instead.
 fn exporter_form(app: &mut App, fs: bool, edit: bool, item: &Value) {
     let href = s(item, "pulp_href");
-    let mut fields = vec![
-        Field::text("name", "Name").required().value(s(item, "name")),
-        Field::text("path", "Directory on the Pulp server").required().value(s(item, "path")).help("inside its ALLOWED_EXPORT_PATHS"),
-    ];
-    let caps = caps(app);
-    if !fs {
-        let repos: Vec<&str> = item["repositories"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-        let mut pick = Field::pick("repositories", "Repositories", Source::ExportRepos).multi().required().value(repos.join("\n"));
-        if !repos.is_empty() {
-            pick.shown = format!("{} selected", repos.len());
-        }
-        fields.push(pick);
-    } else if caps.as_ref().is_none_or(|c| c.has_field("FilesystemExporter", "method")) {
-        let methods = caps
-            .as_ref()
-            .and_then(|c| c.field_enum("FilesystemExporter", "method").map(<[String]>::to_vec))
-            .unwrap_or_else(|| ["write", "hardlink", "symlink"].map(String::from).to_vec());
-        let method = Field::new("method", "Method", FieldKind::Choice(methods)).help("hardlink and symlink need Pulp's file storage");
-        fields.push(if edit { method.value(s(item, "method")) } else { method });
-    }
+    let fields = exporter_fields(caps(app).as_deref(), fs, edit, item);
     let (kind, collection, note) = match fs {
         false => ("Pulp", "exporters/core/pulp/", "An export writes a .tar file (or chunks) and a -toc.json file into this directory."),
         true => (
@@ -1256,20 +1275,49 @@ fn exporter_form(app: &mut App, fs: bool, edit: bool, item: &Value) {
     };
     let title = if edit { format!("Edit exporter {}", s(item, "name")) } else { format!("New {kind} exporter") };
     app.form(Form::new(title, fields).note(note), move |app, f| {
-        let mut b = json!({});
-        for fld in f.fields.iter().filter(|x| !edit || x.changed()) {
-            let k = fld.key.as_str();
-            b[k] = match k {
-                "repositories" => f.get(k).split('\n').filter(|v| !v.is_empty()).collect::<Vec<_>>().into(),
-                _ => f.get(k).into(),
-            };
-        }
+        let b = exporter_body(f, edit);
         let href = href.clone();
         submit(app, format!("{} exporter {}", if edit { "update" } else { "create" }, f.get("name")), move |c| async move {
             Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api(collection), &b).await? })
         });
         Ok(())
     });
+}
+
+/// The body of the exporter form: an edit sends only the changed fields.
+fn exporter_body(f: &Form, edit: bool) -> Value {
+    let mut b = json!({});
+    for fld in f.fields.iter().filter(|x| !edit || x.changed()) {
+        let k = fld.key.as_str();
+        b[k] = match k {
+            "repositories" => f.get(k).split('\n').filter(|v| !v.is_empty()).collect::<Vec<_>>().into(),
+            _ => f.get(k).into(),
+        };
+    }
+    b
+}
+
+/// A Pulp exporter has repositories (Content View snapshots too); a filesystem exporter (`fs`) a method instead.
+fn exporter_fields(caps: Option<&Capabilities>, fs: bool, edit: bool, item: &Value) -> Vec<Field> {
+    let mut fields = vec![
+        Field::text("name", "Name").required().value(s(item, "name")),
+        Field::text("path", "Directory on the Pulp server").required().value(s(item, "path")).help("inside its ALLOWED_EXPORT_PATHS"),
+    ];
+    if !fs {
+        let repos: Vec<&str> = item["repositories"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let mut pick = Field::pick("repositories", "Repositories", Source::ExportRepos).multi().required().value(repos.join("\n"));
+        if !repos.is_empty() {
+            pick.shown = format!("{} selected", repos.len());
+        }
+        fields.push(pick);
+    } else if caps.is_none_or(|c| c.has_field("FilesystemExporter", "method")) {
+        let methods = caps
+            .and_then(|c| c.field_enum("FilesystemExporter", "method").map(<[String]>::to_vec))
+            .unwrap_or_else(|| ["write", "hardlink", "symlink"].map(String::from).to_vec());
+        let method = Field::new("method", "Method", FieldKind::Choice(methods)).help("hardlink and symlink need Pulp's file storage");
+        fields.push(if edit { method.value(s(item, "method")) } else { method });
+    }
+    fields
 }
 
 /// A repository of a Pulp exporter: its latest version, and its version in the exporter's last export.
@@ -1431,19 +1479,7 @@ fn fs_export(app: &mut App, href: String, name: String, path: String) {
         let (href, name, path) = (href.clone(), name.clone(), path.clone());
         app.job(format!("export {name}"), move |ctx| async move {
             let c = &ctx.client;
-            let v = match number {
-                Some(n) => format!("{repo}versions/{n}/"),
-                None => s(&c.get::<Value>(&repo, &[]).await?, "latest_version_href"),
-            };
-            let mut body = if publication {
-                let q = [("repository_version", v.clone()), ("ordering", "-pulp_created".into()), ("limit", "1".into())];
-                let newest = c.list::<Value>(&c.api(t.publications()), &q).await?.results.first().map(|p| s(p, "pulp_href"));
-                let p = newest
-                    .ok_or_else(|| anyhow::anyhow!("{} has no publication: publish it, or export the repository version", short(&v)))?;
-                json!({ "publication": p })
-            } else {
-                json!({ "repository_version": v })
-            };
+            let mut body = fs_export_source(c, t, &repo, number, publication).await?;
             if let Some(s) = start {
                 body["start_repository_version"] = s.into();
             }
@@ -1453,6 +1489,21 @@ fn fs_export(app: &mut App, href: String, name: String, path: String) {
         });
         Ok(())
     });
+}
+
+/// What a filesystem export of `repo` writes: version `number` (None = latest), or its newest publication.
+async fn fs_export_source(c: &PulpClient, t: RepoType, repo: &str, number: Option<i64>, publication: bool) -> anyhow::Result<Value> {
+    let v = match number {
+        Some(n) => format!("{repo}versions/{n}/"),
+        None => s(&c.get::<Value>(repo, &[]).await?, "latest_version_href"),
+    };
+    if !publication {
+        return Ok(json!({ "repository_version": v }));
+    }
+    let q = [("repository_version", v.clone()), ("ordering", "-pulp_created".into()), ("limit", "1".into())];
+    let newest = c.list::<Value>(&c.api(t.publications()), &q).await?.results.first().map(|p| s(p, "pulp_href"));
+    let p = newest.ok_or_else(|| anyhow::anyhow!("{} has no publication: publish it, or export the repository version", short(&v)))?;
+    Ok(json!({ "publication": p }))
 }
 
 /// An export record: Pulp deletes the record only, never the files.
