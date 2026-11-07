@@ -785,3 +785,28 @@ async fn remote_timeouts_keep_decimal_seconds_through_the_tui() {
     app.modal = None;
     cleanup(&c, &[r["pulp_href"].as_str().unwrap()]).await;
 }
+
+/// A Content View snapshot repository of another database (labels set with the API) is not deleted from the
+/// Repositories screen, alone or marked (audit F02): the refusal names the view and the database, and nothing is sent.
+#[tokio::test]
+async fn snapshot_repository_of_another_database_is_not_deleted_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("it-snap"));
+    let labels = json!({ "pulp_tui_cv": "foreignview", "pulp_tui_db": "another-database-id" });
+    let repo = create(&c, RepoType::File.repositories(), json!({ "name": name, "pulp_labels": labels }), "/repositories/").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(RepoType::File, false);
+    let item: Value = c.get(&repo, &[]).await.unwrap();
+    let refused = format!("refused: {name} is a snapshot repository of Content View foreignview (database another-database-id); ");
+    run(&mut app, Act::Delete, item.clone());
+    settle(&mut app, &mut rx).await;
+    assert!(app.modal.is_none() && texts(&app).last().unwrap().starts_with(&refused), "{:?}", texts(&app));
+    app.list.marked = [repo.clone()].into();
+    run(&mut app, Act::Delete, item);
+    settle(&mut app, &mut rx).await;
+    assert!(app.modal.is_none() && texts(&app).last().unwrap().contains(&refused), "{:?}", texts(&app));
+    assert!(c.get::<Value>(&repo, &[]).await.is_ok(), "the repository stays");
+    cleanup(&c, &[&repo]).await;
+}

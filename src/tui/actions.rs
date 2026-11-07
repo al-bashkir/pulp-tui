@@ -168,10 +168,13 @@ fn cv_owner(item: &Value) -> Option<String> {
     item["pulp_labels"].get(crate::cv::LABEL_CV).and_then(Value::as_str).map(str::to_string)
 }
 
+/// Refuse any change of a Content View snapshot repository, also one of another database (`pulp_tui_db`).
 fn snapshot_refusal(repo: &Value) -> Option<String> {
+    let db = repo["pulp_labels"].get(crate::cv::LABEL_DB).and_then(Value::as_str).map(|d| format!(" (database {d})")).unwrap_or_default();
     cv_owner(repo).map(|cv| {
         format!(
-            "refused: {} is a snapshot repository of Content View {cv}; change its source repositories and publish a new version",
+            "refused: {} is a snapshot repository of Content View {cv}{db}; \
+             use the Content View actions (publish a new version, delete a version or the view)",
             s(repo, "name")
         )
     })
@@ -1304,7 +1307,10 @@ fn delete_marked(app: &mut App, kind: Kind) {
             let item: Value = c.get(&href, &[]).await?;
             let name = s(&item, "name");
             lines.extend(match kind {
-                Kind::Repos(..) => repo_delete_impact(&ctx, t, &href, &name).await?,
+                Kind::Repos(..) => match snapshot_refusal(&item) {
+                    Some(e) => bail!(e),
+                    None => repo_delete_impact(&ctx, t, &href, &name).await?,
+                },
                 Kind::Remotes(_, alt) => {
                     let (l, users) = remote_delete_impact(&ctx, t, alt, &href, &name).await?;
                     acs.extend(users);
@@ -1365,6 +1371,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 | Act::CopyContent
                 | Act::Reclaim
                 | Act::Edit
+                | Act::Delete
         )
     {
         app.error(e);
@@ -6021,6 +6028,37 @@ mod tests {
         assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("not supported by this server: task purge (tasks/purge/)"));
     }
 
+    /// A Content View snapshot repository, also one of another database, is never deleted from the Repositories screen.
+    #[tokio::test]
+    async fn delete_refuses_a_snapshot_repository_alone_and_marked() {
+        let server = wiremock::MockServer::start().await;
+        let (snap, other) = (format!("{API}repositories/file/file/snap/"), format!("{API}repositories/file/file/other/"));
+        let snap_row = json!({ "pulp_href": snap, "name": "snap", "pulp_labels": { "pulp_tui_cv": "web", "pulp_tui_db": "other-db" } });
+        get(&server, &snap, snap_row.clone()).await;
+        get(&server, &other, json!({ "pulp_href": other, "name": "other", "pulp_labels": {} })).await;
+        for p in [format!("{other}versions/"), format!("{API}publications/file/file/"), format!("{API}distributions/file/file/")] {
+            get(&server, &p, page(json!([]))).await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Repos(RepoType::File, false);
+        let refused = "refused: snap is a snapshot repository of Content View web (database other-db); \
+                       use the Content View actions (publish a new version, delete a version or the view)";
+        let last = |app: &App| app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+
+        run(&mut app, Act::Delete, snap_row);
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none());
+        assert_eq!(last(&app), refused);
+
+        app.list.marked = [snap.clone(), other.clone()].into();
+        run(&mut app, Act::Delete, json!({ "pulp_href": other, "name": "other" }));
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none());
+        assert!(last(&app).ends_with(refused), "{}", last(&app));
+        let sent = server.received_requests().await.unwrap();
+        assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "no request changes Pulp");
+    }
+
     #[tokio::test]
     async fn delete_marked_distributions_confirms_once_and_keeps_the_failed_mark() {
         use crate::tui::app::Modal;
@@ -8306,7 +8344,8 @@ mod tests {
         prune(&mut app, &mut rx, json!({ "pulp_href": snap, "name": "snap" })).await;
         assert!(
             last(&app).ends_with(
-                "refused: snap is a snapshot repository of Content View web; change its source repositories and publish a new version"
+                "refused: snap is a snapshot repository of Content View web; \
+                 use the Content View actions (publish a new version, delete a version or the view)"
             ),
             "{}",
             last(&app)
