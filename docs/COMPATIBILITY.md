@@ -501,6 +501,11 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
 * **`base_path` PATCH** (environment relabel) is a task (`ageneral_update`) that keeps the
   href and publication. When it ends, the new path answers 200 and the old one 404 (no
   cache delay seen); a later promotion serves at the new label. A taken base path gets 409.
+* **Overlapping base paths** (pulpcore 3.123.1, `DistributionSerializer.validate_base_path`): a
+  base path that equals another, is a prefix of another (`a` and `a/b`), or is inside another
+  gets HTTP 400 `Overlaps with an existing distribution.` (checked on POST and PATCH). The
+  relabel therefore refuses a label when another distribution has the label or a path below it
+  as its base path, before it stores anything.
 * **RPM publications.** A `mirror_complete` sync makes its own publication with upstream
   paths, so served-content checks also try `location_href`. The RPM publication has no
   `distributions` field (the File one has) and `distributions/` has no `publication`

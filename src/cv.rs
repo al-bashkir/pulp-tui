@@ -1372,17 +1372,37 @@ impl CvService {
         if let Some(e) = self.store.environments(&self.scope).await?.into_iter().find(|e| e.id != env_id && e.label == label) {
             bail!("label {label} is already used by environment {}", e.name);
         }
-        let mut out = vec![];
+        let (mut own, mut out) = (vec![], vec![]);
         for cv_id in self.store.env_cv_ids(env_id).await? {
             let cv = self.store.content_view(cv_id).await?.name;
             for b in self.store.binding_repos(env_id, cv_id).await? {
+                own.push(b.distribution.clone());
                 let new = base_path(&cv, label, &b.repo_name);
                 if b.base_path != new {
                     out.push((b, new));
                 }
             }
         }
+        self.refuse_label_overlap(label, &own).await?;
         Ok(out)
+    }
+
+    /// Refused when another distribution (not in `own`) has the base path `label` or one below it: a served path
+    /// `<label>/<view>/<repo>` would overlap it, and Pulp refuses a base path that equals, contains or is inside
+    /// another one (USER_GUIDE "Lifecycle Environments").
+    async fn refuse_label_overlap(&self, label: &str, own: &[String]) -> Result<()> {
+        let c = &self.client;
+        let found: Vec<Distribution> = c.list_all(&c.api("distributions/"), &[("base_path__contains", label.into())], 100_000).await?;
+        let under = |p: &str| p == label || p.strip_prefix(label).is_some_and(|r| r.starts_with('/'));
+        if let Some(d) = found.iter().find(|d| !own.contains(&d.pulp_href) && under(&d.base_path)) {
+            bail!(
+                "label {label} is refused: distribution {} has base path /{}, the label or below it \
+                 (served paths would overlap it; Pulp refuses that)",
+                d.name,
+                d.base_path
+            );
+        }
+        Ok(())
     }
 
     /// Change the label of environment `env_id` and move its served paths in place. The stored label is
@@ -1401,10 +1421,11 @@ impl CvService {
         alive()?;
         let aliases = self.store.aliases().await?;
         let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice()));
+        let moves = self.relabel_impact(env_id, label).await?; // under the locks; refuses an overlapping label
         self.store.set_env_label(env_id, label).await?; // after the calls that can fail: then the audit entry below is always written
         let (mut lines, mut moved, mut failed) = (vec![], 0, 0);
         let res = async {
-            for (b, new) in self.relabel_impact(env_id, label).await? {
+            for (b, new) in moves {
                 let (repo, old) = (b.repo_name.clone(), b.base_path.clone());
                 // A view bound after the locks were taken is not ours to change now.
                 let Some((_, cv, _)) = locks.iter().find(|l| l.0 == b.cv_id) else {
@@ -3200,6 +3221,14 @@ mod tests {
             }
         }
         Mock::given(method("PATCH")).respond_with(ResponseTemplate::new(200).set_body_json(json!({}))).mount(&server).await;
+        // Under the new label: only distributions of this environment (pkgs, moved by an earlier PATCH).
+        let pkgs = json!({ "pulp_href": "/pulp/api/v3/distributions/rpm/rpm/2/", "name": "pkgs", "base_path": "qa/web/pkgs" });
+        let list = json!({ "count": 1, "next": null, "results": [pkgs] });
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/distributions/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list))
+            .mount(&server)
+            .await;
         let patches = || async {
             let all = server.received_requests().await.unwrap();
             all.into_iter()
@@ -3230,6 +3259,55 @@ mod tests {
         let audit: Vec<_> = svc.store.audit_log("k", 10).await.unwrap().into_iter().filter(|a| a.action == "env.relabel").collect();
         assert_eq!(audit.len(), 1, "the rerun changed nothing: {audit:?}");
         assert_eq!(audit[0].detail, "Dev: dev -> qa: 2 moved, 2 failed");
+    }
+
+    /// Pulp refuses a base path that equals, contains or is inside another one: a label whose served paths would
+    /// overlap another distribution is refused before it is stored and before any PATCH.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relabel_is_refused_before_the_label_is_stored_when_a_base_path_overlaps() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (dev, cv) = web_in_dev(&svc).await;
+        let own = "/pulp/api/v3/distributions/rpm/rpm/1/";
+        let row = BindingRepo {
+            env_id: dev,
+            cv_id: cv,
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/1/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: own.into(),
+            base_path: "dev/web/os".into(),
+            publication: None,
+        };
+        svc.store.save_binding_repo(&row).await.unwrap();
+        // `base_path__contains` narrows the list; the overlap is checked on each path.
+        let dists = |found: &[(&str, &str)]| {
+            let results: Vec<Value> =
+                found.iter().map(|(h, p)| json!({ "pulp_href": h, "name": format!("d{p}"), "base_path": p })).collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "count": results.len(), "next": null, "results": results }))
+        };
+        for (label, found) in [
+            ("qa", vec![("/d/1/", "qa/legacy"), ("/d/2/", "aqa/x")]),
+            ("stage", vec![("/d/3/", "stage")]),
+            ("dev", vec![(own, "dev/web/os")]), // its own row: a rerun with the same label
+            ("prod", vec![("/d/4/", "x/prod"), ("/d/5/", "prod-old/x"), ("/d/6/", "prodx")]),
+        ] {
+            let q = Mock::given(method("GET")).and(path("/pulp/api/v3/distributions/")).and(query_param("base_path__contains", label));
+            q.respond_with(dists(&found)).mount(&server).await;
+        }
+        for (label, clash) in [("qa", "dqa/legacy has base path /qa/legacy"), ("stage", "dstage has base path /stage")] {
+            let want = format!(
+                "label {label} is refused: distribution {clash}, the label or below it (served paths would overlap it; Pulp refuses that)"
+            );
+            assert_eq!(svc.relabel_impact(dev, label).await.unwrap_err().to_string(), want, "the preview refuses");
+            assert_eq!(svc.relabel_env(dev, label, &|_| {}, &ops::no_progress).await.unwrap_err().to_string(), want);
+            assert_eq!(svc.store.environments("k").await.unwrap()[1].label, "dev", "not stored");
+        }
+        assert_none(&server, "PATCH").await;
+        assert!(svc.relabel_impact(dev, "dev").await.unwrap().is_empty());
+        assert_eq!(svc.relabel_impact(dev, "prod").await.unwrap()[0].1, "prod/web/os", "a path that only contains the label");
     }
 
     #[tokio::test(flavor = "multi_thread")]

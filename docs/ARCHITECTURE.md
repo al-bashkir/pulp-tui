@@ -232,9 +232,12 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
 `CvService::relabel_env` moves the distributions with a PATCH of `base_path`
 (`ops::move_distribution`):
 
-1. Load the impact (`relabel_impact`), then `confirm_danger` with the environment name.
+1. Load the impact (`relabel_impact`), then `confirm_danger` with the environment name. The
+   impact refuses a label when a distribution that is not one of the environment's rows has
+   the label or a path below it as its base path (`refuse_label_overlap`; Pulp refuses
+   overlapping base paths, COMPATIBILITY.md).
 2. Lock every view with rows in the environment, in `cv_id` order.
-3. Store the new label (the checkpoint).
+3. Load the impact again (the same refusal), then store the new label (the checkpoint).
 4. Per row: check the labels and database id, PATCH, wait, save the row.
 
 A failed row keeps its old path; a rerun with the same label moves the rest (a row whose
