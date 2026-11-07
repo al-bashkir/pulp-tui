@@ -3093,14 +3093,62 @@ fn distribution_form(app: &mut App, t: RepoType, current: Option<Value>) {
         }
         let current = v.clone();
         let label = format!("{} distribution {}", if edit { "update" } else { "create" }, f.get("name"));
-        app.job(label.clone(), move |ctx| async move {
-            save_distribution(&ctx, t, edit.then_some(&current), b, serve).await?;
-            ap(move |app| {
-                app.ok(format!("{label}: done"));
-                app.reload();
+        let (will, path) = (serve_line(&serve), b["base_path"].as_str().map(str::to_string));
+        let go = move |app: &mut App| {
+            app.job(label.clone(), move |ctx| async move {
+                save_distribution(&ctx, t, edit.then_some(&current), b, serve).await?;
+                ap(move |app| {
+                    app.ok(format!("{label}: done"));
+                    app.reload();
+                })
             })
-        });
+        };
+        match edit && (will.is_some() || path.is_some()) {
+            true => distribution_edit_confirm(app, t, v.clone(), will, path, go),
+            false => go(app),
+        }
         Ok(())
+    });
+}
+
+/// What a distribution serves after the form saves `serve`; `None`: the binding stays.
+fn serve_line(serve: &Serve) -> Option<String> {
+    match serve {
+        Serve::Keep => None,
+        Serve::Nothing => Some("nothing".into()),
+        Serve::Follow(r) => Some(format!("the newest publication of repository {r} (follows it)")),
+        Serve::Pin(r, n, _) => {
+            let n = n.map_or_else(|| "latest".to_string(), |n| n.to_string());
+            Some(format!("a publication of version {n} of repository {r} (pinned)"))
+        }
+    }
+}
+
+/// An edit of distribution `d` that changes what its clients get: what it serves now, what it serves after (`will`),
+/// the new base path (`path`), then `go` after the typed name.
+fn distribution_edit_confirm(
+    app: &mut App,
+    t: RepoType,
+    d: Value,
+    will: Option<String>,
+    path: Option<String>,
+    go: impl FnOnce(&mut App) + Send + 'static,
+) {
+    let name = s(&d, "name");
+    app.job(format!("impact of editing distribution {name}"), move |ctx| async move {
+        let c = &ctx.client;
+        let d: Value = c.get(&s(&d, "pulp_href"), &[]).await?;
+        let now = match served_now(c, &ctx.caps, t, &d).await? {
+            Some((v, _, how)) => format!("{} ({how})", short(&v)),
+            None => "nothing".into(),
+        };
+        let mut lines = vec![format!("Distribution {name} ({})", s(&d, "base_url")), format!("  now serves:  {now}")];
+        lines.extend(will.map(|w| format!("  will serve:  {w}")));
+        if let Some(p) = path {
+            lines.push(format!("  base path:   {} -> {p}", s(&d, "base_path")));
+            lines.push("Clients of the old URL get HTTP 404 after the change.".into());
+        }
+        ap(move |app| app.confirm_danger(format!("Edit distribution {name}"), lines, &name.clone(), go))
     });
 }
 
@@ -6862,6 +6910,62 @@ mod tests {
         assert!(app.notices.iter().any(|n| n.text == "update repository os: done"), "{:?}", app.notices.back().map(|n| &n.text));
     }
 
+    /// An edit that changes what clients get (Serve = none, follow, re-pin, base path) loads what the distribution
+    /// serves now and asks for the typed name before the PATCH; a label-only edit saves at once.
+    #[tokio::test]
+    async fn distribution_edit_of_the_binding_or_base_path_needs_the_typed_name() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (r, d, pubs) = (
+            format!("{API}repositories/file/file/r/"),
+            format!("{API}distributions/file/file/1/"),
+            format!("{API}publications/file/file/"),
+        );
+        let p1 = format!("{pubs}1/");
+        let item = json!({ "pulp_href": d, "name": "docs", "base_path": "docs", "base_url": "http://h/docs/", "publication": p1,
+            "pulp_labels": {} });
+        get(&server, &d, item.clone()).await;
+        let publication = |n: u32| {
+            json!({ "pulp_href": format!("{pubs}{n}/"), "repository_version": format!("{r}versions/{n}/"),
+            "manifest": "PULP_MANIFEST" })
+        };
+        get(&server, &p1, publication(1)).await;
+        let repo = json!({ "pulp_href": r, "name": "r", "latest_version_href": format!("{r}versions/2/"), "manifest": "PULP_MANIFEST" });
+        get(&server, &r, repo.clone()).await;
+        get(&server, &format!("{API}repositories/file/file/"), page(json!([repo]))).await;
+        get(&server, &pubs, page(json!([publication(2)]))).await;
+        answer(&server, "PATCH", &d, 200, json!({ "pulp_href": d })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let follow = "  will serve:  the newest publication of repository r (follows it)";
+        let pin = "  will serve:  a publication of version 2 of repository r (pinned)";
+        let path = "  base path:   docs -> docs2";
+        for (changes, want) in [
+            (vec![("mode", "none")], "  will serve:  nothing"),
+            (vec![("mode", "follow repository latest"), ("repo", "r")], follow),
+            (vec![("repo", "r"), ("number", "2")], pin),
+            (vec![("base_path", "docs2")], path),
+        ] {
+            let sent = bodies(&server, "PATCH", &d).await.len();
+            distribution_action(&mut app, RepoType::File, Act::Edit, item.clone());
+            fill_and_submit(&mut app, &changes);
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {changes:?}") };
+            assert_eq!(typed.as_deref(), Some("docs"));
+            assert_eq!(lines[..2], ["Distribution docs (http://h/docs/)", "  now serves:  r@v1 (pinned to publication 1)"]);
+            assert!(lines.iter().any(|l| l == want), "{changes:?}: {lines:?}");
+            assert_eq!(bodies(&server, "PATCH", &d).await.len(), sent, "nothing is sent before the confirm");
+            yes(&mut app);
+            settle(&mut app, &mut rx).await;
+            assert_eq!(bodies(&server, "PATCH", &d).await.len(), sent + 1, "{:?}", app.notices.back().map(|n| &n.text));
+        }
+
+        distribution_action(&mut app, RepoType::File, Act::Edit, item);
+        fill_and_submit(&mut app, &[("labels", "team=ops")]);
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none());
+        assert_eq!(bodies(&server, "PATCH", &d).await.last(), Some(&json!({ "pulp_labels": { "team": "ops" } })));
+    }
+
     #[tokio::test]
     async fn binding_edit_of_a_version_bound_distribution_clears_the_version() {
         use crate::tui::app::Modal;
@@ -6878,10 +6982,15 @@ mod tests {
         let (mut app, mut rx) = connected(&server).await;
         let item = json!({ "pulp_href": d, "name": "replica", "base_path": "replica",
             "repository_version": format!("{API}repositories/file/file/r/versions/1/"), "pulp_labels": {} });
+        get(&server, &d, item.clone()).await;
+        get(&server, &format!("{API}publications/file/file/"), page(json!([]))).await;
         distribution_action(&mut app, RepoType::File, Act::Edit, item);
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
         form.fields.iter_mut().find(|f| f.key == "mode").unwrap().value = "none".into();
         submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        yes(&mut app);
         settle(&mut app, &mut rx).await;
         assert!(app.notices.iter().any(|n| n.text == "update distribution replica: done"));
     }
@@ -7703,10 +7812,14 @@ mod tests {
             set(&mut form, "number", number);
             submit(app, &form).unwrap();
         };
-        edit(&mut app, "follow repository latest", "");
-        settle(&mut app, &mut rx).await;
-        edit(&mut app, "publication of a repository version", "2");
-        settle(&mut app, &mut rx).await;
+        get(&server, &d, item.clone()).await;
+        for (mode, number) in [("follow repository latest", ""), ("publication of a repository version", "2")] {
+            edit(&mut app, mode, number);
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {mode}") };
+            yes(&mut app);
+            settle(&mut app, &mut rx).await;
+        }
         assert_eq!(app.notices.back().unwrap().text, "update distribution docs: done");
         assert_eq!(posts_to(&server, &pubs).await, [json!({ "repository_version": format!("{r}versions/2/") })]);
         let patches = bodies(&server, "PATCH", &d).await;
