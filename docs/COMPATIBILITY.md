@@ -613,7 +613,10 @@ Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
   domain; the old files stay. The task locks the domain.
 * **Storage secrets are write-only**: `access_key`, `secret_key`, `security_token`,
   `cloudfront_key` (S3), `account_name`, `account_key` (Azure). GET shows only their names in
-  `hidden_fields`.
+  `hidden_fields`. Azure `connection_string`, `token_credential` and `sas_token` are **not**
+  write-only (pulpcore 3.123.1): GET returns them. Pulp also takes the Django setting names
+  in any case (`AWS_SECRET_ACCESS_KEY`, `AZURE_CONNECTION_STRING`). pulp-tui masks all of them
+  in Inspect, Details and Logs.
 * `default_content_guard` must be a guard of the same domain, and only on update.
 
 ### Sync and remotes

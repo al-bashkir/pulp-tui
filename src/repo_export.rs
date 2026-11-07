@@ -20,8 +20,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Labels of objects that pulp-tui or native replication (`UpstreamPulp`) manage.
 const OWNER_LABELS: [&str; 5] = [LABEL_CV, LABEL_ENV, LABEL_DB, LABEL_REPLICA, "UpstreamPulp"];
-/// Readable fields that can hold a secret.
-const SECRET_FIELDS: [&str; 2] = ["sles_auth_token", "headers"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerExport {
@@ -65,7 +63,7 @@ fn entry(t: RepoType, obj: &Value, writable: &dyn Fn(&str) -> bool, remotes: &BT
 /// The file value of one writable field (None = left out), and a note when something was left out.
 fn field(k: &str, v: &Value, remotes: &BTreeMap<String, String>, api: &str) -> (Option<Value>, Option<String>) {
     match (k, v) {
-        _ if SECRET_FIELDS.contains(&k) => (None, (!v.is_null()).then(|| format!("{k} left out (it can hold a secret)"))),
+        _ if crate::session_log::is_secret(k) => (None, (!v.is_null()).then(|| format!("{k} left out (it can hold a secret)"))),
         ("remote", Value::String(h)) => match remotes.get(h) {
             Some(name) => (Some(name.clone().into()), None),
             None => (None, Some(format!("remote {h} left out (not found)"))),

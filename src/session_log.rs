@@ -1,8 +1,8 @@
 //! In-memory log of the session: every Pulp request and every action notice.
 //!
 //! Keeps the last `MAX_ROWS` rows (hidden poll rows are dropped first); each stored body is cut at
-//! `MAX_BODY` bytes. JSON keys `password`, `token`, `secret`, `client_key` and any key ending in
-//! `_password`, `_token` or `_secret` are replaced with `•••` at any depth. The Authorization header is
+//! `MAX_BODY` bytes. JSON keys in `SECRET_KEYS` (`password`, `token`, `secret`, …) and any key ending in
+//! `_<one of them>` are replaced with `•••` at any depth. The Authorization header is
 //! never recorded (`Request` has no header field) and upload bodies are replaced by their size. The log
 //! lives in memory only and is never written to disk.
 
@@ -113,28 +113,37 @@ pub fn last_id() -> u64 {
     lock().last_id()
 }
 
+/// Keys whose values are never shown: the key itself, or a key that ends in `_<key>` (any case).
+/// `headers` of a remote can carry an Authorization value; `header_value` is a header guard's shared secret;
+/// the rest are the S3 and Azure credentials in a domain's `storage_settings`, also under their Django setting
+/// names (`AWS_SECRET_ACCESS_KEY`, `AZURE_CONNECTION_STRING`), which Pulp accepts too.
+const SECRET_KEYS: &[&str] = &[
+    "password",
+    "token",
+    "secret",
+    "client_key",
+    "authorization",
+    "headers",
+    "header_value",
+    "access_key",
+    "access_key_id",
+    "secret_key",
+    "account_key",
+    "cloudfront_key",
+    "connection_string",
+    "token_credential",
+];
+
+pub fn is_secret(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    SECRET_KEYS.iter().any(|s| k.strip_suffix(s).is_some_and(|rest| rest.is_empty() || rest.ends_with('_')))
+}
+
 pub fn redact(v: &mut Value) {
     match v {
         Value::Object(m) => {
             for (k, v) in m.iter_mut() {
-                // `headers` of a remote can carry an Authorization value; `header_value` is a header guard's shared secret;
-                // the `*_key`s are the S3 and Azure credentials in a domain's `storage_settings`.
-                let k = k.to_ascii_lowercase();
-                let secret = matches!(
-                    k.as_str(),
-                    "password"
-                        | "token"
-                        | "secret"
-                        | "client_key"
-                        | "authorization"
-                        | "headers"
-                        | "header_value"
-                        | "access_key"
-                        | "secret_key"
-                        | "account_key"
-                        | "cloudfront_key"
-                ) || ["_password", "_token", "_secret"].iter().any(|s| k.ends_with(s));
-                if secret {
+                if is_secret(k) {
                     *v = Value::String("•••".into());
                 } else {
                     redact(v);
@@ -238,6 +247,34 @@ mod tests {
         redact(&mut v);
         let hidden = json!({"bucket_name": "b", "access_key": "•••", "secret_key": "•••", "account_key": "•••", "cloudfront_key": "•••"});
         assert_eq!(v["storage_settings"], hidden);
+    }
+
+    #[test]
+    fn redact_domain_storage_secrets_that_pulp_shows() {
+        // pulpcore 3.123 Azure settings: `connection_string`, `token_credential` and `sas_token` are not
+        // write-only, so a domain GET returns them. Pulp also takes the Django setting names (any case).
+        let mut v = json!({"storage_settings": {"azure_container": "c", "connection_string": "AccountKey=k1",
+            "token_credential": "tc", "sas_token": "st", "AZURE_CONNECTION_STRING": "AccountKey=k2",
+            "azure_token_credential": "tc2", "azure_account_key": "ak", "AWS_S3_ACCESS_KEY_ID": "id",
+            "aws_access_key_id": "id2", "aws_secret_access_key": "sk", "aws_cloudfront_key": "cf", "cloudfront_key_id": "kid"}});
+        redact(&mut v);
+        let s = &v["storage_settings"];
+        assert_eq!(s["azure_container"], "c");
+        assert_eq!(s["cloudfront_key_id"], "kid", "an id, readable on GET");
+        for k in [
+            "connection_string",
+            "token_credential",
+            "sas_token",
+            "AZURE_CONNECTION_STRING",
+            "azure_token_credential",
+            "azure_account_key",
+            "AWS_S3_ACCESS_KEY_ID",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_cloudfront_key",
+        ] {
+            assert_eq!(s[k], "•••", "{k}: {s}");
+        }
     }
 
     #[test]
