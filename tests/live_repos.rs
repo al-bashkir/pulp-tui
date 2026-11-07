@@ -976,3 +976,66 @@ async fn deb_publications_and_distributions_through_the_tui() {
         publications_and_distributions_through_the_tui(RepoType::Deb, "deb/", "dists/fixture/Release").await;
     }
 }
+
+/// The Remotes screens through the TUI for File, RPM, Deb and File Git: Create, Edit (a task: labels, and the
+/// policy where the type has one), Delete: the impact names the repository that uses the remote as its default,
+/// the typed name, the task; Pulp then unsets the repository's remote.
+#[tokio::test]
+async fn remotes_create_edit_and_delete_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let (mut app, mut rx) = app().await;
+    for (t, git, path) in [
+        (RepoType::File, false, "file/PULP_MANIFEST"),
+        (RepoType::Rpm, false, "rpm/"),
+        (RepoType::Deb, false, "deb/"),
+        (RepoType::File, true, "git/files.git"),
+    ] {
+        let kind = Kind::Remotes(t, git);
+        if let Some(e) = kind.unsupported(&app.conn.as_ref().unwrap().caps) {
+            eprintln!("skipping: {e}");
+            continue;
+        }
+        let name = unique(&format!("it-remote-{}{}", t.component(), if git { "-git" } else { "" }));
+        open_list(&mut app, &mut rx, kind, &name).await;
+        run(&mut app, Act::Create, Value::Null);
+        let url = format!("{}/{path}", upstream());
+        let mut values = vec![("name", name.as_str()), ("url", url.as_str())];
+        if t == RepoType::Deb {
+            values.push(("distributions", "fixture"));
+        }
+        fill(&mut app, &values);
+        settle(&mut app, &mut rx).await;
+        shown(&app, &format!("create remote {name}: done"));
+        let r = row(&app, "name", &name).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+        assert_eq!(r["url"].as_str(), Some(url.as_str()));
+        let href = s(&r, "pulp_href");
+        let repo = create(&c, t.repositories(), json!({ "name": name, "remote": href }), "/repositories/").await;
+
+        run(&mut app, Act::Edit, r);
+        let mut values = vec![("labels", "a=1")];
+        if !git {
+            values.push(("policy", "on_demand"));
+        }
+        fill(&mut app, &values);
+        settle_tasks(&mut app, &mut rx).await;
+        shown(&app, &format!("task completed: update remote {name}"));
+        let r = row(&app, "name", &name).unwrap();
+        assert_eq!(r["pulp_labels"], json!({ "a": "1" }), "the list reloads");
+        assert_eq!(r["policy"].as_str(), if git { None } else { Some("on_demand") });
+
+        run(&mut app, Act::Delete, r);
+        settle(&mut app, &mut rx).await; // the impact is read before the confirmation
+        let (lines, typed) = yes(&mut app);
+        assert_eq!(typed.as_deref(), Some(name.as_str()));
+        assert_eq!(lines[1], format!("1 repository(ies) use it as default remote: {name}"), "{lines:?}");
+        settle_tasks(&mut app, &mut rx).await;
+        shown(&app, &format!("task completed: delete remote {name}"));
+        assert!(row(&app, "name", &name).is_none(), "the list reloads without it");
+        assert!(c.get::<Value>(&href, &[]).await.unwrap_err().is_not_found());
+        assert_eq!(c.get::<Value>(&repo, &[]).await.unwrap()["remote"], Value::Null, "Pulp unsets the default remote");
+        cleanup(&c, &[&repo]).await;
+    }
+}

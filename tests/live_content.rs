@@ -149,6 +149,75 @@ async fn acs_lifecycle() {
     }
 }
 
+/// The Alternate Content Sources screens through the TUI for RPM, File and Deb: Create on an on_demand remote (picked by
+/// name), Edit (a task: a new name; RPM also adds a path), Delete after the typed name (a task). Each change shows in
+/// Pulp and in the reloaded list. Pulp stores the path "" (the remote URL itself) for an ACS without paths.
+#[tokio::test]
+async fn acs_create_edit_and_delete_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    fn sorted(v: &Value) -> Vec<&str> {
+        let mut p: Vec<&str> = v.as_array().unwrap().iter().map(|p| p.as_str().unwrap()).collect();
+        p.sort();
+        p
+    }
+    let (mut app, mut rx) = app().await;
+    for (t, url, paths, edited, stored) in [
+        (RepoType::Rpm, "", "rpm/", Some("rpm/,rpm-new/"), [vec!["rpm/"], vec!["rpm-new/", "rpm/"]]),
+        (RepoType::File, "file/PULP_MANIFEST", "", None, [vec![""], vec![""]]),
+        (RepoType::Deb, "deb/", "", None, [vec![""], vec![""]]),
+    ] {
+        if let Some(e) = Kind::Acs(t).unsupported(&app.conn.as_ref().unwrap().caps) {
+            eprintln!("skipping: {e}");
+            continue;
+        }
+        let name = unique(&format!("it-tui-acs-{}", t.component()));
+        let mut body = json!({ "name": name, "url": format!("{}/{url}", upstream()), "policy": "on_demand" });
+        if t == RepoType::Deb {
+            body["distributions"] = "fixture".into();
+        }
+        let remote = create(&c, t.remotes(), body, "/remotes/").await;
+        open_list(&mut app, &mut rx, Kind::Acs(t), &name).await;
+        run(&mut app, Act::Create, Value::Null);
+        let mut values = vec![("name", name.as_str()), ("remote", name.as_str())];
+        if t != RepoType::Deb {
+            values.push(("paths", paths)); // pulp_deb refreshes the remote URL: the form has no paths
+        }
+        fill(&mut app, &values);
+        settle(&mut app, &mut rx).await;
+        shown(&app, &format!("create ACS {name}: done"));
+        let a = row(&app, "name", &name).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+        assert_eq!((a["remote"].as_str(), sorted(&a["paths"])), (Some(remote.as_str()), stored[0].clone()));
+        let href = a["pulp_href"].as_str().unwrap().to_string();
+
+        let renamed = format!("{name}-b");
+        run(&mut app, Act::Edit, a);
+        settle(&mut app, &mut rx).await; // the name of the remote is read before the form
+        let mut values = vec![("name", renamed.as_str())];
+        values.extend(edited.map(|p| ("paths", p)));
+        fill(&mut app, &values);
+        settle_tasks(&mut app, &mut rx).await;
+        shown(&app, &format!("task completed: update ACS {renamed}"));
+        let a: Value = c.get(&href, &[]).await.unwrap();
+        assert_eq!((a["name"].as_str(), sorted(&a["paths"])), (Some(renamed.as_str()), stored[1].clone()));
+
+        open_list(&mut app, &mut rx, Kind::Acs(t), &renamed).await;
+        let a = row(&app, "name", &renamed).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+        run(&mut app, Act::Delete, a);
+        let (lines, typed) = yes(&mut app);
+        assert_eq!(typed.as_deref(), Some(renamed.as_str()));
+        let first = format!("Delete alternate content source {renamed} and its {} path(s).", stored[1].len());
+        assert!(lines[0].starts_with(&first), "{lines:?}");
+        settle_tasks(&mut app, &mut rx).await;
+        shown(&app, &format!("task completed: delete ACS {renamed}"));
+        assert!(row(&app, "name", &renamed).is_none(), "the list reloads without it");
+        assert!(c.get::<Value>(&href, &[]).await.unwrap_err().is_not_found());
+        cleanup(&c, &[&remote]).await;
+    }
+}
+
 /// pulpcore 3.123 deletes a path that an edit removes from every ACS with that path (`_update_paths`
 /// filters by path only); the Edit form warns about it.
 #[tokio::test]
