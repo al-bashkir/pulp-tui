@@ -203,10 +203,14 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
 * **u** uploads a local file: an RPM package, File content with its relative path, or Deb
   content. Large files go in chunks with progress. pulp-tui verifies the server digest and
   deletes a failed chunked upload. The message names the new content and the new version.
-  * Deb **Kind**: `auto` (default) takes the kind from the file name: a `.deb` is a package and a
-    `.udeb` an installer package. Any other file needs a Kind: `generic` uploads it as generic
-    content at **Relative path** (default: the file name). The form refuses a field of another
-    kind, and a kind whose endpoint the server does not have.
+  * Deb **Kind**: `auto` (default) takes the kind from the file name: a `.deb` is a package, a
+    `.udeb` an installer package and a `.dsc` a source package. Any other file needs a Kind:
+    `generic` uploads it as generic content at **Relative path** (default: the file name). The
+    form refuses a field of another kind, and a kind whose endpoint the server does not have.
+  * A source package needs the files that its `.dsc` lists (`Checksums-Sha256`) in the directory
+    of the `.dsc`. pulp-tui uploads each file that Pulp does not have yet (same sha256) and the
+    `.dsc` as artifacts, then makes the source package. Artifacts need the right to create
+    artifacts (by default, an admin only).
   * **Overwrite** (default on, as Pulp): the new content replaces other content of the repository
     with the same key (File: the relative path; RPM: name, version, release, architecture and
     location). Off: the task fails instead, and the repository does not change.

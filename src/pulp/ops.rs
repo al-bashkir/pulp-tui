@@ -778,6 +778,9 @@ pub async fn upload(
     upload_fields(c, t.content(), path, fields, progress, on).await
 }
 
+/// The artifacts collection: `upload_fields` to it makes an artifact (a large file: `commit/` of the upload).
+pub const ARTIFACTS: &str = "artifacts/";
+
 /// Upload a local file with the form `fields` (`repository`, ...) to the content endpoint `content`.
 /// Small files go in one request; large ones use the chunked upload API. The server's
 /// digest is compared with the local one, and an unfinished chunked upload is deleted on failure.
@@ -826,6 +829,9 @@ pub async fn upload_fields(
                 c.put_chunk(&href, (offset, offset + n as u64 - 1, size), buf[..n].to_vec()).await?;
                 offset += n as u64;
                 progress(offset, size);
+            }
+            if content == ARTIFACTS {
+                return c.post(&format!("{href}commit/"), &json!({ "sha256": hex::encode(hasher.clone().finalize()) })).await;
             }
             fields.push(("upload", href.clone()));
             c.post_form(&c.api(content), &fields, None).await

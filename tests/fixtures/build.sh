@@ -8,7 +8,7 @@
 #   target/fixtures/upstream/git/files.git  bare Git repository (dumb HTTP), tag v1 and branch main
 #   target/fixtures/upstream/deb/          APT repository (dist fixture, component main, amd64)
 #   target/fixtures/files/                 loose files for uploads
-#   target/fixtures/deb-upload/            a .udeb for Deb uploads
+#   target/fixtures/deb-upload/            a .udeb and a source package (.dsc and its files) for Deb uploads
 # Requires rpmbuild, createrepo_c, modifyrepo_c, git, and GNU ar, tar, gzip (the .debs are built
 # without dpkg-deb).
 set -euo pipefail
@@ -160,6 +160,33 @@ build_deb fixture-beta-dbg 2.0-1
 deb_archive fixture-installer 1.0 "$OUT/deb-upload/fixture-installer_1.0_amd64.udeb" \
   "Section: debian-installer
 Package-Type: udeb"
+
+# A source package: pulp_deb reads only the .dsc, and needs an artifact of each file in its Checksums-Sha256.
+SRC=$OUT/build/src/fixture-src-1.0
+mkdir -p "$SRC/debian/source"
+echo "pulp-tui test fixture source" >"$SRC/README"
+echo "3.0 (quilt)" >"$SRC/debian/source/format"
+tarball() { tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$1" -cf - "$2" | gzip -n >"$OUT/deb-upload/$3"; }
+tarball "$SRC/.." fixture-src-1.0/README fixture-src_1.0.orig.tar.gz
+tarball "$SRC" debian fixture-src_1.0-1.debian.tar.gz
+sums() { # checksum command: one line per file of the source package
+  for f in fixture-src_1.0.orig.tar.gz fixture-src_1.0-1.debian.tar.gz; do
+    echo " $($1 "$OUT/deb-upload/$f" | cut -d' ' -f1) $(stat -c %s "$OUT/deb-upload/$f") $f"
+  done
+}
+cat >"$OUT/deb-upload/fixture-src_1.0-1.dsc" <<EOF
+Format: 3.0 (quilt)
+Source: fixture-src
+Binary: fixture-src
+Architecture: all
+Version: 1.0-1
+Maintainer: pulp-tui <pulp-tui@example.com>
+Standards-Version: 4.6.2
+Checksums-Sha256:
+$(sums sha256sum)
+Files:
+$(sums md5sum)
+EOF
 
 # Only the plain Packages index is listed; a sync needs no compressed variant.
 cat >"$DEB/dists/fixture/Release" <<EOF

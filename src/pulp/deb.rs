@@ -177,6 +177,8 @@ pub enum Upload {
     Package { distribution: Option<String>, component: Option<String> },
     /// A `.udeb` (section `debian-installer`): no release records.
     Installer,
+    /// A `.dsc` and the files that it lists (`upload_source`).
+    Source,
     /// Any file, served at `relative_path` of a publication.
     Generic { relative_path: String },
 }
@@ -186,6 +188,7 @@ impl Upload {
         match self {
             Upload::Package { .. } => "content/deb/packages/",
             Upload::Installer => "content/deb/installer_packages/",
+            Upload::Source => "content/deb/source_packages/",
             Upload::Generic { .. } => "content/deb/generic_contents/",
         }
     }
@@ -204,6 +207,7 @@ pub async fn upload(
     let (distribution, component, relative_path) = match up {
         Upload::Package { distribution, component } => (distribution.as_deref(), component.as_deref(), None),
         Upload::Installer => (None, None, None),
+        Upload::Source => return upload_source(c, path, repository, overwrite, progress, on).await,
         Upload::Generic { relative_path } => (None, None, Some(relative_path.as_str())),
     };
     let overwrite = (!overwrite).then_some("false");
@@ -216,6 +220,73 @@ pub async fn upload(
     ];
     let fields = fields.into_iter().filter_map(|(k, v)| Some((k, v?.to_string()))).collect();
     ops::upload_fields(c, up.endpoint(), path, fields, progress, on).await
+}
+
+/// Upload the source package of the `.dsc` at `path`. pulp_deb reads the `.dsc` from an artifact and needs an artifact
+/// of each file that it lists (`dsc_files`, read next to the `.dsc`), so these are made first (`artifact`).
+async fn upload_source(
+    c: &PulpClient,
+    path: &Path,
+    repository: Option<&str>,
+    overwrite: bool,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+    on: OnTask<'_>,
+) -> Result<UploadResult> {
+    let dsc = tokio::fs::read(path).await.map_err(|e| PulpError::Config(format!("{}: {e}", path.display())))?;
+    let dir = path.parent().unwrap_or(Path::new(""));
+    for (sha256, name) in dsc_files(&String::from_utf8_lossy(&dsc))? {
+        artifact(c, &dir.join(name), &sha256, progress, on).await?;
+    }
+    let sha256 = hex::encode(Sha256::digest(&dsc));
+    let mut body = json!({ "artifact": artifact(c, path, &sha256, progress, on).await? });
+    if let Some(r) = repository {
+        body["repository"] = r.into();
+    }
+    if !overwrite {
+        body["overwrite"] = false.into();
+    }
+    let task = ops::settle(c, c.post(&c.api(Upload::Source.endpoint()), &body).await?, on).await?;
+    let content_href = ops::created_href(None, task.as_ref(), "/content/deb/source_packages/")?;
+    Ok(UploadResult { content_href, sha256, task })
+}
+
+/// The artifact of the local file `path`, whose sha256 must be `sha256`: the one Pulp has, else `path` uploaded.
+async fn artifact(
+    c: &PulpClient,
+    path: &Path,
+    sha256: &str,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+    on: OnTask<'_>,
+) -> Result<String> {
+    let q = [("sha256", sha256.to_string()), ("fields", "pulp_href".into())];
+    let found: Page<Value> = c.list(&c.api(ops::ARTIFACTS), &q).await?;
+    if let Some(h) = found.results.first().and_then(|a| a["pulp_href"].as_str()) {
+        return Ok(h.to_string());
+    }
+    let up = ops::upload_fields(c, ops::ARTIFACTS, path, vec![], progress, on).await?;
+    if up.sha256 != sha256 {
+        return Err(PulpError::Mismatch(format!("{}: sha256 {} is not {sha256} of the .dsc", path.display(), up.sha256)));
+    }
+    Ok(up.content_href)
+}
+
+/// The files that a `.dsc` lists in `Checksums-Sha256`: (sha256, name). Each name must be a plain file name: it is
+/// read next to the `.dsc`.
+fn dsc_files(dsc: &str) -> Result<Vec<(String, String)>> {
+    let bad = |m: String| Err(PulpError::Config(m));
+    let mut files = vec![];
+    for line in dsc.lines().skip_while(|l| !l.starts_with("Checksums-Sha256:")).skip(1).take_while(|l| l.starts_with(' ')) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [sha256, _, name] = words[..] else { return bad(format!("bad Checksums-Sha256 line in the .dsc: {line:?}")) };
+        if Path::new(name).file_name().and_then(|n| n.to_str()) != Some(name) {
+            return bad(format!("{name:?} is not a file name (Checksums-Sha256 of the .dsc)"));
+        }
+        files.push((sha256.to_string(), name.to_string()));
+    }
+    if files.is_empty() {
+        return bad("the .dsc lists no files (Checksums-Sha256)".into());
+    }
+    Ok(files)
 }
 
 /// Hrefs of the release records (`PackageReleaseComponent`) in `version` whose package is in `packages`.
@@ -264,4 +335,26 @@ pub async fn copy(
         cfg["content"] = u.into();
     }
     c.post(&c.api("deb/copy/"), &json!({ "config": [cfg], "structured": true, "dependency_solving": false })).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The files of `Checksums-Sha256`, also in a signed `.dsc`; a name that is not a plain file name is refused, as
+    /// pulp-tui reads each one next to the `.dsc`.
+    #[test]
+    fn dsc_files_are_the_plain_file_names_of_checksums_sha256() {
+        let dsc = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nFormat: 3.0 (quilt)\nSource: h\nChecksums-Sha1:\n 1111 10 \
+                   h_1.0.orig.tar.gz\nChecksums-Sha256:\n aaaa 10 h_1.0.orig.tar.gz\n bbbb 12 h_1.0-1.debian.tar.xz\nFiles:\n cccc 10 \
+                   h_1.0.orig.tar.gz\n\n-----BEGIN PGP SIGNATURE-----\n";
+        let want = [("aaaa", "h_1.0.orig.tar.gz"), ("bbbb", "h_1.0-1.debian.tar.xz")].map(|(s, n)| (s.to_string(), n.to_string()));
+        assert_eq!(dsc_files(dsc).unwrap(), want);
+        for bad in ["../h.tar.gz", "/etc/passwd", "d/h.tar.gz", ".."] {
+            let err = dsc_files(&format!("Checksums-Sha256:\n aaaa 10 {bad}\n")).unwrap_err().to_string();
+            assert!(err.contains(&format!("{bad:?} is not a file name")), "{bad}: {err}");
+        }
+        assert!(dsc_files("Checksums-Sha256:\n aaaa 10\n").unwrap_err().to_string().contains("\" aaaa 10\""));
+        assert!(dsc_files("Source: h\nFiles:\n cccc 10 h.tar.gz\n").unwrap_err().to_string().contains("lists no files"));
+    }
 }

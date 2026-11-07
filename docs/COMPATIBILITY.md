@@ -802,6 +802,15 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
   `debian-installer`, and `packages/` refuses one whose section is) and
   `content/deb/generic_contents/` (`relative_path` required; an equal `sha256` and path is
   reused). pulp_deb 3.5.4, 3.8.1 and 3.11.1 have both endpoints (read in their source).
+* **Source package upload** (`content/deb/source_packages/`, JSON, in 3.5.4, 3.8.1 and 3.11.1)
+  takes no file: `artifact` is the `.dsc` as an artifact. The task parses it and refuses it
+  unless an artifact with the `sha256` and size of each `Checksums-Sha256` file exists
+  (`SourcePackageSerializer.deferred_validate`). pulp-tui looks each one up
+  (`artifacts/?sha256=`) and uploads only the missing ones: `artifacts/` (multipart `file`, 201),
+  or above one chunk `uploads/` and `{upload}commit/` with `sha256` (a task). A second POST of an
+  existing artifact answers 400, so the lookup makes a rerun safe. pulp_deb reuses a source
+  package with the same `source` and `version`. pulpcore allows `artifacts/` (list, create)
+  only to admins by default.
 * **`sha256` is `null` until download** for `on_demand` packages. Verify takes the digest
   from the served `Packages` index (what apt checks) and fails when the API differs.
 * **Structured copy.** `deb/copy/` with `structured: true` also copies the

@@ -1529,7 +1529,7 @@ fn repo_upload(app: &mut App, t: RepoType, href: String, name: String) {
 }
 
 /// The Kind choice of the Deb upload form: `auto` takes the extension of the file.
-const DEB_KINDS: [&str; 4] = ["auto", "deb", "udeb", "generic"];
+const DEB_KINDS: [&str; 5] = ["auto", "deb", "udeb", "dsc", "generic"];
 
 /// What the Deb upload form sends `path` as: its Kind, or the kind of its extension; another file needs a Kind. The
 /// fields of another kind, and a kind that the server cannot take, are refused.
@@ -1543,11 +1543,12 @@ fn deb_upload(app: &App, f: &Form, path: &Path) -> Result<deb::Upload, String> {
     let up = match kind {
         "deb" => deb::Upload::Package { distribution: distribution.map(Into::into), component: component.map(Into::into) },
         "udeb" => deb::Upload::Installer,
+        "dsc" => deb::Upload::Source,
         "generic" => {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             deb::Upload::Generic { relative_path: rel.map_or(name, Into::into) }
         }
-        _ => return Err(format!("pick the Kind: {} is not a .deb or .udeb file", path.display())),
+        _ => return Err(format!("pick the Kind: {} is not a .deb, .udeb or .dsc file", path.display())),
     };
     if kind != "deb" && (distribution.is_some() || component.is_some()) {
         return Err("Distribution and Component are for a .deb package".into());
@@ -1555,11 +1556,12 @@ fn deb_upload(app: &App, f: &Form, path: &Path) -> Result<deb::Upload, String> {
     if kind != "generic" && rel.is_some() {
         return Err("Relative path is for generic content".into());
     }
-    match caps(app) {
-        Some(c) if !c.has_operation(up.endpoint(), "post") => {
-            Err(format!("not supported by this server: Deb {kind} upload ({})", up.endpoint()))
-        }
-        _ => Ok(up),
+    // A source package is made from artifacts of its files.
+    let artifacts = (up == deb::Upload::Source).then_some(ops::ARTIFACTS);
+    let caps = caps(app);
+    match [Some(up.endpoint()), artifacts].into_iter().flatten().find(|e| caps.as_ref().is_some_and(|c| !c.has_operation(e, "post"))) {
+        Some(e) => Err(format!("not supported by this server: Deb {kind} upload ({e})")),
+        None => Ok(up),
     }
 }
 
@@ -1571,7 +1573,10 @@ fn upload_fields(app: &App, t: RepoType) -> Vec<Field> {
         RepoType::File => fields.push(Field::text("relative_path", "Relative path in repository").help("default: file name")),
         RepoType::Deb => {
             let kinds = DEB_KINDS.map(String::from).to_vec();
-            fields.push(Field::new("kind", "Kind", FieldKind::Choice(kinds)).help("auto = by file name (.deb, .udeb); generic = any file"));
+            fields.push(
+                Field::new("kind", "Kind", FieldKind::Choice(kinds))
+                    .help("auto = by file name (.deb, .udeb, .dsc: its files next to it); generic = any file"),
+            );
             // The release whose indices list the package; older pulp_deb has no such fields.
             fields.extend(
                 [
@@ -8531,7 +8536,7 @@ mod tests {
             values.iter().for_each(|(k, v)| set(&mut form, k, v));
             submit(app, &form)
         };
-        let not_deb = format!("pick the Kind: {} is not a .deb or .udeb file", path("notes.txt"));
+        let not_deb = format!("pick the Kind: {} is not a .deb, .udeb or .dsc file", path("notes.txt"));
         assert_eq!(submit(&mut app, &[("path", &path("notes.txt"))]), Err(not_deb));
         let release = "Distribution and Component are for a .deb package".to_string();
         assert_eq!(submit(&mut app, &[("path", &path("d-i_1.0_amd64.udeb")), ("component", "main")]), Err(release));
@@ -8560,12 +8565,18 @@ mod tests {
         assert!(!posts[0].1.contains("relative_path") && !posts[0].1.contains("distribution"), "{}", posts[0].1);
         assert!(posts[1].1.contains("name=\"relative_path\"\n\nnotes.txt\n"), "{}", posts[1].1);
 
-        // A server without the installer package endpoint.
+        // A server without the installer package endpoint, and one that takes source packages but no artifacts.
         let mut caps = plugins();
-        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/content/deb/packages/": { "post": {} } } }));
+        let post = json!({ "post": {} });
+        caps.load_openapi(
+            &json!({ "paths": { "/pulp/api/v3/content/deb/packages/": post, "/pulp/api/v3/content/deb/source_packages/": post } }),
+        );
         app.conn.as_mut().unwrap().caps = Arc::new(caps);
         let unsupported = "not supported by this server: Deb udeb upload (content/deb/installer_packages/)".to_string();
         assert_eq!(submit(&mut app, &[("path", &path("d-i_1.0_amd64.udeb"))]), Err(unsupported));
+        std::fs::write(dir.path().join("h_1.0-1.dsc"), "Source: h").unwrap();
+        let unsupported = "not supported by this server: Deb dsc upload (artifacts/)".to_string();
+        assert_eq!(submit(&mut app, &[("path", &path("h_1.0-1.dsc"))]), Err(unsupported));
     }
 
     #[tokio::test]

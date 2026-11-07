@@ -701,6 +701,69 @@ async fn deb_installer_and_generic_uploads_go_to_their_endpoints() {
     }
 }
 
+/// A source package: pulp_deb reads the `.dsc` from an artifact and needs an artifact of each file that it lists. An
+/// artifact with the listed sha256 is reused, the other files and the `.dsc` are uploaded first (a file above one
+/// chunk through `uploads/` and its `commit/`); then the source package is made from the `.dsc` artifact. A listed
+/// file that is not next to the `.dsc` stops it before that.
+#[tokio::test]
+async fn deb_source_upload_sends_the_listed_files_and_the_dsc_as_artifacts() {
+    let (repo, src, arts) =
+        (format!("{API}repositories/deb/apt/r/"), format!("{API}content/deb/source_packages/1/"), format!("{API}artifacts/"));
+    let sha = |b: &[u8]| hex::encode(Sha256::digest(b));
+    let dir = tempfile::tempdir().unwrap();
+    let (orig, debian) = (dir.path().join("h_1.0.orig.tar.gz"), dir.path().join("h_1.0-1.debian.tar.xz"));
+    let big = vec![7u8; 1024 * 1024 + 6];
+    std::fs::write(&orig, "orig").unwrap();
+    std::fs::write(&debian, &big).unwrap();
+    let text = format!("Source: h\nChecksums-Sha256:\n {} 4 h_1.0.orig.tar.gz\n {} 6 h_1.0-1.debian.tar.xz\n", sha(b"orig"), sha(&big));
+    let dsc = dir.path().join("h_1.0-1.dsc");
+    std::fs::write(&dsc, &text).unwrap();
+
+    let server = MockServer::start().await;
+    let ok = |status: u16, body: Value| ResponseTemplate::new(status).set_body_json(body);
+    let answer =
+        |verb: &str, p: &str, status: u16, body: Value| Mock::given(method(verb)).and(path(p.to_string())).respond_with(ok(status, body));
+    let page = |r: Value| json!({ "count": r.as_array().unwrap().len(), "next": null, "results": r });
+    let found = page(json!([{ "pulp_href": format!("{arts}1/") }]));
+    let lookup = Mock::given(method("GET")).and(path(&arts)).and(query_param("sha256", sha(b"orig")));
+    lookup.respond_with(ok(200, found)).with_priority(1).mount(&server).await;
+    answer("GET", &arts, 200, page(json!([]))).mount(&server).await;
+    // The large file: an upload and its chunks, then commit/ makes the artifact in a task.
+    let (upload, commit) = (format!("{API}uploads/1/"), format!("{API}uploads/1/commit/"));
+    answer("POST", &format!("{API}uploads/"), 201, json!({ "pulp_href": upload })).mount(&server).await;
+    answer("PUT", &upload, 200, json!({})).mount(&server).await;
+    answer("POST", &commit, 202, json!({ "task": format!("{API}tasks/2/") })).mount(&server).await;
+    let made = json!({ "pulp_href": format!("{API}tasks/2/"), "state": "completed", "created_resources": [format!("{arts}2/")] });
+    answer("GET", &format!("{API}tasks/2/"), 200, made).mount(&server).await;
+    answer("GET", &format!("{arts}2/"), 200, json!({ "sha256": sha(&big) })).mount(&server).await;
+    // The .dsc: one request.
+    answer("POST", &arts, 201, json!({ "pulp_href": format!("{arts}3/") })).mount(&server).await;
+    answer("GET", &format!("{arts}3/"), 200, json!({ "sha256": sha(text.as_bytes()) })).mount(&server).await;
+    let source_packages = format!("{API}content/deb/source_packages/");
+    answer("POST", &source_packages, 202, json!({ "task": format!("{API}tasks/1/") })).mount(&server).await;
+    let task =
+        json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [format!("{repo}versions/2/"), src] });
+    answer("GET", &format!("{API}tasks/1/"), 200, task).mount(&server).await;
+    let c = client(&server, |_, s| s.upload_chunk_mb = 1);
+
+    let r = deb::upload(&c, &deb::Upload::Source, &dsc, Some(&repo), false, &|_, _| {}, &no_progress).await.unwrap();
+    assert_eq!((r.content_href, r.sha256), (src, sha(text.as_bytes())));
+    let sent = server.received_requests().await.unwrap();
+    let posts: Vec<_> = sent.iter().filter(|r| r.method.as_str() == "POST").collect();
+    let names: Vec<String> = posts.iter().map(|p| p.url.path().to_string()).collect();
+    assert_eq!(names, [format!("{API}uploads/"), commit, arts.clone(), source_packages.clone()], "orig is there already: not sent");
+    assert_eq!(posts[1].body_json::<Value>().unwrap(), json!({ "sha256": sha(&big) }));
+    assert!(String::from_utf8_lossy(&posts[2].body).contains("filename=\"h_1.0-1.dsc\""));
+    let body: Value = posts[3].body_json().unwrap();
+    assert_eq!(body, json!({ "artifact": format!("{arts}3/"), "repository": repo, "overwrite": false }));
+
+    std::fs::remove_file(&debian).unwrap();
+    let e = deb::upload(&c, &deb::Upload::Source, &dsc, Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap_err();
+    assert!(e.to_string().contains("h_1.0-1.debian.tar.xz"), "{e}");
+    let sent = server.received_requests().await.unwrap();
+    assert_eq!(sent.iter().filter(|r| r.url.path() == source_packages).count(), 1, "no second source package");
+}
+
 #[tokio::test]
 async fn deb_copy_is_structured_without_dependency_solving() {
     let server = MockServer::start().await;

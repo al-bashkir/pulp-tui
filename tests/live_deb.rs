@@ -299,10 +299,11 @@ async fn an_uploaded_deb_package_is_published_and_served() {
     cleanup(&c, &[&dist, &repo]).await;
 }
 
-/// Upload (u) in the TUI: a `.udeb` (Kind auto) becomes an installer package, another file (Kind generic) generic
-/// content at its relative path; each goes into a new version of the repository.
+/// Upload (u) in the TUI: a `.udeb` (Kind auto) becomes an installer package, a `.dsc` (Kind auto) a source package
+/// with the files it lists, another file (Kind generic) generic content at its relative path; each goes into a new
+/// version of the repository.
 #[tokio::test]
-async fn the_tui_uploads_a_udeb_and_generic_content_as_their_types() {
+async fn the_tui_uploads_a_udeb_a_source_package_and_generic_content_as_their_types() {
     if !live_enabled() {
         return;
     }
@@ -312,20 +313,28 @@ async fn the_tui_uploads_a_udeb_and_generic_content_as_their_types() {
     let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
     let (mut app, mut rx) = app().await;
     app.list.kind = Kind::Repos(t, false);
-    let (udeb, txt) = (fixtures().join("deb-upload/fixture-installer_1.0_amd64.udeb"), fixtures().join("files/one.txt"));
+    let file = |p: &str| fixtures().join(p).display().to_string();
+    let (udeb, dsc, txt) =
+        (file("deb-upload/fixture-installer_1.0_amd64.udeb"), file("deb-upload/fixture-src_1.0-1.dsc"), file("files/one.txt"));
     let rel = format!("docs/{name}.txt");
-    let forms =
-        [vec![("path", udeb.to_str().unwrap())], vec![("path", txt.to_str().unwrap()), ("kind", "generic"), ("relative_path", &rel)]];
+    let forms = [vec![("path", udeb.as_str())], vec![("path", &dsc)], vec![("path", &txt), ("kind", "generic"), ("relative_path", &rel)]];
     for values in forms {
         run(&mut app, Act::Upload, json!({ "pulp_href": repo, "name": name }));
         fill(&mut app, &values);
         settle(&mut app, &mut rx).await;
     }
     let uploaded: Vec<String> = texts(&app).into_iter().filter(|n| n.starts_with("uploaded ")).collect();
-    assert!(uploaded.len() == 2 && uploaded[1].ends_with(": new version 2"), "{:?}", texts(&app));
+    assert!(uploaded.len() == 3 && uploaded[2].ends_with(": new version 3"), "{:?}", texts(&app));
     let all = ops::all_content_keys(&c, &Capabilities::default(), t, &latest(&c, &repo).await).await.unwrap();
     assert!(all.contains("installer package fixture-installer_1.0_amd64"), "{all:?}");
+    assert!(all.contains("source package fixture-src_1.0-1"), "{all:?}");
     assert!(all.iter().any(|k| k.starts_with(&format!("generic content {rel}  ("))), "{all:?}");
+    // The source package has the .dsc and both files it lists.
+    let q = [("repository_version", latest(&c, &repo).await), ("fields", "artifacts".into())];
+    let src: Page<Value> = c.list(&c.api("content/deb/source_packages/"), &q).await.unwrap();
+    let files: Vec<&String> = src.results[0]["artifacts"].as_object().unwrap().keys().collect();
+    assert_eq!(files.len(), 3, "{files:?}");
+    assert!(files.iter().all(|f| f.starts_with("pool/")) && files.iter().any(|f| f.ends_with("/fixture-src_1.0-1.dsc")), "{files:?}");
     cleanup(&c, &[&repo]).await;
 }
 
