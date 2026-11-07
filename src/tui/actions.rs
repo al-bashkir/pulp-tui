@@ -1217,6 +1217,9 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
                     "Pulp refuses mirror policies with retain_package_versions above 0: set it to 0 (Edit) or choose additive".into()
                 );
             }
+            if remote.is_none() && own.is_none() {
+                return Err(format!("{name} has no default remote: pick a remote, or set the default remote with Edit"));
+            }
             let go = move |app: &mut App| {
                 submit(app, format!("sync {name} ({policy})"), move |c| async move {
                     let r = match remote {
@@ -1623,6 +1626,11 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                                 deb::packages_in(c, &sv).await?.into_iter().filter(|p| sel.deb_package(p)).map(|p| p.pulp_href).collect(),
                             ),
                         };
+                        // pulp_rpm and pulp_deb copy nothing for `content: []`, and an empty modify/ makes no version.
+                        if units.as_ref().is_some_and(Vec::is_empty) && meta.is_empty() {
+                            let text = format!("copy {source} -> {name}: the filter selects no unit of {}; nothing sent", short(&sv));
+                            return ap(move |app| app.notify(Level::Warn, text));
+                        }
                         let what = units.as_ref().map(|u| format!("{} unit(s)", u.len())).unwrap_or("all content".into());
                         let mut lines = vec![format!("Copy {what} from {} into {name}.", short(&sv))];
                         if !meta.is_empty() {
@@ -1640,7 +1648,12 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                                     // (units, through modify/): the RPM metadata goes after the packages, through modify/.
                                     let mut batches: Vec<(Option<Vec<String>>, bool)> = match units {
                                         None => vec![(None, false)],
-                                        Some(u) => ops::batches(&u).into_iter().map(|b| (Some(b.to_vec()), false)).collect(),
+                                        // No package chosen: only the metadata batches go.
+                                        Some(u) => ops::batches(&u)
+                                            .into_iter()
+                                            .filter(|b| !b.is_empty())
+                                            .map(|b| (Some(b.to_vec()), false))
+                                            .collect(),
                                     };
                                     if !meta.is_empty() {
                                         batches.extend(ops::batches(&meta).into_iter().map(|b| (Some(b.to_vec()), true)));
@@ -4629,6 +4642,34 @@ mod tests {
         assert_eq!(posts_to(&server, &format!("{dst}modify/")).await.len(), 1);
     }
 
+    /// Requests that Pulp turns into a no-op or a 400 are not sent: a Copy whose filter selects nothing, and a Sync
+    /// with no default remote and no picked one.
+    #[tokio::test]
+    async fn copy_of_nothing_and_sync_without_a_remote_send_nothing() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (src, dst) = (format!("{API}repositories/file/file/src/"), format!("{API}repositories/file/file/dst/"));
+        let repo = json!([{ "pulp_href": src, "name": "src", "latest_version_href": format!("{src}versions/1/") }]);
+        get(&server, &format!("{API}repositories/file/file/"), page(repo)).await;
+        let file = json!({ "pulp_href": format!("{API}content/file/files/1/"), "relative_path": "a.txt", "sha256": "ab" });
+        get(&server, &format!("{API}content/file/files/"), page(json!([file]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+
+        repo_action(&mut app, RepoType::File, Act::CopyContent, json!({ "pulp_href": dst, "name": "dst" }));
+        fill_and_submit(&mut app, &[("source", "src"), ("filters", "include path=docs/*")]);
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no confirm");
+        let last = app.notices.back().map(|n| (n.level, n.text.clone()));
+        assert_eq!(last, Some((Level::Warn, "copy src -> dst: the filter selects no unit of src@v1; nothing sent".into())));
+
+        repo_action(&mut app, RepoType::File, Act::Sync, json!({ "pulp_href": dst, "name": "dst", "remote": null }));
+        let Some(Modal::Form { form, mut submit }) = app.modal.take() else { panic!("no form") };
+        let e = "dst has no default remote: pick a remote, or set the default remote with Edit";
+        assert_eq!(submit(&mut app, &form), Err(e.into()));
+        settle(&mut app, &mut rx).await;
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing sent");
+    }
+
     #[tokio::test]
     async fn a_large_copy_is_sent_in_batches_one_after_the_other() {
         use crate::tui::app::Modal;
@@ -5610,8 +5651,11 @@ mod tests {
         get(&server, &format!("{API}publications/file/file/"), page(json!([]))).await;
         get(&server, &format!("{API}distributions/file/file/"), page(json!([]))).await;
         answer(&server, "POST", &format!("{repo}sync/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        let remote = format!("{API}remotes/file/file/1/");
+        get(&server, &remote, json!({ "name": "up" })).await;
         let (mut app, mut rx) = connected(&server).await;
-        repo_action(&mut app, RepoType::File, Act::Sync, json!({ "pulp_href": repo, "name": "os", "remote": null }));
+        repo_action(&mut app, RepoType::File, Act::Sync, json!({ "pulp_href": repo, "name": "os", "remote": remote }));
+        settle(&mut app, &mut rx).await;
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
         set(&mut form, "policy", "mirror");
         submit(&mut app, &form).unwrap();
@@ -5624,7 +5668,7 @@ mod tests {
         assert!(posts_to(&server, &format!("{repo}sync/")).await.is_empty(), "nothing sent before a yes");
         yes(&mut app);
         settle(&mut app, &mut rx).await;
-        assert_eq!(posts_to(&server, &format!("{repo}sync/")).await, [json!({ "mirror": true })]);
+        assert_eq!(posts_to(&server, &format!("{repo}sync/")).await, [json!({ "remote": remote, "mirror": true })]);
     }
 
     #[tokio::test]
@@ -6938,8 +6982,10 @@ mod tests {
             // A remote picked by name is sent as its href.
             (RepoType::File, &[("remote", "web")], deb, json!({ "remote": remote, "mirror": false })),
         ] {
-            let repo = format!("{API}{}r/", t.repositories());
-            repo_action(&mut app, t, Act::Sync, json!({ "pulp_href": repo, "name": "os", "remote": null }));
+            let (repo, own) = (format!("{API}{}r/", t.repositories()), format!("{API}{}1/", t.remotes()));
+            // The default remote cannot be read (404): the field stays empty and the sync uses its href.
+            repo_action(&mut app, t, Act::Sync, json!({ "pulp_href": repo, "name": "os", "remote": own }));
+            settle(&mut app, &mut rx).await;
             let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
             assert_eq!(keys(&form), fields, "{t:?}");
             for (k, v) in set {
@@ -6947,6 +6993,8 @@ mod tests {
             }
             submit(&mut app, &form).unwrap();
             settle(&mut app, &mut rx).await;
+            let mut want = want;
+            want["remote"] = want.get("remote").cloned().unwrap_or(own.into());
             assert_eq!(posts_to(&server, &format!("{repo}sync/")).await.last(), Some(&want), "{t:?} {set:?}");
         }
         // Pulp answers 400 to skip types with mirror_complete: the form refuses them and sends nothing.
@@ -6995,6 +7043,7 @@ mod tests {
             repo_action(&mut app, RepoType::Rpm, Act::Sync, item);
             let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
             form.fields.iter_mut().find(|f| f.key == "policy").unwrap().value = policy.into();
+            form.fields.iter_mut().find(|f| f.key == "remote").unwrap().value = "up".into();
             let got = submit(&mut app, &form);
             app.modal = None; // the mirror confirm of an accepted form
             assert_eq!(got, want.map_or(Ok(()), |e| Err(e.into())), "{settings} {policy}");

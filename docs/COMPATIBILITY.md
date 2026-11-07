@@ -449,6 +449,9 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   packages (`depsolving.py`, pulp_rpm 3.39.5). The result changes with the batch size, so a filtered RPM snapshot uses `modify/`, which adds exactly the given units.
   The copy action (**C**) with filter rules sends only the chosen packages to `rpm/copy/` (with
   dependency solving when asked), then adds the advisories and metadata of the selection with `modify/`.
+* **An empty `content` list copies nothing** (pulp_rpm and pulp_deb `tasks/copy.py`: only
+  `content_pks is None` means everything). The task completes with no new version. **C** sends
+  nothing when its filter rules select no unit, and leaves out an empty package batch.
 * **Request body limit.** A body above Django's `DATA_UPLOAD_MAX_MEMORY_SIZE` (2,621,440
   bytes, the test image default) gets HTTP 400 with an HTML page `Bad Request (400)`, not
   413 (log: `django.core.exceptions.RequestDataTooBig`); nginx allows 10 MB. Same for
@@ -613,6 +616,8 @@ Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
 * **Refused sync pairs** (pulp_rpm 3.39.5, HTTP 400): `mirror_complete` with `skip_types`
   or `autopublish`, and both mirror policies with `retain_package_versions` above 0. The
   sync form refuses them first (it reads both settings from the repository row).
+* **Sync without a remote** (pulpcore `RepositorySyncURLSerializer`, HTTP 400): "This field is
+  required since a remote is not set on the repository." The sync form refuses it first.
 * **`retain_package_versions`** (pulp_rpm `IntegerField(min_value=0)`, not nullable; model
   default 0 = keep all): an emptied field on edit sends 0 (live,
   `rpm_retain_package_versions_cleared_through_the_tui`).

@@ -191,7 +191,8 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
 * **f** sync. Choose the remote and the policy: RPM `additive`, `mirror_complete`,
   `mirror_content_only`; File and Deb `additive`, `mirror`. The Remote field shows the default
   remote; untouched or empty, the sync uses the default remote by its href, of any type (also a
-  ULN or Git remote). Edit sends the remote only when you change it. A mirror policy
+  ULN or Git remote). A repository without a default remote needs a picked one; the form says so
+  and sends nothing. Edit sends the remote only when you change it. A mirror policy
   shows a warning first. With **Retain versions** 1, Pulp deletes the current version after the
   sync, unless a distribution serves it: then the warning says so and you type the repository
   name (on a Content View sync, the names of those repositories). Options:
@@ -236,7 +237,8 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   "Filters"). RPM can copy dependencies. With filter rules, RPM takes what a Content View filter
   takes: the chosen packages, each advisory whose packages are all chosen, and the comps, modules
   and other metadata as they are (added after the packages; the confirm counts them). Advisories
-  of the dependencies are not added. A Deb copy is structured: it also copies the Release,
+  of the dependencies are not added. Filter rules that select nothing give a warning, and nothing
+  is sent. A Deb copy is structured: it also copies the Release,
   component and architecture records, and does not solve dependencies. A large selection goes in
   batches, as for **x** and **a** on Content.
 * **R** reclaims disk space. Pulp deletes the stored files of synced content that no other
