@@ -248,7 +248,8 @@ rerun of the relabel moves its row.
 ### Verify and drift
 
 Verify checks for every binding that the distribution serves the expected publication, the
-publication belongs to the snapshot, the snapshot exists, and served content matches:
+publication belongs to the snapshot, the snapshot exists, and a served sample matches (not every
+file; the OK line of the drift check says so):
 
 | Type | Served check                                                                                  |
 | ---- | --------------------------------------------------------------------------------------------- |

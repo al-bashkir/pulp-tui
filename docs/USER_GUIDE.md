@@ -560,7 +560,10 @@ retry, or roll back to the served version to clear the failed attempt.
   the paths; type the view name) and removes the binding, so you can delete the version. Versions
   and snapshots stay. Refused while a later environment on the path has the view: go back along
   the path (Prod, then Test, then Dev).
-* **D** verifies all environments (drift check). For each environment with drift, it tells how to
+* **D** verifies all environments (drift check). `OK` means: each distribution serves the
+  publication of the snapshot, and the served metadata (`repomd.xml`, `Release`, the File
+  manifest) match it; for RPM and Deb also the smallest package with its digest. Other files are
+  not downloaded. For each environment with drift, it tells how to
   reconcile: promote the bound version again, or, when the prior environment no longer has that
   version active (Promote refuses it), roll back to it (**b**).
 * **U** breaks the lock of the view. It shows the holder; type the view name. See "Locks".

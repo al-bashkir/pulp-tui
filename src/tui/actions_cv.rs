@@ -602,7 +602,8 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                         "{}: {} {}",
                         e.name,
                         shown_binding(&svc.store, &b).await?,
-                        if issues.is_empty() { "OK - served content matches" } else { "DRIFT" }
+                        // What `verify` reads (`ops::verify_served`): metadata, and one package of RPM and Deb.
+                        if issues.is_empty() { "OK - served metadata match; RPM/Deb: also the smallest package" } else { "DRIFT" }
                     ));
                     if !issues.is_empty() {
                         // The rule of `CvService::promote`: Rollback to the bound version always runs.
@@ -761,7 +762,7 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
                     let issues = svc.verify(cv, e.id).await.unwrap_or_else(|e| vec![e.to_string()]);
                     ap(move |app| {
                         match (res, issues.is_empty()) {
-                            (Ok(()), true) => app.ok(format!("{name} v{} active in {env}; served content verified", v.number)),
+                            (Ok(()), true) => app.ok(format!("{name} v{} active in {env}; served metadata verified", v.number)),
                             (Ok(()), false) => {
                                 app.notify(Level::Warn, format!("{name} in {env}: bound, verification found: {}", issues.join("; ")))
                             }
@@ -2191,7 +2192,8 @@ mod tests {
         cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
         drain(&mut app, &mut rx).await;
         let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
-        assert_eq!(lines[0], "Library: v2 OK - served content matches");
+        // Verify reads the served metadata and one sample package, not every file: the line says so.
+        assert_eq!(lines[0], "Library: v2 OK - served metadata match; RPM/Deb: also the smallest package");
         assert_eq!(
             lines[lines.len() - 4..],
             [
