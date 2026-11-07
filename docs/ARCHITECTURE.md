@@ -304,8 +304,9 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
 ## Replication
 
 * **Native** (`upstream-pulps/`, pulpcore ≥ 3.23, tech preview): pulp-tui manages the
-  Upstream Pulp, starts `replicate/` and follows the task group. A failed task fails it; a
-  canceled or skipped one gives a warning. Pulp owns the deletion policy; the form puts
+  Upstream Pulp, starts `replicate/` and follows the task group. Only an all-completed group
+  is a success; the result title names any other outcome (`FAILED`, `CANCELED`, `SKIPPED`).
+  Pulp owns the deletion policy; the form puts
   `nodelete` first. Every other policy may delete local objects, so saving or replicating
   with it needs typed confirmation.
 * **Fallback** (`src/replication.rs`): content sync only, RPM, File and Deb. Per upstream

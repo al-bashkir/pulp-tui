@@ -6,10 +6,13 @@ mod common;
 use common::*;
 use pulp_tui::pulp::models::{Distribution, TaskGroup};
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{Capabilities, Feature, Mutation, PulpClient, RepoType};
+use pulp_tui::pulp::{Capabilities, Feature, PulpClient, RepoType};
 use pulp_tui::replication::{self, PlanAction};
 use pulp_tui::repo_export;
 use pulp_tui::store::Store;
+use pulp_tui::tui::actions::run;
+use pulp_tui::tui::app::Modal;
+use pulp_tui::tui::kinds::{Act, Kind};
 use serde_json::{Value, json};
 
 fn upstream_client() -> PulpClient {
@@ -86,7 +89,8 @@ async fn upstream_pulp(dst: &PulpClient, caps: &Capabilities, prefix: &str) -> S
     ops::create(dst, &dst.api("upstream-pulps/"), &body, "/upstream-pulps/", &no_progress).await.unwrap()
 }
 
-/// A canceled replication ends (its Task Center row becomes final) and is never reported as completed.
+/// A canceled replication, started from the TUI, ends (its Task Center row becomes final) and is never reported
+/// as completed: the result view says CANCELED.
 #[tokio::test]
 async fn canceled_native_replication_is_not_complete() {
     if !live_enabled() {
@@ -98,16 +102,28 @@ async fn canceled_native_replication_is_not_complete() {
         eprintln!("native replication unsupported by this server; skipping");
         return;
     }
-    let upstream_href = upstream_pulp(&dst, &caps, &unique("natc")).await;
-    let Mutation::TaskGroup(g) = dst.post(&format!("{upstream_href}replicate/"), &json!({})).await.unwrap() else {
-        panic!("replicate did not return a task group");
-    };
-    let started: TaskGroup = dst.get(&g, &[]).await.unwrap();
+    let name = unique("natc");
+    let upstream_href = upstream_pulp(&dst, &caps, &name).await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::UpstreamPulps;
+    run(&mut app, Act::Replicate, dst.get(&upstream_href, &[]).await.unwrap());
+    let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(&app)) };
+    yes(&mut app);
+    // The job reports the group to the Task Center at its first poll.
+    while app.tasks.items.is_empty() {
+        app.handle_msg(rx.recv().await.unwrap());
+    }
+    let started: TaskGroup = dst.get(&app.tasks.items[0].href, &[]).await.unwrap();
     let canceled = dst.patch(started.tasks[0]["pulp_href"].as_str().unwrap(), &json!({ "state": "canceled" })).await;
-    let row = ops::wait_task_group(&dst, &g, &|_| {}).await.unwrap().as_task();
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { title, lines, .. }) = &app.modal else { panic!("no result: {:?}", texts(&app)) };
+    let row = &app.tasks.items[0];
     match canceled {
-        Ok(_) => assert!(row.state != "completed" && row.error.is_some(), "{row:?}"),
-        Err(e) => eprintln!("replicate_distributions ended before the cancel ({e}): {row:?}"),
+        Ok(_) => {
+            assert_eq!(title, &format!("Replication of {name} CANCELED"), "{lines:?}");
+            assert!(row.state == "canceled" && row.is_final(), "{row:?}");
+        }
+        Err(e) => eprintln!("replicate_distributions ended before the cancel ({e}): {title} {lines:?}"),
     }
     cleanup(&dst, &[&upstream_href]).await;
 }

@@ -5,7 +5,7 @@ use super::app::{App, Level};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, guard_type, s, short};
 use crate::pulp::client::Page;
-use crate::pulp::{PulpClient, RepoType, ops};
+use crate::pulp::{PulpClient, PulpError, RepoType, ops};
 use crate::replication::{self, PlanAction};
 use anyhow::{Context, bail};
 use futures::future::try_join_all;
@@ -1007,7 +1007,13 @@ fn upstream_action(app: &mut App, act: Act, item: Value) {
                     let res = replication::replicate_native(&ctx.client, &href, &group_progress(&ctx)).await;
                     ap(move |app| match res {
                         Ok(lines) => app.text(format!("Replication of {name}"), lines),
-                        Err(e) => app.text(format!("Replication of {name} FAILED"), format!("{e:#}").lines().map(str::to_string).collect()),
+                        Err(e) => {
+                            let outcome = match e.downcast_ref() {
+                                Some(PulpError::TaskFailed { state, .. }) => state.to_uppercase(),
+                                _ => "FAILED".into(),
+                            };
+                            app.text(format!("Replication of {name} {outcome}"), format!("{e:#}").lines().map(str::to_string).collect())
+                        }
                     })
                 });
             };
@@ -1608,22 +1614,34 @@ mod tests {
         app.notices.iter().map(|n| (n.level, n.text.clone())).collect()
     }
 
+    /// The title of the result view that a job left open.
+    fn result_title(app: &App) -> String {
+        let Some(Modal::Text { title, .. }) = &app.modal else { panic!("no result view: {:?}", notices(app)) };
+        title.clone()
+    }
+
     #[tokio::test]
     async fn a_replication_with_canceled_or_skipped_tasks_is_not_a_success() {
-        for (state, counts) in [("canceled", "canceled 1"), ("skipped", "skipped 1")] {
+        for (state, counts, title) in [
+            ("canceled", "canceled 1", "Replication of up CANCELED"),
+            ("skipped", "skipped 1", "Replication of up SKIPPED"),
+            ("failed", "failed 1", "Replication of up FAILED"),
+        ] {
             let server = MockServer::start().await;
             serve(&server, "GET", GROUP, 200, group(state)).await;
             let (mut app, mut rx) = start_replication(&server).await;
             settle(&mut app, &mut rx).await;
             let n = notices(&app);
-            assert!(n.iter().any(|(l, t)| *l == Level::Warn && t.contains(counts)), "{state}: {n:?}");
+            assert!(n.iter().any(|(l, t)| *l != Level::Ok && t.contains(counts)), "{state}: {n:?}");
             assert!(!n.iter().any(|(l, t)| *l == Level::Ok && t.contains("replicate up")), "{state}: {n:?}");
+            assert_eq!(result_title(&app), title, "{state}");
         }
         let server = MockServer::start().await;
         serve(&server, "GET", GROUP, 200, group("completed")).await;
         let (mut app, mut rx) = start_replication(&server).await;
         settle(&mut app, &mut rx).await;
         assert!(notices(&app).iter().any(|(l, t)| *l == Level::Ok && t.contains("completed")), "{:?}", notices(&app));
+        assert_eq!(result_title(&app), "Replication of up");
     }
 
     /// Apply job messages until `done` holds (at most 5 s).

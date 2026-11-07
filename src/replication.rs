@@ -19,15 +19,15 @@ use serde_json::{Value, json};
 
 pub const LABEL_REPLICA: &str = "pulp_tui_replica";
 
-/// Trigger native replication and wait for its task group. A failed task is an error;
-/// `on` gets each snapshot, whose `TaskGroup::outcome` tells canceled or skipped tasks.
+/// Trigger native replication and wait for its task group; `on` gets each snapshot. Any outcome
+/// but `completed` (a failed, canceled or skipped task) is `PulpError::TaskFailed` with that state.
 pub async fn replicate_native(c: &PulpClient, upstream_href: &str, on: &(dyn Fn(&TaskGroup) + Send + Sync)) -> Result<Vec<String>> {
     let Mutation::TaskGroup(g) = c.post(&format!("{upstream_href}replicate/"), &json!({})).await? else {
         bail!("replicate did not return a task group");
     };
     let (group, lines) = ops::group_report(c, &g, on).await?;
-    if group.failed > 0 {
-        bail!("{}", lines.join("\n"));
+    if group.outcome() != "completed" {
+        return Err(PulpError::TaskFailed { href: g, state: group.outcome().into(), message: lines.join("\n") }.into());
     }
     Ok(lines)
 }
