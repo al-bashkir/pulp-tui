@@ -940,7 +940,10 @@ impl Kind {
             }
             // A structured Deb copy brings the release records of binary packages only; other units would arrive alone.
             Kind::Content { version, ctype } if RepoType::from_href(version) == Some(RepoType::Deb) && *ctype != 0 => {
-                vec![Inspect, RemoveContent]
+                match RepoType::Deb.content_types().get(*ctype).is_some_and(|t| deb::RECORDS.contains(&t.path)) {
+                    true => vec![Create, Inspect, RemoveContent],
+                    false => vec![Inspect, RemoveContent],
+                }
             }
             Kind::Content { .. } => vec![Inspect, RemoveContent, AddToRepo],
             Kind::Publications(_) => vec![Create, Distribute, Delete, ObjectRoles, Inspect],

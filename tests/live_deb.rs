@@ -338,6 +338,56 @@ async fn the_tui_uploads_a_udeb_a_source_package_and_generic_content_as_their_ty
     cleanup(&c, &[&repo]).await;
 }
 
+/// Create (c) on the Deb Content screens of a version: a release, a release component and a release architecture, then
+/// a package release component that lists an uploaded package in that component. Each makes a new version; a
+/// structured publication of the last one serves the package in `dists/<distribution>/<component>/`.
+#[tokio::test]
+async fn the_tui_creates_release_records_that_a_publication_serves() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let t = RepoType::Deb;
+    let name = unique("it-deb-records");
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    // The package goes into the default release of an upload (pulp/upload).
+    let file = fixtures().join("upstream/deb/pool/main/f/fixture-alpha/fixture-alpha_1.0-1_amd64.deb");
+    let pkg = deb::Upload::Package { distribution: None, component: None };
+    deb::upload(&c, &pkg, &file, Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
+    let (mut app, mut rx) = app().await;
+    let component = format!("{name}/main");
+    let records: [(usize, Vec<(&str, &str)>); 4] = [
+        (1, vec![("codename", &name), ("suite", "testing"), ("distribution", &name), ("description", "it")]),
+        (2, vec![("component", "main"), ("distribution", &name)]),
+        (9, vec![("architecture", "amd64"), ("distribution", &name)]),
+        (11, vec![("package", "fixture-alpha"), ("release_component", &component)]),
+    ];
+    for (ctype, values) in records {
+        app.list.kind = Kind::Content { version: latest(&c, &repo).await, ctype };
+        run(&mut app, Act::Create, Value::Null);
+        settle(&mut app, &mut rx).await; // the release components of the version (package release component)
+        fill(&mut app, &values);
+        settle(&mut app, &mut rx).await;
+    }
+    let made: Vec<String> = texts(&app).into_iter().filter(|n| n.starts_with("create ")).collect();
+    assert_eq!(made.len(), 4, "{:?}", texts(&app));
+    assert_eq!(made[0], format!("create release {name} (codename {name}, suite testing): new version 2"));
+    assert_eq!(made[3], format!("create package release component fixture-alpha in {name}/main: new version 5"));
+
+    let v = latest(&c, &repo).await;
+    let publication = ops::create_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap();
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
+    let d: Value = c.get(&dist, &[]).await.unwrap();
+    let base = d["base_url"].as_str().unwrap().to_string();
+    let (status, release) = served(&c, &format!("{base}dists/{name}/Release")).await;
+    let release = String::from_utf8_lossy(&release);
+    assert!(status == 200 && release.contains("Suite: testing") && release.contains("Description: it"), "{status} {release}");
+    let (status, index) = served(&c, &format!("{base}dists/{name}/main/binary-amd64/Packages")).await;
+    let index = String::from_utf8_lossy(&index);
+    assert!(status == 200 && index.contains("Package: fixture-alpha\n"), "{status} {index}");
+    cleanup(&c, &[&dist, &repo]).await;
+}
+
 /// An operator repository with its own signing service: a publication without one is signed by the
 /// repository's service, and after the edit form clears it (`signing_service: null`) it is not.
 #[tokio::test]

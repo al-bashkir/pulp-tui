@@ -292,7 +292,7 @@ fn dsc_files(dsc: &str) -> Result<Vec<(String, String)>> {
 /// Hrefs of the release records (`PackageReleaseComponent`) in `version` whose package is in `packages`.
 pub async fn release_records_of(c: &PulpClient, version: &str, packages: &HashSet<&str>) -> Result<HashSet<String>> {
     let q = [("repository_version", version.to_string()), ("fields", "pulp_href,package".into()), ("limit", CONTENT_PAGE.into())];
-    let v: Vec<Value> = c.list_all(&c.api("content/deb/package_release_components/"), &q, 2_000_000).await?;
+    let v: Vec<Value> = c.list_all(&c.api(PACKAGE_RELEASE_COMPONENTS), &q, 2_000_000).await?;
     Ok(v.iter()
         .filter(|r| r["package"].as_str().is_some_and(|p| packages.contains(p)))
         .filter_map(|r| r["pulp_href"].as_str().map(str::to_string))
@@ -310,6 +310,40 @@ pub async fn with_release_records(c: &PulpClient, version: &str, units: Vec<Stri
     // Sorted: the set has no order, and a request body should not change from run to run.
     records.sort();
     Ok(units.into_iter().chain(records).collect())
+}
+
+/// Package release component records: a package listed in a release component.
+pub const PACKAGE_RELEASE_COMPONENTS: &str = "content/deb/package_release_components/";
+
+/// The release records that the TUI creates in a repository (Create on the Content screen of the type).
+pub const RECORDS: [&str; 4] =
+    ["content/deb/releases/", "content/deb/release_components/", "content/deb/release_architectures/", PACKAGE_RELEASE_COMPONENTS];
+
+/// The href of the package `key` of `version`: `name`, `name_version` or `name_version_arch` (`DebPackage::key`), when
+/// exactly one package of the version matches.
+pub async fn package_in(c: &PulpClient, version: &str, key: &str) -> Result<String> {
+    let mut q = vec![("repository_version", version.to_string()), ("fields", "pulp_href".into()), ("limit", "2".into())];
+    q.extend(["package", "version", "architecture"].into_iter().zip(key.splitn(3, '_').map(str::to_string)));
+    let p: Page<Value> = c.list(&c.api("content/deb/packages/"), &q).await?;
+    match (p.count, p.results.first().and_then(|r| r["pulp_href"].as_str())) {
+        (1, Some(h)) => Ok(h.to_string()),
+        (n, _) => Err(PulpError::Config(format!(
+            "{n} packages of version {} match {key:?}: give name_version_arch",
+            ops::version_number(version)
+        ))),
+    }
+}
+
+/// The record of `package` in `release_component`: an existing one (a POST makes a new record each time), else a new
+/// one. It is in no repository until it is added.
+pub async fn package_release_component(c: &PulpClient, package: &str, release_component: &str) -> Result<String> {
+    let q = [("package", package.to_string()), ("release_component", release_component.to_string()), ("fields", "pulp_href".into())];
+    let found: Page<Value> = c.list(&c.api(PACKAGE_RELEASE_COMPONENTS), &q).await?;
+    if let Some(h) = found.results.first().and_then(|r| r["pulp_href"].as_str()) {
+        return Ok(h.to_string());
+    }
+    let body = json!({ "package": package, "release_component": release_component });
+    ops::create(c, &c.api(PACKAGE_RELEASE_COMPONENTS), &body, &format!("/{PACKAGE_RELEASE_COMPONENTS}"), &ops::no_progress).await
 }
 
 /// Release, release component and release architecture records: shared by all packages of a release.

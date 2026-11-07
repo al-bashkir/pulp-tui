@@ -438,6 +438,15 @@ releases, components, indices and more). `/` searches package names or file path
   else orphan cleanup can delete them.
 * **a** adds them to another repository: a new version. On Deb, it is a structured copy, only on
   the packages list.
+* **c** (Deb: releases, release components, release architectures and package release
+  components) creates a record in a new version of the latest version of the repository. The
+  form asks for the required fields first (a release: codename, suite, distribution; then
+  version, origin, label, description, and components and architectures, space or comma
+  separated). A package release component lists a package of the version (name, name_version or
+  name_version_arch) in one of its release components; pulp-tui reuses an existing record of
+  that pair and adds it with its package and release component. The screen then shows the new
+  version. A structured publication serves the packages of a component in
+  `dists/<distribution>/<component>/`.
 * **x** and **a** send a large selection (above about 27,000 units) in batches, one task after
   the other; each batch makes a new version. The Task Center shows the task of each batch. When
   a batch fails, the batches after it are not sent. The confirm of **x** says how many versions

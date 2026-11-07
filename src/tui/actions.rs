@@ -129,13 +129,19 @@ fn content_removed(app: &mut App, old: &str, n: usize, made: &[Option<String>]) 
     let Some(new) = newest else {
         return app.ok(format!("removed {n} unit(s): no new version (the latest version did not have them)"));
     };
+    show_new_version(app, old, new, &format!("removed {n} unit(s){batches}"));
+}
+
+/// A task made version `new` of the repository of `old`: a Content screen that still shows `old` moves to it. The
+/// notice starts with `what`.
+fn show_new_version(app: &mut App, old: &str, new: String, what: &str) {
     let v = version_number(&new);
     match &app.screen {
         Screen::List(Kind::Content { version, ctype }) if version == old => {
             app.replace(Kind::Content { version: new, ctype: *ctype });
-            app.ok(format!("removed {n} unit(s){batches}: now showing version {v}"));
+            app.ok(format!("{what}: now showing version {v}"));
         }
-        _ => app.ok(format!("removed {n} unit(s){batches}: new version {v}")),
+        _ => app.ok(format!("{what}: new version {v}")),
     }
 }
 
@@ -397,6 +403,7 @@ pub fn run(app: &mut App, act: Act, item: Value) {
         (Kind::Versions(_), Act::PruneOrphans) => prune_orphans(app),
         (Kind::Artifacts, Act::RepairServer) => repair_server(app),
         (Kind::Versions(_), _) => version_action(app, act, item),
+        (Kind::Content { version, ctype }, Act::Create) => deb_record_create(app, version.clone(), *ctype),
         (Kind::Content { version, .. }, _) => content_action(app, version.clone(), act),
         (Kind::Publications(t), _) => publication_action(app, *t, act, item),
         (Kind::Distributions(t), _) => distribution_action(app, *t, act, item),
@@ -3090,6 +3097,111 @@ fn add_run(app: &mut App, t: RepoType, version: String, target: String, units: V
     });
 }
 
+/// Create on the Deb Content screen of type `ctype` of `version`: a release record (`deb::RECORDS`) in a new version of
+/// the repository.
+fn deb_record_create(app: &mut App, version: String, ctype: usize) {
+    let deb = RepoType::from_href(&version) == Some(RepoType::Deb);
+    let Some(ct) = RepoType::Deb.content_types().get(ctype).filter(|t| deb && deb::RECORDS.contains(&t.path)) else { return };
+    if caps(app).is_some_and(|c| !c.has_operation(ct.path, "post")) {
+        return app.error(format!("not supported by this server: create {} ({})", ct.label, ct.path));
+    }
+    match ct.path {
+        deb::PACKAGE_RELEASE_COMPONENTS => package_record_create(app, version),
+        path => record_create(app, version, path, ct.key),
+    }
+}
+
+/// The form of a release, release component or release architecture (required fields first), then its POST with the
+/// repository of `version`: pulp_deb reuses an equal record and adds it to a new version in a task.
+fn record_create(app: &mut App, version: String, path: &'static str, key: fn(&Value) -> String) {
+    let (required, optional): (&[&str], &[&str]) = match path {
+        "content/deb/releases/" => {
+            (&["codename", "suite", "distribution"], &["version", "origin", "label", "description", "components", "architectures"])
+        }
+        "content/deb/release_components/" => (&["component", "distribution"], &[]),
+        _ => (&["architecture", "distribution"], &[]),
+    };
+    let lists = ["components", "architectures"];
+    let fields = required.iter().map(|k| Field::text(k, k).required());
+    let fields =
+        fields.chain(optional.iter().map(|k| Field::text(k, k).help(if lists.contains(k) { "space or comma separated" } else { "" })));
+    let note = "Adds the record to a new version of the latest version of the repository.";
+    let title = format!("New {}", path.trim_start_matches("content/deb/").trim_end_matches("s/").replace('_', " "));
+    app.form(Form::new(title, fields.collect()).note(note), move |app, f| {
+        let mut body = json!({});
+        for field in f.fields.iter().filter(|x| !x.value.trim().is_empty()) {
+            let v = field.value.trim();
+            body[&field.key] = match lists.contains(&field.key.as_str()) {
+                true => v.split([' ', ',']).filter(|x| !x.is_empty()).collect::<Vec<_>>().into(),
+                false => v.into(),
+            };
+        }
+        let label = format!("create {}", key(&body));
+        record_job(app, version.clone(), label, move |c, repo| async move {
+            body["repository"] = repo.into();
+            Ok(c.post(&c.api(path), &body).await?)
+        });
+        Ok(())
+    });
+}
+
+/// A package release component: a release component of `version` and a package of it by name. The record (an existing
+/// one if there is one) goes into the repository with its package and release component (`modify/`).
+fn package_record_create(app: &mut App, version: String) {
+    app.job("read release components", move |ctx| async move {
+        let c = &ctx.client;
+        let q = [("repository_version", version.clone()), ("fields", "pulp_href,distribution,component".into())];
+        let comps: Vec<Value> = c.list_all(&c.api("content/deb/release_components/"), &q, 10_000).await?;
+        if comps.is_empty() {
+            bail!("version {} has no release components: create one first", version_number(&version));
+        }
+        let choices: Vec<(String, String)> =
+            comps.iter().map(|r| (format!("{}/{}", s(r, "distribution"), s(r, "component")), s(r, "pulp_href"))).collect();
+        ap(move |app| {
+            let fields = vec![
+                Field::text("package", "package").required().help("name, name_version or name_version_arch"),
+                Field::new("release_component", "release_component", FieldKind::Choice(choices.iter().map(|x| x.0.clone()).collect())),
+            ];
+            app.form(Form::new("New package release component", fields), move |app, f| {
+                let Some((name, rc)) = choices.iter().find(|x| x.0 == f.get("release_component")).cloned() else {
+                    return Err("pick a release component".into());
+                };
+                let (package, version) = (f.get("package").trim().to_string(), version.clone());
+                let label = format!("create package release component {package} in {name}");
+                record_job(app, version.clone(), label, move |c, repo| async move {
+                    let p = deb::package_in(&c, &version, &package).await?;
+                    let prc = deb::package_release_component(&c, &p, &rc).await?;
+                    Ok(ops::add_content(&c, &repo, vec![p, rc, prc]).await?)
+                });
+                Ok(())
+            });
+        })
+    });
+}
+
+/// Add a release record to the repository of `version`: `send` makes the request after the snapshot check, then the
+/// Content screen moves to the new version.
+fn record_job<F, Fut>(app: &mut App, version: String, label: String, send: F)
+where
+    F: FnOnce(PulpClient, String) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<Mutation>> + Send + 'static,
+{
+    app.job(label.clone(), move |ctx| async move {
+        let repo = repo_of_version(&version);
+        let r: Value = ctx.client.get(&repo, &[]).await?;
+        if let Some(e) = snapshot_refusal(&r) {
+            bail!(e);
+        }
+        let m = send(ctx.client.clone(), repo).await?;
+        ap(move |app| {
+            follow(app, m, label.clone(), move |app, t| match t.created_matching("/versions/") {
+                Some(new) => show_new_version(app, &version, new, &label),
+                None => app.ok(format!("{label}: no new version (the latest version has it already)")),
+            })
+        })
+    });
+}
+
 // ---- publications and distributions --------------------------------------------------------
 
 fn publication_action(app: &mut App, t: RepoType, act: Act, item: Value) {
@@ -5219,6 +5331,171 @@ mod tests {
         settle(&mut app, &mut rx).await;
         let last = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
         assert_eq!(last, "added 30000 unit(s) to dst in 2 batches (version 4, no new version): version 4");
+    }
+
+    /// A connected app on the Deb Content screen of type `ctype` of version 1 of repository `r` (labels: `labels`).
+    async fn deb_content_screen(
+        server: &wiremock::MockServer,
+        ctype: usize,
+        labels: Value,
+    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<super::super::app::Msg>) {
+        use crate::tui::app::{ListState, Screen};
+        let repo = format!("{API}repositories/deb/apt/r/");
+        get(server, &repo, json!({ "pulp_href": repo, "name": "r", "pulp_labels": labels })).await;
+        let (mut app, rx) = connected(server).await;
+        let k = Kind::Content { version: format!("{repo}versions/1/"), ctype };
+        (app.screen, app.list) = (Screen::List(k.clone()), ListState::new(k));
+        (app, rx)
+    }
+
+    /// Create on the Deb Content screens of releases, release components and release architectures: a form with the
+    /// fields of the record (required first), then a POST with the repository of the version; the screen moves to the
+    /// new version. Other Deb types have no Create. A server without the endpoint, and a Content View snapshot
+    /// repository, are refused before any POST.
+    #[tokio::test]
+    async fn deb_release_records_are_created_in_the_repository_of_the_version() {
+        use crate::tui::app::{Modal, Screen};
+        let (repo, server) = (format!("{API}repositories/deb/apt/r/"), wiremock::MockServer::start().await);
+        for ep in ["releases", "release_components", "release_architectures"] {
+            answer(&server, "POST", &format!("{API}content/deb/{ep}/"), 202, json!({ "task": format!("{API}tasks/{ep}/") })).await;
+            let created = json!([format!("{API}content/deb/{ep}/1/"), format!("{repo}versions/2/")]);
+            get(
+                &server,
+                &format!("{API}tasks/{ep}/"),
+                json!({ "pulp_href": format!("{API}tasks/{ep}/"), "state": "completed", "created_resources": created }),
+            )
+            .await;
+        }
+        let cases = [
+            (
+                1,
+                vec!["codename", "suite", "distribution", "version", "origin", "label", "description", "components", "architectures"],
+                vec![("codename", "bookworm"), ("suite", "stable"), ("distribution", "bookworm"), ("components", "main, contrib")],
+                json!({ "codename": "bookworm", "suite": "stable", "distribution": "bookworm", "components": ["main", "contrib"], "repository": repo }),
+                "create release bookworm (codename bookworm, suite stable): now showing version 2",
+            ),
+            (
+                2,
+                vec!["component", "distribution"],
+                vec![("component", "main"), ("distribution", "bookworm")],
+                json!({ "component": "main", "distribution": "bookworm", "repository": repo }),
+                "create release component bookworm/main: now showing version 2",
+            ),
+            (
+                9,
+                vec!["architecture", "distribution"],
+                vec![("architecture", "amd64"), ("distribution", "bookworm")],
+                json!({ "architecture": "amd64", "distribution": "bookworm", "repository": repo }),
+                "create release architecture bookworm/amd64: now showing version 2",
+            ),
+        ];
+        for (ctype, keys_, values, body, notice) in cases {
+            let (mut app, mut rx) = deb_content_screen(&server, ctype, json!({})).await;
+            assert!(app.list.kind.actions().contains(&Act::Create), "{ctype}");
+            run(&mut app, Act::Create, Value::Null);
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form for {ctype}") };
+            assert_eq!(keys(&form), keys_);
+            values.iter().for_each(|(k, v)| set(&mut form, k, v));
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+            let ep = RepoType::Deb.content_types()[ctype].path;
+            assert_eq!(posts_to(&server, &format!("{API}{ep}")).await.last(), Some(&body));
+            assert!(app.notices.iter().any(|n| n.text == notice), "{:?}", app.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
+            assert_eq!(app.screen, Screen::List(Kind::Content { version: format!("{repo}versions/2/"), ctype }));
+        }
+        for ctype in [0, 3, 4, 10] {
+            assert!(!Kind::Content { version: format!("{repo}versions/1/"), ctype }.actions().contains(&Act::Create), "{ctype}");
+        }
+
+        let server = wiremock::MockServer::start().await;
+        let (mut app, mut rx) = deb_content_screen(&server, 2, json!({ "pulp_tui_cv": "web" })).await;
+        run(&mut app, Act::Create, Value::Null);
+        fill_and_submit(&mut app, &[("component", "main"), ("distribution", "bookworm")]);
+        settle(&mut app, &mut rx).await;
+        assert!(
+            app.notices.iter().any(|n| n.text.contains("refused: r is a snapshot repository of Content View web")),
+            "{:?}",
+            app.notices.iter().map(|n| &n.text).collect::<Vec<_>>()
+        );
+        let mut caps = plugins();
+        caps.load_openapi(&json!({ "paths": { "/pulp/api/v3/content/deb/packages/": { "post": {} } } }));
+        app.conn.as_mut().unwrap().caps = Arc::new(caps);
+        run(&mut app, Act::Create, Value::Null);
+        assert!(app.modal.is_none(), "no form");
+        let last = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        assert_eq!(last, "not supported by this server: create release components (content/deb/release_components/)");
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "no POST");
+    }
+
+    /// Create on the package release components screen: the release component is one of the version, the package is
+    /// named as the packages list keys it (name, name_version or name_version_arch). An existing record of that pair is
+    /// reused (pulp_deb makes a new one on each POST); the record goes into the repository with its package and
+    /// release component (`modify/`). A name that matches more than one package is refused.
+    #[tokio::test]
+    async fn deb_package_release_component_is_found_or_created_and_added_with_its_package() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let (repo, rc, pkg, prc) = (
+            format!("{API}repositories/deb/apt/r/"),
+            format!("{API}content/deb/release_components/1/"),
+            format!("{API}content/deb/packages/1/"),
+            format!("{API}content/deb/package_release_components/"),
+        );
+        let comps = json!([{ "pulp_href": rc, "distribution": "bookworm", "component": "main" }]);
+        get(&server, &format!("{API}content/deb/release_components/"), page(comps)).await;
+        let packages = |r: Value| wiremock::ResponseTemplate::new(200).set_body_json(page(r));
+        let one = wiremock::Mock::given(method("GET")).and(path(format!("{API}content/deb/packages/"))).and(query_param("version", "1.0"));
+        one.respond_with(packages(json!([{ "pulp_href": pkg }]))).with_priority(1).mount(&server).await;
+        let two = json!([{ "pulp_href": pkg }, { "pulp_href": format!("{pkg}2/") }]);
+        wiremock::Mock::given(method("GET"))
+            .and(path(format!("{API}content/deb/packages/")))
+            .respond_with(packages(two))
+            .mount(&server)
+            .await;
+        // The pair has no record yet: the first Create makes one, the second finds it.
+        let none = wiremock::ResponseTemplate::new(200).set_body_json(page(json!([])));
+        wiremock::Mock::given(method("GET")).and(path(&prc)).respond_with(none).up_to_n_times(1).mount(&server).await;
+        get(&server, &prc, page(json!([{ "pulp_href": format!("{prc}1/") }]))).await;
+        answer(&server, "POST", &prc, 201, json!({ "pulp_href": format!("{prc}1/") })).await;
+        answer(&server, "POST", &format!("{repo}modify/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        let done =
+            json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [format!("{repo}versions/2/")] });
+        get(&server, &format!("{API}tasks/1/"), done).await;
+        let (mut app, mut rx) = deb_content_screen(&server, 11, json!({})).await;
+        let create = |app: &mut App, package: &str| {
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else {
+                panic!("no form: {:?}", app.notices.iter().map(|n| &n.text).collect::<Vec<_>>())
+            };
+            assert_eq!(keys(&form), ["package", "release_component"]);
+            assert_eq!(form.get("release_component"), "bookworm/main");
+            set(&mut form, "package", package);
+            submit(app, &form).unwrap();
+        };
+        for package in ["hello_1.0", "hello_1.0_amd64"] {
+            run(&mut app, Act::Create, Value::Null);
+            settle(&mut app, &mut rx).await; // the release components of the version
+            create(&mut app, package);
+            settle(&mut app, &mut rx).await;
+        }
+        assert_eq!(posts_to(&server, &prc).await, [json!({ "package": pkg, "release_component": rc })], "one record");
+        let add = json!({ "add_content_units": [pkg, rc, format!("{prc}1/")] });
+        assert_eq!(posts_to(&server, &format!("{repo}modify/")).await, [add.clone(), add]);
+        let sent = server.received_requests().await.unwrap();
+        let lookup =
+            sent.iter().find(|r| r.url.path() == format!("{API}content/deb/packages/")).unwrap().url.query_pairs().collect::<Vec<_>>();
+        assert!(
+            lookup.iter().any(|(k, v)| k == "package" && v == "hello")
+                && lookup.iter().any(|(k, v)| k == "repository_version" && v == format!("{repo}versions/1/").as_str()),
+            "{lookup:?}"
+        );
+
+        run(&mut app, Act::Create, Value::Null);
+        settle(&mut app, &mut rx).await;
+        create(&mut app, "hello");
+        settle(&mut app, &mut rx).await;
+        let last = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        assert!(last.ends_with("2 packages of version 2 match \"hello\": give name_version_arch"), "{last}");
     }
 
     #[tokio::test]

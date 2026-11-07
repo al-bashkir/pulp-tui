@@ -811,6 +811,13 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
   existing artifact answers 400, so the lookup makes a rerun safe. pulp_deb reuses a source
   package with the same `source` and `version`. pulpcore allows `artifacts/` (list, create)
   only to admins by default.
+* **Release record create.** `content/deb/releases/`, `release_components/` and
+  `release_architectures/` (JSON with `repository`, in 3.5.4, 3.8.1 and 3.11.1) answer 202: the
+  task reuses an equal record (`retrieve`) and adds it to a new version (none when the latest
+  version has it). A release also makes the records of its `components` and `architectures`.
+  `package_release_components/` is a plain create: 201 with the record, and a new record on each
+  POST, also for the same package and release component (seen live). So pulp-tui looks the pair up
+  first (`?package=&release_component=`) and adds the record with `modify/`.
 * **`sha256` is `null` until download** for `on_demand` packages. Verify takes the digest
   from the served `Packages` index (what apt checks) and fails when the API differs.
 * **Structured copy.** `deb/copy/` with `structured: true` also copies the
