@@ -1351,3 +1351,99 @@ async fn copy_content_through_the_tui() {
         cleanup(&c, &[&dst, &src, &remote]).await;
     }
 }
+
+/// The repository version that distribution `name` of type `t` serves through its pinned publication.
+async fn pinned_version(c: &PulpClient, t: RepoType, name: &str) -> (String, String) {
+    let d: Value = ops::find_by_name(c, &c.api(t.distributions()), name).await.unwrap().unwrap_or_else(|| panic!("no distribution {name}"));
+    let p: Value = c.get(&s(&d, "publication"), &[]).await.unwrap();
+    (s(&p, "pulp_href"), s(&p, "repository_version"))
+}
+
+/// Serving from the Versions and Repositories screens through the TUI, on a repository with versions 1 and 2
+/// (`path`: its fixture; `file`: a file each publication serves):
+/// * Publish (P) on version 1 makes its publication;
+/// * Distribute (D) on version 2 makes a distribution pinned to a publication of version 2;
+/// * Rollback (b) on version 1 points that distribution to the publication of version 1 (the preview names it);
+/// * Distribute (D) on Repositories with "follow repository latest" binds a distribution to the repository;
+/// * the Logs screen lists the actions and the requests; Inspect shows a request.
+async fn serve_from_versions_through_the_tui(t: RepoType, path: &str, file: &str) {
+    let (c, name) = (client(), unique(&format!("it-serve-{}", t.component())));
+    let (repo, remote, [v1, v2]) = two_versions(&c, t, &name, path).await;
+    let (pinned, follow) = (format!("{name}-pin"), format!("{name}-follow"));
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Versions(Some((repo.clone(), name.clone()))), "").await;
+
+    // Publish (P) version 1 with the default options.
+    let r = version_row(&app, 1);
+    run(&mut app, Act::Publish, r);
+    if matches!(app.modal, Some(Modal::Form { .. })) {
+        fill(&mut app, &[]);
+    }
+    settle(&mut app, &mut rx).await;
+    let pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository_version", v1.clone())], 10).await.unwrap();
+    let p1 = pubs.first().map(|p| s(p, "pulp_href")).unwrap_or_else(|| panic!("no publication: {:?}", texts(&app)));
+    shown(&app, &format!("publication {} for {}", short(&p1), short(&v1)));
+
+    // Distribute (D) version 2: pinned.
+    let r = version_row(&app, 2);
+    run(&mut app, Act::Distribute, r.clone());
+    settle(&mut app, &mut rx).await; // the repository name is read before the form
+    fill(&mut app, &[("dist", &pinned), ("base_path", &pinned)]);
+    settle(&mut app, &mut rx).await;
+    let d: Value = ops::find_by_name(&c, &c.api(t.distributions()), &pinned).await.unwrap().unwrap_or_else(|| panic!("{:?}", texts(&app)));
+    shown(&app, &format!("distribution {pinned} serves {}", s(&d, "base_url")));
+    assert_eq!(pinned_version(&c, t, &pinned).await.1, v2);
+    assert_eq!(served(&c, &format!("{}{file}", s(&d, "base_url"))).await.0, 200);
+
+    // Rollback (b) on version 1: the distribution then serves the publication of version 1.
+    let r1 = version_row(&app, 1);
+    run(&mut app, Act::Rollback, r1);
+    fill(&mut app, &[("dist", &pinned)]);
+    settle(&mut app, &mut rx).await; // the preview
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed, None, "a plain confirmation on a profile that is not production");
+    assert_eq!(lines[2], format!("  will serve:  {} (pinned)", short(&v1)));
+    assert!(lines[3].starts_with(&format!("  publication: existing {} (", short(&p1))), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).iter().any(|n| n.starts_with(&format!("{pinned} now serves {}: ", short(&v1)))), "{:?}", texts(&app));
+    assert_eq!(pinned_version(&c, t, &pinned).await, (p1.clone(), v1.clone()));
+
+    // Distribute (D) on Repositories: follow the repository.
+    open_list(&mut app, &mut rx, Kind::Repos(t, false), &name).await;
+    let rr = row(&app, "name", &name).unwrap();
+    run(&mut app, Act::Distribute, rr);
+    fill(&mut app, &[("dist", &follow), ("base_path", &follow), ("mode", "follow repository latest")]);
+    settle(&mut app, &mut rx).await;
+    let f: Value = ops::find_by_name(&c, &c.api(t.distributions()), &follow).await.unwrap().unwrap_or_else(|| panic!("{:?}", texts(&app)));
+    shown(&app, &format!("distribution {follow} serves {}", s(&f, "base_url")));
+    assert_eq!((s(&f, "repository"), &f["publication"]), (repo.clone(), &Value::Null));
+    assert_eq!(served(&c, &format!("{}{file}", s(&f, "base_url"))).await.0, 200, "the newest publication");
+
+    // Logs: the actions and the requests of this session; Inspect of the request that made the distribution.
+    open_list(&mut app, &mut rx, Kind::Logs { polls: false }, "").await;
+    let has = |kind: &str, summary: &dyn Fn(&str) -> bool| {
+        app.list.items.iter().find(|l| l["kind"] == kind && summary(&s(l, "summary"))).cloned()
+    };
+    let action = format!("{} on {}", Act::Distribute.label(), short(&v2));
+    assert!(has("action", &|x| x == action).is_some(), "{:?}", app.list.items.iter().take(20).collect::<Vec<_>>());
+    let made = has("request", &|x| x.starts_with("POST ") && x.contains(t.distributions()) && x.contains(" 202 "));
+    let made = made.unwrap_or_else(|| panic!("no distribution create: {:?}", app.list.items.iter().take(30).collect::<Vec<_>>()));
+    run(&mut app, Act::Inspect, made);
+    let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no detail: {:?}", texts(&app)) };
+    assert!(lines[0].starts_with("POST http") && lines.iter().any(|l| l.contains(&follow)), "{lines:?}");
+    cleanup(&c, &[s(&f, "pulp_href").as_str(), s(&d, "pulp_href").as_str(), &repo, &remote]).await;
+}
+
+#[tokio::test]
+async fn file_serve_from_versions_through_the_tui() {
+    if live_enabled() {
+        serve_from_versions_through_the_tui(RepoType::File, "file/PULP_MANIFEST", "PULP_MANIFEST").await;
+    }
+}
+
+#[tokio::test]
+async fn rpm_serve_from_versions_through_the_tui() {
+    if live_enabled() {
+        serve_from_versions_through_the_tui(RepoType::Rpm, "rpm/", "repodata/repomd.xml").await;
+    }
+}
