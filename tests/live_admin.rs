@@ -5,12 +5,16 @@
 mod common;
 
 use common::*;
+use pulp_tui::config::Config;
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{PulpClient, RepoType};
+use pulp_tui::store::Store;
 use pulp_tui::tui::actions::run;
-use pulp_tui::tui::app::{App, Modal, Screen};
+use pulp_tui::tui::app::{App, Modal, Msg, NO_PROFILE, Screen};
 use pulp_tui::tui::kinds::{Act, Kind, s};
 use serde_json::{Value, json};
+use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 #[tokio::test]
 async fn group_rename() {
@@ -871,4 +875,124 @@ async fn group_create_roles_and_delete_through_the_tui() {
     assert!(row(&app, "name", &name).is_none(), "the list reloads without it");
     assert!(c.get::<Value>(&group, &[]).await.unwrap_err().is_not_found());
     cleanup(&c, &[&repo, &user]).await;
+}
+
+/// An app that is not connected, on the config file `path` (its profiles as loaded), with a local store in memory.
+async fn app_on_file(path: &std::path::Path) -> (App, UnboundedReceiver<Msg>) {
+    let local = Arc::new(Store::open_in_memory().await.unwrap());
+    let mut app = App::new(Config::load(path).unwrap(), path.into(), local, Err(NO_PROFILE.into()));
+    let rx = app.rx.take().unwrap();
+    (app, rx)
+}
+
+fn test_url() -> String {
+    std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into())
+}
+
+/// Server profiles through the TUI on a config file with a comment: Create (c) two profiles for pulp1 with a file
+/// secret; Connect (o) to one; Edit (e) it to read-only: saved, and a mutation is refused at once; Delete (d) of the
+/// profile of the session is refused, of the other one after the typed name. Every save keeps the comment.
+#[tokio::test]
+async fn server_profiles_create_edit_and_delete_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (path, pw) = (dir.path().join("config.toml"), dir.path().join("pw"));
+    std::fs::write(&pw, std::env::var("PULP_TUI_TEST_PASSWORD").unwrap_or_else(|_| "password".into())).unwrap();
+    let comment = "# operator note: keep this line";
+    std::fs::write(&path, format!("{comment}\n")).unwrap();
+    let (mut app, mut rx) = app_on_file(&path).await;
+    let saved = || Config::load(&path).unwrap();
+    let kept = || std::fs::read_to_string(&path).unwrap().contains(comment);
+    let (url, secret) = (test_url(), format!("file:{}", pw.display()));
+
+    // Create (c) two profiles: each in the file, the first one the default.
+    open_list(&mut app, &mut rx, Kind::Profiles, "").await;
+    for name in ["it-a", "it-b"] {
+        run(&mut app, Act::Create, Value::Null);
+        fill(&mut app, &[("name", name), ("url", &url), ("username", "admin"), ("secret", &secret)]);
+        settle(&mut app, &mut rx).await;
+        shown(&app, &format!("profile {name} saved"));
+        let p = &saved().profiles[name];
+        assert_eq!((p.url.as_str(), p.username.as_deref(), p.secret.as_deref()), (url.as_str(), Some("admin"), Some(secret.as_str())));
+        assert!(row(&app, "name", name).is_some(), "the list reloads with it: {:?}", app.list.items);
+    }
+    assert!(saved().default_profile.as_deref() == Some("it-a") && kept(), "{}", std::fs::read_to_string(&path).unwrap());
+
+    // Connect (o) to it-a.
+    let a = row(&app, "name", "it-a").unwrap();
+    run(&mut app, Act::Connect, a.clone());
+    settle(&mut app, &mut rx).await;
+    assert!(app.conn.is_some() && app.profile.as_deref() == Some("it-a"), "{:?}", texts(&app));
+    shown(&app, "connected to it-a as admin");
+    open_list(&mut app, &mut rx, Kind::Profiles, "").await; // Connect shows the Dashboard
+    assert_eq!(row(&app, "name", "it-a").unwrap()["active"], true);
+
+    // Edit (e) it-a to read-only: saved, and it applies to the session at once.
+    run(&mut app, Act::Edit, a.clone());
+    fill(&mut app, &[("read_only", "true")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, "profile it-a saved (read-only and production apply at once; the rest at the next Connect)");
+    assert!(saved().profiles["it-a"].read_only && kept());
+    assert!(s(&row(&app, "name", "it-a").unwrap(), "flags").contains("read-only"), "the list reloads: {:?}", app.list.items);
+    app.list.kind = Kind::Repos(RepoType::File, false);
+    run(&mut app, Act::Create, Value::Null);
+    assert!(app.modal.is_none() && texts(&app).last().unwrap() == "read-only mode: this action changes the server", "{:?}", texts(&app));
+    open_list(&mut app, &mut rx, Kind::Profiles, "").await;
+
+    // Delete (d): not the profile of the session; it-b after the typed name.
+    run(&mut app, Act::Delete, a);
+    assert!(app.modal.is_none(), "refused at once");
+    shown(&app, "refused: it-a is the profile of this session; connect to another profile first");
+    let b = row(&app, "name", "it-b").unwrap();
+    run(&mut app, Act::Delete, b);
+    let (lines, typed) = yes(&mut app);
+    assert_eq!((typed.as_deref(), lines[0].as_str()), (Some("it-b"), "Remove profile it-b from the config file."));
+    settle(&mut app, &mut rx).await;
+    assert!(row(&app, "name", "it-b").is_none(), "the list reloads without it");
+    let left: Vec<String> = saved().profiles.into_keys().collect();
+    assert!(left == ["it-a"] && kept(), "{left:?}");
+}
+
+/// Store secret (K) through the TUI into the system keyring, where one answers in this session: a profile whose secret
+/// is `keyring` then connects with it. The keyring entry is removed afterwards.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn store_secret_in_the_keyring_through_the_tui() {
+    use pulp_tui::config::{KEYRING_SERVICE, Profile};
+    if !live_enabled() {
+        return;
+    }
+    let name = unique("it-keyring");
+    let entry = |user: &str| keyring::Entry::new(KEYRING_SERVICE, user);
+    // A probe in a thread of its own: a locked or missing keyring can fail or block, and the test must not hang.
+    let (tx, answer) = std::sync::mpsc::channel();
+    let probe = format!("{name}-probe");
+    std::thread::spawn(move || {
+        let r = entry(&probe).and_then(|e| e.set_password("probe").and_then(|_| e.delete_credential()));
+        let _ = tx.send(r.map_err(|e| e.to_string()));
+    });
+    match answer.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return eprintln!("skipping: no usable system keyring in this session ({e})"),
+        Err(_) => return eprintln!("skipping: the system keyring did not answer within 10 s (locked?)"),
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut cfg = Config::default();
+    let p = Profile { url: test_url(), username: Some("admin".into()), secret: Some("keyring".into()), ..Default::default() };
+    cfg.profiles.insert(name.clone(), p);
+    cfg.save(&path).unwrap();
+    let (mut app, mut rx) = app_on_file(&path).await;
+    open_list(&mut app, &mut rx, Kind::Profiles, "").await;
+    let r = row(&app, "name", &name).unwrap();
+    run(&mut app, Act::StoreSecret, r);
+    fill(&mut app, &[("secret", &std::env::var("PULP_TUI_TEST_PASSWORD").unwrap_or_else(|_| "password".into()))]);
+    settle(&mut app, &mut rx).await;
+    app.connect(&name);
+    settle(&mut app, &mut rx).await;
+    let (connected, notices) = (app.conn.is_some(), texts(&app));
+    entry(&name).and_then(|e| e.delete_credential()).unwrap_or_else(|e| panic!("the secret was not stored: {e}; {notices:?}"));
+    assert!(notices.contains(&"secret stored in keyring".to_string()) && connected, "{notices:?}");
 }
