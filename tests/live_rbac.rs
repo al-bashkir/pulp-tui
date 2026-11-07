@@ -4,22 +4,9 @@
 mod common;
 
 use common::*;
-use pulp_tui::config::{Profile, Settings};
+use pulp_tui::pulp::RepoType;
 use pulp_tui::pulp::ops::{self, no_progress};
-use pulp_tui::pulp::{PulpClient, RepoType};
 use serde_json::{Value, json};
-
-fn user_client(user: &str, password: &str) -> PulpClient {
-    let dir = tempfile::tempdir().unwrap().keep();
-    std::fs::write(dir.join("pw"), password).unwrap();
-    let p = Profile {
-        url: std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
-        username: Some(user.into()),
-        secret: Some(format!("file:{}", dir.join("pw").display())),
-        ..Default::default()
-    };
-    PulpClient::new(user, &p, &Settings { poll_min_ms: 300, poll_max_ms: 2000, ..Default::default() }).unwrap()
-}
 
 #[tokio::test]
 async fn rbac_is_enforced_and_not_bypassed() {

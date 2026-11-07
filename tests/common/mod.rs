@@ -39,6 +39,19 @@ pub fn client_for(url: &str, name: &str) -> PulpClient {
     PulpClient::new(name, &p, &s).unwrap()
 }
 
+/// Client for user `user` of the test Pulp, with `password`.
+pub fn user_client(user: &str, password: &str) -> PulpClient {
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::write(dir.join("pw"), password).unwrap();
+    let p = Profile {
+        url: std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
+        username: Some(user.into()),
+        secret: Some(format!("file:{}", dir.join("pw").display())),
+        ..Default::default()
+    };
+    PulpClient::new(user, &p, &Settings { poll_min_ms: 300, poll_max_ms: 2000, ..Default::default() }).unwrap()
+}
+
 pub fn client() -> PulpClient {
     client_for(&std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()), "pulp1")
 }

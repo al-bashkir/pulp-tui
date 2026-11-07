@@ -9,7 +9,7 @@ use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{PulpClient, RepoType};
 use pulp_tui::tui::actions::run;
 use pulp_tui::tui::app::{App, Modal, Screen};
-use pulp_tui::tui::kinds::{Act, Kind};
+use pulp_tui::tui::kinds::{Act, Kind, s};
 use serde_json::{Value, json};
 
 #[tokio::test]
@@ -91,13 +91,6 @@ async fn server_tasks_filter() {
     let e = app.list.error.clone().unwrap_or_default();
     assert!(e.contains("Enter a valid date/time"), "{e}");
     cleanup(&c, &[&repo]).await;
-}
-
-/// Answer yes to the open confirmation; returns its lines and the typed name it asks for.
-fn yes(app: &mut App) -> (Vec<String>, Option<String>) {
-    let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(app)) };
-    yes(app);
-    (lines, typed)
 }
 
 #[tokio::test]
@@ -635,4 +628,150 @@ async fn access_policy_reset_restores_the_default() {
     settle(&mut app, &mut rx).await;
     let after: Value = c.get(&href, &[]).await.unwrap();
     assert_eq!((after["customized"].clone(), after["statements"].clone()), (json!(false), before), "{:?}", texts(&app));
+}
+
+/// The notice `text` is shown.
+fn shown(app: &App, text: &str) {
+    assert!(texts(app).iter().any(|t| t == text), "no notice {text:?}: {:?}", texts(app));
+}
+
+/// Users through the TUI: Create with a password, Edit, Password (w), Disable (A), Delete. Each change shows in the
+/// reloaded list and in Pulp; the passwords are checked by signing in with them.
+#[tokio::test]
+async fn user_create_edit_password_disable_and_delete_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("admin-user"));
+    let (pw1, pw2) = ("Xq7!mLp2-zR9v", "Wd4#nKs8-pT6c");
+    let signs_in = async |pw: &str| {
+        let r = user_client(&name, pw).get::<Value>(&c.api(RepoType::File.repositories()), &[("limit", "1".into())]).await;
+        r.map(|_| ()).map_err(|e| e.status())
+    };
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Users, &name).await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("username", &name), ("password", pw1), ("first_name", "Ann")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("create user {name}: done"));
+    let u = row(&app, "username", &name).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    assert_eq!((u["first_name"].as_str(), &u["is_active"], &u["is_staff"]), (Some("Ann"), &json!(true), &json!(false)));
+    assert_eq!(signs_in(pw1).await, Ok(()));
+
+    run(&mut app, Act::Edit, u);
+    fill(&mut app, &[("last_name", "Bee")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("update user {name}: done"));
+    let u = row(&app, "username", &name).unwrap();
+    assert_eq!((u["first_name"].as_str(), u["last_name"].as_str()), (Some("Ann"), Some("Bee")));
+
+    run(&mut app, Act::Password, u.clone());
+    fill(&mut app, &[("p1", pw2), ("p2", pw2)]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("set password of {name}: done"));
+    assert_eq!((signs_in(pw2).await, signs_in(pw1).await), (Ok(()), Err(Some(401))));
+
+    run(&mut app, Act::ToggleActive, u);
+    let (lines, typed) = yes(&mut app);
+    assert_eq!((lines, typed), (vec![format!("Disable user {name}.")], None));
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("set {name} active=false: done"));
+    let u = row(&app, "username", &name).unwrap();
+    assert_eq!(u["is_active"], false, "the list reloads");
+    assert_eq!(signs_in(pw2).await, Err(Some(401)), "a disabled user cannot sign in");
+
+    run(&mut app, Act::Delete, u.clone());
+    settle(&mut app, &mut rx).await; // the impact is read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    assert_eq!((typed.as_deref(), lines[0].clone()), (Some(name.as_str()), format!("Delete user {name}.")));
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("delete user {name}: done"));
+    assert!(row(&app, "username", &name).is_none(), "the list reloads without it");
+    assert!(c.get::<Value>(&s(&u, "pulp_href"), &[]).await.unwrap_err().is_not_found());
+}
+
+/// The role assignments of user or group `owner`: (role, object).
+async fn roles_of(c: &PulpClient, owner: &str) -> Vec<(String, Value)> {
+    let p: pulp_tui::pulp::client::Page<Value> = c.list(&format!("{owner}roles/"), &[]).await.unwrap();
+    p.results.iter().map(|r| (s(r, "role"), r["content_object"].clone())).collect()
+}
+
+/// Groups and roles through the TUI: Create a group; on its Roles screen Assign a model-level owner role (a powerful
+/// role asks first) and Remove it; on a user's Roles screen Assign the viewer role of one repository (the user then
+/// sees that repository) and Remove it (the user sees none); Delete the group.
+#[tokio::test]
+async fn group_create_roles_and_delete_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("admin-roles"));
+    let pw = "Xq7!mLp2-zR9v";
+    let user = create(&c, "users/", json!({ "username": name, "password": pw }), "/users/").await;
+    let repo = create(&c, RepoType::File.repositories(), json!({ "name": name }), "/repositories/").await;
+    let sees = async || {
+        let u = user_client(&name, pw);
+        u.get::<Value>(&u.api(RepoType::File.repositories()), &[]).await.unwrap()["count"].clone()
+    };
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Groups, &name).await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("name", &name)]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("create group {name}: done"));
+    let g = row(&app, "name", &name).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    let group = s(&g, "pulp_href");
+
+    // Group roles: a model-level owner role asks first.
+    let owner = "file.filerepository_owner";
+    run(&mut app, Act::Roles, g);
+    settle(&mut app, &mut rx).await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("role", owner)]);
+    let (lines, typed) = yes(&mut app);
+    assert_eq!((typed, lines[0].clone()), (None, format!("{owner} grants owner/admin level permissions on ALL objects of its type.")));
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("assign {owner} to group {name}: done"));
+    assert_eq!(roles_of(&c, &group).await, [(owner.to_string(), Value::Null)]);
+    let r = row(&app, "role", owner).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    run(&mut app, Act::Delete, r);
+    let (lines, _) = yes(&mut app);
+    assert_eq!(lines, [format!("Remove role {owner} from group {name}.")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("remove {owner}: done"));
+    assert_eq!((roles_of(&c, &group).await, app.list.items.len()), (vec![], 0));
+    app.back();
+
+    // User roles: the viewer role of one repository; the user sees that repository only while it has the role.
+    let viewer = "file.filerepository_viewer";
+    open_list(&mut app, &mut rx, Kind::Users, &name).await;
+    let u = row(&app, "username", &name).unwrap();
+    run(&mut app, Act::Roles, u);
+    settle(&mut app, &mut rx).await;
+    assert_eq!(sees().await, 0);
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("role", viewer), ("content_object", &repo)]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("assign {viewer} to user {name}: done"));
+    assert_eq!(roles_of(&c, &user).await, [(viewer.to_string(), json!(repo))]);
+    assert_eq!(sees().await, 1);
+    let r = row(&app, "role", viewer).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    run(&mut app, Act::Delete, r);
+    yes(&mut app);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("remove {viewer}: done"));
+    assert_eq!((roles_of(&c, &user).await, sees().await), (vec![], json!(0)));
+    app.back();
+
+    // Delete the group: the impact, the typed name.
+    open_list(&mut app, &mut rx, Kind::Groups, &name).await;
+    let g = row(&app, "name", &name).unwrap();
+    run(&mut app, Act::Delete, g);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!((typed.as_deref(), lines[0].clone()), (Some(name.as_str()), format!("Delete group {name}.")));
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("delete group {name}: done"));
+    assert!(row(&app, "name", &name).is_none(), "the list reloads without it");
+    assert!(c.get::<Value>(&group, &[]).await.unwrap_err().is_not_found());
+    cleanup(&c, &[&repo, &user]).await;
 }
