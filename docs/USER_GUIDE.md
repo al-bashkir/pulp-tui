@@ -210,7 +210,9 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
     version and sets the `pool/` path. A structured publication serves the package under
     `dists/<distribution>/<component>/`.
 * **U** (RPM) uploads a comps.xml. Its package groups, categories, environments and langpacks go
-  into a new version. **Replace** first removes the comps units of the repository.
+  into a new version. **Replace** first removes the comps units of the repository. With
+  **Retain versions** 1 Pulp then deletes the current version, unless a distribution serves it:
+  the confirm says so and you type the repository name.
 * **A** (RPM) uploads one advisory: a JSON file with the fields of an updateinfo record. `id`,
   `issued` and `updated` are required, and each package needs `sum_type` (for example `sha256`).
   Example: `tests/fixtures/advisory.json`.
@@ -247,8 +249,9 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   the repository more than **Keep days** ago (default 14; 0 keeps only the newest). pulp-tui runs
   Pulp's dry run first; the confirm shows how many packages each repository loses (Pulp names them
   only in its debug log). Type the repository name (several: `prune 2 repositories`). Each
-  repository gets a new latest version without them; older versions keep them. A dry run that
-  finds nothing ends with a notice. Content View snapshot repositories are refused. Some pulp_rpm
+  repository gets a new latest version without them; older versions keep them, but with
+  **Retain versions** 1 Pulp deletes the current version, unless a distribution serves it (the
+  confirm then says so). A dry run that finds nothing ends with a notice. Content View snapshot repositories are refused. Some pulp_rpm
   versions (for example 3.34.0 with pulpcore 3.95.3; fixed in 3.35.0, 3.32.15, 3.29.13 and
   3.27.14) make the new version but keep the packages in it; the result then says that the new
   version still has them. Upgrade pulp_rpm to fix it.

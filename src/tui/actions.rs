@@ -316,6 +316,28 @@ fn goes_lines(names: &str, retain: u64, what: &str) -> Vec<String> {
     ]
 }
 
+/// Run `go` at once, or after the typed confirm when the next new version makes Pulp delete the current version of
+/// `repo` (`latest_goes`): `what` then stays only in versions that distributions serve.
+fn confirm_if_latest_goes(
+    app: &mut App,
+    repo: String,
+    title: &'static str,
+    what: &'static str,
+    go: impl FnOnce(&mut App) + Send + 'static,
+) {
+    app.job("read the retention of the repository", move |ctx| async move {
+        let r: Value = ctx.client.get(&repo, &[]).await?;
+        let goes = latest_goes(&ctx, &r, 1).await?;
+        ap(move |app| match goes {
+            true => {
+                let name = s(&r, "name");
+                app.confirm_danger(title, goes_lines(&name, r["retain_repo_versions"].as_u64().unwrap_or(1), what), &name, go)
+            }
+            false => go(app),
+        })
+    });
+}
+
 pub fn pretty(v: &Value) -> Vec<String> {
     serde_json::to_string_pretty(v).unwrap_or_default().lines().map(str::to_string).collect()
 }
@@ -1516,16 +1538,22 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                 if !path.is_file() {
                     return Err(format!("{} is not a readable file", path.display()));
                 }
-                let (href, replace, label) = (href.clone(), f.bool("replace"), format!("upload {what} to {name}"));
-                app.job(label.clone(), move |ctx| async move {
-                    let c = &ctx.client;
-                    let m = if comps {
-                        rpm::upload_comps(c, &path, &href, replace).await?
-                    } else {
-                        rpm::upload_advisory(c, &path, &href).await?
-                    };
-                    ap(move |app| follow(app, m, label.clone(), move |app, t| new_version(app, &label, &t)))
-                });
+                let (repo, replace, label) = (href.clone(), f.bool("replace"), format!("upload {what} to {name}"));
+                let go = move |app: &mut App| {
+                    app.job(label.clone(), move |ctx| async move {
+                        let c = &ctx.client;
+                        let m = if comps {
+                            rpm::upload_comps(c, &path, &repo, replace).await?
+                        } else {
+                            rpm::upload_advisory(c, &path, &repo).await?
+                        };
+                        ap(move |app| follow(app, m, label.clone(), move |app, t| new_version(app, &label, &t)))
+                    })
+                };
+                match replace {
+                    true => confirm_if_latest_goes(app, href.clone(), "Replace comps", "The replaced comps units", go),
+                    false => go(app),
+                }
                 Ok(())
             });
         }
@@ -1722,14 +1750,15 @@ fn prune_packages(app: &mut App, repo: String) {
         let repos = repos.clone();
         app.job("prune dry run", move |ctx| async move {
             let c = &ctx.client;
-            let mut names = vec![];
+            let (mut names, mut read) = (vec![], vec![]);
             for h in &repos {
                 // Marks can be on other pages: read each repository.
-                let r: Value = c.get(h, &[("fields", "name,pulp_labels".into())]).await?;
+                let r: Value = c.get(h, &[("fields", "name,pulp_labels,latest_version_href,retain_repo_versions".into())]).await?;
                 if let Some(e) = snapshot_refusal(&r) {
                     bail!(e);
                 }
                 names.push(s(&r, "name"));
+                read.push(r);
             }
             let dry = rpm::prune(c, &repos, keep_days, true, &group_progress(&ctx)).await?;
             if dry.iter().all(|p| p.packages == 0) {
@@ -1739,7 +1768,18 @@ fn prune_packages(app: &mut App, repo: String) {
             let mut lines = vec![format!("Pulp removes these packages from the latest version (keep {keep_days} days):")];
             lines.extend(dry.iter().map(|p| format!("  {}: {} package(s)", p.repo, p.packages)));
             lines.push("Each is an older version (same name and arch) of a package that the repository has. The new".into());
-            lines.push("latest version lacks them; older versions keep them. Pulp names them only in its debug log.".into());
+            let mut goes = vec![];
+            for r in read.iter().filter(|r| dry.iter().any(|p| p.repo == s(r, "name") && p.packages > 0)) {
+                if latest_goes(&ctx, r, 1).await? {
+                    goes.push(s(r, "name"));
+                }
+            }
+            if goes.is_empty() {
+                lines.push("latest version lacks them; older versions keep them. Pulp names them only in its debug log.".into());
+            } else {
+                lines.push("latest version lacks them. Pulp names them only in its debug log.".into());
+                lines.extend(goes_lines(&goes.join(", "), 1, "The pruned packages"));
+            }
             let (title, typed) = match names.as_slice() {
                 [one] => (format!("Prune old packages of {one}"), one.clone()),
                 _ => (format!("Prune old packages of {} repositories", names.len()), format!("prune {} repositories", names.len())),
@@ -7918,6 +7958,8 @@ mod tests {
             )
             .await;
         }
+        // No retention limit: Replace keeps the current version, so no confirm.
+        get(&server, &repo, json!({ "pulp_href": repo, "name": "os", "latest_version_href": format!("{repo}versions/1/") })).await;
         let dir = tempfile::tempdir().unwrap();
         let (comps, advisory) = (dir.path().join("comps.xml"), dir.path().join("errata.json"));
         std::fs::write(&comps, "<comps></comps>").unwrap();
@@ -7976,6 +8018,48 @@ mod tests {
             assert!(app.modal.is_none(), "{act:?}");
             assert_eq!(last(&app), want);
         }
+    }
+
+    /// With `retain_repo_versions = 1` and no distribution on the current version, Pulp deletes it after the new
+    /// version: the comps Replace and the prune confirms say that the content then stays in no served version.
+    #[tokio::test]
+    async fn comps_replace_and_prune_confirms_warn_when_retention_deletes_the_current_version() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = prune_server(&[("os", 2, Some(3), 0)]).await;
+        let os = format!("{API}repositories/rpm/rpm/os/");
+        let r = json!({ "pulp_href": os, "name": "os", "pulp_labels": {}, "latest_version_href": format!("{os}versions/2/"),
+            "retain_repo_versions": 1 });
+        // Before the repository answer of prune_server.
+        let answer = wiremock::ResponseTemplate::new(200).set_body_json(r);
+        wiremock::Mock::given(method("GET")).and(path(os.as_str())).respond_with(answer).with_priority(1).mount(&server).await;
+        for coll in ["publications/rpm/rpm/", "distributions/rpm/rpm/"] {
+            get(&server, &format!("{API}{coll}"), page(json!([]))).await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let comps = dir.path().join("comps.xml");
+        std::fs::write(&comps, "<comps></comps>").unwrap();
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Repos(RepoType::Rpm, false);
+        let item = json!({ "pulp_href": os, "name": "os" });
+        let warning = goes_lines("os", 1, "")[0].clone();
+
+        run(&mut app, Act::UploadComps, item.clone());
+        fill_and_submit(&mut app, &[("path", &comps.display().to_string()), ("replace", "true")]);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, .. }) = app.modal.take() else {
+            panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text))
+        };
+        assert_eq!(typed.as_deref(), Some("os"));
+        assert!(lines.contains(&warning), "{lines:?}");
+        assert!(posts_to(&server, &format!("{API}rpm/comps/")).await.is_empty(), "nothing sent before the confirm");
+
+        run(&mut app, Act::PrunePackages, item);
+        fill_and_submit(&mut app, &[]);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert!(lines.contains(&warning), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("older versions keep them")), "{lines:?}");
     }
 
     /// Overwrite (pulpcore, default on): off sends `overwrite=false`, so the task fails instead of replacing other
