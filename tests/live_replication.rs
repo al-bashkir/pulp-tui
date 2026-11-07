@@ -116,15 +116,21 @@ async fn canceled_native_replication_is_not_complete() {
     let started: TaskGroup = dst.get(&app.tasks.items[0].href, &[]).await.unwrap();
     let canceled = dst.patch(started.tasks[0]["pulp_href"].as_str().unwrap(), &json!({ "state": "canceled" })).await;
     settle(&mut app, &mut rx).await;
-    let Some(Modal::Text { title, lines, .. }) = &app.modal else { panic!("no result: {:?}", texts(&app)) };
+    let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no result: {:?}", texts(&app)) };
     let row = &app.tasks.items[0];
     match canceled {
         Ok(_) => {
-            assert_eq!(title, &format!("Replication of {name} CANCELED"), "{lines:?}");
+            assert_eq!(title, format!("Replication of {name} CANCELED"), "{lines:?}");
             assert!(row.state == "canceled" && row.is_final(), "{row:?}");
         }
         Err(e) => eprintln!("replicate_distributions ended before the cancel ({e}): {title} {lines:?}"),
     }
+    // History (H) finds the run by the task that reserves this Upstream Pulp.
+    let group = row.href.clone();
+    run(&mut app, Act::ReplicationHistory, json!({ "pulp_href": upstream_href, "name": name }));
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("no history: {:?}", texts(&app)) };
+    assert!(lines[0].starts_with(&format!("{group}  ")), "{lines:?}");
     cleanup(&dst, &[&upstream_href]).await;
 }
 

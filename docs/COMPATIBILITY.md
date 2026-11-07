@@ -675,8 +675,10 @@ Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
 * **Canceled tasks.** On 3.63, a canceled sync leaves `failed 0, canceled 1`. From 3.95, a
   canceled `replicate_distributions` dispatches no finalizer, so the group has only
   `canceled 1`. pulp-tui reports canceled or skipped tasks as not complete.
-* **History** pages through `task-groups/` for `Replication of <upstream>` and stops at
-  five matches or 2000 groups.
+* **History** lists the groups of the five newest `replicate_distributions` tasks that reserve
+  the Upstream Pulp (`tasks/?reserved_resources=<upstream href>`; 3.123.1 dispatches it with
+  `shared_resources=[server]`). The group description holds the name at run time, so it is
+  no link after a rename. An unknown filter is a 400 in pulpcore, never a wider list.
 * **Deb replica (fallback).** A structured APT publication serves each release of its
   release components under `dists/<release>/`, and a flat `/` as an ordinary release under
   `dists/flat-repo/` (pulp_deb 3.11.1 `_ReleaseHelper`); a simple one serves `dists/default/`
