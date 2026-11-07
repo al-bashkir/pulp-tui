@@ -14,7 +14,7 @@ use pulp_tui::pulp::{Capabilities, PulpClient, RepoType, deb};
 use pulp_tui::store::{CvRepo, Store};
 use pulp_tui::tui::actions::run;
 use pulp_tui::tui::app::Modal;
-use pulp_tui::tui::kinds::{Act, Kind};
+use pulp_tui::tui::kinds::{Act, Kind, s};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -619,4 +619,45 @@ async fn deb_repository_delete_impact_names_the_distribution_of_a_verbatim_publi
     }
     assert!(c.get::<Value>(&verbatim, &[]).await.is_err(), "the verbatim publication is gone");
     cleanup(&c, &[&d1, &d2, &remote]).await;
+}
+
+/// Publish (P) of a Deb Content View through the TUI with each signing choice of its form: the test signing service
+/// (Library serves a signed Release), none, and same as source (the source has no key): unsigned. Each version
+/// stores its choice.
+#[tokio::test]
+async fn deb_content_view_publish_signing_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, id) = (client(), RepoType::Deb, unique("cvdebtui"));
+    let found: Option<Value> = ops::find_by_name(&c, &c.api("signing-services/"), "pulp-tui-deb-test").await.unwrap();
+    let service = s(&found.expect("the Deb test signing service (tests/env/pulp-env.sh deb-signing-up)"), "pulp_href");
+    let (repo, remote) = synced_repo(&c, t, &id, "deb/", "mirror").await;
+    let (mut app, mut rx) = app().await;
+    let (st, scope) = (app.cv_store.clone().unwrap(), app.conn.as_ref().unwrap().scope.clone());
+    let svc = CvService { client: c.clone(), store: st.clone(), scope: scope.clone(), actor: "test@live".into(), lock: None };
+    let cv = st.create_cv(&scope, &id, "").await.unwrap();
+    st.set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: "apt".into(), repo_type: t, filters: vec![] }).await.unwrap();
+    let lib = st.ensure_library(&scope).await.unwrap();
+    open_list(&mut app, &mut rx, Kind::ContentViews, "").await;
+    for (number, signing, stored, signs) in
+        [(1, "service", service.as_str(), true), (2, "none", "none", false), (3, "same as source", "", false)]
+    {
+        let r = row(&app, "name", &id).unwrap();
+        run(&mut app, Act::CvPublish, r);
+        settle(&mut app, &mut rx).await; // the repositories are read before the form
+        fill(&mut app, &[("signing", signing), ("signing_service", &service)]);
+        settle(&mut app, &mut rx).await; // the preview
+        let (lines, typed) = yes(&mut app);
+        assert_eq!((typed, lines[0].as_str()), (None, "Publishing creates a new immutable version and makes it active in Library."));
+        settle(&mut app, &mut rx).await;
+        shown(&app, &format!("{id} version {number} published and active in Library"));
+        let v = st.versions(cv).await.unwrap().remove(0);
+        assert_eq!((v.number, st.version_repos(v.id).await.unwrap().remove(0).signing.as_str()), (number, stored));
+        assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
+        assert_eq!(signed(&c, &served_base(&c, &st, lib, cv).await).await, signs, "{signing}");
+        assert_eq!(row(&app, "name", &id).unwrap()["latest"], format!("v{number}"), "the list reloads");
+    }
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote]).await;
 }

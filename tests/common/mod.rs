@@ -7,6 +7,7 @@ use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{Mutation, PulpClient, RepoType};
 use pulp_tui::store::Store;
 use pulp_tui::tui::app::{App, Modal, Msg, NO_PROFILE, Screen};
+use pulp_tui::tui::form::FieldKind;
 use pulp_tui::tui::kinds::Kind;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -180,6 +181,17 @@ pub fn fill(app: &mut App, values: &[(&str, &str)]) {
         form.fields.iter_mut().find(|f| f.key == *k).unwrap_or_else(|| panic!("no field {k}")).value = v.to_string();
     }
     submit(app, &form).unwrap();
+}
+
+/// Load the options of pick field `key` of the open form from the server, as opening its picker does: a multi pick
+/// submits only values that are among its options.
+pub async fn load_choices(app: &mut App, rx: &mut UnboundedReceiver<Msg>, key: &str) {
+    let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no form: {:?}", texts(app)) };
+    let i = form.fields.iter().position(|f| f.key == key).unwrap_or_else(|| panic!("no field {key}"));
+    let FieldKind::Pick { source, .. } = form.fields[i].kind.clone() else { panic!("{key} is not a pick field") };
+    let (id, role) = (form.id, form.get("role").to_string());
+    app.load_pick(id, i, source, role);
+    settle(app, rx).await;
 }
 
 /// Best-effort removal; tests use unique names so leftovers never collide.

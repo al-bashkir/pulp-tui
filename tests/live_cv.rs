@@ -7,8 +7,9 @@
 mod common;
 
 use common::*;
-use pulp_tui::cv::{CvService, Mode, base_path, export, import};
+use pulp_tui::cv::{CvService, Mode, base_path, export, import, unix_now};
 use pulp_tui::filters::parse_rules;
+use pulp_tui::pulp::client::Page;
 use pulp_tui::pulp::models::{RepoVersion, Task};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{Capabilities, Mutation, PulpClient, RepoType};
@@ -999,4 +1000,182 @@ async fn content_view_workflows_through_the_tui() {
     for (_, _, repo, remote) in &sources {
         cleanup(&c, &[repo, remote]).await;
     }
+}
+
+/// A Content View service on the store of the TUI `app`, for the setup and the cleanup of a test.
+fn service(app: &App, c: &PulpClient) -> CvService {
+    let (store, scope) = (app.cv_store.clone().unwrap(), app.conn.as_ref().unwrap().scope.clone());
+    CvService { client: c.clone(), store, scope, actor: "test@live".into(), lock: None }
+}
+
+/// A composite view through the TUI: Create (composite), Add components (a) with their pins (os at v1, extras at
+/// latest), Edit (auto publish on), Publish (P): Library serves the composite's own paths. A Publish of the extras then
+/// auto-publishes the composite with extras v2 and os still v1. Remove component (x) of the extras.
+#[tokio::test]
+async fn composite_content_view_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvctui"));
+    let (os_name, extras_name) = (format!("{id}-os"), format!("{id}-extras"));
+    let (file_repo, file_remote) = synced_repo(&c, RepoType::File, &format!("{id}-src-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let (rpm_repo, rpm_remote) = synced_repo(&c, RepoType::Rpm, &format!("{id}-src-os"), "rpm/", "additive").await;
+    let (mut app, mut rx) = app().await;
+    let svc = service(&app, &c);
+    let (st, scope) = (svc.store.clone(), svc.scope.clone());
+    let os = st.create_cv(&scope, &os_name, "").await.unwrap();
+    let extras = st.create_cv(&scope, &extras_name, "").await.unwrap();
+    let repo = |href: &str, name: &str, t| CvRepo { repo_href: href.into(), repo_name: name.into(), repo_type: t, filters: vec![] };
+    st.set_cv_repo(os, &repo(&file_repo, "docs", RepoType::File)).await.unwrap();
+    st.set_cv_repo(extras, &repo(&rpm_repo, "os", RepoType::Rpm)).await.unwrap();
+    tui_publish(&mut app, &mut rx, &os_name, "").await;
+    tui_publish(&mut app, &mut rx, &extras_name, "").await;
+
+    // Create (c) the composite.
+    open_list(&mut app, &mut rx, Kind::ContentViews, "").await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("name", &id), ("composite", "true")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("composite content view {id} created; add components with a"));
+    let r = row(&app, "name", &id).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    assert_eq!(r["composite"], true);
+    let comp = r["id"].as_i64().unwrap();
+
+    // Add components (a): both views; os pinned at v1, extras at latest.
+    run(&mut app, Act::CvAddComponent, r);
+    load_choices(&mut app, &mut rx, "components").await;
+    fill(&mut app, &[("components", &format!("{os}\n{extras}"))]);
+    settle(&mut app, &mut rx).await; // the versions of each are read before the pin form
+    fill(&mut app, &[(os.to_string().as_str(), "v1"), (extras.to_string().as_str(), "latest")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, "added 2 component(s) (takes effect on next publish)");
+    let pins =
+        |r: Value| -> Vec<(String, String)> { r["components"].as_array().unwrap().iter().map(|c| (s(c, "name"), s(c, "pin"))).collect() };
+    let r = row(&app, "name", &id).unwrap();
+    assert_eq!(pins(r.clone()), [(extras_name.clone(), "latest (v1)".into()), (os_name.clone(), "pinned v1".into())], "the list reloads");
+
+    // Edit (e): auto publish on.
+    run(&mut app, Act::Edit, r);
+    settle(&mut app, &mut rx).await; // the components are read before the form
+    fill(&mut app, &[("auto", "true")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, "saved");
+    assert!(st.content_view(comp).await.unwrap().auto_publish);
+
+    // Publish (P) the composite: Library serves the paths of the composite.
+    tui_publish(&mut app, &mut rx, &id, "first").await;
+    shown(&app, &format!("{id} version 1 published and active in Library"));
+    let lib = st.ensure_library(&scope).await.unwrap();
+    assert_eq!(svc.verify(comp, lib).await.unwrap(), Vec::<String>::new());
+    let url = |repo: &str, file: &str| format!("http://127.0.0.1:8080/pulp/content/{}/{file}", base_path(&id, "library", repo));
+    assert_eq!(served(&c, &url("docs", "docs/readme.txt")).await.0, 200);
+    assert_eq!(served(&c, &url("os", "repodata/repomd.xml")).await.0, 200);
+
+    // Publish (P) of the extras: the composite follows with auto publish, os stays at v1.
+    tui_publish(&mut app, &mut rx, &extras_name, "again").await;
+    shown(&app, &format!("{extras_name} version 2 published and active in Library; auto publish: {id} v2 published"));
+    let c2 = st.versions(comp).await.unwrap().remove(0);
+    assert_eq!((c2.number, c2.state.as_str()), (2, "published"));
+    let used: Vec<_> = st.version_components(c2.id).await.unwrap().into_iter().map(|u| (u.name, u.number)).collect();
+    assert_eq!(used, [(extras_name.clone(), 2), (os_name.clone(), 1)]);
+    assert_eq!(svc.verify(comp, lib).await.unwrap(), Vec::<String>::new());
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    assert_eq!((&r["latest"], pins(r.clone())[0].1.as_str()), (&json!("v2"), "latest (v2)"), "the list reloads");
+
+    // Remove component (x): the extras.
+    run(&mut app, Act::CvRemoveComponent, r);
+    fill(&mut app, &[("component", &extras_name)]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("{extras_name} removed from {id}; published versions are unchanged"));
+    let left: Vec<String> = st.components(comp).await.unwrap().into_iter().map(|c| c.name).collect();
+    assert_eq!(left, [os_name.as_str()]);
+    assert_eq!(pins(row(&app, "name", &id).unwrap()), [(os_name, "pinned v1".into())], "the list reloads");
+
+    for v in [comp, os, extras] {
+        svc.delete_view(v, &quiet, &no_progress).await.unwrap();
+    }
+    cleanup(&c, &[&file_repo, &rpm_repo, &file_remote, &rpm_remote]).await;
+}
+
+/// A publish that stopped after its checkpoint, through the TUI on the Versions screen: Watch (W) shows the task of
+/// its pending step; Resume (R) is refused while another operator holds the lock of the view; Break lock (U) on the
+/// Content Views screen, after the typed name, removes that lock; then Resume publishes the version and Library serves it.
+#[tokio::test]
+async fn resume_watch_and_break_lock_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvresume"));
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let (mut app, mut rx) = app().await;
+    let svc = service(&app, &c);
+    let (st, scope) = (svc.store.clone(), svc.scope.clone());
+    let cv = st.create_cv(&scope, &id, "").await.unwrap();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    st.set_cv_repo(cv, &docs).await.unwrap();
+    // v1 stopped after its checkpoint, with the sync task of the source as its pending step.
+    let sync: Page<Task> = c.list(&c.api("tasks/"), &[("reserved_resources", repo.clone()), ("limit", "1".into())]).await.unwrap();
+    let pending = sync.results[0].pulp_href.clone();
+    let v1 = st.begin_version(cv, "", &[docs]).await.unwrap();
+    let mut step = st.version_repos(v1.id).await.unwrap().remove(0);
+    step.source_version = Some(latest(&c, &repo).await);
+    step.pending_task = Some(pending.clone());
+    st.save_version_repo(&step).await.unwrap();
+    st.finish_version(v1.id, "failed", Some("stopped")).await.unwrap();
+
+    // Watch (W): the pending step's task, followed by the Task Center.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvVersions, r);
+    settle(&mut app, &mut rx).await;
+    let v1_row = app.list.items.iter().find(|v| v["number"] == 1).cloned().unwrap();
+    run(&mut app, Act::WatchTask, v1_row.clone());
+    settle_tasks(&mut app, &mut rx).await;
+    let Some(Modal::Text { title, lines, watch, .. }) = app.modal.take() else { panic!("no watch: {:?}", texts(&app)) };
+    assert_eq!((title, watch), (format!("Watch task {id} v1: copy docs"), Some(pending.clone())));
+    assert!(lines.contains(&format!("href:  {pending}")) && lines.contains(&"state: completed".to_string()), "{lines:?}");
+    step.pending_task = None; // the step itself is done: Resume starts it again
+    st.save_version_repo(&step).await.unwrap();
+
+    // Resume (R) while another operator holds the lock: refused, the version stays failed.
+    st.try_lock(cv, "bob@ws2", "dead-token", "publish", unix_now()).await.unwrap().unwrap();
+    run(&mut app, Act::Resume, v1_row.clone());
+    settle(&mut app, &mut rx).await;
+    let refused = format!("Content View {id} is locked by bob@ws2 (publish) since ");
+    assert!(texts(&app).iter().any(|t| t.contains(&refused)), "{:?}", texts(&app));
+    assert_eq!(st.version(v1.id).await.unwrap().state, "failed");
+    app.back();
+    settle(&mut app, &mut rx).await;
+
+    // Break lock (U): the holder, the typed name.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::BreakLock, r);
+    settle(&mut app, &mut rx).await; // the holder is read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some(id.as_str()));
+    assert!(lines[0].starts_with("Locked by bob@ws2 (publish) since "), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("lock on {id} broken"));
+    assert_eq!(st.lock_holder(cv).await.unwrap(), None);
+
+    // Resume (R): v1 is published and active in Library.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvVersions, r);
+    settle(&mut app, &mut rx).await;
+    run(&mut app, Act::Resume, v1_row.clone());
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("{id} v1 published"));
+    assert_eq!(st.version(v1.id).await.unwrap().state, "published");
+    let lib = st.ensure_library(&scope).await.unwrap();
+    assert_eq!(st.binding(lib, cv).await.unwrap().unwrap().active(), Some(v1.id));
+    assert!(svc.verify(cv, lib).await.unwrap().is_empty());
+    let readme = format!("http://127.0.0.1:8080/pulp/content/{}/docs/readme.txt", base_path(&id, "library", "docs"));
+    assert_eq!(served(&c, &readme).await.0, 200);
+    assert_eq!(app.list.items.iter().find(|v| v["number"] == 1).unwrap()["state"], "published", "the list reloads");
+    // Watch (W) of a published version: no step is pending.
+    run(&mut app, Act::WatchTask, v1_row);
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).last().unwrap().starts_with("v1 has no copy or publication task now."), "{:?}", texts(&app));
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote]).await;
 }
