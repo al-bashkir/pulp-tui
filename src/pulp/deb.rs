@@ -240,6 +240,12 @@ async fn upload_source(
     let sha256 = hex::encode(Sha256::digest(&dsc));
     let dsc_artifact = artifact(c, path, &sha256, progress, on).await?;
     let (content_href, task) = create_source(c, dsc_artifact, repository, overwrite, on).await?;
+    ops::check_digest(c, &content_href, &sha256).await.map_err(|e| match e {
+        PulpError::Decode(m) => PulpError::Decode(format!(
+            "{m}: pulp_deb keeps one source package per Source and Version (and added that one); give a rebuilt .dsc a new Version"
+        )),
+        e => e,
+    })?;
     Ok(UploadResult { content_href, sha256, task })
 }
 

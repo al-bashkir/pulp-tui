@@ -814,6 +814,7 @@ async fn deb_source_upload_sends_the_listed_files_and_the_dsc_as_artifacts() {
     let task =
         json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [format!("{repo}versions/2/"), src] });
     answer("GET", &format!("{API}tasks/1/"), 200, task).mount(&server).await;
+    answer("GET", &src, 200, json!({ "sha256": sha(text.as_bytes()) })).mount(&server).await;
     let c = client(&server, |_, s| s.upload_chunk_mb = 1);
 
     let r = deb::upload(&c, &deb::Upload::Source, &dsc, Some(&repo), false, &|_, _| {}, &no_progress).await.unwrap();
@@ -832,6 +833,31 @@ async fn deb_source_upload_sends_the_listed_files_and_the_dsc_as_artifacts() {
     assert!(e.to_string().contains("h_1.0-1.debian.tar.xz"), "{e}");
     let sent = server.received_requests().await.unwrap();
     assert_eq!(sent.iter().filter(|r| r.url.path() == source_packages).count(), 1, "no second source package");
+}
+
+/// pulp_deb keeps one source package per Source and Version, so a rebuilt `.dsc` of the same version gets the old
+/// package back. The upload compares the server's digest with the local `.dsc` and says why they differ.
+#[tokio::test]
+async fn deb_source_upload_refuses_the_kept_package_of_another_dsc() {
+    let src = format!("{API}content/deb/source_packages/1/");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("h_1.0.tar.gz"), "orig").unwrap();
+    let dsc = dir.path().join("h_1.0.dsc");
+    std::fs::write(&dsc, format!("Source: h\nChecksums-Sha256:\n {} 4 h_1.0.tar.gz\n", hex::encode(Sha256::digest(b"orig")))).unwrap();
+    let server = MockServer::start().await;
+    let answer = |verb: &str, p: &str, status: u16, body: Value| {
+        Mock::given(method(verb)).and(path(p.to_string())).respond_with(ResponseTemplate::new(status).set_body_json(body))
+    };
+    let artifact = json!({ "count": 1, "next": null, "results": [{ "pulp_href": format!("{API}artifacts/1/") }] });
+    answer("GET", &format!("{API}artifacts/"), 200, artifact).mount(&server).await;
+    answer("POST", &format!("{API}content/deb/source_packages/"), 202, json!({ "task": format!("{API}tasks/1/") })).mount(&server).await;
+    let task = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [src] });
+    answer("GET", &format!("{API}tasks/1/"), 200, task).mount(&server).await;
+    answer("GET", &src, 200, json!({ "sha256": "0".repeat(64) })).mount(&server).await;
+    let c = client(&server, |_, _| {});
+
+    let e = deb::upload(&c, &deb::Upload::Source, &dsc, None, true, &|_, _| {}, &no_progress).await.unwrap_err().to_string();
+    assert!(e.contains(&src) && e.contains("Source and Version"), "{e}");
 }
 
 #[tokio::test]

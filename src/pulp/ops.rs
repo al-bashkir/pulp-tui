@@ -887,11 +887,17 @@ async fn uploaded(
     };
     // A Deb upload task also names the release records it made.
     let content_href = created_href(obj.as_ref(), task.as_ref(), &format!("/{content}"))?;
-    let content: Value = c.get(&content_href, &[("fields", "sha256".into())]).await?;
-    if content["sha256"].as_str() != Some(sha256.as_str()) {
+    check_digest(c, &content_href, &sha256).await?;
+    Ok(UploadResult { content_href, sha256, task })
+}
+
+/// The uploaded unit `content_href` must have the local digest `sha256`: Pulp can return an existing unit instead.
+pub async fn check_digest(c: &PulpClient, content_href: &str, sha256: &str) -> Result<()> {
+    let content: Value = c.get(content_href, &[("fields", "sha256".into())]).await?;
+    if content["sha256"].as_str() != Some(sha256) {
         return Err(PulpError::Decode(format!("digest mismatch for {content_href}: local {sha256}, server {}", content["sha256"])));
     }
-    Ok(UploadResult { content_href, sha256, task })
+    Ok(())
 }
 
 #[cfg(test)]
