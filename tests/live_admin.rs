@@ -703,6 +703,90 @@ async fn server_profile_test_connection() {
     assert!(content.starts_with("http") && content.contains("/pulp/content/"), "{lines:?}");
 }
 
+/// Roles through the TUI: Create a custom role, Edit its permissions, Delete it: the impact names the user that has
+/// it, the typed name; Pulp then drops the user's assignment.
+#[tokio::test]
+async fn custom_role_create_edit_and_delete_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("admin-role"));
+    let user = create(&c, "users/", json!({ "username": name }), "/users/").await;
+    let perms = |r: &Value| {
+        let mut p: Vec<String> = r["permissions"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_string()).collect();
+        p.sort();
+        p
+    };
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Roles, &name).await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("name", &name), ("description", "test"), ("permissions", "file.view_filerepository")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("create role {name}: done"));
+    let r = row(&app, "name", &name).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    assert_eq!((perms(&r), &r["locked"]), (vec!["file.view_filerepository".to_string()], &json!(false)));
+
+    run(&mut app, Act::Edit, r);
+    fill(&mut app, &[("permissions", "file.view_filerepository, file.change_filerepository")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("update role {name}: done"));
+    let r = row(&app, "name", &name).unwrap();
+    assert_eq!(perms(&r), ["file.change_filerepository", "file.view_filerepository"], "the list reloads");
+
+    c.post(&format!("{user}roles/"), &json!({ "role": name, "content_object": null })).await.unwrap();
+    run(&mut app, Act::Delete, r.clone());
+    settle(&mut app, &mut rx).await; // the holders are read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some(name.as_str()));
+    assert_eq!(lines[1..], [format!("1 user(s) have it: {name}"), "0 group(s) have it".into()]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("delete role {name}: done"));
+    assert!(row(&app, "name", &name).is_none(), "the list reloads without it");
+    assert!(c.get::<Value>(&s(&r, "pulp_href"), &[]).await.unwrap_err().is_not_found());
+    assert_eq!(roles_of(&c, &user).await, [], "Pulp drops the assignment");
+    cleanup(&c, &[&user]).await;
+}
+
+/// Upstream Pulps through the TUI (no replication): Create with an account, Edit to policy `labeled` (the typed
+/// policy word) and clear the password, Delete after the impact and the typed name.
+#[tokio::test]
+async fn upstream_pulp_create_edit_and_delete_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, name) = (client(), unique("admin-upstream"));
+    let set = |u: &Value, k: &str| u["hidden_fields"].as_array().unwrap().iter().any(|h| h["name"] == k && h["is_set"] == true);
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::UpstreamPulps, &name).await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("name", &name), ("base_url", "https://upstream.example.com"), ("username", "u"), ("password", "p")]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("create upstream {name}: done"));
+    let u = row(&app, "name", &name).unwrap_or_else(|| panic!("the list reloads with it: {:?}", app.list.items));
+    assert_eq!((u["policy"].as_str(), set(&u, "username"), set(&u, "password")), (Some("nodelete"), true, true));
+    let href = s(&u, "pulp_href");
+
+    run(&mut app, Act::Edit, u);
+    fill(&mut app, &[("policy", "labeled"), ("clear_password", "true")]);
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some("labeled"));
+    assert!(lines[0].starts_with("!!! policy `labeled` may DELETE "), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("update upstream {name}: done"));
+    let u: Value = c.get(&href, &[]).await.unwrap();
+    assert_eq!((u["policy"].as_str(), set(&u, "username"), set(&u, "password")), (Some("labeled"), true, false));
+
+    let r = row(&app, "name", &name).unwrap();
+    run(&mut app, Act::Delete, r);
+    settle(&mut app, &mut rx).await; // the impact is read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    assert_eq!((typed.as_deref(), lines[0].clone()), (Some(name.as_str()), format!("Delete the Upstream Pulp definition {name}.")));
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("delete upstream {name}: done"));
+    assert!(row(&app, "name", &name).is_none(), "the list reloads without it");
+    assert!(c.get::<Value>(&href, &[]).await.unwrap_err().is_not_found());
+}
+
 /// The role assignments of user or group `owner`: (role, object).
 async fn roles_of(c: &PulpClient, owner: &str) -> Vec<(String, Value)> {
     let p: pulp_tui::pulp::client::Page<Value> = c.list(&format!("{owner}roles/"), &[]).await.unwrap();
