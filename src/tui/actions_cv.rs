@@ -720,11 +720,13 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
         let envs = st.environments(&svc.scope).await?;
         let e = envs.into_iter().find(|e| e.name == env).ok_or_else(|| anyhow!("unknown environment {env}"))?;
         let v = st.version(vid).await?;
-        // The rule of `CvService::promote`, before a preview that the operator would confirm in vain.
-        if mode == Mode::Rollback
-            && e.prior_id.is_some()
-            && let Some(why) = crate::cv::rollback_refusal(&env, v.number, svc.bound_number(e.id, cv).await?)
-        {
+        // The rules of `CvService::promote`, before a preview that the operator would confirm in vain.
+        let refusal = match mode {
+            Mode::Promote => svc.promote_refusal(&v, &e).await?,
+            Mode::Rollback if e.prior_id.is_some() => crate::cv::rollback_refusal(&env, v.number, svc.bound_number(e.id, cv).await?),
+            Mode::Rollback => None,
+        };
+        if let Some(why) = refusal {
             return ap(move |app| app.error(why));
         }
         let cur_num = match st.binding(e.id, cv).await? {
@@ -747,9 +749,6 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
             lines.push("Rollback only changes bindings; newer versions stay available.".into());
             lines.push("Files of the replaced publications may stay downloadable for Pulp's".into());
             lines.push("DISTRIBUTED_PUBLICATION_RETENTION_PERIOD; repository metadata switches immediately.".into());
-        } else if svc.promote_refusal(&v, &e).await?.is_some() {
-            lines.push(String::new());
-            lines.push("BLOCKED: the version is not active in the prior environment.".into());
         }
         let protected = e.protected;
         let (title, danger_title, typed) = (format!("{name} -> {env}"), format!("{env} is protected"), env.clone());
@@ -2131,6 +2130,22 @@ mod tests {
                  pulp-tui-cv-web-Dev-os and fails: rename it back"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_promotion_shows_why_and_offers_no_confirmation() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        st.create_env("lab", "Dev", lib, false).await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await; // not active in Library
+        promote_preview(&mut app, web, "web".into(), v.id, "Dev".into(), Mode::Promote);
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no preview to confirm");
+        assert_eq!(last_notice(&app), (Level::Error, "version 1 is not active in Library; promote it there first (or use rollback)"));
+        assert!(server.received_requests().await.unwrap().is_empty(), "nothing read from Pulp for a refused promotion");
     }
 
     fn confirm_lines(app: &mut App) -> Vec<String> {
