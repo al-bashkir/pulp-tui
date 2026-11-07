@@ -339,8 +339,9 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
 
 * **Pulp export and import**: Pulp writes and reads the files on its own disk. Export
   waits for the task and shows the TOC. Before an importer create or edit, the job finds
-  every mapped destination and sends nothing when one is missing. *Import* runs
-  `ops::import_check` first, then `ops::pulp_import` after `confirm_prod`, and follows the
+  every mapped destination and sends nothing when one is missing. *Import* reads the
+  importer's mapping again and runs `ops::import_check` with it, then `ops::pulp_import` after
+  `confirm_prod`, and follows the
   task group like replication. Deletes of exporters and importers load the impact and need
   the typed name.
 * **Content View definitions** (`export-cv`, `import-cv`; format 2, reads format 1; an

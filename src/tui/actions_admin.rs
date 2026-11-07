@@ -1428,7 +1428,7 @@ fn importer_action(app: &mut App, act: Act, item: Value) {
     match act {
         Act::Imports => app.push(Kind::Imports { importer: href, name }),
         Act::Create | Act::Edit => importer_form(app, act == Act::Edit, &item),
-        Act::Import => import_form(app, href, name, item["repo_mapping"].clone()),
+        Act::Import => import_form(app, href, name),
         Act::Delete => app.job(format!("impact of deleting importer {name}"), move |ctx| async move {
             let n = ctx.client.list::<Value>(&format!("{href}imports/"), &[("limit", "1".into())]).await?.count;
             let lines = vec![
@@ -1483,7 +1483,7 @@ fn importer_form(app: &mut App, edit: bool, item: &Value) {
 }
 
 /// The import check is the preview; the import runs only after the confirmation.
-fn import_form(app: &mut App, href: String, name: String, mapping: Value) {
+fn import_form(app: &mut App, href: String, name: String) {
     let help = "the -toc.json of the export, or its .tar (an export without chunks); inside ALLOWED_IMPORT_PATHS";
     let toc = Field::text("toc", "TOC or export file on the Pulp server").required().help(help);
     let form = Form::new(format!("Import with {name}"), vec![toc])
@@ -1494,8 +1494,10 @@ fn import_form(app: &mut App, href: String, name: String, mapping: Value) {
         if ops::import_field(&toc) == "path" && !tar_ok {
             return Err("not supported by this server: import from an export .tar (path)".into());
         }
-        let (href, name, mapping) = (href.clone(), name.clone(), mapping.clone());
+        let (href, name) = (href.clone(), name.clone());
         app.job(format!("import check {toc}"), move |ctx| async move {
+            // The import uses the importer's mapping as Pulp has it now; the list row can be stale.
+            let mapping = ctx.client.get::<Value>(&href, &[]).await?["repo_mapping"].take();
             let (ok, lines) = ops::import_check(&ctx.client, &toc, &mapping).await?;
             ap(move |app| match ok {
                 true => confirm_import(app, href, name, toc, &mapping, lines),
@@ -2646,6 +2648,7 @@ mod tests {
         };
         let server = MockServer::start().await;
         let check_path = "/pulp/api/v3/importers/core/pulp/import-check/";
+        serve(&server, "GET", IMP, 200, item.clone()).await;
         serve(&server, "POST", check_path, 200, check(false, json!([format!("file {toc} does not exist")]))).await;
         let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
         app.list.kind = Kind::Importers;
@@ -2659,6 +2662,7 @@ mod tests {
         assert_eq!(sent(&server).await.len(), 1, "no import without a valid check");
 
         server.reset().await;
+        serve(&server, "GET", IMP, 200, item.clone()).await;
         serve(&server, "POST", check_path, 200, check(true, json!([]))).await;
         serve(&server, "POST", &format!("{IMP}imports/"), 202, json!({ "task_group": GROUP })).await;
         let group = json!({ "pulp_href": GROUP, "description": format!("Import of {toc}"), "all_tasks_dispatched": false, "completed": 2,
@@ -2689,6 +2693,32 @@ mod tests {
         assert_eq!((row.label.as_str(), row.state.as_str()), ("import dvd", "completed"), "final without all_tasks_dispatched");
     }
 
+    /// The check tests the mapping that the import uses: the importer's current one, not the one of a stale list row.
+    #[tokio::test]
+    async fn the_import_check_uses_the_current_mapping_of_the_importer() {
+        use crate::tui::kinds::Act;
+        let toc = "/var/lib/pulp/exports/dvd/export-9-20261102_1000-toc.json";
+        let stale = json!({ "pulp_href": IMP, "name": "dvd", "repo_mapping": { "web": "web-old" } });
+        let server = MockServer::start().await;
+        serve(&server, "GET", IMP, 200, json!({ "pulp_href": IMP, "name": "dvd", "repo_mapping": { "web": "web-copy" } })).await;
+        let check_path = "/pulp/api/v3/importers/core/pulp/import-check/";
+        let check = json!({ "toc": { "context": toc, "is_valid": true, "messages": [] },
+            "repo_mapping": { "context": "{\"web\":\"web-copy\"}", "is_valid": true, "messages": [] } });
+        serve(&server, "POST", check_path, 200, check).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Importers;
+        let (mut f, mut submit) = open_form(&mut app, Act::Import, stale);
+        set(&mut f, "toc", toc);
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
+        assert!(lines.contains(&"  web -> web-copy".to_string()) && !lines.iter().any(|l| l.contains("web-old")), "{lines:?}");
+        assert_eq!(
+            sent(&server).await,
+            [("POST".into(), check_path.into(), json!({ "toc": toc, "repo_mapping": "{\"web\":\"web-copy\"}" }))]
+        );
+    }
+
     /// A `.tar` (an export without chunks) goes as `path`, in the check and in the import.
     #[tokio::test]
     async fn an_import_of_the_export_tar_sends_its_path() {
@@ -2700,6 +2730,7 @@ mod tests {
         let check_path = "/pulp/api/v3/importers/core/pulp/import-check/";
         let check = json!({ "path": { "context": tar, "is_valid": true, "messages": [] },
             "repo_mapping": { "context": "{}", "is_valid": true, "messages": [] } });
+        serve(&server, "GET", IMP, 200, item.clone()).await;
         serve(&server, "POST", check_path, 200, check).await;
         serve(&server, "POST", &format!("{IMP}imports/"), 202, json!({ "task_group": GROUP })).await;
         let group = json!({ "pulp_href": GROUP, "completed": 1,
