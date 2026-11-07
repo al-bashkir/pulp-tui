@@ -1854,7 +1854,7 @@ mod tests {
         use crate::tui::kinds::Act;
         let server = MockServer::start().await;
         let count = |n: u64| json!({ "count": n, "next": null, "results": [] });
-        for (p, n) in [("repositories/", 2), ("remotes/", 2), ("distributions/", 3), ("tasks/", 1)] {
+        for (p, n) in [("repositories/", 2), ("remotes/", 4), ("distributions/", 3), ("tasks/", 1)] {
             serve(&server, "GET", &format!("/pulp/api/v3/{p}"), 200, count(n)).await;
         }
         serve(&server, "DELETE", UP, 204, Value::Null).await;
@@ -1871,7 +1871,7 @@ mod tests {
             lines,
             [
                 "Delete the Upstream Pulp definition up.",
-                "Its replications labelled 2 repositories, 2 remotes and 3 distributions (UpstreamPulp=1): they stay.",
+                "Its replications labelled 2 repositories, 4 remotes and 3 distributions (UpstreamPulp=1): they stay.",
                 "1 replication task(s) of it are waiting or running: they fail without it.",
             ]
         );
@@ -1882,6 +1882,16 @@ mod tests {
         yes(&mut app);
         settle(&mut app, &mut rx).await;
         assert_eq!(sent(&server).await, [("DELETE".into(), UP.into(), Value::Null)]);
+
+        // Nothing waits or runs: no task line.
+        server.reset().await;
+        for p in ["repositories/", "remotes/", "distributions/", "tasks/"] {
+            serve(&server, "GET", &format!("/pulp/api/v3/{p}"), 200, count(0)).await;
+        }
+        super::run(&mut app, Act::Delete, json!({ "pulp_href": UP, "name": "up" }));
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
+        assert_eq!(lines.len(), 2, "{lines:?}");
     }
 
     /// Create on a selected role starts from its permissions, never its name: an unchanged submit would be a duplicate.
@@ -1918,8 +1928,10 @@ mod tests {
             "policy": "all", "ca_cert": "PEM", "client_cert": null, "tls_validation": true,
             "hidden_fields": [{ "name": "client_key", "is_set": false }, { "name": "username", "is_set": true }, { "name": "password", "is_set": true }] });
         let (mut f, mut submit) = open_form(&mut app, Act::Edit, item);
-        let clear: Vec<_> = f.fields.iter().filter(|x| x.key.starts_with("clear_")).map(|x| x.key.as_str()).collect();
-        assert_eq!(clear, ["clear_username", "clear_password", "clear_ca_cert"], "only what is set");
+        let keys: Vec<_> = f.fields.iter().map(|x| x.key.as_str()).collect();
+        let at = keys.iter().position(|k| *k == "client_key").unwrap();
+        let clear = ["clear_username", "clear_password", "clear_ca_cert", "tls_validation"];
+        assert_eq!(keys[at + 1..at + 5], clear, "only what is set, after the credential fields");
 
         set(&mut f, "tls_validation", "false");
         submit(&mut app, &f).unwrap();
@@ -1929,6 +1941,10 @@ mod tests {
 
         set(&mut f, "clear_password", "true");
         set(&mut f, "clear_ca_cert", "true");
+        set(&mut f, "ca_cert", "/nonexistent/ca.pem"); // a checked clear wins: the file is not read
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("client.pem"), "CERT").unwrap();
+        set(&mut f, "client_cert", &dir.path().join("client.pem").display().to_string()); // a new one is read
         submit(&mut app, &f).unwrap();
         settle(&mut app, &mut rx).await;
 
@@ -1943,8 +1959,8 @@ mod tests {
             bodies,
             [
                 json!({ "tls_validation": false }),
-                json!({ "tls_validation": false, "password": null, "ca_cert": null }),
-                json!({ "tls_validation": false, "password": null, "ca_cert": null, "policy": "labeled" }),
+                json!({ "tls_validation": false, "password": null, "ca_cert": null, "client_cert": "CERT" }),
+                json!({ "tls_validation": false, "password": null, "ca_cert": null, "client_cert": "CERT", "policy": "labeled" }),
             ]
         );
     }
