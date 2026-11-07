@@ -869,15 +869,12 @@ fn cv_publish(app: &mut App, id: i64, name: String, deb: bool) {
 fn resume(app: &mut App, cv: i64, name: String, vid: i64, number: String) {
     app.job(format!("resume {name} v{number}"), move |ctx| async move {
         let svc = ctx.cv()?.locked(cv, &format!("resume v{number}")).await?;
-        // Published with its Library step done (another session can finish it after the check): resume returns at
-        // once, nothing new to auto publish. A stopped Library step also stopped the auto publish after it.
-        let before = svc.store.version(vid).await?;
-        let was_published = before.state == "published" && !svc.library_interrupted(&before).await?;
         let (v, note) = svc.resume(vid, &ctx.log(), &ctx.on_task()).await?;
-        // Composites follow the newest version: an older one gives them nothing new.
+        // Composites follow the newest version: an older one gives them nothing new. Only composites that lack it
+        // publish (`lagging_composites`), also when a stopped client never ran their auto publish.
         let newest = svc.store.versions(cv).await?.into_iter().find(|n| n.state == "published").is_some_and(|n| n.id == v.id);
         drop(svc); // release the lock of this view; composites take their own
-        let auto = if was_published || !newest { vec![] } else { ctx.cv()?.auto_publish(cv, &ctx.log(), &ctx.on_task()).await };
+        let auto = if newest { ctx.cv()?.auto_publish(cv, &ctx.log(), &ctx.on_task()).await } else { vec![] };
         ap(move |app| {
             let (level, text) = auto_notice(format!("{name} v{} published", v.number), note, auto);
             app.notify(level, text);
@@ -928,7 +925,10 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
             app.load_job(format!("check resume of {name} v{number}"), move |ctx| async move {
                 let svc = ctx.cv()?;
                 let v = svc.store.version(vid).await?;
-                if v.state == "published" && !svc.library_interrupted(&v).await? {
+                // Of the newest version: a composite whose auto publish after it did not run is left to do.
+                let newest = svc.store.versions(cv).await?.into_iter().find(|n| n.state == "published").is_some_and(|n| n.id == vid);
+                let lagging = newest && !svc.lagging_composites(cv).await?.is_empty();
+                if v.state == "published" && !svc.library_interrupted(&v).await? && !lagging {
                     return ap(|app| app.notify(Level::Info, "version is already published"));
                 }
                 // As for Publish: every Deb copy step uses `deb/copy/`.
@@ -2001,20 +2001,35 @@ mod tests {
         assert_eq!(st.cv_repos(web).await.unwrap().len(), 1);
     }
 
+    /// The publish job of extras v2 ended (Connect, quit, crash) after the publish and before the auto publish of rocky9.
     #[tokio::test]
-    async fn resume_of_an_already_published_version_does_not_auto_publish() {
+    async fn resume_runs_the_auto_publish_that_an_aborted_job_left_out() {
         let server = MockServer::start().await;
         let (mut app, mut rx, st) = composite_app().await;
         app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
         let (c, _, extras, _) = rocky(&st).await;
         st.set_auto_publish(c, true).await.unwrap();
-        let v = st.versions(extras).await.unwrap().remove(0);
-        // The list is stale: it shows `failed`, the database says `published`.
-        let item = json!({ "id": v.id, "number": v.number, "state": "failed" });
-        version_action(&mut app, "lab", extras, "extras".into(), Act::Resume, item);
+        let svc = crate::cv::CvService { client: client(&server), store: st.clone(), scope: "lab".into(), actor: "t".into(), lock: None };
+        svc.publish(c, "", "", &|_| {}, &ops::no_progress).await.unwrap(); // rocky9 v1 uses extras v1
+        let v2 = publish_empty(&st, extras).await; // the aborted job: published, no auto publish
+        app.push(Kind::CvVersions { cv: extras, name: "extras".into() });
+        let (v1, resume) = (st.versions(extras).await.unwrap()[1].clone(), |app: &mut App, v: &CvVersion| {
+            // The list is stale: it shows `failed`, the database says `published`.
+            let item = json!({ "id": v.id, "number": v.number, "state": "failed" });
+            version_action(app, "lab", extras, "extras".into(), Act::Resume, item);
+        });
+        resume(&mut app, &v1);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Info, "version is already published"), "composites follow the newest version");
+        resume(&mut app, &v2);
+        drain(&mut app, &mut rx).await;
+        assert_eq!(last_notice(&app), (Level::Ok, "extras v2 published; auto publish: rocky9 v2 published"));
+        let used = st.version_components(st.versions(c).await.unwrap()[0].id).await.unwrap();
+        assert!(used.iter().any(|u| u.version_id == v2.id), "{used:?}");
+        resume(&mut app, &v2);
         drain(&mut app, &mut rx).await;
         assert_eq!(last_notice(&app), (Level::Info, "version is already published"));
-        assert!(st.versions(c).await.unwrap().is_empty(), "no composite version for a version that was already published");
+        assert_eq!(st.versions(c).await.unwrap().len(), 2, "no third composite version");
     }
 
     #[tokio::test]

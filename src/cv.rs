@@ -675,14 +675,32 @@ impl CvService {
         self.resume(v.id, log, on).await
     }
 
-    /// Publish every composite with auto publish that uses `component_id` as latest, each under its own
+    /// The composites with auto publish that use `component_id` as latest and whose newest published version lacks the
+    /// component's newest published one: the auto publish after it did not run (the client stopped first) or failed.
+    pub async fn lagging_composites(&self, component_id: i64) -> Result<Vec<ContentView>> {
+        let newest = self.store.versions(component_id).await?.into_iter().find(|v| v.state == "published");
+        let Some(newest) = newest else { return Ok(vec![]) };
+        let mut out = vec![];
+        for c in self.store.auto_composites(component_id).await? {
+            let used = match self.store.versions(c.id).await?.into_iter().find(|v| v.state == "published") {
+                Some(v) => self.store.version_components(v.id).await?,
+                None => vec![],
+            };
+            if !used.iter().any(|u| u.version_id == newest.id) {
+                out.push(c);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Publish every composite with auto publish that lags `component_id` (`lagging_composites`), each under its own
     /// lock. One result per composite; a failure does not stop the others. Never promotes beyond Library.
     pub async fn auto_publish(&self, component_id: i64, log: Log<'_>, on: OnTask<'_>) -> Vec<std::result::Result<String, String>> {
         let found = async {
             let name = self.store.content_view(component_id).await?.name;
             let latest = self.store.versions(component_id).await?.into_iter().find(|v| v.state == "published");
             let notes = format!("auto publish after {name} v{}", latest.map_or(0, |v| v.number));
-            anyhow::Ok((notes, self.store.auto_composites(component_id).await?, self.library_protected().await?))
+            anyhow::Ok((notes, self.lagging_composites(component_id).await?, self.library_protected().await?))
         };
         let (notes, composites, protected) = match found.await {
             Ok(x) => x,
@@ -3759,6 +3777,12 @@ mod tests {
             assert!(s.versions(c).await.unwrap().is_empty());
         }
         assert_eq!(s.version(v.id).await.unwrap().state, "published", "the component's publish stays");
+        let names = |cs: Vec<ContentView>| cs.into_iter().map(|c| c.name).collect::<Vec<_>>();
+        assert_eq!(names(svc.lagging_composites(os).await.unwrap()), ["broken", "rocky9"], "web has os v1; quiet does not follow");
+        // A new version of os: every composite with auto publish lacks it.
+        let v2 = s.begin_version(os, "", &[]).await.unwrap();
+        s.finish_version(v2.id, "published", None).await.unwrap();
+        assert_eq!(names(svc.lagging_composites(os).await.unwrap()), ["broken", "rocky9", "web"]);
 
         // Nobody types the confirmation of a protected Library during an auto publish.
         let lib = s.ensure_library("k").await.unwrap();

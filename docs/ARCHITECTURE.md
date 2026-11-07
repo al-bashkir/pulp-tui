@@ -286,8 +286,13 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
 * The composite takes only its own lock and never changes its components.
 * **Auto publish** (`CvService::auto_publish`) runs after a component publish (or Resume
   of its newest version), outside the component's lock. It locks and publishes each
-  composite that follows the component as `latest`, one result per composite. It never
-  promotes beyond Library and does nothing while Library is protected.
+  composite that follows the component as `latest` and lags it: the newest published
+  composite version does not use the component's newest published version
+  (`CvService::lagging_composites`). One result per composite. It never promotes beyond
+  Library and does nothing while Library is protected.
+* Nothing records a pending auto publish: the lag is the record. When the client stops
+  between the component publish and the auto publish, Resume of the component's newest
+  version (also when it is published) publishes the composites that lag it.
 
 ## Replication
 

@@ -640,7 +640,8 @@ A composite view joins other Content Views (its **components**). Example: `rocky
 * **Auto publish** (default off): when a component on `latest` publishes, the composite publishes
   too, under its own lock. The notice gives the result. A failed composite gives a warning; the
   component stays published. Auto publish never promotes, and publishes nothing while Library is
-  protected.
+  protected. When the client stopped before the auto publish (quit, crash, Connect), press **R**
+  on the newest component version: it publishes each composite that does not have it yet.
 * **Delete**: you cannot delete a component view, or a component version that a composite version
   uses or a composite pins. The error names the users. A composite delete removes only its own
   records and distributions.
@@ -652,7 +653,8 @@ A composite view joins other Content Views (its **components**). Example: `rocky
 * **R** resumes a failed or interrupted publish. It continues from the checkpoints and attaches to
   a submitted task, also for a publish that another operator started. The version becomes active
   in Library only when no newer version is published. For a published version with an
-  `interrupted` Library step, it runs the Library step and auto publish again.
+  `interrupted` Library step, it runs the Library step and auto publish again. For the newest
+  published version, it runs the auto publish of each composite that does not have it yet.
 * **W** watches the task of the copy step or the publication step. Other steps show their tasks
   only in the session that runs the publish.
 * The *environments* column names each environment that serves the version, and an attempted
