@@ -2699,6 +2699,24 @@ mod tests {
         assert_eq!(e, "label qa is already used by environment QA");
     }
 
+    /// A Library that exists keeps its label: the label of the file's Library does not block an environment. Auto
+    /// publish is a composite's setting only.
+    #[tokio::test]
+    async fn import_keeps_the_existing_library_and_auto_publish_of_composites_only() {
+        let s = Store::open_in_memory().await.unwrap();
+        let lib = s.ensure_library("k").await.unwrap();
+        let e = s.create_env("k", "library", lib, false).await.unwrap_err().to_string();
+        assert_eq!(e, "label library is already used by environment Library");
+        let ex: Export = serde_json::from_value(serde_json::json!({ "format": 2,
+            "environments": [{ "name": "Library", "prior": "", "label": "lib2" }, { "name": "Dev", "prior": "Library", "label": "lib2" }],
+            "content_views": [{ "name": "os", "auto_publish": true, "repos": [] }] }))
+        .unwrap();
+        assert_eq!(s.import("k", &ex).await.unwrap(), (1, 1, vec![]));
+        let labels: Vec<String> = s.environments("k").await.unwrap().into_iter().map(|e| e.label).collect();
+        assert_eq!(labels, ["library", "lib2"]);
+        assert!(!s.content_views("k").await.unwrap()[0].auto_publish);
+    }
+
     #[tokio::test]
     async fn import_is_one_transaction_and_a_rerun_names_what_it_skips() {
         let s = Store::open_in_memory().await.unwrap();

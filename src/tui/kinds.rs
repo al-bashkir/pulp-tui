@@ -1122,7 +1122,7 @@ pub async fn load(
                     .iter()
                     .filter_map(|b| {
                         let e = envs.iter().find(|e| e.id == b.env_id)?;
-                        let text = crate::cv::binding_text(b, |id| numbers.get(&id).copied().unwrap_or(0), running, "-");
+                        let text = crate::cv::binding_text(b, &numbers, running, "-");
                         Some((envs.iter().position(|x| x.id == e.id), format!("{}:{text}", e.name)))
                     })
                     .collect::<std::collections::BTreeMap<_, _>>()
@@ -1202,7 +1202,7 @@ pub async fn load(
                 let numbers: std::collections::HashMap<i64, i64> = store.versions(cv.id).await?.iter().map(|v| (v.id, v.number)).collect();
                 let running = store.lock_live(cv.id, crate::cv::unix_now()).await?;
                 for b in store.bindings_for_cv(cv.id).await? {
-                    let text = crate::cv::binding_text(&b, |id| numbers.get(&id).copied().unwrap_or(0), running, "-");
+                    let text = crate::cv::binding_text(&b, &numbers, running, "-");
                     bound.entry(b.env_id).or_default().push(format!("{}:{text}", cv.name));
                 }
             }
@@ -1372,6 +1372,9 @@ mod tests {
             bound,
             [("Library".to_string(), "os:v2, web:- (v1 partial)".to_string()), ("Dev".to_string(), "os:v1 (v2 failed)".to_string())]
         );
+        // The Content Views screen lists the environments of a view in path order.
+        let (views, _) = load(&Kind::ContentViews, None, Ok(&st), "lab", "lab", &cfg, 0, "os").await.unwrap();
+        assert_eq!(s(&views[0], "bound"), "Library:v2  Dev:v1 (v2 failed)");
     }
 
     #[tokio::test]

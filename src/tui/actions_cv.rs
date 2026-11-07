@@ -749,7 +749,7 @@ async fn bind_hint(svc: &CvService, e: &Environment, b: &Binding) -> anyhow::Res
 async fn shown_binding(st: &Store, b: &Binding) -> anyhow::Result<String> {
     let running = st.lock_live(b.cv_id, crate::cv::unix_now()).await?;
     let numbers: std::collections::HashMap<i64, i64> = st.versions(b.cv_id).await?.iter().map(|v| (v.id, v.number)).collect();
-    Ok(crate::cv::binding_text(b, |id| numbers.get(&id).copied().unwrap_or_default(), running, "nothing"))
+    Ok(crate::cv::binding_text(b, &numbers, running, "nothing"))
 }
 
 /// Show the exact distribution changes of a promotion/rollback, then run it.
@@ -2166,6 +2166,27 @@ mod tests {
                  pulp-tui-cv-web-Dev-os and fails: rename it back"
             ]
         );
+    }
+
+    /// A confirmed promotion says what it verified: the served metadata, not every file.
+    #[tokio::test]
+    async fn a_confirmed_promotion_says_it_verified_the_served_metadata() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        app.push(Kind::ContentViews);
+        drain(&mut app, &mut rx).await;
+        let lib = st.ensure_library("lab").await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await; // no repositories: nothing to send to Pulp
+        promote_preview(&mut app, web, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirmation: {:?}", last_notice(&app)) };
+        on_yes.unwrap()(&mut app);
+        drain(&mut app, &mut rx).await;
+        let notices: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+        assert!(notices.contains(&"web v1 active in Library; served metadata verified"), "{notices:?}");
+        assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v.id));
     }
 
     /// Drift that a promotion cannot fix gets a hint that names what fixes it, and no "promote again".

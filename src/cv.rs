@@ -75,8 +75,10 @@ pub fn shown_state(state: &str, running: bool) -> &str {
 }
 
 /// How binding `b` shows: the served version (`none` when there is none), then a promotion that has not completed,
-/// as in `v1 (v2 failed)`. `number` gives the number of a version id.
-pub fn binding_text(b: &Binding, number: impl Fn(i64) -> i64, running: bool, none: &str) -> String {
+/// as in `v1 (v2 failed)`. `numbers` maps the version ids of the view to their numbers.
+pub fn binding_text(b: &Binding, numbers: &HashMap<i64, i64>, running: bool, none: &str) -> String {
+    // `promote` binds only versions of the view, so every id is in `numbers`.
+    let number = |id| numbers.get(&id).copied().unwrap_or_default();
     let served = b.served.map_or_else(|| none.to_string(), |s| format!("v{}", number(s)));
     match &b.attempt {
         Some(a) => format!("{served} (v{} {})", number(a.version_id), shown_state(&a.state, running)),
@@ -4113,6 +4115,61 @@ mod tests {
         assert_eq!(svc.verify(cv, lib).await.unwrap(), want.clone().map(|(t, _)| t));
         let fixes: Vec<_> = svc.drift(cv, lib).await.unwrap().into_iter().map(|d| (d.text, d.fix)).collect();
         assert_eq!(fixes, want);
+    }
+
+    /// Only a `promoting` attempt of this very version is an interrupted Library step.
+    #[tokio::test]
+    async fn only_a_promoting_attempt_of_the_version_is_an_interrupted_library_step() {
+        let svc = mock_service(&wiremock::MockServer::start().await).await;
+        let s = &svc.store;
+        let cv = s.create_cv("k", "web", "").await.unwrap();
+        let (v1, v2) = (published(&svc, cv, "os", "/r/1/").await, published(&svc, cv, "os", "/r/1/").await);
+        assert!(!svc.library_interrupted(&v1).await.unwrap(), "no Library yet");
+        let lib = s.ensure_library("k").await.unwrap();
+        for (v, state, want) in [(&v1, "failed", false), (&v2, "promoting", false), (&v1, "promoting", true)] {
+            s.promoted(lib, cv, v.id, state).await.unwrap();
+            assert_eq!(svc.library_interrupted(&v1).await.unwrap(), want, "v{} {state}", v.number);
+        }
+    }
+
+    /// The preview names a recorded distribution only when it still has both ownership labels of the view in the
+    /// environment; otherwise the promotion makes a new one.
+    #[tokio::test]
+    async fn a_recorded_distribution_of_another_environment_is_not_shown_as_renamed() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let lib = svc.store.ensure_library("k").await.unwrap();
+        let env = svc.store.environments("k").await.unwrap().into_iter().find(|e| e.id == lib).unwrap();
+        let repo = CvRepo {
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/1/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            filters: vec![],
+        };
+        let row = BindingRepo {
+            env_id: lib,
+            cv_id: 1,
+            repo_href: repo.repo_href.clone(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: DIST.into(),
+            base_path: "library/web/os".into(),
+            publication: None,
+        };
+        let none = json!({ "count": 0, "next": null, "results": [] });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pulp/api/v3/distributions/rpm/rpm/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(none))
+            .mount(&server)
+            .await;
+        let d = json!({ "pulp_href": DIST, "name": "moved", "base_path": "x/os", "pulp_labels": { LABEL_CV: "web", LABEL_ENV: "Dev" } });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(DIST))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(d))
+            .mount(&server)
+            .await;
+        let line = svc.promote_target("web", &env, &repo, Some(&row)).await.unwrap();
+        assert_eq!(line, "  os (RPM): new distribution pulp-tui-cv-web-Library-os at /library/web/os");
     }
 
     /// A served manifest that lists other files than the snapshot holds: promoting again cannot fix it.
