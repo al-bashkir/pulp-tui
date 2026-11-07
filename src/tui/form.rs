@@ -43,6 +43,13 @@ pub enum FieldKind {
     },
 }
 
+impl FieldKind {
+    /// A field that edit mode types into.
+    fn is_text(&self) -> bool {
+        matches!(self, FieldKind::Text | FieldKind::Secret | FieldKind::Number | FieldKind::Decimal)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PickItem {
     pub label: String,
@@ -261,6 +268,8 @@ pub struct Form {
     pub editing: bool,
     /// Char index of the edit cursor in the focused field.
     pub cursor: usize,
+    /// `Enter` moved onto a field that is not text: plain characters (typed ahead) do nothing until another key.
+    hold: bool,
 }
 
 pub enum FormEvent {
@@ -283,7 +292,7 @@ fn matching<'a>(f: &'a Field, filter: &str) -> Vec<&'a PickItem> {
 impl Form {
     pub fn new(title: impl Into<String>, fields: Vec<Field>) -> Self {
         // A lone text field starts in edit mode: nothing else could take the keys, and an early `i` would be lost.
-        let editing = matches!(fields.as_slice(), [f] if matches!(f.kind, FieldKind::Text | FieldKind::Secret | FieldKind::Number | FieldKind::Decimal));
+        let editing = matches!(fields.as_slice(), [f] if f.kind.is_text());
         let cursor = fields.first().map_or(0, |f| f.value.chars().count());
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -295,6 +304,7 @@ impl Form {
             picker: None,
             editing,
             cursor,
+            hold: false,
         }
     }
     pub fn note(mut self, n: impl Into<String>) -> Self {
@@ -405,13 +415,19 @@ impl Form {
         if load { FormEvent::Load(field) } else { FormEvent::None }
     }
 
-    /// Enter while editing: leave edit mode, then next field, or submit on the last one.
+    /// Enter while editing: submit on the last field, else go to the next one. Text typed ahead must not become
+    /// move-mode commands there: a text field is edited at once; on another field plain characters do nothing
+    /// until a key that is not text (`hold`).
     fn advance(&mut self) -> FormEvent {
-        self.editing = false;
         if self.focus + 1 == self.fields.len() {
+            self.editing = false;
             return FormEvent::Submit;
         }
         self.focus += 1;
+        let f = &self.fields[self.focus];
+        self.editing = f.kind.is_text();
+        self.hold = !self.editing;
+        self.cursor = f.value.chars().count();
         FormEvent::None
     }
 
@@ -540,10 +556,14 @@ impl Form {
         if self.picker.is_some() {
             return self.picker_key(k);
         }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if self.hold && matches!(k.code, KeyCode::Char(_)) && !ctrl {
+            return FormEvent::None;
+        }
+        self.hold = false;
         if let Some(ev) = self.pick_field_key(k) {
             return ev;
         }
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         // Move mode: j k h l are the arrow keys.
         let code = match k.code {
             KeyCode::Char('j') if !ctrl && !self.editing => KeyCode::Down,
@@ -554,7 +574,7 @@ impl Form {
         };
         let (next, prev) = ((self.focus + 1) % n, (self.focus + n - 1) % n);
         let f = &mut self.fields[self.focus];
-        let text = matches!(f.kind, FieldKind::Text | FieldKind::Secret | FieldKind::Number | FieldKind::Decimal);
+        let text = f.kind.is_text();
         match (self.editing, code) {
             (_, KeyCode::Char('s')) if ctrl => return FormEvent::Submit,
             (_, KeyCode::Tab | KeyCode::Down) => (self.focus, self.editing) = (next, false),
@@ -660,15 +680,72 @@ mod tests {
         assert!(f.editing);
         f.handle_key(ch('1'));
         assert!(matches!(f.handle_key(key(KeyCode::Enter)), FormEvent::None));
-        assert_eq!((f.focus, f.editing, f.get("a")), (1, false, "1"));
-        f.handle_key(key(KeyCode::Enter));
+        assert_eq!((f.focus, f.editing, f.get("a")), (1, true, "1"), "the next text field is edited at once");
         assert!(matches!(f.handle_key(key(KeyCode::Enter)), FormEvent::Submit));
         assert!(!f.editing);
+        // In move mode Enter on the last text field edits it; it submits only from edit mode.
+        f.handle_key(key(KeyCode::Esc));
+        assert!(matches!(f.handle_key(key(KeyCode::Enter)), FormEvent::None));
+        assert!(matches!(f.handle_key(key(KeyCode::Enter)), FormEvent::Submit));
         // Last field is a bool: Enter in move mode moves on and never submits.
         let mut f = Form::new("t", vec![Field::text("a", "A"), Field::new("b", "B", FieldKind::Bool)]);
         f.focus = 1;
         assert!(matches!(f.handle_key(key(KeyCode::Enter)), FormEvent::None));
         assert_eq!(f.focus, 0);
+    }
+
+    /// The fields of a new RPM remote. Runtime (audit F15): Name `x2`, Enter, then fast `jl j ` moved, changed the
+    /// download policy to `streamed` and cleared Validate TLS.
+    fn remote_form() -> Form {
+        let policies = FieldKind::Choice(vec!["immediate".into(), "on_demand".into(), "streamed".into()]);
+        Form::new(
+            "New RPM remote",
+            vec![
+                Field::text("name", "Name"),
+                Field::text("url", "URL"),
+                Field::new("policy", "Download policy", policies),
+                Field::new("tls_validation", "Validate TLS", FieldKind::Bool).value("true"),
+                Field::text("ca_cert", "CA cert"),
+            ],
+        )
+    }
+
+    fn typed(f: &mut Form, s: &str) {
+        s.chars().for_each(|c| {
+            f.handle_key(ch(c));
+        });
+    }
+
+    #[test]
+    fn text_typed_after_enter_goes_into_the_next_text_field() {
+        let mut f = remote_form();
+        f.handle_key(ch('i'));
+        typed(&mut f, "x2");
+        f.handle_key(key(KeyCode::Enter));
+        typed(&mut f, "jl j ");
+        let values = |f: &Form| f.fields.iter().take(4).map(|x| x.value.clone()).collect::<Vec<_>>();
+        assert_eq!(values(&f), ["x2", "jl j ", "immediate", "true"]);
+        assert_eq!((f.focus, f.editing), (1, true));
+    }
+
+    #[test]
+    fn text_typed_after_enter_never_changes_a_choice_or_checkbox() {
+        let mut f = remote_form();
+        f.focus = 1;
+        f.handle_key(ch('i'));
+        typed(&mut f, "https://h/");
+        f.handle_key(key(KeyCode::Enter));
+        // Enter moved onto the choice: typed-ahead letters and Space do nothing, also not move to the checkbox.
+        typed(&mut f, "jl j l");
+        assert_eq!((f.get("policy"), f.get("tls_validation"), f.focus, f.editing), ("immediate", "true", 2, false));
+        // A key that is not text ends that, and acts: then the choice keys work again.
+        f.handle_key(key(KeyCode::Right));
+        assert_eq!(f.get("policy"), "on_demand");
+        f.handle_key(ch('l'));
+        f.handle_key(ch('j'));
+        f.handle_key(ch(' '));
+        assert_eq!((f.get("policy"), f.get("tls_validation"), f.focus), ("streamed", "false", 3));
+        assert_eq!(f.get("url"), "https://h/");
     }
 
     #[test]
