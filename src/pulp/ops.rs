@@ -844,7 +844,7 @@ async fn post_chunked(
     }
 }
 
-/// PUT file `f` (`size` bytes, read from `path`) to upload `href` in chunks, and add them to `hasher`.
+/// PUT the `size` bytes of file `f` (read from `path`) to upload `href` in chunks, and add them to `hasher`.
 async fn put_chunks(
     c: &PulpClient,
     href: &str,
@@ -852,30 +852,17 @@ async fn put_chunks(
     hasher: &mut Sha256,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<()> {
-    let mut buf = vec![0u8; c.upload_chunk()];
-    let mut offset = 0u64;
-    loop {
-        let n = read_chunk(f, &mut buf).await.map_err(|e| PulpError::Config(format!("{}: {e}", path.display())))?;
-        if n == 0 {
-            return Ok(());
-        }
-        hasher.update(&buf[..n]);
-        c.put_chunk(href, (offset, offset + n as u64 - 1, size), buf[..n].to_vec()).await?;
-        offset += n as u64;
-        progress(offset, size);
+    let chunk = c.upload_chunk();
+    for offset in (0..size).step_by(chunk) {
+        let mut buf = Vec::with_capacity(chunk);
+        let read = (&mut *f).take(chunk as u64).read_to_end(&mut buf).await;
+        let n = read.map_err(|e| PulpError::Config(format!("{}: {e}", path.display())))? as u64;
+        hasher.update(&buf);
+        // A file that shrank after its size was read sends a bad range here, and Pulp refuses the upload.
+        c.put_chunk(href, (offset, (offset + n).saturating_sub(1), size), buf).await?;
+        progress(offset + n, size);
     }
-}
-
-/// Fill `buf` from `f`; fewer bytes only at the end of the file.
-async fn read_chunk(f: &mut tokio::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
-    let mut n = 0;
-    while n < buf.len() {
-        match f.read(&mut buf[n..]).await? {
-            0 => break,
-            r => n += r,
-        }
-    }
-    Ok(n)
+    Ok(())
 }
 
 /// Wait for the upload mutation `m`; the unit it made under `content` must have the local digest `sha256`. When the

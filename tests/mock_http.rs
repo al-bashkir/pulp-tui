@@ -658,13 +658,14 @@ async fn deb_package_upload_sends_the_release_and_checks_the_package() {
             Some((d, cp)) => assert!(body.contains(&field("distribution", d)) && body.contains(&field("component", cp)), "{body}"),
             None => assert!(!body.contains("distribution") && !body.contains("component"), "{body}"),
         }
-        let puts = sent.iter().filter(|r| r.method.as_str() == "PUT").count();
+        let ranges: Vec<&str> =
+            sent.iter().filter(|r| r.method.as_str() == "PUT").map(|r| r.headers["content-range"].to_str().unwrap()).collect();
         if size > 1024 * 1024 {
             assert!(body.contains(&field("upload", &format!("{API}uploads/1/"))) && !body.contains("filename="), "{body}");
-            assert_eq!(puts, 2, "two chunks");
+            assert_eq!(ranges, ["bytes 0-1048575/1048581", "bytes 1048576-1048580/1048581"], "two chunks");
         } else {
             assert!(body.contains("filename=\"p10.deb\"") && !body.contains("name=\"upload\""), "{body}");
-            assert_eq!(puts, 0);
+            assert!(ranges.is_empty());
         }
     }
 }
@@ -701,6 +702,41 @@ async fn a_failed_chunked_upload_is_deleted_and_a_digest_mismatch_is_an_error() 
     answer("GET", &unit, 200, json!({ "sha256": "other" })).mount(&server).await;
     let e = ops::upload(&client(&server, |_, _| {}), RepoType::File, &file, None, None, true, &|_, _| {}, &no_progress).await.unwrap_err();
     assert!(e.to_string().contains(&format!("digest mismatch for {unit}: local ")), "{e}");
+}
+
+/// A chunked upload sends each byte once, in chunks of the chunk size: an exact multiple of it has no empty last
+/// chunk, and a short last chunk ends at the file size. An empty file goes in one request, with no chunk.
+#[tokio::test]
+async fn chunk_ranges_cover_the_file_once() {
+    let (dir, mib) = (tempfile::tempdir().unwrap(), 1024 * 1024);
+    let (files, upload, unit) = (format!("{API}content/file/files/"), format!("{API}uploads/1/"), format!("{API}content/file/files/1/"));
+    for (size, want) in [
+        (2 * mib, vec!["bytes 0-1048575/2097152", "bytes 1048576-2097151/2097152"]),
+        (mib + 5, vec!["bytes 0-1048575/1048581", "bytes 1048576-1048580/1048581"]),
+        (0, vec![]),
+    ] {
+        let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let file = dir.path().join(format!("{size}.bin"));
+        std::fs::write(&file, &bytes).unwrap();
+        let server = MockServer::start().await;
+        let answer = |verb: &str, p: &str, status: u16, body: Value| {
+            Mock::given(method(verb)).and(path(p.to_string())).respond_with(ResponseTemplate::new(status).set_body_json(body))
+        };
+        answer("POST", &format!("{API}uploads/"), 201, json!({ "pulp_href": upload })).mount(&server).await;
+        answer("PUT", &upload, 200, json!({})).mount(&server).await;
+        answer("POST", &files, 202, json!({ "task": format!("{API}tasks/1/") })).mount(&server).await;
+        let task = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [unit] });
+        answer("GET", &format!("{API}tasks/1/"), 200, task).mount(&server).await;
+        answer("GET", &unit, 200, json!({ "sha256": hex::encode(Sha256::digest(&bytes)) })).mount(&server).await;
+        let c = client(&server, |_, s| s.upload_chunk_mb = 1);
+
+        let r = ops::upload(&c, RepoType::File, &file, None, None, true, &|_, _| {}, &no_progress).await.unwrap();
+        assert_eq!(r.sha256, hex::encode(Sha256::digest(&bytes)), "{size}");
+        let sent = server.received_requests().await.unwrap();
+        let ranges: Vec<&str> =
+            sent.iter().filter(|r| r.method.as_str() == "PUT").map(|r| r.headers["content-range"].to_str().unwrap()).collect();
+        assert_eq!(ranges, want, "{size}");
+    }
 }
 
 /// A `.udeb` goes to `content/deb/installer_packages/`, any other file to `content/deb/generic_contents/` with its
