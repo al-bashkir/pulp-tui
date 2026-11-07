@@ -39,7 +39,8 @@ These rules apply to all screens. The screen sections do not repeat them.
   deletes). Then you type the shown name to confirm.
 * **Capabilities.** A form field shows only when the server has it, and is sent only when you set
   or change it. An action that needs a missing endpoint shows
-  `not supported by this server: <feature>` and sends nothing.
+  `not supported by this server: <feature>` and sends nothing. A screen that the server does not
+  have offers no actions; its keys show that message.
 * **Edit** sends only the changed fields. Clear a field to remove the setting, or to return to the
   server default.
 * **Secret fields** (passwords, keys, tokens, headers) never show their value. On edit, empty keeps

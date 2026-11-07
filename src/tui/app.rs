@@ -1335,21 +1335,33 @@ impl App {
                 let item = self.list.current().cloned().unwrap_or(Value::Null);
                 if let Some(a) = self.available_actions(&item).into_iter().find(|a| a.key() == c) {
                     super::actions::run(self, a, item);
+                } else if let Some(why) = self.unsupported()
+                    && self.list.kind.actions().iter().any(|a| a.key() == c)
+                {
+                    self.error(why);
                 }
             }
             _ => {}
         }
     }
 
+    /// Why the server cannot serve the current screen (`Kind::unsupported`); None while not connected.
+    fn unsupported(&self) -> Option<String> {
+        self.conn.as_ref().and_then(|c| self.list.kind.unsupported(&c.caps))
+    }
+
     pub fn available_actions(&self, item: &Value) -> Vec<Act> {
         let ro = self.read_only();
         let shared = self.shared();
+        let unsupported = self.unsupported().is_some();
         self.list
             .kind
             .item_actions(item)
             .into_iter()
             .filter(|a| !(ro && a.mutates(&self.list.kind, shared)))
             .filter(|a| item.is_object() || !a.needs_item())
+            // The fallback replication needs no native replication: the unsupported message names it.
+            .filter(|a| !unsupported || *a == Act::FallbackReplicate)
             .collect()
     }
 
@@ -1816,6 +1828,29 @@ mod tests {
         assert!(!app.available_actions(&Value::Null).contains(&Act::Create));
         super::super::actions::run(&mut app, Act::Create, Value::Null);
         assert!(app.modal.is_none() && app.notices.iter().any(|n| n.text.contains("read-only mode")));
+    }
+
+    /// A screen the server does not support (`Kind::unsupported`) offers no actions; its key says why.
+    #[tokio::test]
+    async fn an_unsupported_screen_offers_no_create_and_says_why() {
+        let server = pulp().await; // status without `domain_enabled: true`, no pulpcore version
+        let local = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(lab(&server.uri()), "/dev/null".into(), local.clone(), Ok(local));
+        let mut rx = app.rx.take().unwrap();
+        app.connect("lab");
+        settle(&mut app, &mut rx).await;
+        app.open(Screen::List(Kind::Domains));
+        settle(&mut app, &mut rx).await;
+        let why = "not supported by this server: domains (domains/, with DOMAIN_ENABLED on the server)";
+        assert_eq!(app.list.error.as_deref(), Some(why));
+        assert_eq!(app.available_actions(&Value::Null), []);
+        app.handle_key(ch('c'));
+        assert!(app.modal.is_none() && app.jobs.is_empty());
+        assert_eq!(app.notices.back().map(|n| (n.level, n.text.as_str())), Some((Level::Error, why)));
+        // Upstream Pulps without native replication keep the fallback, which the message names.
+        app.open(Screen::List(Kind::UpstreamPulps));
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.available_actions(&Value::Null), [Act::FallbackReplicate]);
     }
 
     #[tokio::test]
