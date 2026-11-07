@@ -1179,3 +1179,78 @@ async fn resume_watch_and_break_lock_through_the_tui() {
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &[&repo, &remote]).await;
 }
+
+/// Answer the open path input with `path`.
+fn type_path(app: &mut App, path: &str) {
+    let Some(Modal::Input { on_done: Some(done), .. }) = app.modal.take() else { panic!("no path input: {:?}", texts(app)) };
+    done(app, path.into());
+}
+
+/// Environment Edit (relabel) and the Content View definitions export and import, through the TUI: a view served in
+/// Dev; Edit of Dev's label: the impact names the path that moves, the typed name; Pulp serves at the new path only.
+/// Export definitions (E on Servers) writes the view to a file; Import definitions (I) in a session with an empty
+/// database creates it there, with the repository of this server.
+#[tokio::test]
+async fn environment_relabel_and_definitions_export_import_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvlbtui"));
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let (mut app, mut rx) = app().await;
+    let svc = service(&app, &c);
+    let (st, scope) = (svc.store.clone(), svc.scope.clone());
+    let cv = st.create_cv(&scope, &id, "").await.unwrap();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    st.set_cv_repo(cv, &docs).await.unwrap();
+    let lib = st.ensure_library(&scope).await.unwrap();
+    let dev = st.create_env(&scope, "Dev", lib, false).await.unwrap();
+    tui_publish(&mut app, &mut rx, &id, "").await;
+    tui_promote(&mut app, &mut rx, &id, Act::Promote, "1", "Dev").await;
+    let readme = |label: &str| format!("http://127.0.0.1:8080/pulp/content/{}/docs/readme.txt", base_path(&id, label, "docs"));
+    assert_eq!(served(&c, &readme("dev")).await.0, 200);
+
+    // Edit (e) of Dev: label dev2.
+    open_list(&mut app, &mut rx, Kind::Environments, "").await;
+    let e = row(&app, "name", "Dev").unwrap();
+    run(&mut app, Act::Edit, e);
+    fill(&mut app, &[("label", "dev2")]);
+    settle(&mut app, &mut rx).await; // the served paths are read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some("Dev"));
+    let moved = format!("  /{} -> /{}", base_path(&id, "dev", "docs"), base_path(&id, "dev2", "docs"));
+    assert_eq!(lines[..2], ["Label dev -> dev2. Served paths move:".to_string(), moved]);
+    settle(&mut app, &mut rx).await;
+    shown(&app, "label of Dev is dev2");
+    assert!(matches!(app.modal.take(), Some(Modal::Text { title, .. }) if title == "Label of Dev"));
+    assert_eq!(row(&app, "name", "Dev").unwrap()["label"], "dev2", "the list reloads");
+    assert_eq!((served(&c, &readme("dev2")).await.0, served(&c, &readme("dev")).await.0), (200, 404));
+    assert!(svc.verify(cv, dev).await.unwrap().is_empty());
+
+    // Export definitions (E on Servers) to a file.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cv.json").display().to_string();
+    open_list(&mut app, &mut rx, Kind::Profiles, "").await;
+    let p = row(&app, "name", "pulp1").unwrap();
+    run(&mut app, Act::ExportCv, p.clone());
+    type_path(&mut app, &file);
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("exported 1 content view(s) to {file} (no secrets, no Pulp state)"));
+    assert!(std::fs::read_to_string(&file).unwrap().contains(&id));
+
+    // Import definitions (I) in another session, with its own empty database.
+    let (mut other, mut orx) = common::app().await;
+    open_list(&mut other, &mut orx, Kind::Profiles, "").await;
+    run(&mut other, Act::ImportCv, p);
+    type_path(&mut other, &file);
+    settle(&mut other, &mut orx).await;
+    assert!(texts(&other).iter().any(|t| t.starts_with("imported 1 content view(s), ")), "{:?}", texts(&other));
+    let ost = other.cv_store.clone().unwrap();
+    let views = ost.content_views(&scope).await.unwrap();
+    let view = views.iter().find(|v| v.name == id).unwrap_or_else(|| panic!("not imported: {views:?}"));
+    let hrefs: Vec<String> = ost.cv_repos(view.id).await.unwrap().into_iter().map(|r| r.repo_href).collect();
+    assert_eq!(hrefs, [repo.as_str()], "mapped to the repository of this server by its name");
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote]).await;
+}
