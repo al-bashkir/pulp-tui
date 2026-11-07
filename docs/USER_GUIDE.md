@@ -420,7 +420,8 @@ packages, advisories, modulemds, package groups, distribution trees and more; De
 releases, components, indices and more). `/` searches package names or file paths.
 
 * **i** shows all metadata of the unit (requires, provides, files, ...).
-* **x** removes the marked (or selected) units: a new version. The screen then shows the new
+* **x** removes the marked (or selected) units: a new version of the latest version. On an older
+  version, the confirm says that the units leave the latest one. The screen then shows the new
   version. The marks stay when the task fails. Older versions keep the units, but with
   **Retain versions** 1 Pulp deletes the current version, unless a distribution serves it. Then
   the confirm says so and you type the repository name: the units stay only in served versions,
@@ -430,8 +431,9 @@ releases, components, indices and more). `/` searches package names or file path
 * **x** and **a** send a large selection (above about 27,000 units) in batches, one task after
   the other; each batch makes a new version. The Task Center shows the task of each batch. When
   a batch fails, the batches after it are not sent. The confirm of **x** says how many versions
-  it makes (on Deb, the release records of the packages count too). With N versions, Pulp deletes
-  the current version when **Retain versions** is N or less, unless a distribution serves it.
+  it makes (on Deb, the release records of the packages count too), and its result gives the
+  version of each batch. With N versions, Pulp deletes the current version when **Retain
+  versions** is N or less, unless a distribution serves it.
 
 ### Publications
 

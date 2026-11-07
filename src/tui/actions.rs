@@ -84,21 +84,22 @@ pub(super) fn unmark_when_deleted(app: &mut App, href: String, m: Mutation, labe
 }
 
 /// Send `steps` one after the other: each adds to the latest version, so each task ends before the next is sent.
-/// The Task Center tracks every task; the last mutation is returned for the caller to report or follow.
-async fn one_by_one<T, E, Fut>(ctx: &Ctx, steps: Vec<T>, mut send: impl FnMut(T) -> Fut) -> anyhow::Result<Mutation>
+/// The Task Center tracks every task. Returns the version that each step before the last made (`None`: no new
+/// version) and the last mutation, for the caller to report or follow.
+async fn one_by_one<T, E, Fut>(ctx: &Ctx, steps: Vec<T>, mut send: impl FnMut(T) -> Fut) -> anyhow::Result<(Vec<Option<String>>, Mutation)>
 where
     Fut: Future<Output = std::result::Result<Mutation, E>>,
     anyhow::Error: From<E>,
 {
     let on = ctx.on_task();
-    let mut sent = None;
+    let (mut made, mut sent) = (vec![], None);
     for step in steps {
         if let Some(m) = sent.take() {
-            ops::settle(&ctx.client, m, &on).await?;
+            made.push(ops::settle(&ctx.client, m, &on).await?.and_then(|t| t.created_matching("/versions/")));
         }
         sent = Some(send(step).await?);
     }
-    sent.ok_or_else(|| anyhow!("nothing to send"))
+    Ok((made, sent.ok_or_else(|| anyhow!("nothing to send"))?))
 }
 
 /// The units that Remove sends: Deb adds the release records of the packages in `latest` (`deb::with_release_records`).
@@ -110,18 +111,24 @@ async fn remove_units(c: &PulpClient, t: RepoType, latest: &str, units: Vec<Stri
     }
 }
 
-/// A Remove task ended: a Content screen that still shows the browsed version moves to the new one.
-fn content_removed(app: &mut App, old: &str, n: usize, t: &Task) {
-    let Some(new) = t.created_matching("/versions/") else {
+/// A Remove ended; `made`: the version of each batch (`None`: no new version). A Content screen that still shows
+/// the browsed version moves to the newest one.
+fn content_removed(app: &mut App, old: &str, n: usize, made: &[Option<String>]) {
+    let Some(new) = made.iter().flatten().last().cloned() else {
         return app.ok(format!("removed {n} unit(s): no new version (the latest version did not have them)"));
+    };
+    let each = |m: &Option<String>| m.as_deref().map_or_else(|| "no new version".to_string(), |v| format!("version {}", version_number(v)));
+    let batches = match made {
+        [_] => String::new(),
+        _ => format!(" in {} batches ({})", made.len(), made.iter().map(each).collect::<Vec<_>>().join(", ")),
     };
     let v = version_number(&new);
     match &app.screen {
         Screen::List(Kind::Content { version, ctype }) if version == old => {
             app.replace(Kind::Content { version: new, ctype: *ctype });
-            app.ok(format!("removed {n} unit(s): now showing version {v}"));
+            app.ok(format!("removed {n} unit(s){batches}: now showing version {v}"));
         }
-        _ => app.ok(format!("removed {n} unit(s): new version {v}")),
+        _ => app.ok(format!("removed {n} unit(s){batches}: new version {v}")),
     }
 }
 
@@ -1639,7 +1646,7 @@ fn repo_action(app: &mut App, t: RepoType, act: Act, item: Value) {
                                         batches.extend(ops::batches(&meta).into_iter().map(|b| (Some(b.to_vec()), true)));
                                     }
                                     let (c, sv, href) = (&ctx.client, &sv, &href);
-                                    let m = one_by_one(&ctx, batches, move |(units, modify)| async move {
+                                    let (_, m) = one_by_one(&ctx, batches, move |(units, modify)| async move {
                                         match t {
                                             RepoType::Rpm if !modify => rpm::copy(c, sv, href, None, units, deps).await,
                                             RepoType::Rpm | RepoType::File => ops::add_content(c, href, units.unwrap_or_default()).await,
@@ -2835,6 +2842,10 @@ fn content_action(app: &mut App, version: String, act: Act) {
                     units.len()
                 ),
             }];
+            if latest != version {
+                let (shown, now) = (version_number(&version), version_number(&latest));
+                lines.push(format!("NOTE: the units leave the LATEST version {now} of {name}, not the version {shown} shown here."));
+            }
             if goes {
                 lines.extend(goes_lines(&name, r["retain_repo_versions"].as_u64().unwrap_or(1), "The removed content"));
             } else {
@@ -2851,9 +2862,14 @@ fn content_action(app: &mut App, version: String, act: Act) {
                         }
                         let now = s(&r, "latest_version_href");
                         let units = if now == latest { sent } else { remove_units(c, t, &now, units).await? };
-                        let m = one_by_one(&ctx, ops::batches(&units), |b| ops::remove_content(c, &repo, b.to_vec())).await?;
+                        let (mut made, m) = one_by_one(&ctx, ops::batches(&units), |b| ops::remove_content(c, &repo, b.to_vec())).await?;
                         // Only a success shows the new version (without marks): on a failure the operator keeps them.
-                        ap(move |app| follow(app, m, label, move |app, t| content_removed(app, &version, n, &t)))
+                        ap(move |app| {
+                            follow(app, m, label, move |app, t| {
+                                made.push(t.created_matching("/versions/"));
+                                content_removed(app, &version, n, &made)
+                            })
+                        })
                     });
                 };
                 if goes { app.confirm_danger("Remove content", lines, &name, go) } else { app.confirm("Remove content", lines, go) }
@@ -2879,7 +2895,7 @@ fn content_action(app: &mut App, version: String, act: Act) {
                     }
                     let dest = s(&r, "pulp_href");
                     let (dest, version) = (&dest, &version);
-                    let m = one_by_one(&ctx, ops::batches(&units), move |b| async move {
+                    let (_, m) = one_by_one(&ctx, ops::batches(&units), move |b| async move {
                         match t {
                             RepoType::Rpm | RepoType::File => ops::add_content(c, dest, b.to_vec()).await,
                             // modify/ adds no release component records, so apt would not see the packages.
@@ -4928,6 +4944,38 @@ mod tests {
         }
         settle(&mut app, &mut rx).await;
         app
+    }
+
+    /// Remove acts on the latest version: from an older version the confirm says so. With two batches the result
+    /// names the outcome of each, also when the last one made no version.
+    #[tokio::test]
+    async fn content_remove_names_the_latest_version_and_reports_every_batch() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/file/file/r/");
+        get(&server, &repo, json!({ "pulp_href": repo, "name": "r", "latest_version_href": format!("{repo}versions/3/") })).await;
+        for (i, created) in [(1, json!([format!("{repo}versions/4/")])), (2, json!([]))] {
+            let task = format!("{API}tasks/{i}/");
+            let accepted = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": task }));
+            wiremock::Mock::given(method("POST"))
+                .and(path(format!("{repo}modify/")))
+                .respond_with(accepted)
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            get(&server, &task, json!({ "pulp_href": task, "state": "completed", "created_resources": created })).await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.marked = (0..30_000).map(|i| format!("{API}content/file/files/{i:036}/")).collect();
+        content_action(&mut app, format!("{repo}versions/1/"), Act::RemoveContent);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert!(lines.contains(&"NOTE: the units leave the LATEST version 3 of r, not the version 1 shown here.".into()), "{lines:?}");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        let last = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        assert_eq!(last, "removed 30000 unit(s) in 2 batches (version 4, no new version): new version 4");
     }
 
     #[tokio::test]
