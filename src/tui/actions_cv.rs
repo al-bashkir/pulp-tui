@@ -793,9 +793,15 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
             lines.push(svc.promote_target(&name, &e, vr.repo(), row).await?);
         }
         for b in rows {
-            if !vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) && b.publication.is_some() {
-                lines.push(format!("  {}: not part of v{} -> its distribution stops serving (kept for rollback)", b.repo_name, v.number));
+            // The rule of `CvService::unbind_removed`.
+            if vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) || !svc.needs_unbind(&b).await? {
+                continue;
             }
+            let outside = if b.publication.is_none() { "; Pulp shows that it serves a publication set outside pulp-tui" } else { "" };
+            lines.push(format!(
+                "  {}: not part of v{} -> its distribution stops serving (kept for rollback){outside}",
+                b.repo_name, v.number
+            ));
         }
         if mode == Mode::Rollback {
             lines.push(String::new());
@@ -2235,6 +2241,38 @@ mod tests {
             drain(&mut app, &mut rx).await;
             assert_eq!(confirm_lines(&mut app)[2..4], [docs, want], "renamed one at {at}");
         }
+    }
+
+    /// Rows of repositories that the version lacks and that record no publication: the promotion unserves the one whose
+    /// distribution serves a publication (set outside pulp-tui), and the preview names it; it names no other one.
+    #[tokio::test]
+    async fn the_promote_preview_names_a_left_out_distribution_that_serves_again() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        for (n, id) in [("old", "1"), ("idle", "2"), ("gone", "3")] {
+            let row = crate::store::BindingRepo {
+                env_id: lib,
+                cv_id: web,
+                repo_href: format!("{REPOS}rpm/rpm/{id}/"),
+                repo_name: n.into(),
+                repo_type: RepoType::Rpm,
+                distribution: format!("/pulp/api/v3/distributions/rpm/rpm/{id}/"),
+                base_path: format!("library/web/{n}"),
+                publication: None,
+            };
+            st.save_binding_repo(&row).await.unwrap();
+        }
+        serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/1/".into(), 200, json!({ "publication": "/p/3/" })).await;
+        serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/2/".into(), 200, json!({ "publication": null })).await;
+        promote_preview(&mut app, web, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        let old = "  old: not part of v1 -> its distribution stops serving (kept for rollback); Pulp shows that it serves a \
+                   publication set outside pulp-tui";
+        assert_eq!(confirm_lines(&mut app)[2..4], [old, ""]);
     }
 
     /// A confirmed promotion says what it verified: the served metadata, not every file.

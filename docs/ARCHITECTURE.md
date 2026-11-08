@@ -275,7 +275,8 @@ new version; served files that differ need a repair; a missing `base_url` needs
 
 * A promotion re-points also a repository that the version lacks when Pulp shows that its
   distribution serves a publication (`unbind_removed` reads the distribution of a row that
-  records none), so the "promote again" hint fixes that drift too.
+  records none, `CvService::needs_unbind`), so the "promote again" hint fixes that drift too.
+  The promote preview uses the same rule, so it names that change.
 * While a workflow holds a live lock on the view, the hint names that workflow: the lock
   refuses Promote and Rollback.
 * `Fix::Unchecked` is not drift: a File publication without a manifest gives nothing to

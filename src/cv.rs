@@ -1305,15 +1305,12 @@ impl CvService {
             if vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) {
                 continue;
             }
-            if b.publication.is_none() {
-                match self.client.get::<Value>(&b.distribution, &[]).await {
-                    Ok(d) if d["publication"].is_string() => {}
-                    Ok(_) => continue,
-                    Err(e) if e.is_not_found() => continue,
-                    Err(e) => {
-                        errors.push(format!("unbind {}: {e}", b.repo_name));
-                        continue;
-                    }
+            match self.needs_unbind(&b).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    errors.push(format!("unbind {}: {e}", b.repo_name));
+                    continue;
                 }
             }
             match self.unbind(&cv.name, env, &b, &aliases, on).await {
@@ -1322,6 +1319,19 @@ impl CvService {
             }
         }
         Ok(errors)
+    }
+
+    /// Whether `unbind_removed` unserves row `b` of a repository that the version lacks: it records a publication, or
+    /// it records none and Pulp shows that its distribution serves one (set outside pulp-tui). A gone one needs nothing.
+    pub async fn needs_unbind(&self, b: &BindingRepo) -> Result<bool> {
+        if b.publication.is_some() {
+            return Ok(true);
+        }
+        match self.client.get::<Value>(&b.distribution, &[]).await {
+            Ok(d) => Ok(d["publication"].is_string()),
+            Err(e) if e.is_not_found() => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Point the distribution of `b` at no publication; refused unless it is ours.
