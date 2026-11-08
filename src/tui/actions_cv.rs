@@ -596,13 +596,16 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
             for e in svc.store.environments(&svc.scope).await? {
                 if let Some(b) = svc.store.binding(e.id, id).await? {
                     let drift = svc.drift(id, e.id).await?;
-                    lines.push(format!(
-                        "{}: {} {}",
-                        e.name,
-                        shown_binding(&svc.store, &b).await?,
-                        // What `verify` reads (`ops::verify_served`): metadata, and one package of RPM and Deb.
-                        if drift.is_empty() { "OK - served metadata match; RPM/Deb: also the smallest package" } else { "DRIFT" }
-                    ));
+                    // What `verify` reads (`ops::verify_served`): metadata, and one package of RPM and Deb.
+                    let status = match (drift.is_empty(), drift.iter().all(|d| d.fix == Fix::Unchecked)) {
+                        (true, _) => "OK - served metadata match; RPM/Deb: also the smallest package",
+                        (false, true) => {
+                            "OK - served metadata match; RPM/Deb: also the smallest package; File: no manifest compared for the \
+                             repositories below"
+                        }
+                        (false, false) => "DRIFT",
+                    };
+                    lines.push(format!("{}: {} {status}", e.name, shown_binding(&svc.store, &b).await?));
                     hints.extend(reconcile_hints(&svc, &e, &b, &drift).await?);
                     lines.extend(drift.into_iter().map(|d| format!("    {}", d.text)));
                 }
@@ -715,10 +718,11 @@ async fn reconcile_hints(svc: &CvService, e: &Environment, b: &Binding, drift: &
     Ok(out)
 }
 
-/// The action that fixes drift of kind `fix`; `None` for `Fix::Bind`, whose action names a version (`bind_hint`).
+/// The action that fixes drift of kind `fix`; `None` for `Fix::Bind`, whose action names a version (`bind_hint`), and
+/// for `Fix::Unchecked` (nothing to fix; `reconcile_hints` does not ask).
 fn fix_hint(fix: Fix) -> Option<&'static str> {
     Some(match fix {
-        Fix::Bind => return None,
+        Fix::Bind | Fix::Unchecked => return None,
         Fix::Publish => {
             "publish a new version (P) and promote it: a snapshot or publication is gone or another one, \
              so a promotion of this version cannot fix it."
@@ -736,8 +740,17 @@ fn fix_hint(fix: Fix) -> Option<&'static str> {
 }
 
 /// Promote the version that `drift` checks again (the served one, else the attempted one), or roll back to it when
-/// Promote refuses it: the rule of `CvService::promote`, where Rollback to the bound version always runs.
+/// Promote refuses it: the rule of `CvService::promote`, where Rollback to the bound version always runs. While a
+/// workflow holds a live lock on the view (a promotion that runs), neither is possible: wait for it.
 async fn bind_hint(svc: &CvService, e: &Environment, b: &Binding) -> anyhow::Result<String> {
+    if svc.store.lock_live(b.cv_id, crate::cv::unix_now()).await?
+        && let Some(h) = svc.store.lock_holder(b.cv_id).await?
+    {
+        return Ok(format!(
+            "{} by {} is running: verify again when it ends (its lock refuses Promote and Rollback until then).",
+            h.operation, h.owner
+        ));
+    }
     let v = svc.store.version(b.versions().next().unwrap_or_default()).await?;
     Ok(match svc.promote_refusal(&v, e).await? {
         None => format!("promote v{} again (M) to reconcile (idempotent).", v.number),
@@ -2336,6 +2349,78 @@ mod tests {
         drain(&mut app, &mut rx).await;
         let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
         assert_eq!(lines[..2], ["Dev: nothing (v1 interrupted) DRIFT", "    promotion of v1 is interrupted"]);
+    }
+
+    /// While a promotion runs (a live lock), the drift check says so instead of naming Promote or Rollback: the lock
+    /// refuses them.
+    #[tokio::test]
+    async fn drift_names_a_running_promotion_instead_of_promote_or_rollback() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let dev = st.create_env("lab", "Dev", st.ensure_library("lab").await.unwrap(), false).await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        st.promoted(dev, web, v.id, "promoting").await.unwrap();
+        st.try_lock(web, "bob@ws2", "tok", "promote to Dev", crate::cv::unix_now()).await.unwrap().unwrap();
+        cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
+        let hint = "Dev: promote to Dev by bob@ws2 is running: verify again when it ends (its lock refuses Promote and Rollback \
+                    until then).";
+        assert_eq!(lines, ["Dev: nothing (v1 promoting) DRIFT", "    promotion of v1 is promoting", "", hint]);
+    }
+
+    /// A File publication without a manifest: the drift check compares no served file and says so, not a plain OK.
+    #[tokio::test]
+    async fn drift_says_when_a_file_publication_has_no_manifest() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = st.begin_version(web, "", &[cv_repo("docs", "file", "1")]).await.unwrap();
+        let (dv, publication, dist) = (
+            format!("{REPOS}file/file/2/versions/1/"),
+            "/pulp/api/v3/publications/file/file/1/",
+            "/pulp/api/v3/distributions/file/file/3/",
+        );
+        let row = crate::store::CvVersionRepo {
+            derived_version: Some(dv.clone()),
+            publication: Some(publication.into()),
+            ..st.version_repos(v.id).await.unwrap().remove(0)
+        };
+        st.save_version_repo(&row).await.unwrap();
+        st.finish_version(v.id, "published", None).await.unwrap();
+        st.promoted(lib, web, v.id, "active").await.unwrap();
+        let b = crate::store::BindingRepo {
+            env_id: lib,
+            cv_id: web,
+            repo_href: format!("{REPOS}file/file/1/"),
+            repo_name: "docs".into(),
+            repo_type: RepoType::File,
+            distribution: dist.into(),
+            base_path: "library/web/docs".into(),
+            publication: Some(publication.into()),
+        };
+        st.save_binding_repo(&b).await.unwrap();
+        let base = format!("{}/pulp/content/library/web/docs/", server.uri());
+        let d = json!({ "pulp_href": dist, "name": "d", "base_path": "library/web/docs", "base_url": base, "publication": publication });
+        serve(&server, "GET", dist.into(), 200, d).await;
+        let p = json!({ "pulp_href": publication, "repository_version": dv, "manifest": null });
+        serve(&server, "GET", publication.into(), 200, p).await;
+        serve(&server, "GET", dv.clone(), 200, json!({ "pulp_href": dv })).await;
+        cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
+        assert_eq!(
+            lines,
+            [
+                "Library: v1 OK - served metadata match; RPM/Deb: also the smallest package; File: no manifest compared for the \
+                 repositories below",
+                "    docs: the publication has no manifest: served files not compared"
+            ]
+        );
     }
 
     #[tokio::test]
