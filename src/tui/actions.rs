@@ -8115,15 +8115,18 @@ mod tests {
         let guard_reads =
             async || server.received_requests().await.unwrap().iter().filter(|r| r.url.path().contains("/contentguards/")).count();
         let pick = |label: &str, value: &str| PickItem { label: label.into(), value: value.into(), note: String::new() };
-        for (to, loaded, want, reads) in
-            [(b.as_str(), true, "  content guard: staff -> mirrors", 0), ("", false, "  content guard: staff -> none", 1)]
-        {
+        // The picker loaded every guard, then only some (not the old one), then none. `reads` counts from the start.
+        for (to, loaded, want, reads) in [
+            (b.as_str(), Some(vec![pick("(none)", ""), pick("staff", &a), pick("mirrors", &b)]), "  content guard: staff -> mirrors", 0),
+            (b.as_str(), Some(vec![pick("(none)", ""), pick("mirrors", &b)]), "  content guard: staff -> mirrors", 1),
+            ("", None, "  content guard: staff -> none", 2),
+        ] {
             distribution_action(&mut app, RepoType::File, Act::Edit, item.clone());
             let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
             let field = form.fields.iter_mut().find(|f| f.key == "content_guard").unwrap();
             field.value = to.into();
-            if loaded {
-                field.options = Some(vec![pick("(none)", ""), pick("staff", &a), pick("mirrors", &b)]);
+            if let Some(options) = loaded {
+                field.options = Some(options);
             }
             submit(&mut app, &form).unwrap();
             settle(&mut app, &mut rx).await;
