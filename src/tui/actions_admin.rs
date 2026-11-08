@@ -1282,7 +1282,9 @@ fn exporter_action(app: &mut App, act: Act, item: Value) {
     let fs = app.list.kind == Kind::FsExporters;
     match act {
         Act::Exports => app.push(Kind::Exports { exporter: href, name }),
-        Act::Create | Act::Edit => exporter_form(app, fs, act == Act::Edit, &item),
+        // Create never starts from the selected row: its name and directory would be duplicates.
+        Act::Create => exporter_form(app, fs, false, &Value::Null),
+        Act::Edit => exporter_form(app, fs, true, &item),
         Act::Export if fs => fs_export(app, href, name, path),
         Act::Export => pulp_export(app, href, name, &item),
         Act::Delete => app.job(format!("impact of deleting exporter {name}"), move |ctx| async move {
@@ -1567,7 +1569,8 @@ fn importer_action(app: &mut App, act: Act, item: Value) {
     let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
     match act {
         Act::Imports => app.push(Kind::Imports { importer: href, name }),
-        Act::Create | Act::Edit => importer_form(app, act == Act::Edit, &item),
+        Act::Create => importer_form(app, false, &Value::Null),
+        Act::Edit => importer_form(app, true, &item),
         Act::Import => import_form(app, href, name),
         Act::Delete => app.job(format!("impact of deleting importer {name}"), move |ctx| async move {
             let n = ctx.client.list::<Value>(&format!("{href}imports/"), &[("limit", "1".into())]).await?.count;
@@ -2645,6 +2648,26 @@ mod tests {
             ]
         );
         assert!(app.tasks.items.iter().any(|t| t.href == "/pulp/api/v3/tasks/2/"), "the delete task is tracked");
+    }
+
+    /// Create on a selected exporter or importer opens an empty form: its name and directory would be duplicates.
+    #[tokio::test]
+    async fn exporter_and_importer_create_ignore_the_selected_row() {
+        use crate::tui::kinds::Act;
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let row = json!({ "pulp_href": EXP, "name": "dvd", "path": "/var/lib/pulp/exports/dvd", "repositories": ["/r/1/"],
+            "method": "hardlink", "repo_mapping": { "web": "web-copy" } });
+        let values = |f: &super::Form| f.fields.iter().map(|x| (x.key.clone(), x.value.clone())).collect::<Vec<_>>();
+        for kind in [Kind::PulpExporters, Kind::FsExporters, Kind::Importers] {
+            app.list.kind = kind.clone();
+            let (f, _) = open_form(&mut app, Act::Create, row.clone());
+            let (empty, _) = open_form(&mut app, Act::Create, Value::Null);
+            assert_eq!(values(&f), values(&empty), "{kind:?}");
+            assert_eq!(f.get("name"), "", "{kind:?}");
+            let (f, _) = open_form(&mut app, Act::Edit, row.clone());
+            assert_eq!(f.get("name"), "dvd", "Edit keeps the row: {kind:?}");
+        }
     }
 
     /// The Export form of a Pulp exporter: it opens after its repositories and last export are loaded.
