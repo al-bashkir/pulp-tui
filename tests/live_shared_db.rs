@@ -727,8 +727,10 @@ async fn database_migrate_and_copy_through_the_tui() {
     let (lines, typed) = yes(&mut app);
     assert_eq!((typed, &lines[..2]), (None, &[format!("Database: {}", s.display()), format!("Schema: empty -> {n}")][..]));
     settle(&mut app, &mut rx).await;
-    shown(&app, &format!("{}: schema 0 -> {n}", s.display()));
-    let copied = format!("copied 1 content view(s), 0 version(s), 0 environment(s) into {}; profile lab saved ", s.display());
+    // A notice shows the database URL without its user (audit F47); the dialog above shows the configured URL.
+    let noticed = |s: &Schema| pulp_tui::session_log::masked(s.display());
+    shown(&app, &format!("{}: schema 0 -> {n}", noticed(&s)));
+    let copied = format!("copied 1 content view(s), 0 version(s), 0 environment(s) into {}; profile lab saved ", noticed(&s));
     assert!(texts(&app).iter().any(|t| t.starts_with(&copied)), "{:?}", texts(&app));
     assert_eq!(Config::load(&path).unwrap().profiles["lab"].database, Some(s.db.clone()), "saved in the file");
     let key = app.cfg.profiles["lab"].server_key();
@@ -742,7 +744,7 @@ async fn database_migrate_and_copy_through_the_tui() {
     let (lines, typed) = yes(&mut app);
     assert_eq!((typed, lines[0].clone()), (None, format!("Database: {}", s2.display())));
     settle(&mut app, &mut rx).await;
-    shown(&app, &format!("{}: schema 0 -> {n}", s2.display()));
+    shown(&app, &format!("{}: schema 0 -> {n}", noticed(&s2)));
     assert!(app.conn.is_some() && app.cv_store.as_ref().is_ok_and(|st| st.external), "{:?}", texts(&app));
     assert_eq!(s2.open().await.schema_version().await.unwrap(), n);
     open_list(&mut app, &mut rx, Kind::Environments, "").await;
