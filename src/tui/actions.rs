@@ -294,24 +294,7 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl 
             }
         }
         ap(move |app| {
-            let mut lines = vec![
-                "Mirror sync makes the NEW repository version match the upstream exactly:".into(),
-                "content that is not upstream is removed from the new version.".into(),
-            ];
-            if goes.is_empty() {
-                lines.push("Older versions are not changed and can still be published (rollback).".into());
-            } else {
-                lines.extend(goes_lines(&goes.join(", "), 1, "Content that is not upstream"));
-            }
-            if complete {
-                lines.push("mirror_complete also publishes the upstream metadata unchanged (a publication is created).".into());
-            }
-            if !files.is_empty() {
-                let names = files.join(", ");
-                lines.push(format!(
-                    "File: the mirror sync of {names} also publishes the new version with the upstream manifest (a publication is created)."
-                ));
-            }
+            let lines = mirror_lines(&goes, complete, &files);
             if goes.is_empty() {
                 app.confirm("Confirm mirror sync", lines, go)
             } else {
@@ -319,6 +302,30 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl 
             }
         })
     });
+}
+
+/// The mirror confirm: `goes` are the repositories whose current version the sync makes Pulp delete, `complete` is
+/// mirror_complete, and `files` are the File repositories (their mirror sync publishes).
+fn mirror_lines(goes: &[String], complete: bool, files: &[String]) -> Vec<String> {
+    let mut lines = vec![
+        "Mirror sync makes the NEW repository version match the upstream exactly:".into(),
+        "content that is not upstream is removed from the new version.".into(),
+    ];
+    if goes.is_empty() {
+        lines.push("Older versions are not changed and can still be published (rollback).".into());
+    } else {
+        lines.extend(goes_lines(&goes.join(", "), 1, "Content that is not upstream"));
+    }
+    if complete {
+        lines.push("mirror_complete also publishes the upstream metadata unchanged (a publication is created).".into());
+    }
+    if !files.is_empty() {
+        let names = files.join(", ");
+        lines.push(format!(
+            "File: the mirror sync of {names} also publishes the new version with the upstream manifest (a publication is created)."
+        ));
+    }
+    lines
 }
 
 /// pulpcore `Repository.cleanup_old_versions`: after each new version, Pulp keeps the newest `retain_repo_versions`
