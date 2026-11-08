@@ -317,6 +317,8 @@ impl App {
 
     pub fn notify(&mut self, level: Level, text: impl Into<String>) {
         let text = text.into();
+        // The footer, the Logs row and the log file never show the user info of a URL (audit F47).
+        let text = crate::session_log::masked_user_info(&text).unwrap_or(text);
         match level {
             Level::Error => tracing::warn!("{text}"),
             _ => tracing::info!("{text}"),
@@ -503,7 +505,11 @@ impl App {
         self.next_id += 1;
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
-            let result = fut.await.map_err(|e| format!("{e:#}"));
+            // Also the text view of the error has no user info of a URL (audit F47).
+            let result = fut.await.map_err(|e| {
+                let e = format!("{e:#}");
+                crate::session_log::masked_user_info(&e).unwrap_or(e)
+            });
             let _ = tx.send(Msg::JobDone { id, result });
         });
         self.jobs.push(Job { id, label, progress: String::new(), started: Instant::now(), abort: handle.abort_handle(), is_load });
@@ -2381,6 +2387,43 @@ mod tests {
             assert!(app.modal.is_none() && app.queued.is_empty(), "no text view");
         }
         assert_eq!(texts(&app), ["load dashboard: 502 Bad Gateway\n<html>\n</html>"; 2]);
+    }
+
+    /// Audit F47: the footer notice, its Logs row and the text view of an error never show the user info of a URL,
+    /// of each URL in the text.
+    #[tokio::test]
+    async fn an_error_shows_no_user_info_of_a_url() {
+        let mut app = app_on(Kind::Profiles).await;
+        let mut rx = app.rx.take().unwrap();
+        app.spawn("replicate f47".into(), false, async {
+            anyhow::bail!("2 failed:\n  http://u:p@h/a/: 502\n  http://h/ and https://v@h2/")
+        });
+        app.handle_msg(rx.recv().await.unwrap());
+        let masked = ["2 failed:", "  http://•••@h/a/: 502", "  http://h/ and https://•••@h2/"];
+        assert_eq!(text_lines(&app), masked);
+        app.error("refused f47: http://u:p@h/");
+        let notices = [format!("replicate f47: {}", masked.join("\n")), "refused f47: http://•••@h/".into()];
+        assert_eq!(texts(&app), notices);
+        for n in notices {
+            let id = row_with(&format!("[error] {n}"))["id"].as_u64().unwrap();
+            assert_eq!(crate::session_log::detail(id), Some(vec![n]));
+        }
+    }
+
+    /// Audit F47: Pulp's error of a task (pulp_rpm names the remote URL in a sync error) shows without user info in the
+    /// notice, the Task Center row (its ERROR line) and task Inspect.
+    #[tokio::test]
+    async fn a_task_error_shows_no_user_info_of_a_url() {
+        let mut app = app_on(Kind::Tasks).await;
+        let error = serde_json::json!({ "description": "Cannot download http://u:p@h/repomd.xml", "traceback": "at https://v@h2/x" });
+        let t = serde_json::json!({ "pulp_href": "/t/1/", "state": "failed", "name": "sync os", "error": error });
+        app.handle_msg(Msg::Task(serde_json::from_value(t).unwrap(), None));
+        assert_eq!(texts(&app), ["task failed: sync os: Cannot download http://•••@h/repomd.xml"]);
+        let row = app.task_items().remove(0);
+        assert_eq!(row["error"], "Cannot download http://•••@h/repomd.xml");
+        let inspect = super::super::actions::task_lines(&row).join("\n");
+        assert!(inspect.contains("http://•••@h/repomd.xml") && inspect.contains("https://•••@h2/x"), "{inspect}");
+        assert!(!inspect.contains("u:p@") && !inspect.contains("v@h2"), "{inspect}");
     }
 
     /// The text view of a failed job waits behind dialogs only for itself: a dialog that the operator opens after it

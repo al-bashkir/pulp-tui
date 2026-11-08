@@ -3,7 +3,7 @@
 use super::actions::{ap, caps, group_progress, snapshot_refusal, submit, unmark_when_deleted, url_with_scheme};
 use super::app::{App, Level};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
-use super::kinds::{Act, Kind, guard_type, s, short};
+use super::kinds::{Act, Kind, guard_type, masked_url, s, short};
 use crate::pulp::client::Page;
 use crate::pulp::{Capabilities, PulpClient, PulpError, RepoType, ops};
 use crate::replication::{self, PlanAction};
@@ -1056,7 +1056,7 @@ fn replicate(app: &mut App, item: &Value) {
     }
     let policy = s(item, "policy");
     let mut lines = vec![
-        format!("Replicate from {} into this server ({dst_origin}).", s(item, "base_url")),
+        format!("Replicate from {} into this server ({dst_origin}).", masked_url(item, "base_url")),
         format!(
             "Distribution filter: {}",
             if s(item, "q_select").is_empty() { "ALL upstream distributions".into() } else { s(item, "q_select") }
@@ -2186,6 +2186,19 @@ mod tests {
             let warned = lines[0].starts_with("!!!") && lines[0].contains(deletes);
             assert_eq!(warned, typed.is_some(), "{policy:?}: {lines:?}");
         }
+    }
+
+    /// Audit F47: Pulp accepts user info in the `base_url` of an Upstream Pulp. The list and Replicate never show it.
+    #[tokio::test]
+    async fn upstream_base_url_shows_without_its_user_info() {
+        let server = MockServer::start().await;
+        let (mut app, _rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        let item = json!({ "pulp_href": UP, "name": "up", "base_url": "https://u:p@upstream.example.com/", "policy": "nodelete" });
+        let column = Kind::UpstreamPulps.columns().into_iter().find(|c| c.title == "base_url").map(|c| (c.get)(&item));
+        assert_eq!(column.as_deref(), Some("https://•••@upstream.example.com/"));
+        super::upstream_action(&mut app, crate::tui::kinds::Act::Replicate, item);
+        let Some(Modal::Confirm { lines, .. }) = &app.modal else { panic!("no confirmation") };
+        assert!(lines[0].starts_with("Replicate from https://•••@upstream.example.com/ into"), "{lines:?}");
     }
 
     #[tokio::test]

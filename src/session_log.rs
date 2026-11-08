@@ -2,8 +2,8 @@
 //!
 //! Keeps the last `MAX_ROWS` rows (hidden poll rows are dropped first); each stored body is cut at
 //! `MAX_BODY` bytes. JSON keys in `SECRET_KEYS` (`password`, `token`, `secret`, …) and any key ending in
-//! `_<one of them>` are replaced with `•••` at any depth, and so is the user info of a URL in any string
-//! (`http://•••@host/`). The Authorization header is
+//! `_<one of them>` are replaced with `•••` at any depth, and so is the user info of each URL in any string
+//! (`http://•••@host/`), also in the text of a notice. The Authorization header is
 //! never recorded (`Request` has no header field) and upload bodies are replaced by their size. The log
 //! lives in memory only and is never written to disk.
 
@@ -162,12 +162,24 @@ pub fn redact(v: &mut Value) {
     }
 }
 
-/// `u` with the user info of its URL (`scheme://user:password@host`) as `•••`; None when it has none. The user
-/// info ends at the last `@` before the path, query or fragment.
+/// `u` with the user info of each URL in it (`scheme://user:password@host`) as `•••`; None when no URL has any. The
+/// user info ends at the last `@` before the path, query, fragment, a quote, `<`, `>` or white space.
 pub fn masked_user_info(u: &str) -> Option<String> {
-    let (scheme, rest) = u.split_once("://")?;
-    let at = rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())].rfind('@')?;
-    Some(format!("{scheme}://•••{}", &rest[at..]))
+    let (mut out, mut rest, mut masked) = (String::new(), u, false);
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let end = tail.find(|c: char| matches!(c, '/' | '?' | '#' | '"' | '<' | '>') || c.is_whitespace()).unwrap_or(tail.len());
+        rest = match tail[..end].rfind('@') {
+            Some(at) => {
+                out.push_str("•••");
+                masked = true;
+                &tail[at..]
+            }
+            None => tail,
+        };
+    }
+    masked.then(|| out + rest)
 }
 
 /// A GET of one task or task group: the polling a running job does every moment.
@@ -307,6 +319,26 @@ mod tests {
                 "base_url": "https://pulp.example/pulp/content/a@b/", "description": "mail u:p@h" }),
             "an @ in the path, or a text that is not a URL, stays"
         );
+    }
+
+    /// Audit F47: an error text can name more than one URL; each loses its user info. A text that is not one stays.
+    #[test]
+    fn masked_user_info_masks_every_url_of_a_text() {
+        let cases = [
+            (
+                "sync http://u:p@h/x/ failed; proxy https://pu@px:3128 refused",
+                "sync http://•••@h/x/ failed; proxy https://•••@px:3128 refused",
+            ),
+            ("from http://h/ to http://u:p@h2/", "from http://h/ to http://•••@h2/"),
+            ("ошибка «http://ü:pä@hö/» и http://h/ a@b", "ошибка «http://•••@hö/» и http://h/ a@b"),
+            ("2 failed:\n  http://u:p@h\n  http://v:q@h2", "2 failed:\n  http://•••@h\n  http://•••@h2"),
+        ];
+        for (text, masked) in cases {
+            assert_eq!(masked_user_info(text).as_deref(), Some(masked), "{text}");
+        }
+        for text in ["mail u:p@h", "see http://h:8080 or mail admin@example.com", r#"{"a":"http://h","b":"u@x"}"#, "x://", "é://"] {
+            assert_eq!(masked_user_info(text), None, "{text}");
+        }
     }
 
     #[test]

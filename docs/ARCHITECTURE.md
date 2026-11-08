@@ -532,8 +532,13 @@ client clock).
   `token_credential` and `sas_token` are readable on GET). The key list is
   `session_log::SECRET_KEYS`; the repository export uses it too. They also mask the user
   info of every URL (`http://•••@host/`): a remote's `url` and `proxy_url` and a domain's
-  S3 `proxies` are readable on GET. The `url` column of the Remotes lists masks it too; the
-  Edit form shows the URL as Pulp has it.
+  S3 `proxies` are readable on GET. The `url` column of the Remotes lists, the `base_url`
+  column of Upstream Pulps and the Replicate confirmation mask it too; the Edit form shows
+  the URL as Pulp has it (Pulp accepts user info in a `base_url`).
+* Error texts lose the user info of each URL where they come in: a notice (`App::notify`:
+  footer, Logs, log file), a job error (`App::spawn`: also its text view) and Pulp's error of
+  a task (`Task::error`: notice, Task Center, Inspect). The log file writer masks each line
+  as the last guard.
 * The Logs screen (`src/session_log.rs`) keeps the last 1000 entries in memory, bodies cut
   at 64 KiB, secret keys redacted (any case), upload bodies replaced by their size. It is
   never written to disk.

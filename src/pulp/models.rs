@@ -375,10 +375,19 @@ pub struct Task {
     pub progress_reports: Vec<ProgressReport>,
     #[serde(default)]
     pub created_resources: Vec<Option<String>>,
+    #[serde(default, deserialize_with = "masked_error")]
     pub error: Option<Value>,
     pub task_group: Option<String>,
     #[serde(default)]
     pub reserved_resources_record: Vec<String>,
+}
+
+/// Pulp's error of a task can name a URL with its user info (pulp_rpm puts the remote URL in a sync error): it is
+/// masked where the task comes in, for each notice and view of it (audit F47).
+fn masked_error<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    let mut error = Option::<Value>::deserialize(d)?;
+    error.iter_mut().for_each(crate::session_log::redact);
+    Ok(error)
 }
 
 pub const TASK_FINAL_STATES: [&str; 4] = ["completed", "failed", "canceled", "skipped"];

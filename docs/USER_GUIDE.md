@@ -994,6 +994,9 @@ The log never records the `Authorization` header. It shows as `•••` the JS
 in any letter case. An upload shows only its size. A body is
 cut at 64 KiB. The log keeps 1000 rows in memory only and is gone when you quit.
 
+The user info of each URL shows as `•••` (`http://•••@host/`): in Logs, Inspect and Details, in
+notices and error texts, in task errors (Task Center and Inspect) and in the log file.
+
 ## Server profiles
 
 The config file is `--config`, `$PULP_TUI_CONFIG`, or `$XDG_CONFIG_HOME/pulp-tui/config.toml`.

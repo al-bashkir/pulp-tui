@@ -225,8 +225,23 @@ async fn cv_store(cfg: &Config, profile: &str, local: &Arc<Store>) -> Result<Arc
 fn init_logging(dir: &std::path::Path) -> Result<()> {
     let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("pulp-tui.log"))?;
     let filter = tracing_subscriber::EnvFilter::try_from_env("PULP_TUI_LOG").unwrap_or_else(|_| "pulp_tui=info,warn".into());
-    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(file)).init();
+    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(Masked(file))).init();
     Ok(())
+}
+
+/// The log file with the user info of each URL as `•••` (audit F47): the last guard for every line, also for a job's
+/// progress. The formatter writes one event in one `write_all`.
+struct Masked<W>(W);
+
+impl<W: std::io::Write> std::io::Write for Masked<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let masked = pulp_tui::session_log::masked_user_info(&String::from_utf8_lossy(buf));
+        self.0.write_all(masked.as_ref().map_or(buf, |m| m.as_bytes()))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
 #[cfg(test)]
@@ -245,5 +260,17 @@ mod tests {
         let local = Arc::new(Store::open_in_memory().await.unwrap());
         let e = cv_store(&cfg, "lab", &local).await.unwrap_err();
         assert!(e.ends_with("; run pulp-tui db migrate --profile lab"), "{e}");
+    }
+
+    /// Audit F47: a line of `pulp-tui.log` names each URL without its user info.
+    #[test]
+    fn the_log_file_shows_no_user_info_of_a_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pulp-tui.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let log = tracing_subscriber::fmt().with_ansi(false).with_writer(std::sync::Mutex::new(Masked(file))).finish();
+        tracing::subscriber::with_default(log, || tracing::warn!("sync http://u:p@h/ and https://v@h2/ failed"));
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert!(line.ends_with("sync http://•••@h/ and https://•••@h2/ failed\n"), "{line}");
     }
 }

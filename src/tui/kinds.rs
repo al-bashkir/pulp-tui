@@ -128,9 +128,10 @@ fn col(title: &'static str, width: u16, get: fn(&Value) -> String) -> Col {
     Col { title, width, get }
 }
 
-/// A remote's `url` without its user info (`https://•••@host/`); the row keeps it for the Edit form.
-fn remote_url(v: &Value) -> String {
-    let u = s(v, "url");
+/// A remote's `url` or an Upstream Pulp's `base_url` without its user info (`https://•••@host/`); the row keeps it for
+/// the Edit form.
+pub fn masked_url(v: &Value, k: &str) -> String {
+    let u = s(v, k);
     crate::session_log::masked_user_info(&u).unwrap_or(u)
 }
 
@@ -664,9 +665,11 @@ impl Kind {
             ],
             // pulp_file Git remotes have no policy (always immediate).
             Kind::Remotes(RepoType::File, true) => {
-                vec![col("name", 28, |v| s(v, "name")), col("git ref", 14, |v| s(v, "git_ref")), col("url", 50, remote_url)]
+                vec![col("name", 28, |v| s(v, "name")), col("git ref", 14, |v| s(v, "git_ref")), col("url", 50, |v| masked_url(v, "url"))]
             }
-            Kind::Remotes(..) => vec![col("name", 28, |v| s(v, "name")), col("policy", 10, |v| s(v, "policy")), col("url", 50, remote_url)],
+            Kind::Remotes(..) => {
+                vec![col("name", 28, |v| s(v, "name")), col("policy", 10, |v| s(v, "policy")), col("url", 50, |v| masked_url(v, "url"))]
+            }
             Kind::Acs(_) => vec![
                 col("name", 28, |v| s(v, "name")),
                 col("paths", 30, |v| v["paths"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
@@ -798,7 +801,7 @@ impl Kind {
             ],
             Kind::UpstreamPulps => vec![
                 col("name", 20, |v| s(v, "name")),
-                col("base_url", 30, |v| s(v, "base_url")),
+                col("base_url", 30, |v| masked_url(v, "base_url")),
                 col("policy", 9, |v| s(v, "policy")),
                 col("last replication", 19, |v| ts(v, "last_replication")),
             ],
