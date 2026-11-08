@@ -5643,6 +5643,34 @@ mod tests {
         }
     }
 
+    /// A package release component needs a release component of the version; on a Content View snapshot repository it
+    /// is refused before any confirm or change.
+    #[tokio::test]
+    async fn a_package_release_component_needs_a_release_component_and_refuses_a_snapshot() {
+        use crate::tui::app::{ListState, Screen};
+        let server = wiremock::MockServer::start().await;
+        let (repo, comps) = (format!("{API}repositories/deb/apt/snap/"), format!("{API}content/deb/release_components/"));
+        let r = json!({ "pulp_href": repo, "name": "snap", "latest_version_href": format!("{repo}versions/2/"), "pulp_labels": { "pulp_tui_cv": "web" } });
+        let (mut app, mut rx) = connected(&server).await;
+        let k = Kind::Content { version: format!("{repo}versions/1/"), ctype: 11 };
+        (app.screen, app.list) = (Screen::List(k.clone()), ListState::new(k));
+        let last = |app: &App| app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        get(&server, &comps, page(json!([]))).await;
+        run(&mut app, Act::Create, Value::Null);
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none() && last(&app).ends_with("version 1 has no release components: create one first"), "{}", last(&app));
+
+        server.reset().await;
+        get(&server, &repo, r).await;
+        get(&server, &comps, page(json!([{ "pulp_href": format!("{comps}1/"), "distribution": "bookworm", "component": "main" }]))).await;
+        run(&mut app, Act::Create, Value::Null);
+        settle(&mut app, &mut rx).await;
+        fill_and_submit(&mut app, &[("package", "hello"), ("release_component", "bookworm/main")]);
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none() && last(&app).contains("refused: snap is a snapshot repository of Content View web"), "{}", last(&app));
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing is sent");
+    }
+
     #[tokio::test]
     async fn removed_content_shows_the_new_version_where_the_old_one_is_still_shown() {
         use crate::tui::app::Screen;
