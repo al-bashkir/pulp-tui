@@ -983,6 +983,18 @@ mod tests {
         }
     }
 
+    /// The civil-date rule also holds where its century term is not 0 (a year of the 1900s), and a time keeps its
+    /// seconds.
+    #[test]
+    fn the_idle_rule_reads_a_time_of_the_last_century_to_the_second() {
+        for (at, secs) in [("1970-01-01T00:00:00Z", 0), ("1999-12-31T23:59:59Z", 946_684_799), ("1999-12-31T18:59:59-05:00", 946_684_799)] {
+            let g = serde_json::json!({ "pulp_href": "/g/9/", "completed": 1, "tasks": [{ "state": "completed", "finished_at": at }] });
+            let g: TaskGroup = serde_json::from_value(g).unwrap();
+            let ended = secs + IDLE_FINAL_SECS;
+            assert!(g.idle_long(ended) && !g.idle_long(ended - 1), "{at}");
+        }
+    }
+
     /// No group with tasks is final before a task of it ended; a failed or canceled task ends it also without the flag.
     #[test]
     fn a_group_ends_with_a_failure_and_never_before_a_task_ended() {
