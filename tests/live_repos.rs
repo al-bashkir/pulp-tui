@@ -1499,3 +1499,125 @@ async fn rpm_serve_from_versions_through_the_tui() {
         serve_from_versions_through_the_tui(RepoType::Rpm, "rpm/", "repodata/repomd.xml").await;
     }
 }
+
+/// Sync (s) of type `t` with the mirror `policy` through the TUI (audit T02), on a repository whose version 2 lacks one
+/// unit of the upstream (`path`): the mirror confirm says that the new version matches the upstream (mirror_complete:
+/// and is published), then the Task Center follows the sync; version 3 has the upstream content again.
+async fn mirror_sync_through_the_tui(t: RepoType, path: &str, policy: &str) {
+    let (c, name) = (client(), unique(&format!("it-mirror-{}", t.component())));
+    let (repo, remote, [v1, _]) = two_versions(&c, t, &name, path).await;
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Repos(t, false), &name).await;
+    let r = row(&app, "name", &name).unwrap_or_else(|| panic!("no row: {:?}", app.list.items));
+    run(&mut app, Act::Sync, r);
+    settle(&mut app, &mut rx).await; // the name of the default remote
+    fill(&mut app, &[("policy", policy), ("optimize", "false")]);
+    settle(&mut app, &mut rx).await; // the retention of the repository
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed, None, "the retention keeps the current version: {lines:?}");
+    assert_eq!(lines[0], "Mirror sync makes the NEW repository version match the upstream exactly:");
+    assert_eq!(lines.iter().any(|l| l.starts_with("mirror_complete also publishes")), policy == "mirror_complete", "{lines:?}");
+    settle_tasks(&mut app, &mut rx).await;
+    shown(&app, &format!("task completed: sync {name} ({policy})"));
+    let v3 = latest(&c, &repo).await;
+    assert!(v3.ends_with("/versions/3/"), "{v3}");
+    let keys = async |v: &str| ops::content_keys(&c, t, Some(v)).await.unwrap();
+    assert_eq!(keys(&v3).await, keys(&v1).await, "the upstream content again");
+    // pulp_file 3.123 also publishes a mirror sync (docs/COMPATIBILITY.md); the confirm names only mirror_complete.
+    let pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository_version", v3.clone())], 10).await.unwrap();
+    assert_eq!(pubs.len(), usize::from(policy == "mirror_complete" || t == RepoType::File), "{pubs:?}");
+    // The repository delete takes its publications along.
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
+#[tokio::test]
+async fn rpm_mirror_sync_through_the_tui() {
+    if live_enabled() {
+        mirror_sync_through_the_tui(RepoType::Rpm, "rpm/", "mirror_complete").await;
+    }
+}
+
+#[tokio::test]
+async fn file_mirror_sync_through_the_tui() {
+    if live_enabled() {
+        mirror_sync_through_the_tui(RepoType::File, "file/PULP_MANIFEST", "mirror").await;
+    }
+}
+
+#[tokio::test]
+async fn deb_mirror_sync_through_the_tui() {
+    if live_enabled() {
+        mirror_sync_through_the_tui(RepoType::Deb, "deb/", "mirror").await;
+    }
+}
+
+/// Upload (u) of a File with Overwrite off through the TUI (audit T02): other content at the same relative path fails
+/// the task and the repository keeps its file; with Overwrite on it is replaced in a new version.
+#[tokio::test]
+async fn file_upload_without_overwrite_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::File, unique("it-tui-overwrite"));
+    let (mut app, mut rx) = app().await;
+    if !app.conn.as_ref().unwrap().caps.has_field("file.FileContent", "overwrite") {
+        eprintln!("skipping: this server's File uploads have no `overwrite` field (older pulpcore)");
+        return;
+    }
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, new) = (dir.path().join("old.txt"), dir.path().join("new.txt"));
+    // Unique bytes, so a rerun does not find the content units of an earlier run.
+    std::fs::write(&old, format!("{name} old\n")).unwrap();
+    std::fs::write(&new, format!("{name} new\n")).unwrap();
+    // The digests of the files of the latest version.
+    let files = async || -> Vec<String> {
+        let q = [("repository_version", latest(&c, &repo).await), ("fields", "sha256".to_string())];
+        c.list::<Value>(&c.api(t.content()), &q).await.unwrap().results.iter().map(|x| s(x, "sha256")).collect()
+    };
+    let sha = |p: &std::path::Path| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(std::fs::read(p).unwrap()));
+    open_list(&mut app, &mut rx, Kind::Repos(t, false), &name).await;
+    for (file, overwrite, kept) in [(&old, "false", &old), (&new, "false", &old), (&new, "true", &new)] {
+        let r = row(&app, "name", &name).unwrap();
+        run(&mut app, Act::Upload, r);
+        let path = file.display().to_string();
+        fill(&mut app, &[("path", path.as_str()), ("relative_path", "same.txt"), ("overwrite", overwrite)]);
+        settle(&mut app, &mut rx).await;
+        let last = texts(&app).pop().unwrap_or_default();
+        assert_eq!(last.starts_with(&format!("uploaded {path} ")), file == kept, "{overwrite}: {last}");
+        if file != kept {
+            assert!(last.contains("overwrite"), "Pulp says why: {last}");
+        }
+        assert_eq!(files().await, [sha(kept)], "{overwrite}: the file at same.txt");
+    }
+    cleanup(&c, &[&repo]).await;
+}
+
+/// Repository Edit (e) of a File repository through the TUI (audit T02): description, retained versions, manifest
+/// file name, default remote and labels are saved; a second edit clears them.
+#[tokio::test]
+async fn file_repository_edit_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::File, unique("it-file-edit"));
+    let remote = create(&c, t.remotes(), json!({ "name": name, "url": format!("{}/file/PULP_MANIFEST", upstream()) }), "/remotes/").await;
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Repos(t, false), &name).await;
+    let keys = ["description", "retain_repo_versions", "manifest", "remote", "labels"];
+    let set = ["docs", "3", "MANIFEST2", name.as_str(), "team=ops"];
+    let stored = json!(["docs", 3, "MANIFEST2", remote, { "team": "ops" }]);
+    for (values, want) in [(set, stored), (["", "", "PULP_MANIFEST", "", ""], json!([null, null, "PULP_MANIFEST", null, {}]))] {
+        let r: Value = c.get(&repo, &[]).await.unwrap();
+        run(&mut app, Act::Edit, r);
+        settle(&mut app, &mut rx).await; // the name of the default remote, when there is one
+        fill(&mut app, &keys.into_iter().zip(values).collect::<Vec<_>>());
+        settle_tasks(&mut app, &mut rx).await;
+        shown(&app, &format!("task completed: update repository {name}"));
+        let r: Value = c.get(&repo, &[]).await.unwrap();
+        let got = keys.map(|k| if k == "labels" { r["pulp_labels"].clone() } else { r[k].clone() });
+        assert_eq!(json!(got), want, "{:?}", texts(&app));
+    }
+    cleanup(&c, &[&repo, &remote]).await;
+}

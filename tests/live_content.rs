@@ -219,6 +219,47 @@ async fn acs_create_edit_and_delete_through_the_tui() {
     }
 }
 
+/// Refresh (r) on the Alternate Content Sources screens of RPM, File and Deb (audit T02): Pulp answers with a task
+/// group, which the Task Center tracks as one task until its sync tasks end.
+#[tokio::test]
+async fn acs_refresh_through_the_tui_ends_with_its_task_group() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let (mut app, mut rx) = app().await;
+    for (t, url, paths) in
+        [(RepoType::Rpm, "", json!(["rpm/"])), (RepoType::File, "file/PULP_MANIFEST", json!([])), (RepoType::Deb, "deb/", json!([]))]
+    {
+        if let Some(e) = Kind::Acs(t).unsupported(&app.conn.as_ref().unwrap().caps) {
+            eprintln!("skipping: {e}");
+            continue;
+        }
+        let name = unique(&format!("it-tui-refresh-{}", t.component()));
+        let mut body = json!({ "name": name, "url": format!("{}/{url}", upstream()), "policy": "on_demand" });
+        if t == RepoType::Deb {
+            body["distributions"] = "fixture".into();
+        }
+        let remote = create(&c, t.remotes(), body, "/remotes/").await;
+        let acs = create(&c, t.acs(), json!({ "name": name, "remote": remote, "paths": paths }), "/acs/").await;
+        open_list(&mut app, &mut rx, Kind::Acs(t), &name).await;
+        let a = row(&app, "name", &name).unwrap_or_else(|| panic!("no row: {:?}", app.list.items));
+        run(&mut app, Act::Refresh, a);
+        settle_tasks(&mut app, &mut rx).await;
+        shown(&app, &format!("task completed: refresh ACS {name}"));
+        let tracked = &app.tasks.items[0];
+        assert!(tracked.href.contains("/task-groups/") && tracked.is_final(), "{}: {}", t.label(), tracked.href);
+
+        cleanup(&c, &[&acs]).await;
+        // pulp_deb 3.11 keeps its hidden repository after the ACS delete.
+        let hidden: Option<Value> = ops::find_by_name(&c, &c.api(t.repositories()), &format!("{name}--repository")).await.unwrap();
+        if let Some(h) = hidden {
+            cleanup(&c, &[h["pulp_href"].as_str().unwrap()]).await;
+        }
+        cleanup(&c, &[&remote]).await;
+    }
+}
+
 /// pulpcore 3.123 deletes a path that an edit removes from every ACS with that path (`_update_paths`
 /// filters by path only); the Edit form warns about it.
 #[tokio::test]

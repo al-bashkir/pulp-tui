@@ -14,7 +14,7 @@ use pulp_tui::pulp::{Capabilities, PulpClient, RepoType, deb};
 use pulp_tui::store::{CvRepo, Store};
 use pulp_tui::tui::actions::run;
 use pulp_tui::tui::app::Modal;
-use pulp_tui::tui::kinds::{Act, Kind, s};
+use pulp_tui::tui::kinds::{Act, Kind, s, short};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -673,4 +673,68 @@ async fn deb_content_view_publish_signing_through_the_tui() {
     }
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &[&repo, &remote]).await;
+}
+
+/// Publications Create (c) of Kind verbatim through the TUI (audit T02): a verbatim publication of the latest version,
+/// which serves the synced upstream Release as it is.
+#[tokio::test]
+async fn deb_verbatim_publication_create_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::Deb, unique("it-deb-verbatim-tui"));
+    let (repo, remote) = synced_repo(&c, t, &name, "deb/", "mirror").await;
+    let v1 = latest(&c, &repo).await;
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Publications(t), "").await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("repo", &name), ("kind", "verbatim")]);
+    settle(&mut app, &mut rx).await;
+    let q = [("repository_version", v1.clone())];
+    let found: Vec<Value> = c.list_all(&c.api(deb::VERBATIM_PUBLICATIONS), &q, 10).await.unwrap();
+    let p = found.first().map(|p| s(p, "pulp_href")).unwrap_or_else(|| panic!("no verbatim publication: {:?}", texts(&app)));
+    shown(&app, &format!("publication {} of {}", short(&p), short(&v1)));
+    let apt: Vec<Value> = c.list_all(&c.api(t.publications()), &q, 10).await.unwrap();
+    assert!(apt.is_empty(), "no APT publication: {apt:?}");
+    let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
+    let base = s(&c.get::<Value>(&dist, &[]).await.unwrap(), "base_url");
+    let upstream = std::fs::read(fixtures().join("upstream/deb/dists/fixture/Release")).unwrap();
+    assert_eq!(served(&c, &format!("{base}dists/fixture/Release")).await, (200, upstream), "the upstream Release as it is");
+    cleanup(&c, &[&dist, &p, &repo, &remote]).await;
+}
+
+/// Repository Edit (e) of the Deb signing fields through the TUI (audit T02): the signing service, a per-release
+/// signing service, a per-release package fingerprint and the excluded package metadata fields are saved; a second
+/// edit clears them (each release override is deleted, not left behind).
+#[tokio::test]
+async fn deb_repository_edit_of_the_signing_fields_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::Deb, unique("it-deb-edit"));
+    let found: Option<Value> = ops::find_by_name(&c, &c.api("signing-services/"), "pulp-tui-deb-test").await.unwrap();
+    let service = s(&found.expect("the Deb test signing service (tests/env/pulp-env.sh deb-signing-up)"), "pulp_href");
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Repos(t, false), &name).await;
+    let fingerprint = "v4:ABCDEF1234567890ABCDEF1234567890ABCDEF12";
+    let (services, fingerprints) = (format!("fixture={service}"), format!("fixture={fingerprint}"));
+    let keys = [
+        "signing_service",
+        "signing_service_release_overrides",
+        "package_signing_fingerprint_release_overrides",
+        "excluded_package_metadata_fields",
+    ];
+    let set = [service.as_str(), &services, &fingerprints, "Phased-Update-Percentage,X-Custom"];
+    let stored = json!([service, { "fixture": service }, { "fixture": fingerprint }, ["Phased-Update-Percentage", "X-Custom"]]);
+    for (values, want) in [(set, stored), (["", "", "", ""], json!([null, {}, {}, []]))] {
+        let r: Value = c.get(&repo, &[]).await.unwrap();
+        run(&mut app, Act::Edit, r);
+        fill(&mut app, &keys.into_iter().zip(values).collect::<Vec<_>>());
+        settle_tasks(&mut app, &mut rx).await;
+        shown(&app, &format!("task completed: update repository {name}"));
+        let r: Value = c.get(&repo, &[]).await.unwrap();
+        assert_eq!(json!(keys.map(|k| r[k].clone())), want, "{:?}", texts(&app));
+    }
+    cleanup(&c, &[&repo]).await;
 }
