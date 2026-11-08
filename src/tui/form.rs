@@ -301,9 +301,11 @@ pub struct Form {
     pub editing: bool,
     /// Char index of the edit cursor in the focused field.
     pub cursor: usize,
-    /// `Enter` moved onto a field that is not text: plain characters (typed ahead) do nothing until this time; each
-    /// one moves it on by `HOLD`, so only a pause or another key ends it.
+    /// `Enter` moved onto a field that is not text: keys (typed ahead) do nothing until this time; each one moves it on
+    /// by `HOLD`, so only a pause in typing ends it. Ctrl-S still submits.
     hold: Option<std::time::Instant>,
+    /// The time of the key that is handled (`key_at`): the clock of `hold`.
+    now: std::time::Instant,
 }
 
 /// A pause in typing this long ends the typed-ahead text after `Enter` (`Form::hold`).
@@ -342,6 +344,7 @@ impl Form {
             editing,
             cursor,
             hold: None,
+            now: std::time::Instant::now(),
         }
     }
     pub fn note(mut self, n: impl Into<String>) -> Self {
@@ -452,20 +455,24 @@ impl Form {
         if load { FormEvent::Load(field) } else { FormEvent::None }
     }
 
-    /// Enter while editing: submit on the last field, else go to the next one. Text typed ahead must not become
-    /// move-mode commands there: a text field is edited at once; on another field plain characters do nothing
-    /// until a pause in typing or a key that is not text (`hold`).
+    /// Enter while editing: submit on the last field, else go to the next one.
     fn advance(&mut self) -> FormEvent {
         if self.focus + 1 == self.fields.len() {
             self.editing = false;
             return FormEvent::Submit;
         }
-        self.focus += 1;
-        let f = &self.fields[self.focus];
-        self.editing = f.kind.is_text();
-        self.hold = (!self.editing).then(|| std::time::Instant::now() + HOLD);
-        self.cursor = f.value.chars().count();
+        self.enter_field(self.focus + 1);
         FormEvent::None
+    }
+
+    /// Enter goes on to `field`. Keys typed ahead must not become move-mode commands there: a text field is edited at
+    /// once; on another field no key acts until a pause in typing (`hold`).
+    fn enter_field(&mut self, field: usize) {
+        self.focus = field;
+        let f = &self.fields[field];
+        self.editing = f.kind.is_text();
+        self.hold = (!self.editing).then(|| self.now + HOLD);
+        self.cursor = f.value.chars().count();
     }
 
     /// Keys of a focused pick field whose popup is closed; `None` = not a pick key (`j` and `k` move).
@@ -497,9 +504,9 @@ impl Form {
             return if self.picker.is_none() { FormEvent::Submit } else { FormEvent::None };
         }
         if k.code == KeyCode::Enter {
-            // A taken selection counts as Enter on the field: go on. Only Ctrl-S submits here.
-            if self.commit() && self.focus + 1 < self.fields.len() {
-                self.focus += 1;
+            // A taken selection counts as Enter on the field: go on (the last field stays). Only Ctrl-S submits here.
+            if self.commit() {
+                self.enter_field((self.focus + 1).min(self.fields.len() - 1));
             }
             return FormEvent::None;
         }
@@ -583,6 +590,12 @@ impl Form {
     }
 
     pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
+        self.key_at(k, std::time::Instant::now())
+    }
+
+    /// `handle_key` at time `now` (tests give the clock).
+    fn key_at(&mut self, k: KeyEvent, now: std::time::Instant) -> FormEvent {
+        self.now = now;
         if let Some(ev) = self.early_key(k) {
             return ev;
         }
@@ -597,7 +610,7 @@ impl Form {
         }
     }
 
-    /// Keys taken before the field's own: an empty form, an open picker, Ctrl-S, text typed ahead after Enter
+    /// Keys taken before the field's own: an empty form, an open picker, Ctrl-S, keys typed ahead after Enter
     /// (`hold`), a closed pick field.
     fn early_key(&mut self, k: KeyEvent) -> Option<FormEvent> {
         if self.fields.is_empty() {
@@ -610,9 +623,8 @@ impl Form {
         if ctrl && k.code == KeyCode::Char('s') {
             return Some(FormEvent::Submit);
         }
-        let now = std::time::Instant::now();
-        if self.hold.is_some_and(|end| now < end) && matches!(k.code, KeyCode::Char(_)) && !ctrl {
-            self.hold = Some(now + HOLD);
+        if self.hold.is_some_and(|end| self.now < end) {
+            self.hold = Some(self.now + HOLD);
             return Some(FormEvent::None);
         }
         self.hold = None;
@@ -650,7 +662,7 @@ impl Form {
                 self.editing = true;
                 self.cursor = f.value.chars().count();
             }
-            KeyCode::Enter => self.focus = (self.focus + 1) % n,
+            KeyCode::Enter => self.enter_field((self.focus + 1) % n),
             KeyCode::Char(' ') if f.kind == FieldKind::Bool => f.value = (f.value != "true").to_string(),
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => f.choose(code == KeyCode::Left),
             _ => {}
@@ -736,7 +748,7 @@ mod tests {
         assert_eq!(f.focus, 0);
         let mut f = Form::new("t", vec![Field::new("b", "B", FieldKind::Bool), Field::text("a", "A")]);
         f.handle_key(key(KeyCode::Enter));
-        assert_eq!((f.focus, f.editing), (1, false), "Enter on a checkbox goes to the next field");
+        assert_eq!((f.focus, f.editing), (1, true), "Enter on a checkbox goes to the next field and edits a text field");
     }
 
     /// The fields of a new RPM remote. Runtime (audit F15): Name `x2`, Enter, then fast `jl j ` moved, changed the
@@ -773,43 +785,102 @@ mod tests {
         assert_eq!((f.focus, f.editing), (1, true));
     }
 
+    /// `n` milliseconds after `t0`: the clock that tests give to `Form::key_at`.
+    fn ms(t0: std::time::Instant, n: u64) -> std::time::Instant {
+        t0 + std::time::Duration::from_millis(n)
+    }
+
     #[test]
-    fn text_typed_after_enter_never_changes_a_choice_or_checkbox() {
+    fn keys_typed_after_enter_never_change_a_choice_or_checkbox() {
+        let t0 = std::time::Instant::now();
         let mut f = remote_form();
         f.focus = 1;
-        f.handle_key(ch('i'));
-        typed(&mut f, "https://h/");
-        f.handle_key(key(KeyCode::Enter));
-        // Enter moved onto the choice: typed-ahead letters and Space do nothing, also not move to the checkbox.
-        typed(&mut f, "jl j l");
+        f.key_at(ch('i'), t0);
+        "https://h/".chars().for_each(|c| _ = f.key_at(ch(c), t0));
+        f.key_at(key(KeyCode::Enter), t0);
+        // Enter moved onto the choice: typed-ahead letters, Space, arrows and Backspace do nothing, also not move on.
+        for k in [ch('j'), ch('l'), ch(' '), key(KeyCode::Right), key(KeyCode::Backspace), key(KeyCode::Down), ch(' ')] {
+            f.key_at(k, ms(t0, 10));
+        }
         assert_eq!((f.get("policy"), f.get("tls_validation"), f.focus, f.editing), ("immediate", "true", 2, false));
-        // A key that is not text ends that, and acts: then the choice keys work again.
-        f.handle_key(key(KeyCode::Right));
+        // After a pause the choice keys work again.
+        let later = ms(t0, 10) + HOLD;
+        f.key_at(key(KeyCode::Right), later);
         assert_eq!(f.get("policy"), "on_demand");
-        f.handle_key(ch('l'));
-        f.handle_key(ch('j'));
-        f.handle_key(ch(' '));
+        for k in [ch('l'), ch('j'), ch(' ')] {
+            f.key_at(k, later);
+        }
         assert_eq!((f.get("policy"), f.get("tls_validation"), f.focus), ("streamed", "false", 3));
         assert_eq!(f.get("url"), "https://h/");
     }
 
     #[test]
     fn a_key_after_a_pause_acts_and_a_typing_burst_stays_held() {
-        let pause = || std::thread::sleep(HOLD * 2 / 3);
+        let t0 = std::time::Instant::now();
         let mut f = remote_form();
         f.focus = 1;
-        f.handle_key(ch('i'));
-        f.handle_key(key(KeyCode::Enter));
+        f.key_at(ch('i'), t0);
+        f.key_at(key(KeyCode::Enter), t0);
         // Typing that goes on longer than HOLD, with no pause of HOLD, is still typed ahead.
-        for c in "jlj".chars() {
-            pause();
-            f.handle_key(ch(c));
+        let step = HOLD * 2 / 3;
+        for (i, c) in (1..).zip("jlj".chars()) {
+            f.key_at(ch(c), t0 + step * i);
         }
         assert_eq!((f.get("policy"), f.focus), ("immediate", 2));
         // After a pause the operator sees the choice: `l` changes it.
-        std::thread::sleep(HOLD + HOLD / 2);
-        f.handle_key(ch('l'));
+        f.key_at(ch('l'), t0 + step * 3 + HOLD);
         assert_eq!(f.get("policy"), "on_demand");
+    }
+
+    /// Runtime (audit F38): Edit repository, Description `x`, Enter, then Backspace at once cleared the Remote picker.
+    #[test]
+    fn backspace_typed_after_enter_keeps_the_next_pick_field() {
+        let t0 = std::time::Instant::now();
+        let remote = Field::pick("remote", "Remote", Source::Remotes(RepoType::Rpm)).value("/r/1/");
+        let mut f = Form::new("t", vec![Field::text("description", "Description"), remote]);
+        f.key_at(ch('i'), t0);
+        f.key_at(ch('x'), t0);
+        f.key_at(key(KeyCode::Enter), t0);
+        for k in [key(KeyCode::Backspace), key(KeyCode::Delete), ctrl('u'), key(KeyCode::Enter), ch('y')] {
+            f.key_at(k, ms(t0, 10));
+        }
+        assert_eq!((f.get("description"), f.get("remote"), f.picker.is_none(), f.focus), ("x", "/r/1/", true, 1));
+        f.key_at(key(KeyCode::Backspace), ms(t0, 10) + HOLD);
+        assert_eq!(f.get("remote"), "", "after a pause Backspace clears it");
+    }
+
+    /// Enter in the picker popup and Enter in move mode go on like Enter in a text field: the next text field is edited
+    /// at once; on another field keys typed ahead do nothing until a pause.
+    #[test]
+    fn enter_in_the_picker_or_in_move_mode_holds_the_keys_typed_ahead() {
+        let t0 = std::time::Instant::now();
+        let policies = FieldKind::Choice(vec!["immediate".into(), "on_demand".into()]);
+        let fields = vec![
+            Field::pick("remote", "Remote", Source::Remotes(RepoType::Rpm)).required(),
+            Field::new("policy", "Policy", policies),
+            Field::new("tls", "TLS", FieldKind::Bool).value("true"),
+            Field::text("ca", "CA"),
+        ];
+        let mut f = Form::new("t", fields);
+        f.key_at(key(KeyCode::Enter), t0); // opens the picker
+        f.set_options(0, Ok(items()));
+        f.key_at(key(KeyCode::Enter), t0); // takes epel9 and goes on to the choice
+        for k in [ch('j'), ch('l'), ch(' '), key(KeyCode::Backspace)] {
+            f.key_at(k, ms(t0, 10));
+        }
+        assert_eq!((f.get("remote"), f.get("policy"), f.focus), ("/r/epel9/", "immediate", 1));
+        // After a pause, Enter in move mode goes on to the checkbox: keys typed ahead do nothing there.
+        let later = ms(t0, 10) + HOLD;
+        f.key_at(key(KeyCode::Enter), later);
+        for k in [ch(' '), ch('j'), key(KeyCode::Backspace)] {
+            f.key_at(k, later);
+        }
+        assert_eq!((f.get("tls"), f.focus), ("true", 2));
+        // Enter on the checkbox goes on to the text field and edits it at once: text typed ahead goes into it.
+        let later = later + HOLD;
+        f.key_at(key(KeyCode::Enter), later);
+        "ca.pem".chars().for_each(|c| _ = f.key_at(ch(c), later));
+        assert_eq!((f.get("ca"), f.focus, f.editing), ("ca.pem", 3, true));
     }
 
     #[test]
@@ -916,9 +987,11 @@ mod tests {
         assert_eq!((f.number("n"), f.bool("b"), f.get("c")), (Some(7), true, "b"));
         assert!(f.changed("c") && !f.changed("missing"));
         assert!(f.validate().is_ok());
-        // The last field is a choice: Enter moves on, only Ctrl-S submits.
+        // The last field is a choice: Enter moves on (to the first field, edited), only Ctrl-S submits.
         assert!(matches!(f.handle_key(key(KeyCode::Enter)), FormEvent::None));
+        assert_eq!((f.focus, f.editing), (0, true));
         assert!(matches!(f.handle_key(ctrl('s')), FormEvent::Submit));
+        assert!(matches!(f.handle_key(key(KeyCode::Esc)), FormEvent::None), "Esc leaves edit mode");
         assert!(matches!(f.handle_key(key(KeyCode::Esc)), FormEvent::Cancel));
     }
 
@@ -1141,25 +1214,27 @@ mod tests {
         let mut f =
             Form::new("t", vec![Field::pick("role", "Role", Source::Roles).required(), Field::pick("obj", "Object", Source::RoleObjects)]);
         let role = |n: &str| PickItem { label: n.into(), value: n.into(), note: String::new() };
-        f.handle_key(key(KeyCode::Enter));
+        let t0 = std::time::Instant::now();
+        f.key_at(key(KeyCode::Enter), t0);
         f.set_options(0, Ok(vec![role("r1"), role("r2")]));
-        f.handle_key(key(KeyCode::Enter)); // r1 (was empty)
+        f.key_at(key(KeyCode::Enter), t0); // r1 (was empty)
         f.fields[1].value = "/o/1/".into();
         f.fields[1].shown = "obj1".into();
         f.fields[1].options = Some(items());
-        f.focus = 0; // Enter in the popup moved on to the object field
-        f.handle_key(key(KeyCode::Enter));
-        f.handle_key(key(KeyCode::Down));
-        f.handle_key(key(KeyCode::Enter)); // r2
+        f.focus = 0; // Enter in the popup moved on to the object field; the keys come after a pause
+        let later = t0 + HOLD;
+        for k in [key(KeyCode::Enter), key(KeyCode::Down), key(KeyCode::Enter)] {
+            f.key_at(k, later); // r2
+        }
         assert_eq!(f.get("role"), "r2");
         assert_eq!((f.fields[1].value.as_str(), f.fields[1].shown.as_str()), ("", ""));
         assert!(f.fields[1].options.is_none());
         f.fields[1].value = "/o/2/".into();
         f.fields[1].shown = "obj2".into();
         f.focus = 0;
-        f.handle_key(key(KeyCode::Enter));
-        f.handle_key(key(KeyCode::Down));
-        f.handle_key(key(KeyCode::Enter)); // r2 again
+        for k in [key(KeyCode::Enter), key(KeyCode::Down), key(KeyCode::Enter)] {
+            f.key_at(k, later + HOLD); // r2 again
+        }
         assert_eq!((f.fields[1].value.as_str(), f.fields[1].shown.as_str()), ("/o/2/", "obj2"));
     }
 

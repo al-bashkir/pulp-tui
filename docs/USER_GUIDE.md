@@ -113,10 +113,11 @@ These rules apply to all screens. The screen sections do not repeat them.
 * `j k`, `Tab` or `↑ ↓` change the field. `h l`, `← →` or `Space` change a choice. `Space`
   toggles a checkbox.
 * `i` or `Enter` edits a text field (`-- EDIT --`). `Enter` then goes to the next field, or
-  submits on the last one. `Esc` stops editing. A next text field is edited at once. On a
-  choice, checkbox or picker, letters and `Space` that you type without a pause of 0.3 s do
-  nothing, so text typed ahead never changes them. After a pause, or after another key (an
-  arrow, `Tab`, `Enter`, `Esc`), they work again.
+  submits on the last one. `Esc` stops editing. `Enter` on a choice or checkbox, and `Enter`
+  in a picker, also go to the next field. A next text field is edited at once. On a choice,
+  checkbox or picker, the keys that you type after `Enter` without a pause of 0.3 s do nothing
+  (also `Backspace`, arrows and `Esc`), so keys typed ahead never change them. After a pause
+  they work again.
 * `Ctrl-S` submits from both modes, also from an open picker. `Esc` in move mode cancels.
 * A form with one text, secret or number field opens in edit mode.
 * Text editing (also in search): `← →`/`Ctrl-B Ctrl-F` one character, `Alt-B Alt-F`/`Ctrl-← Ctrl-→`
