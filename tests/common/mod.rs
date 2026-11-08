@@ -174,6 +174,11 @@ pub fn row(app: &App, key: &str, value: &str) -> Option<Value> {
     app.list.items.iter().find(|r| r[key] == value).cloned()
 }
 
+/// Whether the open form has field `key`: the TUI shows a version-dependent field only when the server has it.
+pub fn form_has(app: &App, key: &str) -> bool {
+    matches!(&app.modal, Some(Modal::Form { form, .. }) if form.fields.iter().any(|f| f.key == key))
+}
+
 /// Set `values` in the open form and submit it.
 pub fn fill(app: &mut App, values: &[(&str, &str)]) {
     let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form: {:?}", texts(app)) };

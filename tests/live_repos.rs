@@ -918,6 +918,11 @@ async fn publications_and_distributions_through_the_tui(t: RepoType, path: &str,
     ] {
         let f = row(&app, "name", &follow).unwrap();
         run(&mut app, Act::Edit, f);
+        if !form_has(&app, key) {
+            eprintln!("skipping {key}: this server's distributions have no `{key}` field (pulpcore 3.63)");
+            app.modal = None;
+            continue;
+        }
         fill(&mut app, &[(key, value)]);
         settle(&mut app, &mut rx).await;
         let (lines, typed) = yes(&mut app);
@@ -1511,7 +1516,9 @@ async fn mirror_sync_through_the_tui(t: RepoType, path: &str, policy: &str) {
     let r = row(&app, "name", &name).unwrap_or_else(|| panic!("no row: {:?}", app.list.items));
     run(&mut app, Act::Sync, r);
     settle(&mut app, &mut rx).await; // the name of the default remote
-    fill(&mut app, &[("policy", policy), ("optimize", "false")]);
+    // pulp_file 3.95 has no Optimize: its sync is always full.
+    let (values, n) = ([("policy", policy), ("optimize", "false")], 1 + usize::from(form_has(&app, "optimize")));
+    fill(&mut app, &values[..n]);
     settle(&mut app, &mut rx).await; // the retention of the repository
     let (lines, typed) = yes(&mut app);
     assert_eq!(typed, None, "the retention keeps the current version: {lines:?}");
