@@ -1327,3 +1327,170 @@ async fn a_version_that_dev_serves_in_part_is_not_deleted_through_the_tui() {
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
 }
+
+/// Resume (R) of the newest component version whose auto publish never ran (the client stopped first): the composite
+/// that follows it publishes, and Library serves it. A second Resume has nothing left to do.
+#[tokio::test]
+async fn resume_publishes_a_lagging_composite_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvlag"));
+    let extras_name = format!("{id}-extras");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let (mut app, mut rx) = app().await;
+    let svc = service(&app, &c);
+    let (st, scope) = (svc.store.clone(), svc.scope.clone());
+    let extras = st.create_cv(&scope, &extras_name, "").await.unwrap();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    st.set_cv_repo(extras, &docs).await.unwrap();
+    svc.publish(extras, "", "", &quiet, &no_progress).await.unwrap();
+    let comp = st.create_composite(&scope, &id, "").await.unwrap();
+    st.set_component(comp, extras, None).await.unwrap();
+    st.set_auto_publish(comp, true).await.unwrap();
+    svc.publish(comp, "", "", &quiet, &no_progress).await.unwrap(); // composite v1 uses extras v1
+    // extras v2 without the ISO; the client stopped before the auto publish.
+    st.set_cv_repo(extras, &CvRepo { filters: parse_rules("exclude path=isos/*", RepoType::File).unwrap(), ..docs }).await.unwrap();
+    let (e2, _) = svc.publish(extras, "", "", &quiet, &no_progress).await.unwrap();
+
+    // Resume (R) of extras v2 on its Versions screen: the composite publishes with extras v2.
+    let r = cv_row(&mut app, &mut rx, &extras_name).await;
+    run(&mut app, Act::CvVersions, r);
+    settle(&mut app, &mut rx).await;
+    let v2_row = app.list.items.iter().find(|v| v["number"] == 2).cloned().unwrap();
+    run(&mut app, Act::Resume, v2_row.clone());
+    settle(&mut app, &mut rx).await;
+    shown(&app, &format!("{extras_name} v2 published; auto publish: {id} v2 published"));
+    let c2 = st.versions(comp).await.unwrap().remove(0);
+    assert_eq!((c2.number, c2.state.as_str()), (2, "published"));
+    let used: Vec<i64> = st.version_components(c2.id).await.unwrap().into_iter().map(|u| u.version_id).collect();
+    assert_eq!(used, [e2.id]);
+    let lib = st.ensure_library(&scope).await.unwrap();
+    assert_eq!(st.binding(lib, comp).await.unwrap().unwrap().active(), Some(c2.id));
+    assert!(svc.verify(comp, lib).await.unwrap().is_empty());
+    let url = |file: &str| format!("http://127.0.0.1:8080/pulp/content/{}/{file}", base_path(&id, "library", "docs"));
+    // The manifest switches at once (old files can stay downloadable for DISTRIBUTED_PUBLICATION_RETENTION_PERIOD).
+    let (status, manifest) = served(&c, &url("PULP_MANIFEST")).await;
+    let manifest = String::from_utf8(manifest).unwrap();
+    assert!(status == 200 && manifest.contains("docs/readme.txt") && !manifest.contains("isos/boot.iso"), "{status} {manifest}");
+
+    // A second Resume: no third composite version.
+    run(&mut app, Act::Resume, v2_row);
+    settle(&mut app, &mut rx).await;
+    shown(&app, "version is already published");
+    assert_eq!(st.versions(comp).await.unwrap().len(), 2);
+
+    for v in [comp, extras] {
+        svc.delete_view(v, &quiet, &no_progress).await.unwrap();
+    }
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
+/// Environment Edit (e) to a label that a foreign distribution has a path below: refused before the typed
+/// confirmation, with the distribution named. The label stays.
+#[tokio::test]
+async fn relabel_to_an_overlapping_label_is_refused_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvov"));
+    let body = json!({ "name": format!("{id}-foreign"), "base_path": format!("{id}/foo") });
+    let foreign = create(&c, RepoType::File.distributions(), body, "/distributions/").await;
+    let (mut app, mut rx) = app().await;
+    let (st, scope) = (app.cv_store.clone().unwrap(), app.conn.as_ref().unwrap().scope.clone());
+    let lib = st.ensure_library(&scope).await.unwrap();
+    st.create_env(&scope, "Dev", lib, false).await.unwrap();
+
+    open_list(&mut app, &mut rx, Kind::Environments, "").await;
+    let e = row(&app, "name", "Dev").unwrap();
+    run(&mut app, Act::Edit, e);
+    fill(&mut app, &[("label", &id)]);
+    settle(&mut app, &mut rx).await;
+    assert!(app.modal.is_none(), "no confirmation: {:?}", texts(&app));
+    shown(
+        &app,
+        &format!(
+            "read served paths of Dev: label {id} is refused: distribution {id}-foreign has base path /{id}/foo, the label or \
+             below it (the paths below a label are its environment's: a promotion there could overlap it)"
+        ),
+    );
+    let dev = st.environments(&scope).await.unwrap().into_iter().find(|e| e.name == "Dev").unwrap();
+    assert_eq!(dev.label, "dev");
+
+    cleanup(&c, &[&foreign]).await;
+}
+
+/// A partial promotion through the TUI: a foreign distribution has the Dev path of more. The preview warns; the
+/// promotion serves docs and fails for more; Content Views, Versions, Environments and Verify (D) show the attempt, and
+/// Verify names a new promotion. Once the path is free, that promotion completes.
+#[tokio::test]
+async fn a_partial_promotion_and_what_the_screens_show_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvpp"));
+    let (mut app, mut rx) = app().await;
+    let svc = service(&app, &c);
+    let (st, scope) = (svc.store.clone(), svc.scope.clone());
+    let cv = st.create_cv(&scope, &id, "").await.unwrap();
+    let mut sources = vec![];
+    for name in ["docs", "more"] {
+        let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-{name}"), "file/PULP_MANIFEST", "mirror").await;
+        st.set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: name.into(), repo_type: RepoType::File, filters: vec![] })
+            .await
+            .unwrap();
+        sources.extend([repo, remote]);
+    }
+    let lib = st.ensure_library(&scope).await.unwrap();
+    let dev = st.create_env(&scope, "Dev", lib, false).await.unwrap();
+    tui_publish(&mut app, &mut rx, &id, "").await;
+    let (foreign_name, more_path) = (format!("{id}-foreign"), base_path(&id, "dev", "more"));
+    let body = json!({ "name": foreign_name, "base_path": more_path });
+    let foreign = create(&c, RepoType::File.distributions(), body, "/distributions/").await;
+
+    // Promote (M) v1 to Dev: the preview warns for more; docs is served, more fails.
+    let lines = tui_promote(&mut app, &mut rx, &id, Act::Promote, "1", "Dev").await;
+    let more_dist = pulp_tui::cv::distribution_name(&id, "Dev", "more");
+    let warn = format!(
+        "  more (File): new distribution {more_dist} at /{more_path}; distribution {foreign_name} has that base path, so the \
+         promotion fails for it"
+    );
+    assert!(lines.contains(&warn), "{lines:?}");
+    assert!(texts(&app).iter().any(|t| t.starts_with(&format!("{id} in Dev: partial: more: "))), "{:?}", texts(&app));
+    let b = st.binding(dev, cv).await.unwrap().unwrap();
+    assert_eq!((b.served, b.attempt.map(|a| a.state)), (None, Some("partial".to_string())));
+    let readme = format!("http://127.0.0.1:8080/pulp/content/{}/docs/readme.txt", base_path(&id, "dev", "docs"));
+    assert_eq!(served(&c, &readme).await.0, 200, "docs is served");
+
+    // The screens.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    assert_eq!(r["bound"], "Library:v1  Dev:- (v1 partial)");
+    run(&mut app, Act::CvVersions, r);
+    settle(&mut app, &mut rx).await;
+    assert_eq!(app.list.items.iter().find(|v| v["number"] == 1).unwrap()["environments"], "Library, Dev (partial)");
+    open_list(&mut app, &mut rx, Kind::Environments, "").await;
+    assert_eq!(row(&app, "name", "Dev").unwrap()["bound"], format!("{id}:- (v1 partial)"));
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvDrift, r);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verify result: {:?}", texts(&app)) };
+    assert_eq!(
+        lines,
+        [
+            "Library: v1 OK - served metadata match; RPM/Deb: also the smallest package",
+            "Dev: nothing (v1 partial) DRIFT",
+            "    promotion of v1 is partial",
+            "",
+            "Dev: promote v1 again (M) to reconcile (idempotent).",
+        ]
+    );
+
+    // The path is free again: Promote (M) completes.
+    cleanup(&c, &[&foreign]).await;
+    tui_promote(&mut app, &mut rx, &id, Act::Promote, "1", "Dev").await;
+    shown(&app, &format!("{id} v1 active in Dev; served metadata verified"));
+    assert_eq!(cv_row(&mut app, &mut rx, &id).await["bound"], "Library:v1  Dev:v1");
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
+}
