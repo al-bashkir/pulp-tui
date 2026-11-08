@@ -3185,6 +3185,38 @@ mod tests {
         svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap();
     }
 
+    /// A left-out row that records no publication is checked in Pulp: a gone distribution needs nothing, and one that
+    /// cannot be read fails the promotion (nothing else serves), named, with nothing sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_left_out_row_whose_distribution_cannot_be_read_fails_the_promotion() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let v = svc.store.begin_version(cv, "", &[]).await.unwrap();
+        svc.store.finish_version(v.id, "published", None).await.unwrap();
+        let lib = svc.store.ensure_library("k").await.unwrap();
+        svc.store.promoted(lib, cv, v.id, "active").await.unwrap();
+        for (n, status) in [(8, 404), (9, 500)] {
+            let row = BindingRepo {
+                env_id: lib,
+                cv_id: cv,
+                repo_href: format!("/pulp/api/v3/repositories/rpm/rpm/{n}/"),
+                repo_name: format!("r{n}"),
+                repo_type: RepoType::Rpm,
+                distribution: format!("/pulp/api/v3/distributions/rpm/rpm/{n}/"),
+                base_path: format!("library/web/r{n}"),
+                publication: None,
+            };
+            svc.store.save_binding_repo(&row).await.unwrap();
+            Mock::given(method("GET")).and(path(row.distribution.as_str())).respond_with(ResponseTemplate::new(status)).mount(&server).await;
+        }
+        let e = svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap_err().to_string();
+        assert!(e.starts_with("web in Library: failed: unbind r9: ") && !e.contains("r8"), "{e}");
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing is sent");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_unbind_alone_makes_the_promotion_partial() {
         let server = wiremock::MockServer::start().await;
