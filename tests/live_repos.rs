@@ -1581,6 +1581,69 @@ async fn deb_mirror_sync_through_the_tui() {
     }
 }
 
+/// RPM Sync (s) with `mirror_content_only`, Optimize off and Skip srpm through the TUI (audit T03), on a repository
+/// whose version 2 lacks one unit of the upstream: the sync request has the policy and both options, the new version
+/// has the upstream content again, and no publication is made (only `mirror_complete` publishes). The fixture has no
+/// source package, so the skip type shows only in the request. A second sync of the same form is not skipped by
+/// Pulp: Optimize off reaches the task. A server without a field (older pulp_rpm) gets the request without it.
+#[tokio::test]
+async fn rpm_mirror_content_only_sync_with_options_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::Rpm, unique("it-mirror-co"));
+    let (repo, remote, [v1, _]) = two_versions(&c, t, &name, "rpm/").await;
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Repos(t, false), &name).await;
+    // The sync through the form: the request body that the TUI sent, the one it should send, and the finished task.
+    let sync = async |app: &mut App, rx: &mut UnboundedReceiver<Msg>| -> (Value, Value, Task) {
+        let mark = pulp_tui::session_log::last_id();
+        run(app, Act::Sync, row(app, "name", &name).unwrap_or_else(|| panic!("no row: {:?}", app.list.items)));
+        settle(app, rx).await; // the name of the default remote
+        let mut want = json!({ "remote": remote, "sync_policy": "mirror_content_only" });
+        let mut values = vec![("policy", "mirror_content_only")];
+        if form_has(app, "optimize") {
+            (want["optimize"], values) = (json!(false), [values, vec![("optimize", "false")]].concat());
+        }
+        if form_has(app, "skip_srpm") {
+            (want["skip_types"], values) = (json!(["srpm"]), [values, vec![("skip_srpm", "true")]].concat());
+        }
+        fill(app, &values);
+        settle(app, rx).await; // the retention of the repository
+        let (lines, typed) = yes(app);
+        assert_eq!(typed, None, "{lines:?}");
+        assert_eq!(lines[0], "Mirror sync makes the NEW repository version match the upstream exactly:");
+        assert!(!lines.iter().any(|l| l.contains("publishes")), "mirror_content_only makes no publication: {lines:?}");
+        settle_tasks(app, rx).await;
+        shown(app, &format!("task completed: sync {name} (mirror_content_only)"));
+        let rows = pulp_tui::session_log::rows(true);
+        let sent = format!("POST {repo}sync/ ");
+        let post = rows.iter().find(|l| l["id"].as_u64() > Some(mark) && s(l, "summary").starts_with(&sent));
+        let id = post.unwrap_or_else(|| panic!("no {sent}: {rows:?}"))["id"].as_u64().unwrap();
+        let detail = pulp_tui::session_log::detail(id).unwrap();
+        let body = detail.iter().skip_while(|l| *l != "── request body ──").skip(1).take_while(|l| *l != "── response body ──");
+        let body: Value = serde_json::from_str(&body.cloned().collect::<Vec<_>>().join("\n")).unwrap();
+        let task: Task = c.get(&app.tasks.items.first().unwrap().href, &[]).await.unwrap();
+        (body, want, task)
+    };
+    let (body, want, _) = sync(&mut app, &mut rx).await;
+    assert_eq!(body, want);
+    let v3 = latest(&c, &repo).await;
+    assert!(v3.ends_with("/versions/3/"), "{v3}");
+    let keys = async |v: &str| ops::content_keys(&c, t, Some(v)).await.unwrap();
+    assert_eq!(keys(&v3).await, keys(&v1).await, "the upstream content again");
+    let pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository_version", v3.clone())], 10).await.unwrap();
+    assert!(pubs.is_empty(), "{pubs:?}");
+
+    let (_, want, task) = sync(&mut app, &mut rx).await;
+    if want.get("optimize").is_some() {
+        let codes: Vec<&str> = task.progress_reports.iter().map(|p| p.code.as_str()).collect();
+        assert!(!codes.is_empty() && !codes.contains(&"sync.was_skipped"), "a full sync: {codes:?}");
+    }
+    assert_eq!(latest(&c, &repo).await, v3, "the upstream did not change");
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
 /// Upload (u) of a File with Overwrite off through the TUI (audit T02): other content at the same relative path fails
 /// the task and the repository keeps its file; with Overwrite on it is replaced in a new version.
 #[tokio::test]

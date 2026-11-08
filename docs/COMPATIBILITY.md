@@ -157,8 +157,9 @@ One bullet per scenario, with its main checks. The server behavior behind them i
 next section.
 
 * **RPM**: create, upload (and idempotent repeat), remote, sync (`mirror_complete`,
-  `additive`), versions, diff, publish, distribute, served metadata and package digest,
-  update, rollback.
+  `additive`; through the TUI also `mirror_content_only` with Optimize off and Skip srpm:
+  the request, the new version, no publication), versions, diff, publish, distribute, served
+  metadata and package digest, update, rollback.
 * **File**: create, upload (single and chunked with progress), remove content (old versions
   stay), sync from a manifest, publish, distribute, served manifest, update, rollback,
   mismatch detection.
@@ -648,7 +649,9 @@ Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
   default 0 = keep all): an emptied field on edit sends 0 (live,
   `rpm_retain_package_versions_cleared_through_the_tui`).
 * **Sync options** `optimize` (RPM, File, Deb; default `true`) and `skip_types` (RPM) exist
-  in every tested version.
+  in every tested version. pulp_rpm skips a sync whose upstream, remote and repository did
+  not change since the last sync (progress report `sync.was_skipped`); with `optimize` false
+  it syncs in full (live, `rpm_mirror_content_only_sync_with_options_through_the_tui`).
 * **Clearing remote fields** (3.123.0). `null` unsets `ca_cert`, `client_cert`,
   `client_key`, `username`, `password`, `proxy_username`, `proxy_password`, pulp_rpm `sles_auth_token`, pulp_deb `gpgkey` and the repository `remote`
   (`hidden_fields` shows `is_set: false`; checked live). The Edit forms send `null` for `-`
