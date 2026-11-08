@@ -812,6 +812,38 @@ async fn snapshot_repository_of_another_database_is_not_deleted_through_the_tui(
     cleanup(&c, &[&repo]).await;
 }
 
+/// The versions and publications of a Content View snapshot repository of another database are not deleted from the
+/// Versions screens (one repository, all versions) or the Publications screen (audit F25): each Delete is refused
+/// before any dialog, and the version and the publication stay.
+#[tokio::test]
+async fn snapshot_versions_and_publications_of_another_database_are_not_deleted_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::File, unique("it-snapver"));
+    let (repo, remote, [v1, v2]) = two_versions(&c, t, &name, "file/PULP_MANIFEST").await;
+    let labels = json!({ "pulp_tui_cv": "foreignview", "pulp_tui_db": "another-database-id" });
+    ops::settle(&c, c.patch(&repo, &json!({ "pulp_labels": labels })).await.unwrap(), &no_progress).await.unwrap();
+    let publication = ops::create_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
+    let (mut app, mut rx) = app().await;
+    let refused = format!("refused: {name} is a snapshot repository of Content View foreignview (database another-database-id); ");
+    let p: Value = c.get(&publication, &[]).await.unwrap();
+    for (kind, item) in [
+        (Kind::Versions(Some((repo.clone(), name.clone()))), c.get::<Value>(&v1, &[]).await.unwrap()),
+        (Kind::Versions(None), c.get::<Value>(&v2, &[]).await.unwrap()),
+        (Kind::Publications(t), p),
+    ] {
+        app.list.kind = kind.clone();
+        run(&mut app, Act::Delete, item);
+        settle(&mut app, &mut rx).await;
+        assert!(app.modal.is_none() && texts(&app).last().unwrap().contains(&refused), "{kind:?}: {:?}", texts(&app));
+    }
+    for href in [&v1, &v2, &publication] {
+        assert!(c.get::<Value>(href, &[]).await.is_ok(), "{href} stays");
+    }
+    cleanup(&c, &[&publication, &repo, &remote]).await;
+}
+
 /// A repository of type `t` synced from `path` (version 1), and version 2 without one unit of version 1.
 async fn two_versions(c: &PulpClient, t: RepoType, name: &str, path: &str) -> (String, String, [String; 2]) {
     let (repo, remote) = synced_repo(c, t, name, path, "additive").await;

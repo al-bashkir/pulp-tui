@@ -2641,6 +2641,7 @@ fn version_delete(app: &mut App, t: RepoType, href: String, number: String) {
         if ctx.cv()?.store.protected_versions(&ctx.scope).await?.contains(&href) {
             bail!("refused: this version is a snapshot of a Content View version (delete the CV version instead)");
         }
+        refuse_snapshot_of(&ctx, &href).await?;
         let (pubs, by) = ops::version_protection(&ctx.client, &ctx.caps, t, &href).await?;
         let id = short(&href);
         if !by.is_empty() {
@@ -3289,7 +3290,17 @@ async fn cv_publication_refusal(ctx: &Ctx, href: &str, version: &str) -> anyhow:
     if st.protected_versions(&ctx.scope).await?.iter().any(|v| v == version) {
         bail!("refused: publication {id} is of a Content View snapshot (delete the Content View version instead)");
     }
-    Ok(())
+    refuse_snapshot_of(ctx, version).await
+}
+
+/// `snapshot_refusal` for the repository of `version`: its labels also name a snapshot of another database, which
+/// the local store does not know.
+async fn refuse_snapshot_of(ctx: &Ctx, version: &str) -> anyhow::Result<()> {
+    let r: Value = ctx.client.get(&repo_of_version(version), &[("fields", "name,pulp_labels".into())]).await?;
+    match snapshot_refusal(&r) {
+        Some(e) => bail!(e),
+        None => Ok(()),
+    }
 }
 
 /// "  name (URL): then serves X" for each distribution of `ds` that serves publication `href` now
@@ -6250,6 +6261,7 @@ mod tests {
         ]));
         get(&server, &format!("{API}distributions/rpm/rpm/"), dists).await;
         get(&server, &format!("{API}publications/rpm/rpm/"), page(json!([]))).await;
+        get(&server, &format!("{API}repositories/rpm/rpm/r1/"), json!({ "name": "r1", "pulp_labels": {} })).await;
         let (mut app, mut rx) = connected(&server).await;
         let item = json!({ "pulp_href": pubn, "repository_version": version });
         publication_action(&mut app, RepoType::Rpm, Act::Delete, item.clone());
@@ -6299,6 +6311,7 @@ mod tests {
         ]));
         get(&server, &format!("{API}distributions/file/file/"), dists).await;
         get(&server, &format!("{API}publications/file/file/"), pubs).await;
+        get(&server, &repo, json!({ "name": "r", "pulp_labels": {} })).await;
         let (mut app, mut rx) = connected(&server).await;
         publication_action(
             &mut app,
@@ -6352,6 +6365,7 @@ mod tests {
             { "pulp_href": "/d/2/", "name": "follower", "base_path": "follower", "repository": repo },
         ]));
         get(&server, &format!("{API}distributions/file/file/"), dists).await;
+        get(&server, &repo, json!({ "name": "r", "pulp_labels": {} })).await;
         let (mut app, mut rx) = connected(&server).await;
         let delete = |n: u32| json!({ "pulp_href": format!("{repo}versions/{n}/"), "number": n });
 
@@ -6390,6 +6404,7 @@ mod tests {
         for coll in ["publications/file/file/", "distributions/file/file/"] {
             get(&server, &format!("{API}{coll}"), page(json!([]))).await;
         }
+        get(&server, &repo, json!({ "name": "r", "pulp_labels": {} })).await;
         answer(&server, "DELETE", &v(3), 202, json!({ "task": format!("{API}tasks/1/") })).await;
         get(&server, &format!("{API}tasks/1/"), json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed" })).await;
         let (mut app, mut rx) = connected(&server).await;
@@ -6401,6 +6416,37 @@ mod tests {
         yes(&mut app);
         settle(&mut app, &mut rx).await;
         assert_eq!(app.list.marked, [v(4)].into());
+    }
+
+    /// The local store does not know a Content View snapshot of another database: Version Delete (from one repository,
+    /// from all versions, with marks) and Publication Delete read the labels of the repository and refuse before any
+    /// dialog (audit F25).
+    #[tokio::test]
+    async fn version_and_publication_delete_refuse_a_snapshot_of_another_database() {
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/file/file/snap/");
+        let labels = json!({ "pulp_tui_cv": "foreignview", "pulp_tui_db": "another-database-id" });
+        get(&server, &repo, json!({ "pulp_href": repo, "name": "snap", "pulp_labels": labels })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let v = |n: u32| format!("{repo}versions/{n}/");
+        let refused = "refused: snap is a snapshot repository of Content View foreignview (database another-database-id); ";
+        let rows = [
+            (Kind::Versions(Some((repo.clone(), "snap".into()))), json!({ "pulp_href": v(1), "number": 1 })),
+            (Kind::Versions(None), json!({ "pulp_href": v(2), "number": 2 })),
+            (
+                Kind::Publications(RepoType::File),
+                json!({ "pulp_href": format!("{API}publications/file/file/1/"), "repository_version": v(1) }),
+            ),
+        ];
+        for (kind, item) in rows {
+            app.list.kind = kind.clone();
+            app.list.marked = [v(1), v(2)].into();
+            run(&mut app, Act::Delete, item);
+            settle(&mut app, &mut rx).await;
+            let last = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+            assert!(app.modal.is_none() && last.contains(refused), "{kind:?}: {last}");
+        }
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing is sent");
     }
 
     #[tokio::test]
@@ -8342,6 +8388,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let (r, pubs) = (format!("{API}repositories/rpm/rpm/r/"), format!("{API}publications/rpm/rpm/"));
         get(&server, &format!("{API}repositories/rpm/rpm/"), page(json!([{ "pulp_href": r, "name": "r" }]))).await;
+        get(&server, &r, json!({ "name": "r", "pulp_labels": {} })).await;
         get(&server, &pubs, page(json!([]))).await;
         get(&server, &format!("{API}distributions/rpm/rpm/"), page(json!([]))).await;
         answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}3/") })).await;
@@ -8979,6 +9026,7 @@ mod tests {
         get(&server, &format!("{API}publications/deb/apt/"), page(json!([]))).await;
         get(&server, &format!("{API}publications/deb/verbatim/"), page(json!([{ "pulp_href": pubn, "repository_version": version }])))
             .await;
+        get(&server, &format!("{API}repositories/deb/apt/r/"), json!({ "name": "r", "pulp_labels": {} })).await;
         answer(&server, "DELETE", &pubn, 202, json!({ "task": format!("{API}tasks/1/") })).await;
         let (mut app, mut rx) = connected(&server).await;
         publication_action(&mut app, RepoType::Deb, Act::Delete, json!({ "pulp_href": pubn, "repository_version": version }));
