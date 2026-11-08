@@ -729,12 +729,20 @@ async fn deb_repository_edit_of_the_signing_fields_through_the_tui() {
     let stored = json!([service, { "fixture": service }, { "fixture": fingerprint }, ["Phased-Update-Percentage", "X-Custom"]]);
     for (values, want) in [(set, stored), (["", "", "", ""], json!([null, {}, {}, []]))] {
         let r: Value = c.get(&repo, &[]).await.unwrap();
-        run(&mut app, Act::Edit, r);
-        fill(&mut app, &keys.into_iter().zip(values).collect::<Vec<_>>());
+        run(&mut app, Act::Edit, r.clone());
+        // The fields of this server's form (pulp_deb 3.8 has no package_signing_fingerprint_release_overrides); a
+        // hidden one must be absent from the repository too.
+        let on: Vec<usize> = (0..keys.len()).filter(|&i| form_has(&app, keys[i])).collect();
+        for k in keys.iter().enumerate().filter(|(i, _)| !on.contains(i)).map(|(_, k)| k) {
+            assert!(r.get(k).is_none(), "the form hides {k}, which the server has: {r}");
+            eprintln!("skipping {k}: this server's Deb repositories have no `{k}` field");
+        }
+        fill(&mut app, &on.iter().map(|&i| (keys[i], values[i])).collect::<Vec<_>>());
         settle_tasks(&mut app, &mut rx).await;
         shown(&app, &format!("task completed: update repository {name}"));
         let r: Value = c.get(&repo, &[]).await.unwrap();
-        assert_eq!(json!(keys.map(|k| r[k].clone())), want, "{:?}", texts(&app));
+        let pick = |v: &Value| on.iter().map(|&i| v[i].clone()).collect::<Vec<_>>();
+        assert_eq!(pick(&json!(keys.map(|k| r[k].clone()))), pick(&want), "{:?}", texts(&app));
     }
     cleanup(&c, &[&repo]).await;
 }

@@ -1066,17 +1066,20 @@ async fn content_guards_of_the_other_types_are_created_through_the_tui() {
         assert_eq!(g["ca_certificate"].as_str().map(str::trim), Some(ca.trim()), "{t}: the file's certificate");
         made.push(g);
     }
-    match make(&mut app, &mut rx, "core/envvar_header", &[("header_name", "X-Org"), ("env_var", "PULP_TUI_ORG")]).await {
-        (_, Some(env)) => {
-            assert_eq!((s(&env, "header_name"), s(&env, "env_var")), ("X-Org".into(), "PULP_TUI_ORG".into()));
-            made.push(env);
-        }
-        // pulpcore allows no variable by default (`ENVVAR_HEADER_CONTENT_GUARD_ALLOWED_VARS = []`), so the form's
-        // request gets Pulp's refusal of that variable.
-        (said, None) => {
-            let refused =
-                "rejected [400]: env_var: Environment variable 'PULP_TUI_ORG' is not in ENVVAR_HEADER_CONTENT_GUARD_ALLOWED_VARS.";
-            assert!(said.ends_with(refused), "{said}");
+    // pulpcore 3.95 has no core/envvar_header; the type choice does not offer it (checked above).
+    if has("core/envvar_header") {
+        match make(&mut app, &mut rx, "core/envvar_header", &[("header_name", "X-Org"), ("env_var", "PULP_TUI_ORG")]).await {
+            (_, Some(env)) => {
+                assert_eq!((s(&env, "header_name"), s(&env, "env_var")), ("X-Org".into(), "PULP_TUI_ORG".into()));
+                made.push(env);
+            }
+            // pulpcore allows no variable by default (`ENVVAR_HEADER_CONTENT_GUARD_ALLOWED_VARS = []`), so the form's
+            // request gets Pulp's refusal of that variable.
+            (said, None) => {
+                let refused =
+                    "rejected [400]: env_var: Environment variable 'PULP_TUI_ORG' is not in ENVVAR_HEADER_CONTENT_GUARD_ALLOWED_VARS.";
+                assert!(said.ends_with(refused), "{said}");
+            }
         }
     }
     let hrefs: Vec<String> = made.iter().map(|g| s(g, "pulp_href")).collect();
