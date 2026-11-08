@@ -813,10 +813,11 @@ async fn snapshot_repository_of_another_database_is_not_deleted_through_the_tui(
 }
 
 /// The versions and publications of a Content View snapshot repository of another database are not deleted from the
-/// Versions screens (one repository, all versions) or the Publications screen (audit F25): each Delete is refused
-/// before any dialog, and the version and the publication stay.
+/// Versions screens (one repository, all versions) or the Publications screen (audit F25), and its content is not
+/// removed on the Content screen (audit F34): each is refused before any dialog, nothing is sent, and the versions and
+/// the publication stay.
 #[tokio::test]
-async fn snapshot_versions_and_publications_of_another_database_are_not_deleted_through_the_tui() {
+async fn snapshot_versions_publications_and_content_of_another_database_are_not_changed_through_the_tui() {
     if !live_enabled() {
         return;
     }
@@ -825,6 +826,7 @@ async fn snapshot_versions_and_publications_of_another_database_are_not_deleted_
     let labels = json!({ "pulp_tui_cv": "foreignview", "pulp_tui_db": "another-database-id" });
     ops::settle(&c, c.patch(&repo, &json!({ "pulp_labels": labels })).await.unwrap(), &no_progress).await.unwrap();
     let publication = ops::create_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
+    let mark = pulp_tui::session_log::last_id();
     let (mut app, mut rx) = app().await;
     let refused = format!("refused: {name} is a snapshot repository of Content View foreignview (database another-database-id); ");
     let p: Value = c.get(&publication, &[]).await.unwrap();
@@ -838,6 +840,17 @@ async fn snapshot_versions_and_publications_of_another_database_are_not_deleted_
         settle(&mut app, &mut rx).await;
         assert!(app.modal.is_none() && texts(&app).last().unwrap().contains(&refused), "{kind:?}: {:?}", texts(&app));
     }
+    // Remove (x) of a unit on the Content screen of the latest version.
+    open_list(&mut app, &mut rx, Kind::Content { version: v2.clone(), ctype: 0 }, "").await;
+    let unit = app.list.items.first().cloned().unwrap_or_else(|| panic!("no content: {:?}", texts(&app)));
+    run(&mut app, Act::RemoveContent, unit);
+    settle(&mut app, &mut rx).await;
+    assert!(app.modal.is_none() && texts(&app).last().unwrap().contains(&refused), "Remove: {:?}", texts(&app));
+    assert_eq!(latest(&c, &repo).await, v2, "no new version");
+    // The session log (Logs screen): since the TUI connected, every request was a read.
+    let rows = pulp_tui::session_log::rows(true);
+    let sent: Vec<&Value> = rows.iter().filter(|l| l["id"].as_u64() > Some(mark) && l["kind"] == "request").collect();
+    assert!(!sent.is_empty() && sent.iter().all(|l| s(l, "summary").starts_with("GET ")), "only reads: {sent:?}");
     for href in [&v1, &v2, &publication] {
         assert!(c.get::<Value>(href, &[]).await.is_ok(), "{href} stays");
     }
