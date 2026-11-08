@@ -4,7 +4,7 @@ use super::actions::{ap, caps, confirm_mirror, sync_policies, unsupported};
 use super::app::{App, Ctx, Level, NO_PROFILE, unavailable};
 use super::form::{Field, FieldKind, Form, PickItem, Source};
 use super::kinds::{Act, Kind, s};
-use crate::cv::{CvService, Drift, Fix, Mode, check_repo_clash};
+use crate::cv::{CvService, Drift, Fix, LeftOut, Mode, check_repo_clash};
 use crate::filters::{format_rules, parse_rules};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, RepoType};
@@ -819,7 +819,7 @@ async fn promote_lines(svc: &CvService, name: &str, e: &Environment, v: &CvVersi
 }
 
 /// The distribution in `e` of each repository of version `v` (`CvService::promote_target`), then each one that the
-/// version lacks and whose distribution stops serving (`CvService::needs_unbind`).
+/// version lacks and whose distribution stops serving or whose row the promotion forgets (`CvService::left_out`).
 async fn repo_lines(svc: &CvService, name: &str, e: &Environment, v: &CvVersion) -> anyhow::Result<Vec<String>> {
     let (vrs, rows) = (svc.store.version_repos(v.id).await?, svc.store.binding_repos(e.id, v.cv_id).await?);
     let mut lines = vec![];
@@ -828,11 +828,15 @@ async fn repo_lines(svc: &CvService, name: &str, e: &Environment, v: &CvVersion)
         lines.push(svc.promote_target(name, e, vr.repo(), row).await?);
     }
     for b in rows {
-        if !svc.needs_unbind(&vrs, &b).await? {
-            continue;
-        }
-        let outside = if b.publication.is_none() { "; Pulp shows that it serves a publication set outside pulp-tui" } else { "" };
-        lines.push(format!("  {}: not part of v{} -> its distribution stops serving (kept for rollback){outside}", b.repo_name, v.number));
+        let what = match svc.left_out(&vrs, &b).await? {
+            None => continue,
+            Some(LeftOut::Forget(why)) => why,
+            Some(LeftOut::Unbind) if b.publication.is_none() => {
+                "its distribution stops serving (kept for rollback); Pulp shows that it serves a publication set outside pulp-tui".into()
+            }
+            Some(LeftOut::Unbind) => "its distribution stops serving (kept for rollback)".into(),
+        };
+        lines.push(format!("  {}: not part of v{} -> {what}", b.repo_name, v.number));
     }
     Ok(lines)
 }
@@ -2266,7 +2270,8 @@ mod tests {
     }
 
     /// Rows of repositories that the version lacks and that record no publication: the promotion unserves the one whose
-    /// distribution serves a publication (set outside pulp-tui), and the preview names it; it names no other one.
+    /// distribution serves a publication (set outside pulp-tui), and forgets the one whose distribution is gone; the
+    /// preview names both, and no other one.
     #[tokio::test]
     async fn the_promote_preview_names_a_left_out_distribution_that_serves_again() {
         let server = MockServer::start().await;
@@ -2292,9 +2297,10 @@ mod tests {
         serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/2/".into(), 200, json!({ "publication": null })).await;
         promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
+        let gone = "  gone: not part of v1 -> its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it";
         let old = "  old: not part of v1 -> its distribution stops serving (kept for rollback); Pulp shows that it serves a \
                    publication set outside pulp-tui";
-        assert_eq!(confirm_lines(&mut app)[2..4], [old, ""]);
+        assert_eq!(confirm_lines(&mut app)[2..5], [gone, old, ""]);
     }
 
     /// A confirmed promotion says what it verified: the served metadata, not every file.
@@ -2344,9 +2350,13 @@ mod tests {
         st.set_env_protected(lib, true).await.unwrap();
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let v = publish_empty(&st, web).await;
-        // Its distribution is gone: the promotion has nothing to unserve, and Verify names it.
-        let gone = left_out(&st, lib, web, "8", None).await;
-        serve(&server, "GET", gone.distribution.clone(), 404, json!({ "detail": "Not found." })).await;
+        // The unbind of a left-out row completes, but Pulp still shows the publication: Verify names it.
+        let old = left_out(&st, lib, web, "8", Some("/p/3/")).await;
+        let labels = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: LIBRARY, crate::cv::LABEL_DB: st.db_id() });
+        let d = json!({ "pulp_href": old.distribution, "name": "d", "base_path": old.base_path, "publication": "/p/3/", "pulp_labels": labels });
+        serve(&server, "GET", old.distribution.clone(), 200, d).await;
+        serve(&server, "PATCH", old.distribution.clone(), 202, json!({ "task": format!("{TASKS}1/") })).await;
+        serve(&server, "GET", format!("{TASKS}1/"), 200, json!({ "pulp_href": format!("{TASKS}1/"), "state": "completed" })).await;
         promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         let Some(Modal::Confirm { title, typed, on_yes: Some(yes), .. }) = app.modal.take() else {
@@ -2357,7 +2367,7 @@ mod tests {
         drain(&mut app, &mut rx).await;
         let warned = app.notices.iter().any(|n| {
             n.level == Level::Warn
-                && n.text.starts_with("web in Library: bound, verification found: r8: distribution /pulp/api/v3/distributions/rpm/rpm/8/: ")
+                && n.text.starts_with("web in Library: bound, verification found: r8: distribution serves /p/3/, expected nothing")
         });
         assert!(warned, "{:?}", app.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
         assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v.id));

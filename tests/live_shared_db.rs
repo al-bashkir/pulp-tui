@@ -385,6 +385,8 @@ async fn store_methods_on_postgres() {
     };
     st.save_binding_repo(&br).await.unwrap();
     st.save_binding_repo(&BindingRepo { publication: None, ..br.clone() }).await.unwrap(); // upsert
+    st.save_binding_repo(&BindingRepo { repo_href: "/r/gone/".into(), ..br.clone() }).await.unwrap();
+    st.delete_binding_repo(dev, cv, "/r/gone/").await.unwrap(); // a left-out row whose distribution is gone
     assert_eq!(st.binding_repos(dev, cv).await.unwrap(), vec![BindingRepo { publication: None, ..br }]);
     assert_eq!(st.binding(prod, cv).await.unwrap().unwrap().attempt.unwrap().state, "partial");
     assert_eq!(st.bindings_for_cv(cv).await.unwrap().len(), 2);

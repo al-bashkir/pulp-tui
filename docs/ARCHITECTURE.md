@@ -214,7 +214,10 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
 
 * **Promote** binds a version to an environment. The version must be active in the prior
   environment. Each distribution is re-pointed to the version's publication. Bound
-  repositories that the version lacks get `publication: null`; the distribution stays.
+  repositories that the version lacks get `publication: null`; the distribution stays. When
+  that distribution is gone (deleted outside pulp-tui), the promotion sends nothing and
+  forgets the row (`CvService::left_out`): it keeps nothing for rollback, and a row that
+  stays would fail every later promotion and keep its version in use.
 * **Rollback** promotes an earlier version without the prior-environment check. After
   Library, `promote` accepts only a lower number than the highest bound one (served or
   attempted, `CvService::bound_number`), or that one (a retry or drift repair);
@@ -275,7 +278,7 @@ new version; served files that differ need a repair; a missing `base_url` needs
 
 * A promotion re-points also a repository that the version lacks when Pulp shows that its
   distribution serves a publication (`unbind_removed` reads the distribution of a row that
-  records none, `CvService::needs_unbind`), so the "promote again" hint fixes that drift too.
+  records none, `CvService::left_out`), so the "promote again" hint fixes that drift too.
   The promote preview uses the same rule, so it names that change.
 * While a workflow holds a live lock on the view, the drift check gives one hint per
   environment with drift, which names that workflow, and no other: the lock refuses Publish,

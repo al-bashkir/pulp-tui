@@ -1382,6 +1382,17 @@ impl Store {
         Ok(())
     }
 
+    /// Forget the served row of repository `repo_href` of view `cv_id` in environment `env_id`.
+    pub async fn delete_binding_repo(&self, env_id: i64, cv_id: i64, repo_href: &str) -> Result<()> {
+        sqlx::query("DELETE FROM binding_repos WHERE env_id = $1 AND cv_id = $2 AND repo_href = $3")
+            .bind(env_id)
+            .bind(cv_id)
+            .bind(repo_href)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// `Dev (served in part)` for each environment where a served row names a publication of version `version_id` that
     /// neither the served nor the attempted version there has: a partial promotion that a later attempt replaced.
     pub async fn partly_served(&self, version_id: i64) -> Result<Vec<String>> {

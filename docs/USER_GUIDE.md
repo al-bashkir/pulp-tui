@@ -594,9 +594,10 @@ retry, or roll back to the served version to clear the failed attempt.
   first. A new distribution needs a free path that is not above or below the base path of another
   distribution (Pulp refuses overlapping base paths): the preview names a distribution that has
   the path or overlaps it, and the promotion then fails for that repository, before Pulp is
-  asked. A repository that the version does not have
-  stops serving; the preview names it, also when its distribution serves a publication that was
-  set outside pulp-tui.
+  asked. A repository that the version does not have stops serving; the preview names it, also
+  when its distribution serves a publication that was set outside pulp-tui. When its distribution
+  was deleted outside pulp-tui, the promotion sends nothing for it and forgets it; the preview
+  says so.
 * **b** rolls an environment back. After Library: only a version older than the newest bound one
   (served or attempted), or that one again (a retry). For a newer version, or an environment
   without a version, use Promote. In Library: any published version.

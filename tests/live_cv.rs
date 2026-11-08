@@ -469,6 +469,51 @@ async fn a_promotion_to_a_base_path_that_overlaps_another_fails_as_the_preview_s
     cleanup(&c, &[&repo, &remote]).await;
 }
 
+/// F45: Dev serves v1 (docs, more). The Dev distribution of more is deleted outside pulp-tui; v2 has no more. The
+/// promotion of v2 forgets that row instead of a PATCH to the gone distribution, so it completes, Verify finds
+/// nothing, and v1 can be deleted.
+#[tokio::test]
+async fn a_left_out_distribution_deleted_outside_pulp_tui_does_not_block_the_environment() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvgo");
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
+    let cv = store.create_cv(&profile, &id, "").await.unwrap();
+    let mut sources = vec![];
+    for name in ["docs", "more"] {
+        let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-{name}"), "file/PULP_MANIFEST", "mirror").await;
+        let r = CvRepo { repo_href: repo.clone(), repo_name: name.into(), repo_type: RepoType::File, filters: vec![] };
+        store.set_cv_repo(cv, &r).await.unwrap();
+        sources.extend([repo, remote]);
+    }
+    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let lib = store.ensure_library(&profile).await.unwrap();
+    let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
+    svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    let more = store.binding_repos(dev, cv).await.unwrap().into_iter().find(|b| b.repo_name == "more").unwrap();
+    cleanup(&c, &[&more.distribution]).await;
+    store.remove_cv_repo(cv, &more.repo_href).await.unwrap();
+    let (v2, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+
+    let vrs = store.version_repos(v2.id).await.unwrap();
+    let forget = "its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it";
+    assert_eq!(svc.left_out(&vrs, &more).await.unwrap(), Some(pulp_tui::cv::LeftOut::Forget(forget.into())), "the preview says so");
+    svc.promote(cv, v2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    let rows: Vec<_> = store.binding_repos(dev, cv).await.unwrap().into_iter().map(|b| b.repo_name).collect();
+    assert_eq!(rows, ["docs"]);
+    let b = store.binding(dev, cv).await.unwrap().unwrap();
+    assert_eq!((b.served, b.attempt), (Some(v2.id), None));
+    assert!(svc.verify(cv, dev).await.unwrap().is_empty());
+    svc.delete_version(v1.id, &quiet, &no_progress).await.unwrap();
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
+}
+
 /// Two databases (stores with different ids) share one Pulp and one Content View name.
 #[tokio::test]
 async fn content_view_owned_by_another_database() {
