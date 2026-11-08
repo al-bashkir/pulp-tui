@@ -56,6 +56,9 @@ a test path stand for several tests, for example `{file,rpm}_x` for `file_x` and
 * Mirror sync (File, RPM, Deb): the confirmation says that the new version matches the
   upstream; the next version has the upstream content again.
   `live_repos::{rpm,file,deb}_mirror_sync_through_the_tui`
+* RPM sync with `mirror_content_only`, Optimize off and Skip srpm: the request has the
+  policy and both options, the new version has the upstream content again, and no
+  publication is made. `live_repos::rpm_mirror_content_only_sync_with_options_through_the_tui`
 * Uploads of a File, an RPM package and a `.deb` into empty repositories; Copy content
   (path rule, no rules, name rule); Prune orphans.
   `live_repos::uploads_of_each_type_through_the_tui`,
@@ -65,9 +68,10 @@ a test path stand for several tests, for example `{file,rpm}_x` for `file_x` and
 * Repository delete, single (the impact names the distribution and the Content View) and
   marked (one typed confirmation).
   `live_repos::repository_delete_single_and_marked_through_the_tui`
-* A repository, version or publication that belongs to another database is not deleted.
+* A repository, version or publication that belongs to another database is not deleted,
+  and its content is not removed.
   `live_repos::snapshot_repository_of_another_database_is_not_deleted_through_the_tui`,
-  `live_repos::snapshot_versions_and_publications_of_another_database_are_not_deleted_through_the_tui`
+  `live_repos::snapshot_versions_publications_and_content_of_another_database_are_not_changed_through_the_tui`
 * Repository edit: a File repository saves and clears its fields; an emptied *Retain package
   versions* is saved as 0; a label edit keeps the RPM OSV config.
   `live_repos::file_repository_edit_through_the_tui`,
@@ -118,6 +122,9 @@ a test path stand for several tests, for example `{file,rpm}_x` for `file_x` and
 * Release records: the TUI creates a release, a release component, a release architecture
   and a package release component; a structured publication serves the package under the
   component. `live_deb::the_tui_creates_release_records_that_a_publication_serves`
+* A package release component created on the Content screen of an older version goes into
+  the latest version; the confirm names the package and the release component that come
+  back. `live_deb::a_package_release_component_of_an_older_version_confirms_what_comes_back_through_the_tui`
 * Deb Content View: filter, preview, publish signed, promote to Dev, publish unsigned
   (`none`), Resume of a signed version, a composite with this view.
   `live_deb::deb_content_view`
@@ -151,6 +158,13 @@ a test path stand for several tests, for example `{file,rpm}_x` for `file_x` and
   distribution is gone.
   `live_cv::publish_cleanup_keeps_a_served_version_that_no_view_version_records`,
   `live_cv::deletes_keep_what_a_plain_distribution_serves`
+* A promotion to a base path inside or above a foreign distribution: the preview says that
+  it fails, and pulp-tui refuses it before Pulp does; after a clean preview it completes.
+  `live_cv::a_promotion_to_a_base_path_that_overlaps_another_fails_as_the_preview_says`
+* A distribution that left the view and was deleted or taken over outside pulp-tui does
+  not block the environment: the promotion or the Publish forgets its row and completes.
+  `live_cv::a_left_out_distribution_deleted_outside_pulp_tui_does_not_block_the_environment`,
+  `live_cv::publish_leaves_alone_a_kept_library_distribution_taken_over_outside_pulp_tui`
 * `export-cv` on pulp2 and `import-cv` on pulp1 map repositories by name and type; one
   missing repository refuses the whole import.
   `live_cv::import_cv_maps_repositories_by_name_to_the_target_server`
@@ -317,6 +331,9 @@ Through the TUI:
   environment. Migration 7 keeps an active binding served and turns any other into the
   attempt only. `live_shared_db::postgres_served_rows_need_their_environment`,
   `live_shared_db::postgres_migration_7_moves_unfinished_bindings_to_promotions`
+* Migration 9 gives an environment back the served version of an old failed attempt when
+  all its rows serve that version; a mixed set gets no served version.
+  `live_shared_db::postgres_migration_9_restores_the_served_version_of_an_old_failed_row`
 * Two operators: shared views and audit actor, lock conflict names the holder, `break_lock`
   removes only the holder shown, 8 parallel attempts give one winner.
   `live_shared_db::two_operators_share_state_and_locks`
