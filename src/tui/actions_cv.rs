@@ -1956,6 +1956,32 @@ mod tests {
         assert!(st.versions(c).await.unwrap().is_empty(), "nothing before the confirmation");
     }
 
+    /// A view that is not a composite: the Library step compares its rows with the repositories of the definition. The
+    /// row of a repository that the view still has stays as it is; the row of one that it dropped stops serving.
+    #[tokio::test]
+    async fn the_publish_preview_of_a_view_names_the_library_row_of_a_dropped_repository() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let lib = st.ensure_library("lab").await.unwrap();
+        // The definition keeps r1 (no versions yet: the preview reads only the repository) and dropped r2.
+        let kept = left_out(&st, lib, web, "1", Some("/p/1/")).await;
+        let r1 = CvRepo { repo_href: kept.repo_href.clone(), repo_name: "r1".into(), repo_type: RepoType::Rpm, filters: vec![] };
+        st.set_cv_repo(web, &r1).await.unwrap();
+        serve(&server, "GET", kept.repo_href.clone(), 200, json!({ "pulp_href": kept.repo_href, "name": "r1" })).await;
+        let dropped = left_out(&st, lib, web, "2", Some("/p/2/")).await;
+        serve(&server, "GET", dropped.distribution, 200, json!({ "name": "d2", "publication": "/p/2/" })).await;
+        cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": web, "name": "web" }));
+        drain(&mut app, &mut rx).await;
+        let (form, mut submit) = open_form(&mut app);
+        submit(&mut app, &form).unwrap();
+        drain(&mut app, &mut rx).await;
+        let lines = confirm_lines(&mut app);
+        let r2 = "  r2: not part of the new version -> its distribution stops serving (kept for rollback)";
+        assert_eq!(lines[lines.len() - 2..], ["In Library:", r2], "{lines:?}");
+    }
+
     #[tokio::test]
     async fn a_failed_resume_shows_the_failed_version_without_a_reload() {
         let server = MockServer::start().await; // 404 for everything: the derived repository cannot be found
