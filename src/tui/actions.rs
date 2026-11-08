@@ -3226,17 +3226,8 @@ fn package_record_job(app: &mut App, version: String, package: String, name: Str
         }
         let p = deb::package_in(c, &version, &package).await?;
         let latest = s(&r, "latest_version_href");
-        let mut back = vec![];
-        if !latest.is_empty() && latest != version {
-            for (path, href, what) in
-                [("packages/", &p, format!("package {package}")), ("release_components/", &rc, format!("release component {name}"))]
-            {
-                let q = [("repository_version", latest.clone()), ("pulp_href__in", href.clone()), ("fields", "pulp_href".into())];
-                if c.list::<Value>(&c.api(&format!("content/deb/{path}")), &q).await?.count == 0 {
-                    back.push(what);
-                }
-            }
-        }
+        let units = [("packages/", &p, format!("package {package}")), ("release_components/", &rc, format!("release component {name}"))];
+        let back = brought_back(c, &version, &latest, units).await?;
         ap(move |app| {
             let label = format!("create package release component {package} in {name}");
             let (n, repo) = (version_number(&latest), s(&r, "name"));
@@ -3247,6 +3238,22 @@ fn package_record_job(app: &mut App, version: String, package: String, name: Str
             if back.is_empty() { go(app) } else { app.confirm("New package release component", lines, go) }
         })
     });
+}
+
+/// The `units` (Deb content path, href, name) of a record from `version` that the latest version `latest` lacks: the
+/// record brings them back. None when `version` is the latest one.
+async fn brought_back(c: &PulpClient, version: &str, latest: &str, units: [(&str, &String, String); 2]) -> anyhow::Result<Vec<String>> {
+    let mut back = vec![];
+    if latest.is_empty() || latest == version {
+        return Ok(back);
+    }
+    for (path, href, what) in units {
+        let q = [("repository_version", latest.to_string()), ("pulp_href__in", href.clone()), ("fields", "pulp_href".into())];
+        if c.list::<Value>(&c.api(&format!("content/deb/{path}")), &q).await?.count == 0 {
+            back.push(what);
+        }
+    }
+    Ok(back)
 }
 
 /// Add the package release component of package `p` and release component `rc`, with both, to the repository of
