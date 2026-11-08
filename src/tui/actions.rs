@@ -2999,6 +2999,9 @@ fn remove_content(app: &mut App, t: RepoType, version: String, units: Vec<String
     app.job(format!("read repository {}", short(&repo)), move |ctx| async move {
         // The retention of the repository decides whether older versions keep the content.
         let r: Value = ctx.client.get(&repo, &[]).await?;
+        if let Some(e) = snapshot_refusal(&r) {
+            bail!(e);
+        }
         let latest = s(&r, "latest_version_href");
         // What the run sends: one version per batch. The run reuses it while the latest version stays the same.
         let sent = remove_units(&ctx.client, t, &latest, units.clone()).await?;
@@ -6164,6 +6167,23 @@ mod tests {
             assert_eq!((lines.iter().any(|l| l == keep), lines.contains(&warn(n))), (!goes, goes), "{n}: {lines:?}");
         }
         assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing sent before a yes");
+    }
+
+    /// Remove on a Content View snapshot repository is refused before the confirm, as Restore is (audit F34).
+    #[tokio::test]
+    async fn remove_content_refuses_a_snapshot_repository_before_the_confirm() {
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/file/file/snap/");
+        let r = json!({ "pulp_href": repo, "name": "snap", "latest_version_href": format!("{repo}versions/1/"), "pulp_labels": { "pulp_tui_cv": "web" } });
+        get(&server, &repo, r).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.marked = [format!("{API}content/file/files/1/")].into();
+        content_action(&mut app, format!("{repo}versions/1/"), Act::RemoveContent);
+        settle(&mut app, &mut rx).await;
+        let last = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
+        assert!(app.modal.is_none() && last.contains("refused: snap is a snapshot repository of Content View web"), "{last}");
+        let sent = server.received_requests().await.unwrap();
+        assert!(sent.iter().all(|r| r.url.path() == repo || r.url.path().ends_with("/status/")), "only the repository is read");
     }
 
     /// The mirror confirm of a repository whose retention deletes its current version: typed, and says so.
