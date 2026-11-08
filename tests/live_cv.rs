@@ -500,8 +500,9 @@ async fn a_left_out_distribution_deleted_outside_pulp_tui_does_not_block_the_env
     let (v2, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
 
     let vrs = store.version_repos(v2.id).await.unwrap();
-    let forget = "its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it";
-    assert_eq!(svc.left_out(&vrs, &more).await.unwrap(), Some(pulp_tui::cv::LeftOut::Forget(forget.into())), "the preview says so");
+    let env = store.environments(&profile).await.unwrap().into_iter().find(|e| e.id == dev).unwrap();
+    let forget = pulp_tui::cv::LeftOut::Forget("its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it".into());
+    assert_eq!(svc.left_out(&id, &env, &vrs, &more).await.unwrap(), Some(forget), "the preview says so");
     svc.promote(cv, v2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
     let rows: Vec<_> = store.binding_repos(dev, cv).await.unwrap().into_iter().map(|b| b.repo_name).collect();
     assert_eq!(rows, ["docs"]);
@@ -510,6 +511,52 @@ async fn a_left_out_distribution_deleted_outside_pulp_tui_does_not_block_the_env
     assert!(svc.verify(cv, dev).await.unwrap().is_empty());
     svc.delete_version(v1.id, &quiet, &no_progress).await.unwrap();
 
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
+}
+
+/// F46: v2 leaves out `more`, so Library keeps its distribution, serving nothing. An operator points it at the v1
+/// publication and removes the labels of the view (takes it over). The next Publish does not change it: its Library
+/// step forgets the row, completes, and Promote to Dev works.
+#[tokio::test]
+async fn publish_leaves_alone_a_kept_library_distribution_taken_over_outside_pulp_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvto");
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
+    let cv = store.create_cv(&profile, &id, "").await.unwrap();
+    let mut sources = vec![];
+    for name in ["docs", "more"] {
+        let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-{name}"), "file/PULP_MANIFEST", "mirror").await;
+        let r = CvRepo { repo_href: repo.clone(), repo_name: name.into(), repo_type: RepoType::File, filters: vec![] };
+        store.set_cv_repo(cv, &r).await.unwrap();
+        sources.extend([repo, remote]);
+    }
+    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let lib = store.ensure_library(&profile).await.unwrap();
+    let more = store.binding_repos(lib, cv).await.unwrap().into_iter().find(|b| b.repo_name == "more").unwrap();
+    store.remove_cv_repo(cv, &more.repo_href).await.unwrap();
+    svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let m = c.patch(&more.distribution, &json!({ "publication": more.publication, "pulp_labels": {} })).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+
+    let (v3, note) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    assert_eq!(note, None, "the Library step completes");
+    let b = store.binding(lib, cv).await.unwrap().unwrap();
+    assert_eq!((b.served, b.attempt), (Some(v3.id), None));
+    let d: Value = c.get(&more.distribution, &[]).await.unwrap();
+    assert_eq!((&d["publication"], &d["pulp_labels"]), (&json!(more.publication), &json!({})), "not changed");
+    let rows: Vec<_> = store.binding_repos(lib, cv).await.unwrap().into_iter().map(|b| b.repo_name).collect();
+    assert_eq!(rows, ["docs"], "the row is forgotten");
+    let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
+    svc.promote(cv, v3.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    assert_ne!(v1.id, v3.id);
+
+    cleanup(&c, &[&more.distribution]).await;
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
 }

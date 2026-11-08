@@ -8,7 +8,7 @@ use crate::cv::{CvService, Drift, Fix, LeftOut, Mode, check_repo_clash};
 use crate::filters::{format_rules, parse_rules};
 use crate::pulp::ops::{self, OnTask};
 use crate::pulp::{Mutation, PulpClient, RepoType};
-use crate::store::{Binding, Component, CvRepo, CvVersion, Environment, LIBRARY, Store};
+use crate::store::{Binding, BindingRepo, Component, CvRepo, CvVersion, CvVersionRepo, Environment, LIBRARY, Store};
 use anyhow::{anyhow, bail};
 use futures::future::join_all;
 use serde_json::Value;
@@ -818,8 +818,7 @@ async fn promote_lines(svc: &CvService, name: &str, e: &Environment, v: &CvVersi
     Ok(lines)
 }
 
-/// The distribution in `e` of each repository of version `v` (`CvService::promote_target`), then each one that the
-/// version lacks and whose distribution stops serving or whose row the promotion forgets (`CvService::left_out`).
+/// The distribution in `e` of each repository of version `v` (`CvService::promote_target`), then `left_out_lines`.
 async fn repo_lines(svc: &CvService, name: &str, e: &Environment, v: &CvVersion) -> anyhow::Result<Vec<String>> {
     let (vrs, rows) = (svc.store.version_repos(v.id).await?, svc.store.binding_repos(e.id, v.cv_id).await?);
     let mut lines = vec![];
@@ -827,8 +826,23 @@ async fn repo_lines(svc: &CvService, name: &str, e: &Environment, v: &CvVersion)
         let row = rows.iter().find(|b| b.repo_href == vr.repo().repo_href);
         lines.push(svc.promote_target(name, e, vr.repo(), row).await?);
     }
+    lines.extend(left_out_lines(svc, name, e, &vrs, rows, &format!("v{}", v.number)).await?);
+    Ok(lines)
+}
+
+/// A line for each row (`rows`, of view `name` in `e`) of a repository that version `version` (repositories `vrs`)
+/// lacks, when its promotion changes it: the distribution stops serving, or the row is forgotten (`CvService::left_out`).
+async fn left_out_lines(
+    svc: &CvService,
+    name: &str,
+    e: &Environment,
+    vrs: &[CvVersionRepo],
+    rows: Vec<BindingRepo>,
+    version: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut lines = vec![];
     for b in rows {
-        let what = match svc.left_out(&vrs, &b).await? {
+        let what = match svc.left_out(name, e, vrs, &b).await? {
             None => continue,
             Some(LeftOut::Forget(why)) => why,
             Some(LeftOut::Unbind) if b.publication.is_none() => {
@@ -836,9 +850,17 @@ async fn repo_lines(svc: &CvService, name: &str, e: &Environment, v: &CvVersion)
             }
             Some(LeftOut::Unbind) => "its distribution stops serving (kept for rollback)".into(),
         };
-        lines.push(format!("  {}: not part of v{} -> {what}", b.repo_name, v.number));
+        lines.push(format!("  {}: not part of {version} -> {what}", b.repo_name));
     }
     Ok(lines)
+}
+
+/// What the Library step of a Publish of view `id` (`name`) changes (`left_out_lines`), under a heading.
+async fn library_lines(svc: &CvService, id: i64, name: &str) -> anyhow::Result<Vec<String>> {
+    let Some(lib) = svc.store.environments(&svc.scope).await?.into_iter().find(|e| e.name == LIBRARY) else { return Ok(vec![]) };
+    let rows = svc.store.binding_repos(lib.id, id).await?;
+    let lines = left_out_lines(svc, name, &lib, &svc.draft_rows(id).await?, rows, "the new version").await?;
+    Ok(if lines.is_empty() { lines } else { std::iter::once("In Library:".to_string()).chain(lines).collect() })
 }
 
 /// The confirmed `mode` of version `v` of view `name` to `e`, under the view's lock, then what Verify finds.
@@ -930,6 +952,7 @@ fn cv_publish(app: &mut App, id: i64, name: String, deb: bool) {
             let mut lines = svc.preview(id, latest).await?;
             lines.insert(0, "Publishing creates a new immutable version and makes it active in Library.".into());
             lines.insert(1, String::new());
+            lines.extend(library_lines(&svc, id, &name).await?);
             let protected = svc.library_protected().await?;
             ap(move |app| {
                 guard_library(app, protected, lines, Some(format!("Publish {name}")), move |app| {
@@ -1898,6 +1921,41 @@ mod tests {
         assert_eq!(st.version(v2.id).await.unwrap().state, "published");
     }
 
+    /// F46: the Library step of Publish changes the Library rows of repositories that the new version lacks, as a
+    /// promotion does: the Publish preview names each change before the confirmation. A kept distribution that serves
+    /// a publication again stops serving; one that lost the labels of the view is left as it is and forgotten.
+    #[tokio::test]
+    async fn the_publish_preview_names_what_the_library_step_changes() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        // A composite of a version without repositories: the preview reads only the left-out rows from Pulp.
+        let os = st.create_cv("lab", "os", "").await.unwrap();
+        publish_empty(&st, os).await;
+        let c = st.create_composite("lab", "rocky9", "").await.unwrap();
+        st.set_component(c, os, None).await.unwrap();
+        let lib = st.ensure_library("lab").await.unwrap();
+        let ours = json!({ crate::cv::LABEL_CV: "rocky9", crate::cv::LABEL_ENV: LIBRARY, crate::cv::LABEL_DB: st.db_id() });
+        for (n, labels) in [("1", ours), ("2", json!({}))] {
+            let old = left_out(&st, lib, c, n, None).await;
+            let d = json!({ "pulp_href": old.distribution, "name": format!("d{n}"), "base_path": old.base_path, "publication": "/p/3/",
+                "pulp_labels": labels });
+            serve(&server, "GET", old.distribution, 200, d).await;
+        }
+        cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": c, "name": "rocky9", "composite": true }));
+        drain(&mut app, &mut rx).await; // the form opens after the store read
+        let (form, mut submit) = open_form(&mut app);
+        submit(&mut app, &form).unwrap();
+        drain(&mut app, &mut rx).await;
+        let lines = confirm_lines(&mut app);
+        let r1 = "  r1: not part of the new version -> its distribution stops serving (kept for rollback); Pulp shows that it \
+                  serves a publication set outside pulp-tui";
+        let r2 = "  r2: not part of the new version -> its distribution d2 is not labeled pulp_tui_cv=rocky9 (changed outside \
+                  pulp-tui): pulp-tui leaves it as it is and forgets it";
+        assert_eq!(lines[lines.len() - 3..], ["In Library:", r1, r2], "{lines:?}");
+        assert!(st.versions(c).await.unwrap().is_empty(), "nothing before the confirmation");
+    }
+
     #[tokio::test]
     async fn a_failed_resume_shows_the_failed_version_without_a_reload() {
         let server = MockServer::start().await; // 404 for everything: the derived repository cannot be found
@@ -2270,8 +2328,8 @@ mod tests {
     }
 
     /// Rows of repositories that the version lacks and that record no publication: the promotion unserves the one whose
-    /// distribution serves a publication (set outside pulp-tui), and forgets the one whose distribution is gone; the
-    /// preview names both, and no other one.
+    /// distribution serves a publication (set outside pulp-tui), and forgets the one whose distribution is gone or lost
+    /// the labels of the view; the preview names these, and no other one.
     #[tokio::test]
     async fn the_promote_preview_names_a_left_out_distribution_that_serves_again() {
         let server = MockServer::start().await;
@@ -2280,7 +2338,7 @@ mod tests {
         let lib = st.ensure_library("lab").await.unwrap();
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let v = publish_empty(&st, web).await;
-        for (n, id) in [("old", "1"), ("idle", "2"), ("gone", "3")] {
+        for (n, id) in [("old", "1"), ("idle", "2"), ("gone", "3"), ("mine", "4")] {
             let row = crate::store::BindingRepo {
                 env_id: lib,
                 cv_id: web,
@@ -2293,14 +2351,19 @@ mod tests {
             };
             st.save_binding_repo(&row).await.unwrap();
         }
-        serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/1/".into(), 200, json!({ "publication": "/p/3/" })).await;
+        let ours = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: LIBRARY });
+        let serves = |labels: Value| json!({ "name": "d", "publication": "/p/3/", "pulp_labels": labels });
+        serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/1/".into(), 200, serves(ours)).await;
         serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/2/".into(), 200, json!({ "publication": null })).await;
+        serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/4/".into(), 200, serves(json!({ "team": "x" }))).await;
         promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         let gone = "  gone: not part of v1 -> its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it";
+        let mine = "  mine: not part of v1 -> its distribution d is not labeled pulp_tui_cv=web (changed outside pulp-tui): \
+                    pulp-tui leaves it as it is and forgets it";
         let old = "  old: not part of v1 -> its distribution stops serving (kept for rollback); Pulp shows that it serves a \
                    publication set outside pulp-tui";
-        assert_eq!(confirm_lines(&mut app)[2..5], [gone, old, ""]);
+        assert_eq!(confirm_lines(&mut app)[2..6], [gone, mine, old, ""]);
     }
 
     /// A confirmed promotion says what it verified: the served metadata, not every file.

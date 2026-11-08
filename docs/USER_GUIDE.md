@@ -581,7 +581,9 @@ retry, or roll back to the served version to clear the failed attempt.
 * **w** preview: the content that the draft selects, compared with the latest version.
 * **P** publishes a new version: notes (and Deb signing) → preview → confirm. The version becomes
   active in Library. When the Library step fails, the version stays published:
-  `Library step failed: …; promote v4 to Library`.
+  `Library step failed: …; promote v4 to Library`. The Library step changes the Library
+  distributions of repositories that the new version does not have, as **M** does; the preview
+  names each one under `In Library:`.
 * **P** refuses a view that holds a snapshot repository. Remove it (**x**) and add its source. To
   use the content of another view, make a composite.
 * **v** versions. **i** full JSON.
@@ -597,7 +599,10 @@ retry, or roll back to the served version to clear the failed attempt.
   asked. A repository that the version does not have stops serving; the preview names it, also
   when its distribution serves a publication that was set outside pulp-tui. When its distribution
   was deleted outside pulp-tui, the promotion sends nothing for it and forgets it; the preview
-  says so.
+  says so. When its distribution serves a publication that was set outside pulp-tui and no longer
+  has the labels of the view (someone took it over), the promotion does not change it and forgets
+  it too. When pulp-tui still records a publication of the view there, the promotion refuses it
+  instead (that publication stays protected): add the labels again.
 * **b** rolls an environment back. After Library: only a version older than the newest bound one
   (served or attempted), or that one again (a retry). For a newer version, or an environment
   without a version, use Promote. In Library: any published version.

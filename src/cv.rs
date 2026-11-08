@@ -1319,7 +1319,7 @@ impl CvService {
         let aliases = self.store.aliases().await?;
         let mut errors = vec![];
         for b in self.store.binding_repos(env.id, cv.id).await? {
-            let done = match self.left_out(vrs, &b).await {
+            let done = match self.left_out(&cv.name, env, vrs, &b).await {
                 Ok(None) => continue,
                 Ok(Some(LeftOut::Unbind)) => self.unbind(&cv.name, env, &b, &aliases, on).await.map(|()| None),
                 Ok(Some(LeftOut::Forget(why))) => self.alive().map(|()| Some(why)),
@@ -1337,11 +1337,14 @@ impl CvService {
         Ok(errors)
     }
 
-    /// What a promotion of the version with repositories `vrs` does to row `b` (`unbind_removed`), read from Pulp: the
-    /// version lacks its repository, and the row records a publication, or records none and Pulp shows that its
-    /// distribution serves one (set outside pulp-tui): unbind. A gone distribution keeps nothing for rollback and serves
-    /// nothing: forget the row.
-    pub async fn left_out(&self, vrs: &[CvVersionRepo], b: &BindingRepo) -> Result<Option<LeftOut>> {
+    /// What a promotion of the version with repositories `vrs` does to row `b` of view `cv` in `env` (`unbind_removed`),
+    /// read from Pulp: the version lacks its repository, and the row records a publication, or records none and Pulp
+    /// shows that its distribution serves one (set outside pulp-tui): unbind. A gone distribution keeps nothing for
+    /// rollback and serves nothing: forget the row. So does one that records no publication and is not ours any more
+    /// (`not_ours`, an operator took it over): it is never changed, and it must not fail every later promotion. One that
+    /// records a publication and is not ours stays refused (`unbind`): forgetting it would let a version delete remove
+    /// the publication that it serves.
+    pub async fn left_out(&self, cv: &str, env: &Environment, vrs: &[CvVersionRepo], b: &BindingRepo) -> Result<Option<LeftOut>> {
         if vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) {
             return Ok(None);
         }
@@ -1352,7 +1355,20 @@ impl CvService {
             }
             Err(e) => return Err(e.into()),
         };
-        Ok((b.publication.is_some() || d["publication"].is_string()).then_some(LeftOut::Unbind))
+        if b.publication.is_some() {
+            return Ok(Some(LeftOut::Unbind));
+        }
+        if !d["publication"].is_string() {
+            return Ok(None);
+        }
+        let aliases = self.store.aliases().await?;
+        Ok(Some(match self.not_ours(&b.distribution, &dist_labels(cv, &env.name), &aliases).await? {
+            None => LeftOut::Unbind,
+            Some(why) => LeftOut::Forget(format!(
+                "its distribution {} is {why} (changed outside pulp-tui): pulp-tui leaves it as it is and forgets it",
+                d["name"].as_str().unwrap_or("?")
+            )),
+        }))
     }
 
     /// Point the distribution of `b` at no publication; refused unless it is ours.
@@ -1721,6 +1737,17 @@ impl CvService {
     }
 
     // ---- preview / compare -------------------------------------------------------------
+
+    /// The repositories of the version that a Publish of view `cv_id` makes now (a composite: those of its components),
+    /// as rows with only the repository: what the Library step compares its rows with (`left_out`). Reads only.
+    pub async fn draft_rows(&self, cv_id: i64) -> Result<Vec<CvVersionRepo>> {
+        let cv = self.store.content_view(cv_id).await?;
+        if cv.composite {
+            return Ok(self.resolve_components(&cv).await?.into_iter().flat_map(|(_, _, rows)| rows).collect());
+        }
+        let repos = self.store.cv_repos(cv_id).await?;
+        Ok(repos.into_iter().map(|r| CvVersionRepo { repo: Some(r), ..Default::default() }).collect())
+    }
 
     /// Exact content the current definition would select, compared to a published version.
     pub async fn preview(&self, cv_id: i64, against: Option<i64>) -> Result<Vec<String>> {
@@ -3242,6 +3269,45 @@ mod tests {
         assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing is sent");
         let rows: Vec<_> = svc.store.binding_repos(lib, cv).await.unwrap().into_iter().map(|b| b.repo_name).collect();
         assert_eq!(rows, ["r9"], "the row of the gone distribution is forgotten");
+    }
+
+    /// F46: an operator pointed a kept distribution (a left-out row that records no publication) at a publication and
+    /// removed the labels of the view. It is not ours: the promotion (also the Library step of Publish) sends nothing
+    /// to it and forgets the row, so it completes, and later promotions do not end partial on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kept_distribution_that_lost_the_labels_of_the_view_is_forgotten_not_changed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let v = svc.store.begin_version(cv, "", &[]).await.unwrap();
+        svc.store.finish_version(v.id, "published", None).await.unwrap();
+        let lib = svc.store.ensure_library("k").await.unwrap();
+        svc.store.promoted(lib, cv, v.id, "active").await.unwrap();
+        let old = BindingRepo {
+            env_id: lib,
+            cv_id: cv,
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/9/".into(),
+            repo_name: "old".into(),
+            repo_type: RepoType::Rpm,
+            distribution: DIST.into(),
+            base_path: "library/web/old".into(),
+            publication: None,
+        };
+        svc.store.save_binding_repo(&old).await.unwrap();
+        let d = json!({ "pulp_href": DIST, "name": "theirs", "base_path": "library/web/old", "publication": "/p/3/", "pulp_labels": {} });
+        Mock::given(method("GET")).and(path(DIST)).respond_with(ResponseTemplate::new(200).set_body_json(d)).mount(&server).await;
+        let env = svc.store.environments("k").await.unwrap().remove(0);
+        let why = "its distribution theirs is not labeled pulp_tui_cv=web (changed outside pulp-tui): pulp-tui leaves it as it is and \
+                   forgets it";
+        assert_eq!(svc.left_out("web", &env, &[], &old).await.unwrap(), Some(LeftOut::Forget(why.into())));
+        let logged = Mutex::new(vec![]);
+        svc.promote(cv, v.id, lib, Mode::Rollback, &|l| logged.lock().unwrap().push(l), &ops::no_progress).await.unwrap();
+        assert!(logged.lock().unwrap().contains(&format!("old: {why}")), "the workflow log says so");
+        assert_none(&server, "PATCH").await;
+        assert!(svc.store.binding_repos(lib, cv).await.unwrap().is_empty(), "the row is forgotten");
+        assert_eq!(svc.drift(cv, lib).await.unwrap(), [], "no drift: the distribution is not the view's");
     }
 
     /// F45: the distribution of a left-out row that records a publication was deleted outside pulp-tui. The promotion

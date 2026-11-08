@@ -144,7 +144,11 @@ Katello: they live in the store of the profile and are built from Pulp objects.
 * `pulp_tui_db=<database id>` (`Store::db_id`) of another database is refused: publish and
   promote stop, delete keeps the object and logs it.
 * The checks also run on hrefs recorded earlier (`CvService::not_ours`): Resume, version
-  delete and unbind skip or refuse such objects.
+  delete and unbind skip or refuse such objects. A left-out row that records no publication,
+  whose distribution serves one and is not ours any more, is forgotten, not changed
+  (`CvService::left_out`): nothing of the view is served there, and a refusal would fail every
+  later promotion and Library step. A row that records a publication stays refused: forgotten,
+  a version delete could remove the publication that the distribution serves.
 * An object without `pulp_tui_db`, or with an id in the aliases (`meta` key `alias:<id>`),
   is adopted: the workflow sets this database's id when it touches the object.
 
@@ -203,6 +207,9 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
 
 * Publish makes the version active in Library (`bind_library`). Resume does so only for
   the newest published version; Library keeps a newer one.
+* It is a promotion, so it also unbinds or forgets the Library rows of repositories that the
+  new version lacks (`CvService::left_out`). The Publish preview names each one under
+  `In Library:`, compared with the repositories of the draft (`CvService::draft_rows`).
 * A failed Library step is a warning; the version stays published and auto publish runs.
 * A stop in this step leaves the promotion `(version, promoting)`; under the view's lock such
   a row is an interrupted one (`CvService::library_interrupted`). Resume of that version
@@ -279,7 +286,7 @@ new version; served files that differ need a repair; a missing `base_url` needs
 * A promotion re-points also a repository that the version lacks when Pulp shows that its
   distribution serves a publication (`unbind_removed` reads the distribution of a row that
   records none, `CvService::left_out`), so the "promote again" hint fixes that drift too.
-  The promote preview uses the same rule, so it names that change.
+  The promote and Publish previews use the same rule, so they name that change.
 * While a workflow holds a live lock on the view, the drift check gives one hint per
   environment with drift, which names that workflow, and no other: the lock refuses Publish,
   Promote and Rollback, and the workflow can change what drifts.
