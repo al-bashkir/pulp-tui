@@ -404,14 +404,7 @@ pub async fn ensure_distribution(
         }
         return Ok(d.pulp_href);
     }
-    if let Some(o) = overlapping_distribution(c, base_path).await? {
-        let message = if o.base_path == base_path {
-            format!("base path {base_path} is used by distribution {}", o.name)
-        } else {
-            format!("base path {base_path} overlaps base path {} of distribution {}", o.base_path, o.name)
-        };
-        return Err(PulpError::Api { status: 409, message });
-    }
+    refuse_overlap(c, base_path).await?;
     let mut labels = labels.clone();
     if let Some((key, id, _)) = db {
         labels[key] = id.into();
@@ -424,6 +417,18 @@ pub async fn ensure_distribution(
         on,
     )
     .await
+}
+
+/// Refuse a new distribution at `base_path` that another distribution has, contains or is inside of
+/// (`overlapping_distribution`), before the POST.
+async fn refuse_overlap(c: &PulpClient, base_path: &str) -> Result<()> {
+    let Some(o) = overlapping_distribution(c, base_path).await? else { return Ok(()) };
+    let message = if o.base_path == base_path {
+        format!("base path {base_path} is used by distribution {}", o.name)
+    } else {
+        format!("base path {base_path} overlaps base path {} of distribution {}", o.base_path, o.name)
+    };
+    Err(PulpError::Api { status: 409, message })
 }
 
 /// A distribution (any type) whose base path overlaps `base_path`: the same path, a path above it or a path below it.
