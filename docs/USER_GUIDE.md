@@ -579,8 +579,12 @@ retry, or roll back to the served version to clear the failed attempt.
 * **v** versions. **i** full JSON.
 * **M** promotes a version to an environment, with a preview of every distribution. The preview
   reads the distributions from Pulp. A distribution of the view that was renamed outside pulp-tui
-  shows with its real name: the promotion looks for the pulp-tui name and fails for it, so rename
-  it back first.
+  shows with its real name. The promotion looks for the pulp-tui name. When the renamed one still
+  has the pulp-tui path, the promotion fails for it. When it has another path, the promotion makes
+  a new distribution at the pulp-tui path, and the renamed one keeps its publication, but pulp-tui
+  no longer records it (drift check and unpromote do not see it). In both cases, rename it back
+  first. A new distribution needs a free path: the preview names a distribution that has it, and
+  the promotion then fails for that repository.
 * **b** rolls an environment back. After Library: only a version older than the newest bound one
   (served or attempted), or that one again (a retry). For a newer version, or an environment
   without a version, use Promote. In Library: any published version.

@@ -1354,21 +1354,39 @@ impl CvService {
     }
 
     /// The preview line of the promotion of `repo` (view `cv`) to `env`, read from Pulp: the distribution of the derived
-    /// name, the one that `row` records when it still has this view's labels but another name (renamed outside
-    /// pulp-tui: the promotion looks for the derived name and fails on its base path), or a new one.
+    /// name, or a new one. The one that `row` records, when it still has this view's labels but another name (renamed
+    /// outside pulp-tui), is named too: at the derived path the promotion fails on that path; at another path the
+    /// promotion makes the new one and the renamed one keeps its publication, unrecorded. A new one fails on a path
+    /// that another distribution has (`ops::ensure_distribution`).
     pub async fn promote_target(&self, cv: &str, env: &Environment, repo: &CvRepo, row: Option<&BindingRepo>) -> Result<String> {
         let what = format!("  {} ({})", repo.repo_name, repo.repo_type.label());
         let name = distribution_name(cv, &env.name, &repo.repo_name);
         if let Some(d) = self.named_distribution(cv, env, repo).await? {
             return Ok(format!("{what}: distribution {} at /{}", d.name, d.base_path));
         }
-        Ok(match self.recorded_distribution(cv, env, row).await? {
-            Some(d) => format!(
-                "{what}: distribution {} at /{} was renamed outside pulp-tui; the promotion looks for {name} and fails: rename it back",
+        let path = base_path(cv, &env.label, &repo.repo_name);
+        let renamed = self.recorded_distribution(cv, env, row).await?;
+        if let Some(d) = renamed.as_ref().filter(|d| d.base_path == path) {
+            return Ok(format!(
+                "{what}: distribution {} at /{path} was renamed outside pulp-tui; the promotion looks for {name} and fails: rename it back",
+                d.name
+            ));
+        }
+        let mut line = format!("{what}: new distribution {name} at /{path}");
+        let c = &self.client;
+        let taken: crate::pulp::client::Page<Value> =
+            c.list(&c.api("distributions/"), &[("base_path", path), ("limit", "1".into())]).await?;
+        if let Some(o) = taken.results.first() {
+            line += &format!("; distribution {} has that base path, so the promotion fails for it", o["name"].as_str().unwrap_or("?"));
+        }
+        if let Some(d) = renamed {
+            line += &format!(
+                "; {} at /{} (renamed outside pulp-tui) keeps its publication, and pulp-tui no longer records it: rename it back \
+                 first to re-point it",
                 d.name, d.base_path
-            ),
-            None => format!("{what}: new distribution {name} at /{}", base_path(cv, &env.label, &repo.repo_name)),
-        })
+            );
+        }
+        Ok(line)
     }
 
     /// The distribution that `row` records, when Pulp still has it with the labels of view `cv` in `env`.
@@ -4158,11 +4176,13 @@ mod tests {
             publication: None,
         };
         let none = json!({ "count": 0, "next": null, "results": [] });
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/pulp/api/v3/distributions/rpm/rpm/"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(none))
-            .mount(&server)
-            .await;
+        for p in ["/pulp/api/v3/distributions/rpm/rpm/", "/pulp/api/v3/distributions/"] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(p))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(none.clone()))
+                .mount(&server)
+                .await;
+        }
         let d = json!({ "pulp_href": DIST, "name": "moved", "base_path": "x/os", "pulp_labels": { LABEL_CV: "web", LABEL_ENV: "Dev" } });
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(DIST))

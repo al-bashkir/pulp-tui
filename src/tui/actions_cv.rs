@@ -2125,7 +2125,9 @@ mod tests {
         assert_eq!(shown_envs(&st, web, v2.id).await.1, "", "the failed attempt is gone after the rollback");
     }
 
-    /// The distribution of `os` in Dev was renamed in Pulp: the preview names it as Pulp has it, not as derived.
+    /// The distribution of `os` in Dev was renamed in Pulp: the preview names it as Pulp has it, not as derived. At the
+    /// derived path the promotion fails; at another path it makes a new distribution. A foreign distribution has the
+    /// path of the new docs distribution: the promotion fails for docs.
     #[tokio::test]
     async fn the_promote_preview_shows_a_distribution_renamed_outside_pulp_tui() {
         let server = MockServer::start().await;
@@ -2150,22 +2152,33 @@ mod tests {
         };
         st.save_binding_repo(&row).await.unwrap();
         let none = json!({ "count": 0, "next": null, "results": [] });
-        for t in ["rpm/rpm", "file/file"] {
-            serve(&server, "GET", format!("/pulp/api/v3/distributions/{t}/"), 200, none.clone()).await;
+        let docs = "  docs (File): new distribution pulp-tui-cv-web-Dev-docs at /dev/web/docs; distribution foreign has that base \
+                    path, so the promotion fails for it";
+        let at_derived = "  os (RPM): distribution os-moved at /dev/web/os was renamed outside pulp-tui; the promotion looks for \
+                          pulp-tui-cv-web-Dev-os and fails: rename it back";
+        let elsewhere = "  os (RPM): new distribution pulp-tui-cv-web-Dev-os at /dev/web/os; os-moved at /custom/os (renamed outside \
+                         pulp-tui) keeps its publication, and pulp-tui no longer records it: rename it back first to re-point it";
+        for (at, want) in [("dev/web/os", at_derived), ("custom/os", elsewhere)] {
+            server.reset().await;
+            for t in ["rpm/rpm", "file/file"] {
+                serve(&server, "GET", format!("/pulp/api/v3/distributions/{t}/"), 200, none.clone()).await;
+            }
+            let foreign = json!({ "count": 1, "next": null, "results": [{ "name": "foreign", "base_path": "dev/web/docs" }] });
+            Mock::given(method("GET"))
+                .and(path("/pulp/api/v3/distributions/"))
+                .and(wiremock::matchers::query_param("base_path", "dev/web/docs"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(foreign))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            serve(&server, "GET", "/pulp/api/v3/distributions/".into(), 200, none.clone()).await;
+            let labels = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: "Dev" });
+            let renamed = json!({ "pulp_href": os, "name": "os-moved", "base_path": at, "pulp_labels": labels });
+            serve(&server, "GET", os.into(), 200, renamed).await;
+            promote_preview(&mut app, web, "web".into(), v.id, "Dev".into(), Mode::Promote);
+            drain(&mut app, &mut rx).await;
+            assert_eq!(confirm_lines(&mut app)[2..4], [docs, want], "renamed one at {at}");
         }
-        let labels = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: "Dev" });
-        let renamed = json!({ "pulp_href": os, "name": "os-moved", "base_path": "custom/os", "pulp_labels": labels });
-        serve(&server, "GET", os.into(), 200, renamed).await;
-        promote_preview(&mut app, web, "web".into(), v.id, "Dev".into(), Mode::Promote);
-        drain(&mut app, &mut rx).await;
-        assert_eq!(
-            confirm_lines(&mut app)[2..4],
-            [
-                "  docs (File): new distribution pulp-tui-cv-web-Dev-docs at /dev/web/docs",
-                "  os (RPM): distribution os-moved at /custom/os was renamed outside pulp-tui; the promotion looks for \
-                 pulp-tui-cv-web-Dev-os and fails: rename it back"
-            ]
-        );
     }
 
     /// A confirmed promotion says what it verified: the served metadata, not every file.
