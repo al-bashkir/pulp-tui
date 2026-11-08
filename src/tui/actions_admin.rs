@@ -1695,7 +1695,8 @@ fn confirm_import(app: &mut App, href: String, name: String, toc: String, mappin
                     lines.insert(0, "WARNING: no repository was imported: Pulp found no destination repository.".into());
                     app.notify(Level::Warn, format!("import {name}: no repository was imported"));
                 }
-                app.text(format!("Import of {toc}{}", if done { "" } else { " FAILED" }), lines)
+                let outcome = if done { String::new() } else { format!(" {}", group.outcome().to_uppercase()) };
+                app.text(format!("Import of {toc}{outcome}"), lines)
             })
         })
     };
@@ -3154,6 +3155,38 @@ mod tests {
         let (mut f, mut submit) = open_form(&mut app, Act::Import, item);
         set(&mut f, "toc", tar);
         assert_eq!(submit(&mut app, &f).unwrap_err(), "not supported by this server: import from an export .tar (path)");
+    }
+
+    /// The result title names how the group ended: a canceled or skipped import is not a failure (as for replication).
+    #[tokio::test]
+    async fn the_import_result_title_names_the_outcome_of_the_group() {
+        use crate::tui::kinds::Act;
+        const GROUP: &str = "/pulp/api/v3/task-groups/5/";
+        let toc = "/var/lib/pulp/exports/dvd/export-9-20261102_1000-toc.json";
+        let item = json!({ "pulp_href": IMP, "name": "dvd", "repo_mapping": {} });
+        let check = json!({ "toc": { "context": toc, "is_valid": true, "messages": [] },
+            "repo_mapping": { "context": "{}", "is_valid": true, "messages": [] } });
+        for (state, title) in [("canceled", " CANCELED"), ("skipped", " SKIPPED"), ("failed", " FAILED"), ("completed", "")] {
+            let server = MockServer::start().await;
+            serve(&server, "GET", IMP, 200, item.clone()).await;
+            serve(&server, "GET", "/pulp/api/v3/repositories/", 200, page(json!([]))).await; // no snapshot
+            serve(&server, "POST", "/pulp/api/v3/importers/core/pulp/import-check/", 200, check.clone()).await;
+            serve(&server, "POST", &format!("{IMP}imports/"), 202, json!({ "task_group": GROUP })).await;
+            let task = json!({ "name": "pulpcore.app.tasks.importer.pulp_import", "state": state, "pulp_href": "/t/1/" });
+            let group = json!({ "pulp_href": GROUP, "all_tasks_dispatched": true, state: 1, "tasks": [task] });
+            serve(&server, "GET", GROUP, 200, group).await;
+            serve(&server, "GET", "/t/1/", 200, json!({ "pulp_href": "/t/1/", "state": state })).await;
+            let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+            app.list.kind = Kind::Importers;
+            let (mut f, mut submit) = open_form(&mut app, Act::Import, item.clone());
+            set(&mut f, "toc", toc);
+            submit(&mut app, &f).unwrap();
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
+            yes(&mut app);
+            settle(&mut app, &mut rx).await;
+            assert_eq!(result_title(&app), format!("Import of {toc}{title}"));
+        }
     }
 
     /// A Content View snapshot (`pulp_tui_cv`) is never a mapped destination. Pulp does not say which repositories an
