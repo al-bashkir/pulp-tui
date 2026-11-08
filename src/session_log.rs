@@ -164,7 +164,7 @@ pub fn redact(v: &mut Value) {
 
 /// `u` with the user info of its URL (`scheme://user:password@host`) as `•••`; None when it has none. The user
 /// info ends at the last `@` before the path, query or fragment.
-fn masked_user_info(u: &str) -> Option<String> {
+pub fn masked_user_info(u: &str) -> Option<String> {
     let (scheme, rest) = u.split_once("://")?;
     let at = rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())].rfind('@')?;
     Some(format!("{scheme}://•••{}", &rest[at..]))

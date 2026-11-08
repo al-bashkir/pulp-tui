@@ -128,6 +128,12 @@ fn col(title: &'static str, width: u16, get: fn(&Value) -> String) -> Col {
     Col { title, width, get }
 }
 
+/// A remote's `url` without its user info (`https://•••@host/`); the row keeps it for the Edit form.
+fn remote_url(v: &Value) -> String {
+    let u = s(v, "url");
+    crate::session_log::masked_user_info(&u).unwrap_or(u)
+}
+
 pub fn s(v: &Value, k: &str) -> String {
     match v.get(k) {
         Some(Value::String(x)) => x.clone(),
@@ -658,11 +664,9 @@ impl Kind {
             ],
             // pulp_file Git remotes have no policy (always immediate).
             Kind::Remotes(RepoType::File, true) => {
-                vec![col("name", 28, |v| s(v, "name")), col("git ref", 14, |v| s(v, "git_ref")), col("url", 50, |v| s(v, "url"))]
+                vec![col("name", 28, |v| s(v, "name")), col("git ref", 14, |v| s(v, "git_ref")), col("url", 50, remote_url)]
             }
-            Kind::Remotes(..) => {
-                vec![col("name", 28, |v| s(v, "name")), col("policy", 10, |v| s(v, "policy")), col("url", 50, |v| s(v, "url"))]
-            }
+            Kind::Remotes(..) => vec![col("name", 28, |v| s(v, "name")), col("policy", 10, |v| s(v, "policy")), col("url", 50, remote_url)],
             Kind::Acs(_) => vec![
                 col("name", 28, |v| s(v, "name")),
                 col("paths", 30, |v| v["paths"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
@@ -1664,6 +1668,17 @@ mod tests {
         assert_eq!(uln.unsupported(&caps), None);
         caps.versions.clear();
         assert_eq!(uln.unsupported(&caps).as_deref(), Some("not supported by this server: pulp_rpm plugin"));
+    }
+
+    /// The url column masks the user info of a remote URL (audit F42); the row keeps it for the Edit form.
+    #[test]
+    fn remote_lists_mask_the_user_info_of_the_url() {
+        let row = json!({ "name": "os", "policy": "on_demand", "git_ref": "v1", "url": "https://u:p@mirror.example/os/" });
+        for kind in [Kind::Remotes(RepoType::Rpm, false), Kind::Remotes(RepoType::File, true)] {
+            let url = kind.columns().iter().find(|c| c.title == "url").map(|c| (c.get)(&row));
+            assert_eq!(url.as_deref(), Some("https://•••@mirror.example/os/"), "{kind:?}");
+        }
+        assert_eq!(row["url"], "https://u:p@mirror.example/os/");
     }
 
     #[test]
