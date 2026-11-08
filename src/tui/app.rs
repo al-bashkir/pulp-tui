@@ -553,8 +553,9 @@ impl App {
                     Err(e) => {
                         self.error(format!("{}: {e}", job.label));
                         // A notice shows one line: an error of several (a list of failures) opens in the text view too,
-                        // as a job result (`applying`): behind an open dialog.
-                        if e.contains('\n') {
+                        // as a job result (`applying`): behind an open dialog. Not for a read: a reload fails again
+                        // after each finished task.
+                        if !job.is_load && e.contains('\n') {
                             self.applying = true;
                             self.text(format!("{} failed", job.label), e.lines().map(str::to_string).collect());
                             self.applying = false;
@@ -2366,6 +2367,20 @@ mod tests {
         app.spawn("delete x".into(), false, async { anyhow::bail!("refused") });
         app.handle_msg(rx.recv().await.unwrap());
         assert!(app.modal.is_none(), "one line: the notice only");
+    }
+
+    /// Audit F49: a read that fails with an error of several lines (a reload after each finished task, with a Pulp
+    /// error body in plain text) gives one notice and no text view.
+    #[tokio::test]
+    async fn a_failed_read_of_several_lines_opens_no_text_view() {
+        let mut app = app_on(Kind::Profiles).await;
+        let mut rx = app.rx.take().unwrap();
+        for _ in 0..2 {
+            app.spawn("load dashboard".into(), true, async { anyhow::bail!("502 Bad Gateway\n<html>\n</html>") });
+            app.handle_msg(rx.recv().await.unwrap());
+            assert!(app.modal.is_none() && app.queued.is_empty(), "no text view");
+        }
+        assert_eq!(texts(&app), ["load dashboard: 502 Bad Gateway\n<html>\n</html>"; 2]);
     }
 
     /// The text view of a failed job waits behind dialogs only for itself: a dialog that the operator opens after it
