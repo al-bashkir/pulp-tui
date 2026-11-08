@@ -3565,37 +3565,45 @@ fn distribution_edit_confirm(
         };
         let mut lines = vec![format!("Distribution {name} ({})", s(&d, "base_url")), format!("  now serves:  {now}")];
         lines.extend(will.map(|w| format!("  will serve:  {w}")));
-        if let Some(p) = b["base_path"].as_str() {
-            lines.push(format!("  base path:   {} -> {p}", s(&d, "base_path")));
-            lines.push("Clients of the old URL get HTTP 404 after the change.".into());
-        }
-        if let Some(g) = b.get("content_guard") {
-            let guard = |v: &Value| v.as_str().unwrap_or("none").to_string();
-            lines.push(format!("  content guard: {} -> {}", guard(&d["content_guard"]), guard(g)));
-            lines.push(
-                if g.is_null() {
-                    "Anyone with the URL gets the content after the change."
-                } else {
-                    "Clients that the guard does not allow get HTTP 403 after the change."
-                }
-                .into(),
-            );
-        }
-        if let Some(on) = b["checkpoint"].as_bool() {
-            let flag = |on: bool| if on { "on" } else { "off" };
-            lines.push(format!("  checkpoint:  {} -> {}", flag(d["checkpoint"] == true), flag(on)));
-            // pulpcore content/handler.py: a checkpoint distribution serves only `<base path>/<timestamp>/` paths.
-            lines.push(
-                if on {
-                    "The base path then lists the checkpoints; other paths need a timestamp: clients of the old URLs get errors."
-                } else {
-                    "The <base path>/<timestamp>/ URLs stop serving after the change."
-                }
-                .into(),
-            );
-        }
+        lines.extend(url_change_lines(&d, &b));
         ap(move |app| app.confirm_danger(format!("Edit distribution {name}"), lines, &name.clone(), go))
     });
+}
+
+/// The base path, content guard and checkpoint flag of distribution `d` now and after the request body `b` (those
+/// that `b` changes), each with what the clients of its URL get then.
+fn url_change_lines(d: &Value, b: &Value) -> Vec<String> {
+    let mut lines = vec![];
+    if let Some(p) = b["base_path"].as_str() {
+        lines.push(format!("  base path:   {} -> {p}", s(d, "base_path")));
+        lines.push("Clients of the old URL get HTTP 404 after the change.".into());
+    }
+    if let Some(g) = b.get("content_guard") {
+        let guard = |v: &Value| v.as_str().unwrap_or("none").to_string();
+        lines.push(format!("  content guard: {} -> {}", guard(&d["content_guard"]), guard(g)));
+        lines.push(
+            if g.is_null() {
+                "Anyone with the URL gets the content after the change."
+            } else {
+                "Clients that the guard does not allow get HTTP 403 after the change."
+            }
+            .into(),
+        );
+    }
+    if let Some(on) = b["checkpoint"].as_bool() {
+        let flag = |on: bool| if on { "on" } else { "off" };
+        lines.push(format!("  checkpoint:  {} -> {}", flag(d["checkpoint"] == true), flag(on)));
+        // pulpcore content/handler.py: a checkpoint distribution serves only `<base path>/<timestamp>/` paths.
+        lines.push(
+            if on {
+                "The base path then lists the checkpoints; other paths need a timestamp: clients of the old URLs get errors."
+            } else {
+                "The <base path>/<timestamp>/ URLs stop serving after the change."
+            }
+            .into(),
+        );
+    }
+    lines
 }
 
 /// The edit of distribution `b` that Content View `cv` owns keeps its binding, name and ownership labels:
