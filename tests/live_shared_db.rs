@@ -230,6 +230,55 @@ async fn postgres_migration_7_moves_unfinished_bindings_to_promotions() {
     s.drop_schema().await;
 }
 
+/// Migration 9 on a schema 6 database with served rows (the SQLite unit test
+/// `migration_9_restores_the_served_version_of_an_old_failed_row`): v2 failed in Dev, where the rows serve v1, so Dev
+/// gets v1 back as its served version; in QA v2 is partial (os serves v2, docs v1), a mixed set: no served version.
+#[tokio::test]
+async fn postgres_migration_9_restores_the_served_version_of_an_old_failed_row() {
+    if !live_enabled() {
+        return;
+    }
+    let s = Schema::new().await;
+    {
+        let mut c = sqlx::AnyConnection::connect(&s.connect()).await.unwrap();
+        for m in &PG_MIGRATIONS[..6] {
+            c.execute(sqlx::raw_sql(*m)).await.unwrap();
+        }
+        c.execute(sqlx::raw_sql(
+            "INSERT INTO schema_version(version) VALUES (6);
+             INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'old', 'web', 't');
+             INSERT INTO cv_versions(id, cv_id, number, state, created_at) VALUES (1, 1, 1, 'published', 't'), (2, 1, 2, 'published', 't');
+             INSERT INTO cv_version_repos(version_id, repo_href, repo_name, repo_type, filters, publication) VALUES
+                (1, '/r/os/', 'os', 'rpm', '[]', '/p/os/1/'), (1, '/r/docs/', 'docs', 'file', '[]', '/p/docs/1/'),
+                (2, '/r/os/', 'os', 'rpm', '[]', '/p/os/2/'), (2, '/r/docs/', 'docs', 'file', '[]', '/p/docs/2/');
+             INSERT INTO environments(id, profile, name, prior_id, label)
+                VALUES (1, 'old', 'Library', NULL, 'library'), (2, 'old', 'Dev', 1, 'dev'), (3, 'old', 'QA', 1, 'qa');
+             INSERT INTO bindings VALUES (1, 1, 2, 'active', 't1'), (2, 1, 2, 'failed', 't2'), (3, 1, 2, 'partial', 't3');
+             INSERT INTO binding_repos VALUES
+                (2, 1, '/r/os/', 'os', 'rpm', '/d/1/', 'dev/web/os', '/p/os/1/'),
+                (2, 1, '/r/docs/', 'docs', 'file', '/d/2/', 'dev/web/docs', '/p/docs/1/'),
+                (3, 1, '/r/os/', 'os', 'rpm', '/d/3/', 'qa/web/os', '/p/os/2/'),
+                (3, 1, '/r/docs/', 'docs', 'file', '/d/4/', 'qa/web/docs', '/p/docs/1/');",
+        ))
+        .await
+        .unwrap();
+    }
+    assert_eq!(s.migrate().await, (6, PG_MIGRATIONS.len() as i64));
+    let st = s.open().await;
+    let shown: Vec<_> = st
+        .bindings_for_cv(1)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| (b.env_id, b.served, b.attempt.map(|a| (a.version_id, a.state))))
+        .collect();
+    let attempt = |state: &str| Some((2, state.to_string()));
+    assert_eq!(shown, [(1, Some(2), None), (2, Some(1), attempt("failed")), (3, None, attempt("partial"))]);
+    // v1 is the rollback target in Dev, and QA still serves its docs: it cannot be deleted.
+    assert_eq!(st.version_in_use(1).await.unwrap(), ["Dev", "QA (served in part)"]);
+    s.drop_schema().await;
+}
+
 #[tokio::test]
 async fn two_operators_share_state_and_locks() {
     if !live_enabled() {
