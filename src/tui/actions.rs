@@ -3509,14 +3509,26 @@ fn distribution_form(app: &mut App, t: RepoType, current: Option<Value>) {
             owner_refusal(cv, &serve, f, &b, &owned_labels)?;
         }
         let label = format!("{} distribution {}", if edit { "update" } else { "create" }, f.get("name"));
-        distribution_save(app, t, edit.then(|| v.clone()), b, serve, label);
+        // The guard names that the picker loaded (href, name), for the confirm.
+        let options = f.fields.iter().find(|x| x.key == "content_guard").and_then(|x| x.options.as_ref());
+        let guards = options.into_iter().flatten().map(|i| (i.value.clone(), i.label.clone())).collect();
+        distribution_save(app, t, edit.then(|| v.clone()), b, serve, guards, label);
         Ok(())
     });
 }
 
 /// Save the distribution form: at once, or after `distribution_edit_confirm` when the edit of `current` changes what
-/// its clients get (the binding, the base path, the content guard or the checkpoint flag).
-fn distribution_save(app: &mut App, t: RepoType, current: Option<Value>, b: Value, serve: Serve, label: String) {
+/// its clients get (the binding, the base path, the content guard or the checkpoint flag); `guards`: known guard
+/// names (href, name).
+fn distribution_save(
+    app: &mut App,
+    t: RepoType,
+    current: Option<Value>,
+    b: Value,
+    serve: Serve,
+    guards: Vec<(String, String)>,
+    label: String,
+) {
     let will = serve_line(&serve);
     // An edit sends only the changed fields.
     let changes = ["base_path", "content_guard", "checkpoint"].iter().any(|k| b.get(k).is_some());
@@ -3531,7 +3543,7 @@ fn distribution_save(app: &mut App, t: RepoType, current: Option<Value>, b: Valu
         })
     };
     match edited {
-        Some(d) => distribution_edit_confirm(app, t, d, will, shown, go),
+        Some(d) => distribution_edit_confirm(app, t, d, will, shown, guards, go),
         None => go(app),
     }
 }
@@ -3551,13 +3563,14 @@ fn serve_line(serve: &Serve) -> Option<String> {
 
 /// An edit of distribution `d` that changes what its clients get: what it serves now, what it serves after (`will`),
 /// the base path, content guard and checkpoint flag now and after (those that the request body `b` changes), then
-/// `go` after the typed name.
+/// `go` after the typed name. `guards`: known guard names (href, name); the job reads the name of another guard.
 fn distribution_edit_confirm(
     app: &mut App,
     t: RepoType,
     d: Value,
     will: Option<String>,
     b: Value,
+    mut guards: Vec<(String, String)>,
     go: impl FnOnce(&mut App) + Send + 'static,
 ) {
     let name = s(&d, "name");
@@ -3568,23 +3581,36 @@ fn distribution_edit_confirm(
             Some((v, _, how)) => format!("{} ({how})", short(&v)),
             None => "nothing".into(),
         };
+        if b.get("content_guard").is_some() {
+            for h in [&d["content_guard"], &b["content_guard"]].into_iter().filter_map(Value::as_str) {
+                // A guard that cannot be read (no permission, gone) keeps its href in the line.
+                if !guards.iter().any(|g| g.0 == h)
+                    && let Ok(g) = c.get::<Value>(h, &[("fields", "name".into())]).await
+                {
+                    guards.push((h.into(), s(&g, "name")));
+                }
+            }
+        }
         let mut lines = vec![format!("Distribution {name} ({})", s(&d, "base_url")), format!("  now serves:  {now}")];
         lines.extend(will.map(|w| format!("  will serve:  {w}")));
-        lines.extend(url_change_lines(&d, &b));
+        lines.extend(url_change_lines(&d, &b, &guards));
         ap(move |app| app.confirm_danger(format!("Edit distribution {name}"), lines, &name.clone(), go))
     });
 }
 
 /// The base path, content guard and checkpoint flag of distribution `d` now and after the request body `b` (those
-/// that `b` changes), each with what the clients of its URL get then.
-fn url_change_lines(d: &Value, b: &Value) -> Vec<String> {
+/// that `b` changes), each with what the clients of its URL get then; a guard by its name in `guards` (href, name).
+fn url_change_lines(d: &Value, b: &Value, guards: &[(String, String)]) -> Vec<String> {
     let mut lines = vec![];
     if let Some(p) = b["base_path"].as_str() {
         lines.push(format!("  base path:   {} -> {p}", s(d, "base_path")));
         lines.push("Clients of the old URL get HTTP 404 after the change.".into());
     }
     if let Some(g) = b.get("content_guard") {
-        let guard = |v: &Value| v.as_str().unwrap_or("none").to_string();
+        let guard = |v: &Value| match v.as_str() {
+            Some(h) => guards.iter().find(|g| g.0 == h).map_or(h, |g| g.1.as_str()).to_string(),
+            None => "none".into(),
+        };
         lines.push(format!("  content guard: {} -> {}", guard(&d["content_guard"]), guard(g)));
         lines.push(
             if g.is_null() {
@@ -8013,6 +8039,41 @@ mod tests {
             settle(&mut app, &mut rx).await;
             assert!(app.modal.is_none(), "{change:?}");
             assert_eq!(patches().await, sent + 1, "{change:?}");
+        }
+    }
+
+    /// The guard line of the edit confirm names the guards: from the options that the picker loaded, else with one
+    /// read of the guard.
+    #[tokio::test]
+    async fn distribution_edit_confirm_names_the_content_guards() {
+        use crate::tui::app::Modal;
+        use crate::tui::form::PickItem;
+        let server = wiremock::MockServer::start().await;
+        let d = format!("{API}distributions/file/file/1/");
+        let (a, b) = (format!("{API}contentguards/core/rbac/1/"), format!("{API}contentguards/core/content_redirect/2/"));
+        let item = json!({ "pulp_href": d, "name": "docs", "base_path": "docs", "base_url": "http://h/docs/", "content_guard": a, "pulp_labels": {} });
+        get(&server, &d, item.clone()).await;
+        get(&server, &a, json!({ "name": "staff" })).await;
+        get(&server, &format!("{API}publications/file/file/"), page(json!([]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let guard_reads =
+            async || server.received_requests().await.unwrap().iter().filter(|r| r.url.path().contains("/contentguards/")).count();
+        let pick = |label: &str, value: &str| PickItem { label: label.into(), value: value.into(), note: String::new() };
+        for (to, loaded, want, reads) in
+            [(b.as_str(), true, "  content guard: staff -> mirrors", 0), ("", false, "  content guard: staff -> none", 1)]
+        {
+            distribution_action(&mut app, RepoType::File, Act::Edit, item.clone());
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            let field = form.fields.iter_mut().find(|f| f.key == "content_guard").unwrap();
+            field.value = to.into();
+            if loaded {
+                field.options = Some(vec![pick("(none)", ""), pick("staff", &a), pick("mirrors", &b)]);
+            }
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm") };
+            assert!(lines.iter().any(|l| l == want), "{lines:?}");
+            assert_eq!(guard_reads().await, reads, "{want}");
         }
     }
 

@@ -911,8 +911,8 @@ async fn publications_and_distributions_through_the_tui(t: RepoType, path: &str,
     // Edit the content guard and Checkpoint (audit F26): each after the typed name, with the now / after line.
     let guard = create(&c, "contentguards/core/rbac/", json!({ "name": format!("{name}-guard") }), "/contentguards/").await;
     for ((key, value), want, stored) in [
-        (("content_guard", guard.as_str()), format!("  content guard: none -> {guard}"), json!(guard)),
-        (("content_guard", ""), format!("  content guard: {guard} -> none"), Value::Null),
+        (("content_guard", guard.as_str()), format!("  content guard: none -> {name}-guard"), json!(guard)),
+        (("content_guard", ""), format!("  content guard: {name}-guard -> none"), Value::Null),
         (("checkpoint", "true"), "  checkpoint:  off -> on".into(), json!(true)),
         (("checkpoint", "false"), "  checkpoint:  on -> off".into(), json!(false)),
     ] {
