@@ -1538,3 +1538,50 @@ async fn rpm_prune_reports_each_repository_of_its_task_group() {
         "{e}"
     );
 }
+
+/// pulp_deb keeps one source package per Source and Version (`SourcePackageSerializer.retrieve`) and adds that one to
+/// the repository. Another `.dsc` of a kept Source and Version is refused before any change (audit F35); the same
+/// `.dsc` goes on as before.
+#[tokio::test]
+async fn deb_source_upload_refuses_another_dsc_of_a_kept_source_and_version_before_any_change() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("h_1.0.tar.gz"), "orig").unwrap();
+    let dsc = dir.path().join("h_1.0-1.dsc");
+    let text = format!("Source: h\nVersion: 1.0-1\nChecksums-Sha256:\n {} 4 h_1.0.tar.gz\n", hex::encode(Sha256::digest(b"orig")));
+    std::fs::write(&dsc, &text).unwrap();
+    let sha = hex::encode(Sha256::digest(text.as_bytes()));
+    let (src, sources) = (format!("{API}content/deb/source_packages/1/"), format!("{API}content/deb/source_packages/"));
+    let ok = |body: Value| ResponseTemplate::new(200).set_body_json(body);
+    let page = |r: Value| json!({ "count": r.as_array().unwrap().len(), "next": null, "results": r });
+    for (kept, refused) in [("0".repeat(64), true), (sha.clone(), false)] {
+        let server = MockServer::start().await;
+        // pulp_deb 3.11 answers HTTP 500 to a source package read without `artifacts`.
+        Mock::given(method("GET"))
+            .and(path(&sources))
+            .and(query_param("source", "h"))
+            .and(query_param("version", "1.0-1"))
+            .and(query_param("fields", "pulp_href,sha256,artifacts"))
+            .respond_with(ok(page(json!([{ "pulp_href": src, "sha256": kept, "artifacts": {} }]))))
+            .mount(&server)
+            .await;
+        let artifacts = page(json!([{ "pulp_href": format!("{API}artifacts/1/") }]));
+        Mock::given(method("GET")).and(path(format!("{API}artifacts/"))).respond_with(ok(artifacts)).mount(&server).await;
+        let accepted = ResponseTemplate::new(202).set_body_json(json!({ "task": format!("{API}tasks/1/") }));
+        Mock::given(method("POST")).and(path(&sources)).respond_with(accepted).mount(&server).await;
+        let task = json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed", "created_resources": [src] });
+        Mock::given(method("GET")).and(path(format!("{API}tasks/1/"))).respond_with(ok(task)).mount(&server).await;
+        mount_source_package(&server, &src, &kept).await;
+        let c = client(&server, |_, _| {});
+
+        let r = deb::upload(&c, &deb::Upload::Source, &dsc, Some("/r/"), true, &|_, _| {}, &no_progress).await;
+        let sent = server.received_requests().await.unwrap().iter().filter(|r| r.method.as_str() != "GET").count();
+        if refused {
+            let e = r.unwrap_err().to_string();
+            assert!(e.starts_with("refused: ") && e.contains(&src) && e.contains("Source and Version"), "{e}");
+            assert_eq!(sent, 0, "nothing is sent");
+        } else {
+            assert_eq!(r.unwrap().content_href, src);
+            assert_eq!(sent, 1, "the source package");
+        }
+    }
+}

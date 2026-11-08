@@ -823,10 +823,12 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
   or above one chunk `uploads/` and `{upload}commit/` with `sha256` (a task). A second POST of an
   existing artifact answers 400, so the lookup makes a rerun safe. pulp_deb reuses a source
   package with the same `source` and `version` (`SourcePackageSerializer.retrieve`), also when
-  its `.dsc` differs, and adds that one; its `sha256` is the `.dsc` digest, so pulp-tui compares
-  it with the local `.dsc` and reports the mismatch. pulp_deb 3.11.1 answers HTTP 500 to a read
-  of a source package whose `fields` lack `artifacts` (`KeyError` in the serializer's
-  `__init__`; live), so pulp-tui reads `fields=sha256,artifacts`. pulpcore allows `artifacts/`
+  its `.dsc` differs, and adds that one; its `sha256` is the `.dsc` digest. Before any upload,
+  pulp-tui looks up `content/deb/source_packages/?source=&version=` (the `Source` and `Version`
+  of the local `.dsc`; `SourcePackageFilter` has both, 3.11.1) and refuses a package with
+  another `sha256`; after the POST it compares the digest again. pulp_deb 3.11.1 answers HTTP
+  500 to a read or list of source packages whose `fields` lack `artifacts` (`KeyError` in the
+  serializer's `__init__`; live), so pulp-tui reads `fields=…,sha256,artifacts`. pulpcore allows `artifacts/`
   (list, create) only to admins by default.
 * **Release record create.** `content/deb/releases/`, `release_components/` and
   `release_architectures/` (JSON with `repository`, in 3.5.4, 3.8.1 and 3.11.1) answer 202: the

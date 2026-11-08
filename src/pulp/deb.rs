@@ -233,11 +233,17 @@ async fn upload_source(
     on: OnTask<'_>,
 ) -> Result<UploadResult> {
     let dsc = tokio::fs::read(path).await.map_err(|e| PulpError::Config(format!("{}: {e}", path.display())))?;
+    let (text, sha256) = (String::from_utf8_lossy(&dsc), hex::encode(Sha256::digest(&dsc)));
+    if let Some(kept) = other_source(c, &text, &sha256).await? {
+        return Err(PulpError::Config(format!(
+            "refused: Pulp has source package {kept} of this Source and Version with another .dsc; pulp_deb keeps one per \
+             Source and Version and would add that one: give a rebuilt .dsc a new Version"
+        )));
+    }
     let dir = path.parent().unwrap_or(Path::new(""));
-    for (sha256, name) in dsc_files(&String::from_utf8_lossy(&dsc))? {
+    for (sha256, name) in dsc_files(&text)? {
         artifact(c, &dir.join(name), &sha256, progress, on).await?;
     }
-    let sha256 = hex::encode(Sha256::digest(&dsc));
     let dsc_artifact = artifact(c, path, &sha256, progress, on).await?;
     let (content_href, task) = create_source(c, dsc_artifact, repository, overwrite, on).await?;
     ops::check_digest(c, &content_href, &sha256).await.map_err(|e| match e {
@@ -247,6 +253,18 @@ async fn upload_source(
         e => e,
     })?;
     Ok(UploadResult { content_href, sha256, task })
+}
+
+/// The source package that Pulp keeps for the Source and Version of the `.dsc` text `dsc` when its digest is not
+/// `sha256`. pulp_deb returns that package for any `.dsc` of the pair (`SourcePackageSerializer.retrieve`).
+async fn other_source(c: &PulpClient, dsc: &str, sha256: &str) -> Result<Option<String>> {
+    let field = |name: &str| dsc.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(':')).map(|v| v.trim().to_string());
+    // Without them pulp_deb refuses the .dsc itself.
+    let (Some(source), Some(version)) = (field("Source"), field("Version")) else { return Ok(None) };
+    // pulp_deb 3.11 answers HTTP 500 to a source package read without `artifacts` (`ops::check_digest`).
+    let q = [("source", source), ("version", version), ("fields", "pulp_href,sha256,artifacts".into())];
+    let found: Page<Value> = c.list(&c.api(Upload::Source.endpoint()), &q).await?;
+    Ok(found.results.iter().find(|p| p["sha256"].as_str() != Some(sha256)).and_then(|p| p["pulp_href"].as_str()).map(str::to_string))
 }
 
 /// The source package of the `.dsc` artifact `dsc`, optionally in `repository`, and the task that made it.

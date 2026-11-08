@@ -335,6 +335,19 @@ async fn the_tui_uploads_a_udeb_a_source_package_and_generic_content_as_their_ty
     let files: Vec<&String> = src.results[0]["artifacts"].as_object().unwrap().keys().collect();
     assert_eq!(files.len(), 3, "{files:?}");
     assert!(files.iter().all(|f| f.starts_with("pool/")) && files.iter().any(|f| f.ends_with("/fixture-src_1.0-1.dsc")), "{files:?}");
+
+    // A rebuilt .dsc of the same Source and Version (other bytes): pulp_deb would add the kept package, so the
+    // upload is refused before any change (audit F35).
+    let dir = tempfile::tempdir().unwrap();
+    let rebuilt = dir.path().join("fixture-src_1.0-1.dsc");
+    std::fs::write(&rebuilt, format!("{}\n", std::fs::read_to_string(&dsc).unwrap())).unwrap();
+    let before = latest(&c, &repo).await;
+    run(&mut app, Act::Upload, json!({ "pulp_href": repo, "name": name }));
+    fill(&mut app, &[("path", &rebuilt.display().to_string())]);
+    settle(&mut app, &mut rx).await;
+    let last = texts(&app).pop().unwrap_or_default();
+    assert!(last.contains("refused: Pulp has source package") && last.contains("new Version"), "{last}");
+    assert_eq!(latest(&c, &repo).await, before, "no new version");
     cleanup(&c, &[&repo]).await;
 }
 

@@ -215,8 +215,8 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
     of the `.dsc`. pulp-tui uploads each file that Pulp does not have yet (same sha256) and the
     `.dsc` as artifacts, then makes the source package. Artifacts need the right to create
     artifacts (by default, an admin only). Pulp keeps one source package per Source and
-    Version: a rebuilt `.dsc` with the same Version gets the old package back, and pulp-tui
-    reports a digest mismatch. Give a rebuilt package a new Version.
+    Version and adds that one: pulp-tui refuses a rebuilt `.dsc` with the same Version before
+    any change. Give a rebuilt package a new Version.
   * **Overwrite** (default on, as Pulp): the new content replaces other content of the repository
     with the same key (File: the relative path; RPM: name, version, release, architecture and
     location). Off: the task fails instead, and the repository does not change.
