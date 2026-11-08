@@ -1265,8 +1265,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
             let repos = vec![href.clone()];
             sync_refusal(&row, &policy, &options, remote.is_some())?;
             // The picker note of the picked remote names its second type (File: Git).
-            let picked = |r: &String| f.fields.iter().find(|x| x.key == "remote")?.options.as_ref()?.iter().find(|i| &i.value == r);
-            let git = remote.as_ref().map(|r| picked(r).is_some_and(|i| i.note == "Git"));
+            let git = remote.is_some().then(|| f.picked("remote").iter().any(|i| i.note == "Git"));
             let go = move |app: &mut App| {
                 submit(app, format!("sync {name} ({policy})"), move |c| async move {
                     let r = match remote {
