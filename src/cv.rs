@@ -1319,22 +1319,45 @@ impl CvService {
         let aliases = self.store.aliases().await?;
         let mut errors = vec![];
         for b in self.store.binding_repos(env.id, cv.id).await? {
-            let done = match self.left_out(&cv.name, env, vrs, &b).await {
-                Ok(None) => continue,
-                Ok(Some(LeftOut::Unbind)) => self.unbind(&cv.name, env, &b, &aliases, on).await.map(|()| None),
-                Ok(Some(LeftOut::Forget(why))) => self.alive().map(|()| Some(why)),
-                Err(e) => Err(e),
-            };
-            match done {
+            match self.leave_out(&cv.name, env, vrs, &b, &aliases, on).await {
                 Err(e) => errors.push(format!("unbind {}: {e}", b.repo_name)),
-                Ok(None) => self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await?,
-                Ok(Some(why)) => {
-                    log(format!("{}: {why}", b.repo_name));
-                    self.store.delete_binding_repo(env.id, cv.id, &b.repo_href).await?;
-                }
+                Ok(Some(what)) => self.record_left_out(b, what, log).await?,
+                Ok(None) => {}
             }
         }
         Ok(errors)
+    }
+
+    /// The store part of `unbind_removed` for row `b`: an unbound row records no publication, a forgotten one is
+    /// deleted (and logged).
+    async fn record_left_out(&self, b: BindingRepo, what: LeftOut, log: Log<'_>) -> Result<()> {
+        match what {
+            LeftOut::Unbind => self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await,
+            LeftOut::Forget(why) => {
+                log(format!("{}: {why}", b.repo_name));
+                self.store.delete_binding_repo(b.env_id, b.cv_id, &b.repo_href).await
+            }
+        }
+    }
+
+    /// The Pulp part of `unbind_removed` for row `b`: what `left_out` says, done. An unbind is sent; a forget sends
+    /// nothing.
+    async fn leave_out(
+        &self,
+        cv: &str,
+        env: &Environment,
+        vrs: &[CvVersionRepo],
+        b: &BindingRepo,
+        aliases: &[String],
+        on: OnTask<'_>,
+    ) -> Result<Option<LeftOut>> {
+        let what = self.left_out(cv, env, vrs, b).await?;
+        match &what {
+            Some(LeftOut::Unbind) => self.unbind(cv, env, b, aliases, on).await?,
+            Some(LeftOut::Forget(_)) => self.alive()?,
+            None => {}
+        }
+        Ok(what)
     }
 
     /// What a promotion of the version with repositories `vrs` does to row `b` of view `cv` in `env` (`unbind_removed`),
@@ -1361,14 +1384,20 @@ impl CvService {
         if !d["publication"].is_string() {
             return Ok(None);
         }
+        Ok(Some(self.served_again(cv, env, b, &d).await?))
+    }
+
+    /// Row `b` of view `cv` in `env` records no publication, but Pulp shows that its distribution `d` serves one
+    /// (`left_out`): unbind it, or forget the row when the distribution is not ours any more.
+    async fn served_again(&self, cv: &str, env: &Environment, b: &BindingRepo, d: &Value) -> Result<LeftOut> {
         let aliases = self.store.aliases().await?;
-        Ok(Some(match self.not_ours(&b.distribution, &dist_labels(cv, &env.name), &aliases).await? {
+        Ok(match self.not_ours(&b.distribution, &dist_labels(cv, &env.name), &aliases).await? {
             None => LeftOut::Unbind,
             Some(why) => LeftOut::Forget(format!(
                 "its distribution {} is {why} (changed outside pulp-tui): pulp-tui leaves it as it is and forgets it",
                 d["name"].as_str().unwrap_or("?")
             )),
-        }))
+        })
     }
 
     /// Point the distribution of `b` at no publication; refused unless it is ours.
