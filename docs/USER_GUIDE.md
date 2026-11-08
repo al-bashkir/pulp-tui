@@ -601,13 +601,13 @@ retry, or roll back to the served version to clear the failed attempt.
   publication of the snapshot, and the served metadata (`repomd.xml`, `Release`, the File
   manifest) match it; for RPM and Deb also the smallest package with its digest. Other files are
   not downloaded. A File publication without a manifest has nothing to compare: the `OK` line
-  says `no manifest compared` and names the repository. For each environment with drift, it
-  names one action per kind of drift:
+  says `no manifest compared` and names the repository. While a workflow holds the lock of the
+  view (for example a promotion that runs), an environment with drift gets one line that names
+  that workflow: verify again when it ends. Otherwise it names one action per kind of drift:
   * a distribution that serves another publication (also one of a repository that the version
     does not have), is gone, or a promotion that did not complete: promote the bound version
     again, or, when the prior environment no longer has that version active (Promote refuses
-    it), roll back to it (**b**). While a workflow holds the lock of the view (for example a
-    promotion that runs), it names that workflow instead: verify again when it ends;
+    it), roll back to it (**b**);
   * a snapshot or publication that is gone or another one: publish a new version and promote it
     (a promotion of the same version cannot bring it back);
   * served files that differ: check the content app, then **Repair** the snapshot version;

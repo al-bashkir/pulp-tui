@@ -277,8 +277,9 @@ new version; served files that differ need a repair; a missing `base_url` needs
   distribution serves a publication (`unbind_removed` reads the distribution of a row that
   records none, `CvService::needs_unbind`), so the "promote again" hint fixes that drift too.
   The promote preview uses the same rule, so it names that change.
-* While a workflow holds a live lock on the view, the hint names that workflow: the lock
-  refuses Promote and Rollback.
+* While a workflow holds a live lock on the view, the drift check gives one hint per
+  environment with drift, which names that workflow, and no other: the lock refuses Publish,
+  Promote and Rollback, and the workflow can change what drifts.
 * `Fix::Unchecked` is not drift: a File publication without a manifest gives nothing to
   compare. The drift check, the relabel result and the promotion result say `OK` with that
   note.

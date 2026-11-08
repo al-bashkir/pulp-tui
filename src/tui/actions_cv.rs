@@ -702,8 +702,18 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
 }
 
 /// One line per kind of fix that the `drift` of the view in `e` (binding `b`) needs, each naming an action that fixes
-/// that kind.
+/// that kind. While a workflow holds a live lock on the view (a promotion that runs), only that one line: the lock
+/// refuses the actions, and the workflow can change what drifts.
 async fn reconcile_hints(svc: &CvService, e: &Environment, b: &Binding, drift: &[Drift]) -> anyhow::Result<Vec<String>> {
+    if drift.iter().any(|d| d.fix != Fix::Unchecked)
+        && svc.store.lock_live(b.cv_id, crate::cv::unix_now()).await?
+        && let Some(h) = svc.store.lock_holder(b.cv_id).await?
+    {
+        return Ok(vec![format!(
+            "{}: {} by {} is running: verify again when it ends (its lock refuses Publish, Promote and Rollback until then).",
+            e.name, h.operation, h.owner
+        )]);
+    }
     let mut out = vec![];
     for fix in [Fix::Bind, Fix::Publish, Fix::Repair, Fix::Origin, Fix::Retention] {
         if !drift.iter().any(|d| d.fix == fix) {
@@ -740,17 +750,8 @@ fn fix_hint(fix: Fix) -> Option<&'static str> {
 }
 
 /// Promote the version that `drift` checks again (the served one, else the attempted one), or roll back to it when
-/// Promote refuses it: the rule of `CvService::promote`, where Rollback to the bound version always runs. While a
-/// workflow holds a live lock on the view (a promotion that runs), neither is possible: wait for it.
+/// Promote refuses it: the rule of `CvService::promote`, where Rollback to the bound version always runs.
 async fn bind_hint(svc: &CvService, e: &Environment, b: &Binding) -> anyhow::Result<String> {
-    if svc.store.lock_live(b.cv_id, crate::cv::unix_now()).await?
-        && let Some(h) = svc.store.lock_holder(b.cv_id).await?
-    {
-        return Ok(format!(
-            "{} by {} is running: verify again when it ends (its lock refuses Promote and Rollback until then).",
-            h.operation, h.owner
-        ));
-    }
     let v = svc.store.version(b.versions().next().unwrap_or_default()).await?;
     Ok(match svc.promote_refusal(&v, e).await? {
         None => format!("promote v{} again (M) to reconcile (idempotent).", v.number),
@@ -2403,6 +2404,15 @@ mod tests {
                  snapshot repositories): Pulp would prune its versions."
             ]
         );
+        // While a workflow holds a live lock on the view, only that workflow is named.
+        st.try_lock(web, "bob@ws2", "tok", "publish", crate::cv::unix_now()).await.unwrap().unwrap();
+        cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
+        let hints: Vec<&str> = lines.iter().skip_while(|l| !l.is_empty()).skip(1).map(String::as_str).collect();
+        let running = "Library: publish by bob@ws2 is running: verify again when it ends (its lock refuses Publish, Promote and \
+                       Rollback until then).";
+        assert_eq!(hints, [running]);
     }
 
     #[tokio::test]
@@ -2461,8 +2471,8 @@ mod tests {
         cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
         drain(&mut app, &mut rx).await;
         let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verification") };
-        let hint = "Dev: promote to Dev by bob@ws2 is running: verify again when it ends (its lock refuses Promote and Rollback \
-                    until then).";
+        let hint = "Dev: promote to Dev by bob@ws2 is running: verify again when it ends (its lock refuses Publish, Promote and \
+                    Rollback until then).";
         assert_eq!(lines, ["Dev: nothing (v1 promoting) DRIFT", "    promotion of v1 is promoting", "", hint]);
     }
 
