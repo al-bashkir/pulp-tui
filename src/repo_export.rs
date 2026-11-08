@@ -232,7 +232,10 @@ async fn run(c: &PulpClient, caps: &Capabilities, ex: &ServerExport, apply: bool
         notes.extend(n);
         failed.extend(f);
     }
-    if !failed.is_empty() {
+    if !apply {
+        // The plan sends nothing, so its only failures are repositories that wait for a remote it does not create.
+        notes.extend(failed);
+    } else if !failed.is_empty() {
         let head = format!("{} not created (created {created}, kept {kept}; a rerun creates only what is missing):", failed.len());
         let lines =
             [vec![head], failed.iter().map(|f| format!("  {f}")).collect(), notes.iter().map(|n| format!("warning: {n}")).collect()];
@@ -297,6 +300,7 @@ async fn import_type(
                 notes.push(format!(
                     "{label}: not created: it needs {needs} (not in the export); add them to its fields in the file, or create it by hand"
                 ));
+                refused.extend(remote_kind.then(|| e.name.clone()));
                 continue;
             }
             let href = match create_or_plan(c, collection, &body, &e.name, apply).await {
@@ -466,15 +470,14 @@ mod tests {
             serve(&down, coll, json!([])).await;
         }
         let (create, keep, notes) = plan(&client(&down), &caps, &ex).await.unwrap();
-        assert_eq!((create, keep), (2, 0));
+        assert_eq!((create, keep), (1, 0));
         assert_eq!(
             notes,
             [
                 "RPM ULN remote uln-os: not created: it needs password, username (not in the export); add them to its fields in the \
                  file, or create it by hand",
-                "RPM repository ol8: create",
-                "RPM repository ol8: remote uln-os left out (this server does not have it)",
                 "File Git remote docs-git: create",
+                "RPM repository ol8: not created: its remote uln-os was not created",
             ]
         );
         // The operator adds the credentials to the file: the import creates the ULN remote, and the repository gets it.
@@ -514,6 +517,36 @@ mod tests {
             (create, keep, notes),
             (2, 1, vec!["RPM repository ol8: create".to_string(), "File Git remote docs-git: create".into()])
         );
+    }
+
+    /// A remote that the import does not create (it lacks a required field) is like a refused one: its repository
+    /// waits, so the rerun after the fix creates it with its remote (audit F37). The plan says so in a note.
+    #[tokio::test]
+    async fn a_repository_waits_for_its_remote_that_lacks_a_required_field() {
+        let mut caps = caps();
+        caps.load_openapi(&json!({ "paths": {}, "components": { "schemas": {
+            "rpm.UlnRemote": { "required": ["name", "password", "url", "username"],
+                "properties": { "name": {}, "url": {}, "username": {}, "password": {} } } } } }));
+        let ex = ServerExport {
+            format: 1,
+            remotes: vec![],
+            alt_remotes: vec![rpm("uln-os", json!({ "url": "uln://ol8" }))],
+            repositories: vec![rpm("ol8", json!({ "remote": "uln-os" }))],
+        };
+        let server = MockServer::start().await;
+        for coll in ["remotes/rpm/rpm/", "remotes/rpm/uln/", "repositories/rpm/rpm/"] {
+            serve(&server, coll, json!([])).await;
+        }
+        let (skipped, waits) = (
+            "RPM ULN remote uln-os: not created: it needs password, username (not in the export); add them to its fields in the \
+             file, or create it by hand",
+            "RPM repository ol8: not created: its remote uln-os was not created",
+        );
+        assert_eq!(plan(&client(&server), &caps, &ex).await.unwrap(), (0, 0, vec![skipped.to_string(), waits.into()]));
+        let e = import(&client(&server), &caps, &ex).await.unwrap_err().to_string();
+        let head = "1 not created (created 0, kept 0; a rerun creates only what is missing):";
+        assert_eq!(e.lines().collect::<Vec<_>>(), [head, &format!("  {waits}"), &format!("warning: {skipped}")]);
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing is created");
     }
 
     #[tokio::test]

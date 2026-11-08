@@ -1290,7 +1290,8 @@ pulp-tui --profile new import-repos repos.json
   create it and says so:
   `RPM ULN remote ol8: not created: it needs password, username (not in the export); ...`. Add
   `"username"` and `"password"` to its `fields` in the file and import again, or create it by
-  hand.
+  hand. A repository of that remote waits for it, as for a refused remote:
+  `RPM repository ol8: not created: its remote ol8 was not created`.
 * The export leaves out (with a `note:` line on stderr):
   * secrets (credentials, client keys, `sles_auth_token`, `headers`). The import names them:
     `warning: RPM remote os: set username, password again by hand (not in the export)`. Set them

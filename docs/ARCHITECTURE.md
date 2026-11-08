@@ -385,7 +385,8 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
   A create that Pulp refuses does not stop the others (a repository of a refused remote
   waits); the error then names every object not created, and a rerun creates only those.
   It does not create an object that lacks a field of the schema's `required` list (a ULN
-  remote's `username` and `password`). `repo_export::plan` is the dry run.
+  remote's `username` and `password`); a repository of such a remote waits too.
+  `repo_export::plan` is the dry run: it lists such a waiting repository as a note.
 
 ## Storage
 
