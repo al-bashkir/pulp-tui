@@ -378,7 +378,9 @@ async fn pulp_exporter_and_importer_through_the_tui() {
     fill(&mut app, &[("toc", &toc)]);
     settle(&mut app, &mut rx).await;
     let (lines, typed) = yes(&mut app);
-    assert_eq!(typed, None, "a plain confirmation on a profile that is not production");
+    // Content View snapshots of other tests on the server: the confirmation names them and needs the typed name.
+    let warned = lines.iter().any(|l| l.starts_with("WARNING: Pulp does not tell"));
+    assert_eq!(typed, warned.then(|| name.clone()), "else a plain confirmation on a profile that is not production");
     assert!(lines.contains(&format!("  {name} -> {copy}")), "{lines:?}");
     settle_tasks(&mut app, &mut rx).await;
     let Some(Modal::Text { title, lines, .. }) = app.modal.take() else { panic!("no import result: {:?}", texts(&app)) };
