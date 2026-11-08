@@ -3156,7 +3156,8 @@ fn record_create(app: &mut App, version: String, path: &'static str, key: fn(&Va
 }
 
 /// A package release component: a release component of `version` and a package of it by name. The record (an existing
-/// one if there is one) goes into the repository with its package and release component (`modify/`).
+/// one if there is one) goes into the repository with its package and release component (`modify/`, the latest
+/// version): a package that the latest version does not have comes back, after a confirm.
 fn package_record_create(app: &mut App, version: String) {
     app.job("read release components", move |ctx| async move {
         let c = &ctx.client;
@@ -3177,11 +3178,35 @@ fn package_record_create(app: &mut App, version: String) {
                     return Err("pick a release component".into());
                 };
                 let (package, version) = (f.get("package").trim().to_string(), version.clone());
-                let label = format!("create package release component {package} in {name}");
-                record_job(app, version.clone(), label, move |c, repo| async move {
-                    let p = deb::package_in(&c, &version, &package).await?;
-                    let prc = deb::package_release_component(&c, &p, &rc).await?;
-                    Ok(ops::add_content(&c, &repo, vec![p, rc, prc]).await?)
+                app.job(format!("find package {package}"), move |ctx| async move {
+                    let c = &ctx.client;
+                    let r: Value = c.get(&repo_of_version(&version), &[]).await?;
+                    if let Some(e) = snapshot_refusal(&r) {
+                        bail!(e);
+                    }
+                    let p = deb::package_in(c, &version, &package).await?;
+                    let latest = s(&r, "latest_version_href");
+                    let q = [("repository_version", latest.clone()), ("pulp_href__in", p.clone()), ("fields", "pulp_href".into())];
+                    let back =
+                        !latest.is_empty() && latest != version && c.list::<Value>(&c.api("content/deb/packages/"), &q).await?.count == 0;
+                    ap(move |app| {
+                        let label = format!("create package release component {package} in {name}");
+                        let lines = vec![
+                            format!(
+                                "NOTE: package {package} is not in the LATEST version {} of {}, which gets the record.",
+                                version_number(&latest),
+                                s(&r, "name")
+                            ),
+                            "The new version has the package again.".into(),
+                        ];
+                        let go = move |app: &mut App| {
+                            record_job(app, version, label, move |c, repo| async move {
+                                let prc = deb::package_release_component(&c, &p, &rc).await?;
+                                Ok(ops::add_content(&c, &repo, vec![p, rc, prc]).await?)
+                            })
+                        };
+                        if back { app.confirm("New package release component", lines, go) } else { go(app) }
+                    })
                 });
                 Ok(())
             });
@@ -5552,6 +5577,60 @@ mod tests {
         settle(&mut app, &mut rx).await;
         let last = app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
         assert!(last.ends_with("2 packages of version 2 match \"hello\": give name_version_arch"), "{last}");
+    }
+
+    /// The record goes into the LATEST version (`modify/`): from an older version, a package that the latest version
+    /// removed comes back, so the operator confirms that first; a package that the latest version has goes at once
+    /// (audit F33).
+    #[tokio::test]
+    async fn a_package_release_component_from_an_older_version_confirms_a_package_that_comes_back() {
+        use crate::tui::app::{ListState, Modal, Screen};
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let (repo, rc, pkgs, prc) = (
+            format!("{API}repositories/deb/apt/r/"),
+            format!("{API}content/deb/release_components/1/"),
+            format!("{API}content/deb/packages/"),
+            format!("{API}content/deb/package_release_components/"),
+        );
+        let r = json!({ "pulp_href": repo, "name": "r", "latest_version_href": format!("{repo}versions/3/"), "pulp_labels": {} });
+        get(&server, &repo, r).await;
+        let comps = json!([{ "pulp_href": rc, "distribution": "bookworm", "component": "main" }]);
+        get(&server, &format!("{API}content/deb/release_components/"), page(comps)).await;
+        // `gone` is in the browsed version 1 only, `kept` also in the latest version 3.
+        let (gone, kept) = (format!("{pkgs}1/"), format!("{pkgs}2/"));
+        for (k, v, found) in [("package", "gone", json!([{ "pulp_href": gone }])), ("package", "kept", json!([{ "pulp_href": kept }]))]
+            .into_iter()
+            .chain([("pulp_href__in", gone.as_str(), json!([])), ("pulp_href__in", kept.as_str(), json!([{ "pulp_href": kept }]))])
+        {
+            let ok = wiremock::ResponseTemplate::new(200).set_body_json(page(found));
+            wiremock::Mock::given(method("GET")).and(path(&pkgs)).and(query_param(k, v)).respond_with(ok).mount(&server).await;
+        }
+        get(&server, &prc, page(json!([{ "pulp_href": format!("{prc}1/") }]))).await;
+        answer(&server, "POST", &format!("{repo}modify/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        get(&server, &format!("{API}tasks/1/"), json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed" })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let modify = async || posts_to(&server, &format!("{repo}modify/")).await.len();
+        for (package, back) in [("gone", true), ("kept", false)] {
+            let k = Kind::Content { version: format!("{repo}versions/1/"), ctype: 11 };
+            (app.screen, app.list) = (Screen::List(k.clone()), ListState::new(k));
+            run(&mut app, Act::Create, Value::Null);
+            settle(&mut app, &mut rx).await; // the release components of the version
+            fill_and_submit(&mut app, &[("package", package), ("release_component", "bookworm/main")]);
+            settle(&mut app, &mut rx).await;
+            let sent = modify().await;
+            if back {
+                let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+                assert_eq!(typed, None);
+                assert_eq!(lines[0], "NOTE: package gone is not in the LATEST version 3 of r, which gets the record.");
+                assert_eq!(sent, 0, "nothing is sent before the confirm");
+                yes(&mut app);
+                settle(&mut app, &mut rx).await;
+            } else {
+                assert!(app.modal.is_none(), "the latest version has it: no confirm");
+            }
+            assert_eq!(modify().await, if back { 1 } else { 2 }, "{package}: {:?}", app.notices.back().map(|n| &n.text));
+        }
     }
 
     #[tokio::test]
