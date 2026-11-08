@@ -47,6 +47,8 @@ These rules apply to all screens. The screen sections do not repeat them.
   the server value and `-` clears it.
 * **Tasks.** An action that starts a Pulp task waits for the task. The notice then gives the
   result, for example the new version number.
+* **Errors.** An error is a notice in the footer. An error of more than one line (for example the
+  list of objects that **J** on Servers did not create) also opens in a text view, one line each.
 * **Signing service pickers** list the signing services of all plugins. Pulp refuses a service of
   the wrong type.
 * **Content View objects** belong to pulp-tui: snapshot repositories (`pulp-tui-cv-<view>-<repo>`,

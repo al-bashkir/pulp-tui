@@ -552,6 +552,10 @@ impl App {
                     }
                     Err(e) => {
                         self.error(format!("{}: {e}", job.label));
+                        // A notice shows one line: an error of several (a list of failures) opens in the text view too.
+                        if e.contains('\n') {
+                            self.text(format!("{} failed", job.label), e.lines().map(str::to_string).collect());
+                        }
                         // A failed operation can have changed state (a version is `failed` now): show it, as after a task.
                         if !job.is_load && matches!(self.screen, Screen::List(_)) {
                             self.reload();
@@ -2322,6 +2326,25 @@ mod tests {
         let m = rx.recv().await.unwrap();
         app.handle_msg(m);
         assert_eq!(loads(&app), 1, "the list shows what the failed operation left");
+    }
+
+    /// A notice shows one line: a job error of several lines (the failure list of an ImportRepos) also opens in the
+    /// text view, one line each (audit F40).
+    #[tokio::test]
+    async fn a_job_error_of_several_lines_opens_in_the_text_view() {
+        let mut app = app_on(Kind::Profiles).await;
+        let mut rx = app.rx.take().unwrap();
+        let lines = ["1 not created (created 1, kept 0):", "  RPM remote os: bad", "warning: RPM remote os: set password again"];
+        let error = lines.join("\n");
+        app.spawn("import repos.json".into(), false, async move { anyhow::bail!(error) });
+        app.handle_msg(rx.recv().await.unwrap());
+        assert!(matches!(&app.modal, Some(Modal::Text { title, .. }) if title == "import repos.json failed"), "no text view");
+        assert_eq!(text_lines(&app), lines);
+        assert!(app.notices.back().is_some_and(|n| n.level == Level::Error && n.text.starts_with("import repos.json: 1 not created")));
+        app.modal = None;
+        app.spawn("delete x".into(), false, async { anyhow::bail!("refused") });
+        app.handle_msg(rx.recv().await.unwrap());
+        assert!(app.modal.is_none(), "one line: the notice only");
     }
 
     #[tokio::test]
