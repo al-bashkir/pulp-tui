@@ -25,6 +25,14 @@ PG_NAME=pulp-tui-pg
 
 port_of() { case "$1" in pulp1) echo 8080 ;; pulp2) echo 8081 ;; *) echo "unknown instance $1" >&2; exit 2 ;; esac; }
 
+# `exec` in a Pulp container. In the latest image (CentOS Stream 10, rpm 4.19), the createrepo_c wheel loads its own
+# older librpm, which cannot parse the system `%add_sysuser` macro: each pulpcore-manager run prints that one harmless
+# line on stderr. It is dropped; all other stderr passes, line by line, before the function returns.
+pulp_exec() {
+  # stderr goes through the pipe and stdout around it (fd 3); pipefail keeps the exit code of exec.
+  { $RUNTIME exec "$@" 2>&1 1>&3 3>&- | { grep --line-buffered -v '^error: Macro %add_sysuser has unterminated body$' || true; } >&2; } 3>&1
+}
+
 # The content origin must be reachable from the host (tests fetch served content)
 # and, for the upstream, from the other container (replication downloads).
 origin_of() {
@@ -72,7 +80,7 @@ EOF
     --volume "$name-containers:/var/lib/containers" \
     "$IMAGE" >/dev/null
   wait_ready "$port"
-  $RUNTIME exec "$name" pulpcore-manager reset-admin-password --password "$ADMIN_PASSWORD" >/dev/null
+  pulp_exec "$name" pulpcore-manager reset-admin-password --password "$ADMIN_PASSWORD" >/dev/null
   echo "$name ready: http://127.0.0.1:$port (admin/$ADMIN_PASSWORD)"
 }
 
@@ -137,7 +145,7 @@ deb_signing_up() {
     echo "$svc already registered on $name"
     return 0
   fi
-  $RUNTIME exec --interactive --user pulp "$name" bash -s -- /var/lib/pulp/pulp-tui-gpg "$svc" <<'EOS'
+  pulp_exec --interactive --user pulp "$name" bash -s -- /var/lib/pulp/pulp-tui-gpg "$svc" <<'EOS'
 set -euo pipefail
 home=$1 svc=$2
 script=$home/sign-release.sh
@@ -180,7 +188,7 @@ rpm_signing_up() {
     echo "$svc already registered on $name"
     return 0
   fi
-  $RUNTIME exec --interactive --user pulp "$name" bash -s -- /var/lib/pulp/pulp-tui-gpg "$svc" <<'EOS'
+  pulp_exec --interactive --user pulp "$name" bash -s -- /var/lib/pulp/pulp-tui-gpg "$svc" <<'EOS'
 set -euo pipefail
 home=$1 svc=$2
 script=$home/sign-metadata.sh
