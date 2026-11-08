@@ -698,7 +698,9 @@ A composite view joins other Content Views (its **components**). Example: `rocky
   a submitted task, also for a publish that another operator started. The version becomes active
   in Library only when no newer version is published. For a published version with an
   `interrupted` Library step, it runs the Library step and auto publish again. For the newest
-  published version, it runs the auto publish of each composite that does not have it yet.
+  published version, it runs the auto publish of each composite that does not have it yet. Auto
+  publish does not run while Library is protected: when only that is left, **R** refuses and names
+  the composites to publish yourself.
 * **W** watches the task of the copy step or the publication step. Other steps show their tasks
   only in the session that runs the publish.
 * The *environments* column names each environment that serves the version, and an attempted

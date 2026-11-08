@@ -957,14 +957,24 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
             let lines = vec![format!("Resume {name} v{number}: it becomes active in Library unless a newer version is published.")];
             app.load_job(format!("check resume of {name} v{number}"), move |ctx| async move {
                 let svc = ctx.cv()?;
-                if !svc.resume_left(&svc.store.version(vid).await?).await? {
+                let v = svc.store.version(vid).await?;
+                if !svc.resume_left(&v).await? {
                     return ap(|app| app.notify(Level::Info, "version is already published"));
+                }
+                let protected = svc.library_protected().await?;
+                // Only the auto publish is left (`resume_left`), and it does nothing while Library is protected.
+                if protected && v.state == "published" && !svc.library_interrupted(&v).await? {
+                    let names: Vec<String> = svc.lagging_composites(cv).await?.into_iter().map(|c| c.name).collect();
+                    let names = names.join(", ");
+                    bail!(
+                        "v{number} is published; only the auto publish of {names} is left, and it does not run while Library \
+                         is protected: publish {names} yourself"
+                    );
                 }
                 // As for Publish: every Deb copy step uses `deb/copy/`.
                 if svc.store.version_repos(vid).await?.iter().any(|r| r.repo().repo_type == RepoType::Deb) {
                     ctx.caps.require(crate::pulp::Feature::DebCopy)?;
                 }
-                let protected = svc.library_protected().await?;
                 ap(move |app| guard_library(app, protected, lines, None, move |app| resume(app, cv, name, vid, number)))
             });
         }
@@ -2059,6 +2069,29 @@ mod tests {
         drain(&mut app, &mut rx).await;
         assert_eq!(last_notice(&app), (Level::Info, "version is already published"));
         assert_eq!(st.versions(c).await.unwrap().len(), 2, "no third composite version");
+    }
+
+    /// Only the auto publish of a lagging composite is left, and Library is protected (auto publish does not run then):
+    /// one refusal that says why, with no typed Library.
+    #[tokio::test]
+    async fn resume_refuses_an_auto_publish_while_library_is_protected() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let (c, _, extras, _) = rocky(&st).await;
+        st.set_auto_publish(c, true).await.unwrap();
+        let svc = crate::cv::CvService { client: client(&server), store: st.clone(), scope: "lab".into(), actor: "t".into(), lock: None };
+        svc.publish(c, "", "", &|_| {}, &ops::no_progress).await.unwrap(); // rocky9 v1 uses extras v1
+        let v2 = publish_empty(&st, extras).await; // the aborted job: published, no auto publish
+        st.set_env_protected(st.ensure_library("lab").await.unwrap(), true).await.unwrap();
+        let item = json!({ "id": v2.id, "number": v2.number, "state": "published" });
+        version_action(&mut app, "lab", extras, "extras".into(), Act::Resume, item);
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no typed Library");
+        let why = "check resume of extras v2: v2 is published; only the auto publish of rocky9 is left, and it does not run \
+                   while Library is protected: publish rocky9 yourself";
+        assert_eq!(last_notice(&app), (Level::Error, why));
+        assert_eq!(st.versions(c).await.unwrap().len(), 1, "no composite version");
     }
 
     #[tokio::test]
