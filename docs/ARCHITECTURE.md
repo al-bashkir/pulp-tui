@@ -93,6 +93,10 @@ running, at least one is done, and one of these is true:
 7. its newest task ended 10 minutes ago or more (`finished_at`, client clock): the last
    fallback for a group of an unknown kind, so its Task Center row stops polling.
 
+A group with no task and no count is final too (`completed`): a purge deleted its tasks
+(only final ones; `Task.task_group` is `SET_NULL`). Pulp's answer gives a group no time, so
+this rule does not wait 10 minutes.
+
 Its state is `failed`, `canceled` or `skipped` when a task ended so, else `completed`.
 pulpcore 3.123 leaves `all_tasks_dispatched` false after a replication or an import, and
 pulp_rpm 3.39 after a prune (rules 3, 4 and 6 cover them). A workflow does not wait for

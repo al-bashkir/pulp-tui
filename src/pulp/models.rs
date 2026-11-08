@@ -444,14 +444,19 @@ impl TaskGroup {
     /// `pulp_import` or `prune_packages` (each dispatches every repository task) also ends the group. An
     /// ACS refresh dispatches all its tasks before it answers and never sets the flag. Last, a group whose
     /// newest task ended `IDLE_FINAL_SECS` ago is final, so the Task Center stops polling an unknown kind.
+    /// A group with no task at all is final too: purge deleted them (only final ones; `Task.task_group` is `SET_NULL`).
     pub fn is_final(&self) -> bool {
         let last = |n: &str| ["finalize_replication", "importer.pulp_import", "prune.prune_packages"].iter().any(|s| n.ends_with(s));
         let finalized = self.tasks.iter().any(|t| t["name"].as_str().is_some_and(last) && t["state"] == "completed");
         let refresh = self.description.starts_with("Refreshing ") && self.description.to_lowercase().contains("alternate content source");
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        // shortcut: a group has no time in Pulp's answer, so an empty one ends at once, not after IDLE_FINAL_SECS; one
+        // seen in the instant between its create and its first dispatch ends too. Wait when Pulp shows `pulp_created`.
+        let purged = self.tasks.is_empty() && self.done() == 0;
         self.active() == 0
-            && self.done() > 0
-            && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh || self.idle_long(now))
+            && (purged
+                || self.done() > 0
+                    && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh || self.idle_long(now)))
     }
     /// The newest `finished_at` (Pulp's UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`) is `IDLE_FINAL_SECS` or more before
     /// `now` (seconds since the epoch, client clock); the same format compares as text.
@@ -903,13 +908,26 @@ mod tests {
         assert!(ended.idle_long(1_767_226_800) && !ended.idle_long(1_767_226_799));
     }
 
-    /// No group is final before a task of it ended; a failed or canceled task ends it also without the flag.
+    /// No group with tasks is final before a task of it ended; a failed or canceled task ends it also without the flag.
     #[test]
     fn a_group_ends_with_a_failure_and_never_before_a_task_ended() {
         let group = |g: Value| -> TaskGroup { serde_json::from_value(g).unwrap() };
-        let empty = group(serde_json::json!({ "pulp_href": "/g/5/", "all_tasks_dispatched": true }));
-        assert_eq!((empty.is_final(), empty.as_task().state.as_str()), (false, "waiting"));
+        let unknown = group(serde_json::json!({ "pulp_href": "/g/5/", "all_tasks_dispatched": true, "tasks": [{}] }));
+        assert_eq!((unknown.is_final(), unknown.as_task().state.as_str()), (false, "waiting"));
         let both = group(serde_json::json!({ "pulp_href": "/g/5/", "failed": 1, "canceled": 1, "tasks": [{}, {}] }));
         assert_eq!((both.is_final(), both.as_task().state.as_str()), (true, "failed"));
+    }
+
+    /// Purge deletes tasks and `Task.task_group` is `SET_NULL`: the group stays with no task and no count (audit F36).
+    #[test]
+    fn a_group_whose_tasks_were_purged_is_final() {
+        let group = |g: Value| -> TaskGroup { serde_json::from_value(g).unwrap() };
+        for flag in [false, true] {
+            let purged = group(serde_json::json!({ "pulp_href": "/g/6/", "description": "Import of /x-toc.json",
+                "all_tasks_dispatched": flag, "tasks": [] }));
+            assert_eq!((purged.is_final(), purged.as_task().state.as_str()), (true, "completed"), "{flag}");
+        }
+        let waiting = group(serde_json::json!({ "pulp_href": "/g/6/", "waiting": 1, "tasks": [] }));
+        assert!(!waiting.is_final(), "a count says a task waits");
     }
 }
