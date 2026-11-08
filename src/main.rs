@@ -262,15 +262,13 @@ mod tests {
         assert!(e.ends_with("; run pulp-tui db migrate --profile lab"), "{e}");
     }
 
-    /// Audit F47: a line of `pulp-tui.log` names each URL without its user info.
+    /// Audit F47: a line of `pulp-tui.log` names each URL without its user info. The file has no color codes.
     #[test]
     fn the_log_file_shows_no_user_info_of_a_url() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pulp-tui.log");
-        let file = std::fs::File::create(&path).unwrap();
-        let log = tracing_subscriber::fmt().with_ansi(false).with_writer(std::sync::Mutex::new(Masked(file))).finish();
-        tracing::subscriber::with_default(log, || tracing::warn!("sync http://u:p@h/ and https://v@h2/ failed"));
-        let line = std::fs::read_to_string(&path).unwrap();
-        assert!(line.ends_with("sync http://•••@h/ and https://•••@h2/ failed\n"), "{line}");
+        init_logging(dir.path()).unwrap(); // the only test that sets the global subscriber
+        tracing::warn!("sync http://u:p@h/ and https://v@h2/ failed");
+        let log = std::fs::read_to_string(dir.path().join("pulp-tui.log")).unwrap();
+        assert!(log.contains("sync http://•••@h/ and https://•••@h2/ failed\n") && !log.contains('\u{1b}'), "{log}");
     }
 }
