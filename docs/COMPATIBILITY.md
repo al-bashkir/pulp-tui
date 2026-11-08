@@ -198,7 +198,9 @@ next section.
 * **Pulp import** (`live_export`, same server): import check (valid; not valid for a
   missing TOC); import through a mapping into another repository (one
   `import_repository_version` task, same content count, imports list names the TOC);
-  importer delete (204); check and import of the `.tar` as `path` (same content count).
+  importer delete (204); check and import of the `.tar` as `path` (same content count); a
+  snapshot as a mapped destination is refused (create, and a mapping set with the API), and an
+  unmapped import names the local snapshot of the same name.
 * **Comps and advisories** (`live_content`): a comps.xml makes a version with its group; a
   second with `replace` keeps only its own group; an advisory JSON makes the next version.
 * **Version repair** (`live_content`): RPM version synced `immediate`, with and without
@@ -787,7 +789,9 @@ Source: pulpcore 3.123.1 `tasks/export.py`, `tasks/importer.py` and their serial
   across file systems; `hardlink` and `symlink` need file system storage.
 * **Import check** answers 200 with `is_valid` and `messages`: TOC allowed, readable, its
   directory writable; `repo_mapping` is JSON. It answers for each of `toc` and `path` that the
-  request has.
+  request has. It does not list the repositories of the export, and the TOC has only the
+  chunk names, their CRC32 and `meta` (`views/importer.py`, `tasks/export.py`): the
+  repository list is in the tar, read by the `pulp_import` task. No API gives it before the import.
 * **Import source.** A Pulp import takes exactly one of `toc` (the chunks it lists are checked
   and joined) and `path` (one `.tar`, an export without chunks); both or neither is 400.
   pulp-tui sends a file that ends in `.json` as `toc`, any other as `path` (live).

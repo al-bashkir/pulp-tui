@@ -1,6 +1,6 @@
 //! Users, groups, roles (Pulp RBAC), replication, and export and import actions.
 
-use super::actions::{ap, caps, group_progress, submit, unmark_when_deleted, url_with_scheme};
+use super::actions::{ap, caps, group_progress, snapshot_refusal, submit, unmark_when_deleted, url_with_scheme};
 use super::app::{App, Level};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, guard_type, s, short};
@@ -1612,8 +1612,11 @@ fn importer_form(app: &mut App, edit: bool, item: &Value) {
         submit(app, format!("{} importer {}", if edit { "update" } else { "create" }, f.get("name")), move |c| async move {
             // pulpcore 3.123 answers 500 to a PATCH with an unknown destination, and has dropped the old mapping then.
             for d in &dests {
-                if ops::find_by_name::<Value>(&c, &c.api("repositories/"), d).await?.is_none() {
+                let Some(r) = ops::find_by_name::<Value>(&c, &c.api("repositories/"), d).await? else {
                     bail!("no repository named {d}: every destination must exist");
+                };
+                if let Some(why) = snapshot_refusal(&r) {
+                    bail!(why);
                 }
             }
             Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api("importers/core/pulp/"), &b).await? })
@@ -1636,11 +1639,25 @@ fn import_form(app: &mut App, href: String, name: String) {
         }
         let (href, name) = (href.clone(), name.clone());
         app.job(format!("import check {toc}"), move |ctx| async move {
+            let c = &ctx.client;
             // The import uses the importer's mapping as Pulp has it now; the list row can be stale.
-            let mapping = ctx.client.get::<Value>(&href, &[]).await?["repo_mapping"].take();
-            let (ok, lines) = ops::import_check(&ctx.client, &toc, &mapping).await?;
+            let mapping = c.get::<Value>(&href, &[]).await?["repo_mapping"].take();
+            let pairs = mapping.as_object().cloned().unwrap_or_default();
+            let q = [("pulp_label_select", crate::cv::LABEL_CV.to_string()), ("fields", "name,pulp_labels".into())];
+            let snaps: Vec<Value> = c.list_all(&c.api("repositories/"), &q, 100_000).await?;
+            if let Some(why) = snaps.iter().filter(|r| pairs.values().any(|d| *d == r["name"])).find_map(snapshot_refusal) {
+                bail!(why);
+            }
+            // Pulp names the repositories of an export only in the task (not in import-check or the TOC), and an
+            // unmapped one goes into the repository of the same name: name each snapshot that this can change.
+            let same: Vec<String> = snaps
+                .iter()
+                .filter(|r| !pairs.contains_key(&s(r, "name")))
+                .map(|r| format!("  {} (Content View {})", s(r, "name"), s(&r["pulp_labels"], crate::cv::LABEL_CV)))
+                .collect();
+            let (ok, lines) = ops::import_check(c, &toc, &mapping).await?;
             ap(move |app| match ok {
-                true => confirm_import(app, href, name, toc, &mapping, lines),
+                true => confirm_import(app, href, name, toc, &mapping, lines, same),
                 false => app.text(format!("Import check of {toc} failed"), lines),
             })
         });
@@ -1648,13 +1665,24 @@ fn import_form(app: &mut App, href: String, name: String) {
     });
 }
 
-fn confirm_import(app: &mut App, href: String, name: String, toc: String, mapping: &Value, mut lines: Vec<String>) {
+/// `snapshots`: the lines of the Content View snapshots that an unmapped repository of the same name would change.
+fn confirm_import(app: &mut App, href: String, name: String, toc: String, mapping: &Value, mut lines: Vec<String>, snapshots: Vec<String>) {
     lines.push(String::new());
     lines.push("Each repository of the export gets a new version in its destination repository:".into());
     lines.extend(mapping.as_object().into_iter().flatten().map(|(src, dst)| format!("  {src} -> {}", dst.as_str().unwrap_or_default())));
     lines.push("  any other: the repository of the same name (Pulp skips it when there is none)".into());
     lines.push("The new version holds exactly the exported content; older versions stay.".into());
-    app.confirm_prod(format!("Import {toc}?"), lines, &name.clone(), move |app| {
+    let warn = !snapshots.is_empty();
+    if warn {
+        lines.push(String::new());
+        lines.push("WARNING: Pulp does not tell before the import which repositories the export has. An unmapped".into());
+        lines.push("one with the name of a Content View snapshot changes that snapshot outside its Content View:".into());
+        lines.extend(snapshots);
+        lines.push("Map such a repository to another destination (e), or type the importer name to import.".into());
+    }
+    let title = format!("Import {toc}?");
+    let typed = name.clone();
+    let run = move |app: &mut App| {
         app.job(format!("import {name}"), move |ctx| async move {
             let (group, mut lines) = ops::pulp_import(&ctx.client, &href, &toc, &group_progress(&ctx)).await?;
             let repos = group.tasks.iter().filter(|t| t["name"].as_str().is_some_and(|n| n.ends_with("import_repository_version"))).count();
@@ -1667,7 +1695,8 @@ fn confirm_import(app: &mut App, href: String, name: String, toc: String, mappin
                 app.text(format!("Import of {toc}{}", if done { "" } else { " FAILED" }), lines)
             })
         })
-    });
+    };
+    if warn { app.confirm_danger(title, lines, &typed, run) } else { app.confirm_prod(title, lines, &typed, run) }
 }
 
 #[cfg(test)]
@@ -2990,6 +3019,7 @@ mod tests {
         let server = MockServer::start().await;
         let check_path = "/pulp/api/v3/importers/core/pulp/import-check/";
         serve(&server, "GET", IMP, 200, item.clone()).await;
+        serve(&server, "GET", "/pulp/api/v3/repositories/", 200, page(json!([]))).await; // no snapshot
         serve(&server, "POST", check_path, 200, check(false, json!([format!("file {toc} does not exist")]))).await;
         let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
         app.list.kind = Kind::Importers;
@@ -3004,6 +3034,7 @@ mod tests {
 
         server.reset().await;
         serve(&server, "GET", IMP, 200, item.clone()).await;
+        serve(&server, "GET", "/pulp/api/v3/repositories/", 200, page(json!([]))).await; // no snapshot
         serve(&server, "POST", check_path, 200, check(true, json!([]))).await;
         serve(&server, "POST", &format!("{IMP}imports/"), 202, json!({ "task_group": GROUP })).await;
         let group = json!({ "pulp_href": GROUP, "description": format!("Import of {toc}"), "all_tasks_dispatched": false, "completed": 2,
@@ -3042,6 +3073,7 @@ mod tests {
         let stale = json!({ "pulp_href": IMP, "name": "dvd", "repo_mapping": { "web": "web-old" } });
         let server = MockServer::start().await;
         serve(&server, "GET", IMP, 200, json!({ "pulp_href": IMP, "name": "dvd", "repo_mapping": { "web": "web-copy" } })).await;
+        serve(&server, "GET", "/pulp/api/v3/repositories/", 200, page(json!([]))).await; // no snapshot
         let check_path = "/pulp/api/v3/importers/core/pulp/import-check/";
         let check = json!({ "toc": { "context": toc, "is_valid": true, "messages": [] },
             "repo_mapping": { "context": "{\"web\":\"web-copy\"}", "is_valid": true, "messages": [] } });
@@ -3072,6 +3104,7 @@ mod tests {
         let check = json!({ "path": { "context": tar, "is_valid": true, "messages": [] },
             "repo_mapping": { "context": "{}", "is_valid": true, "messages": [] } });
         serve(&server, "GET", IMP, 200, item.clone()).await;
+        serve(&server, "GET", "/pulp/api/v3/repositories/", 200, page(json!([]))).await; // no snapshot
         serve(&server, "POST", check_path, 200, check).await;
         serve(&server, "POST", &format!("{IMP}imports/"), 202, json!({ "task_group": GROUP })).await;
         let group = json!({ "pulp_href": GROUP, "completed": 1,
@@ -3098,6 +3131,62 @@ mod tests {
         let (mut f, mut submit) = open_form(&mut app, Act::Import, item);
         set(&mut f, "toc", tar);
         assert_eq!(submit(&mut app, &f).unwrap_err(), "not supported by this server: import from an export .tar (path)");
+    }
+
+    /// A Content View snapshot (`pulp_tui_cv`) is never a mapped destination. Pulp does not say which repositories an
+    /// export has before the import, so the confirmation names each snapshot that a same-name import changes, and the
+    /// operator types the importer name.
+    #[tokio::test]
+    async fn an_import_refuses_a_snapshot_destination_and_names_the_snapshots_of_the_same_name() {
+        use crate::tui::kinds::Act;
+        use wiremock::matchers::query_param;
+        const IMP2: &str = "/pulp/api/v3/importers/core/pulp/2/";
+        let toc = "/var/lib/pulp/exports/dvd/export-9-20261102_1000-toc.json";
+        let labels = json!({ "pulp_tui_cv": "web", "pulp_tui_db": "b" });
+        let snap = |n: &str| json!({ "name": n, "pulp_href": format!("/r/{n}/"), "pulp_labels": labels });
+        let server = MockServer::start().await;
+        let repos = || Mock::given(method("GET")).and(path("/pulp/api/v3/repositories/"));
+        let answer = |v: Value| ResponseTemplate::new(200).set_body_json(page(v));
+        let os = json!([snap("pulp-tui-cv-web-os")]);
+        repos().and(query_param("name", "pulp-tui-cv-web-os")).respond_with(answer(os)).mount(&server).await;
+        let both = json!([snap("pulp-tui-cv-web-os"), snap("pulp-tui-cv-web-db")]);
+        repos().and(query_param("pulp_label_select", "pulp_tui_cv")).respond_with(answer(both)).mount(&server).await;
+        serve(&server, "GET", IMP, 200, json!({ "pulp_href": IMP, "name": "dvd", "repo_mapping": { "os": "pulp-tui-cv-web-os" } })).await;
+        serve(&server, "GET", IMP2, 200, json!({ "pulp_href": IMP2, "name": "db", "repo_mapping": { "pulp-tui-cv-web-db": "db" } })).await;
+        let check = json!({ "toc": { "context": toc, "is_valid": true, "messages": [] },
+            "repo_mapping": { "context": "{}", "is_valid": true, "messages": [] } });
+        serve(&server, "POST", "/pulp/api/v3/importers/core/pulp/import-check/", 200, check).await;
+        let (mut app, mut rx) = connected(&server, Arc::new(crate::store::Store::open_in_memory().await.unwrap())).await;
+        app.list.kind = Kind::Importers;
+        let refused = "refused: pulp-tui-cv-web-os is a snapshot repository of Content View web (database b)";
+
+        // Create (and Edit) with a snapshot destination: refused before the request.
+        let (mut f, mut submit) = open_form(&mut app, Act::Create, Value::Null);
+        set(&mut f, "name", "dvd");
+        set(&mut f, "repo_mapping", "os=pulp-tui-cv-web-os");
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let n = notices(&app);
+        assert!(n.iter().any(|(l, t)| *l == Level::Error && t.contains(refused)), "{n:?}");
+
+        // Import with a mapping made outside pulp-tui: refused before the check.
+        let (mut f, mut submit) = open_form(&mut app, Act::Import, json!({ "pulp_href": IMP, "name": "dvd" }));
+        set(&mut f, "toc", toc);
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let n = notices(&app);
+        assert!(app.modal.is_none() && n.last().is_some_and(|(l, t)| *l == Level::Error && t.contains(refused)), "{n:?}");
+        assert_eq!(sent(&server).await, [], "no create, no check");
+
+        // Unmapped names: the confirmation names the snapshot that a same-name import changes (not the mapped one).
+        let (mut f, mut submit) = open_form(&mut app, Act::Import, json!({ "pulp_href": IMP2, "name": "db" }));
+        set(&mut f, "toc", toc);
+        submit(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
+        assert_eq!(typed.as_deref(), Some("db"), "the typed importer name");
+        assert!(lines.contains(&"  pulp-tui-cv-web-os (Content View web)".to_string()), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("pulp-tui-cv-web-db (")), "a mapped source does not go by name: {lines:?}");
     }
 
     const GUARDS: &str = "/pulp/api/v3/contentguards/";

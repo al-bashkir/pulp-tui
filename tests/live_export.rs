@@ -206,6 +206,59 @@ async fn a_content_view_snapshot_can_be_exported() {
     cleanup(&c, &[&exporter, &repo, &remote]).await;
 }
 
+/// Pulp imports an unmapped repository into the local repository of the same name, and tells which repositories an
+/// export has only in the task (audit F28). So the TUI refuses a Content View snapshot as a mapped destination, and
+/// the Import confirmation names the local snapshot of the same name and asks for the typed importer name.
+#[tokio::test]
+async fn an_import_does_not_write_into_a_content_view_snapshot_unasked() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let name = unique("it-import-snap");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &name, "file/PULP_MANIFEST", "mirror").await;
+    let body = json!({ "name": name, "path": format!("{EXPORTS}/{name}"), "repositories": [repo] });
+    let exporter = create(&c, "exporters/core/pulp/", body, "/exporters/").await;
+    let export = ops::create(&c, &format!("{exporter}exports/"), &json!({}), "/exports/", &no_progress).await.unwrap();
+    let toc = c.get::<Value>(&export, &[]).await.unwrap()["toc_info"]["file"].as_str().unwrap().to_string();
+    // Now the exported repository is also a local snapshot of the same name.
+    let m = c.patch(&repo, &json!({ "pulp_labels": { "pulp_tui_cv": "snapview", "pulp_tui_db": "it" } })).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    let before = latest(&c, &repo).await;
+    let refused = format!("refused: {name} is a snapshot repository of Content View snapview (database it)");
+
+    // Create (c) with the snapshot as a destination: refused, nothing made.
+    let (mut app, mut rx) = app().await;
+    let imp = format!("{name}-imp");
+    open_list(&mut app, &mut rx, Kind::Importers, &imp).await;
+    run(&mut app, Act::Create, Value::Null);
+    fill(&mut app, &[("name", &imp), ("repo_mapping", &format!("other={name}"))]);
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).last().is_some_and(|t| t.contains(&refused)), "{:?}", texts(&app));
+    assert!(ops::find_by_name::<Value>(&c, &c.api("importers/core/pulp/"), &imp).await.unwrap().is_none());
+
+    // Import (I) unmapped: the confirmation names the snapshot and needs the typed importer name; cancelled here.
+    let importer = create(&c, "importers/core/pulp/", json!({ "name": imp }), "/importers/").await;
+    let i = json!({ "pulp_href": importer, "name": imp });
+    run(&mut app, Act::Import, i.clone());
+    fill(&mut app, &[("toc", &toc)]);
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Confirm { lines, typed, .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(&app)) };
+    assert_eq!(typed.as_deref(), Some(imp.as_str()), "{lines:?}");
+    assert!(lines.contains(&format!("  {name} (Content View snapview)")), "{lines:?}");
+
+    // A mapping set outside pulp-tui that names the snapshot: refused before the check.
+    let m = c.patch(&importer, &json!({ "repo_mapping": { "other": name } })).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+    run(&mut app, Act::Import, i);
+    fill(&mut app, &[("toc", &toc)]);
+    settle(&mut app, &mut rx).await;
+    assert!(app.modal.is_none() && texts(&app).last().is_some_and(|t| t.contains(&refused)), "{:?}", texts(&app));
+    assert_eq!(c.list::<Value>(&format!("{importer}imports/"), &[]).await.unwrap().count, 0, "no import");
+    assert_eq!(latest(&c, &repo).await, before, "the snapshot has no new version");
+    cleanup(&c, &[&importer, &exporter, &repo, &remote]).await;
+}
+
 #[tokio::test]
 async fn filesystem_export_of_a_file_publication() {
     if !live_enabled() {

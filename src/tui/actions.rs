@@ -189,7 +189,7 @@ fn cv_owner(item: &Value) -> Option<String> {
 }
 
 /// Refuse any change of a Content View snapshot repository, also one of another database (`pulp_tui_db`).
-fn snapshot_refusal(repo: &Value) -> Option<String> {
+pub(super) fn snapshot_refusal(repo: &Value) -> Option<String> {
     let db = repo["pulp_labels"].get(crate::cv::LABEL_DB).and_then(Value::as_str).map(|d| format!(" (database {d})")).unwrap_or_default();
     cv_owner(repo).map(|cv| {
         format!(

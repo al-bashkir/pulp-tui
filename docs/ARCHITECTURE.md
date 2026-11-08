@@ -350,11 +350,17 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
 
 * **Pulp export and import**: Pulp writes and reads the files on its own disk. Export
   waits for the task and shows the TOC. Before an importer create or edit, the job finds
-  every mapped destination and sends nothing when one is missing. *Import* reads the
-  importer's mapping again and runs `ops::import_check` with it, then `ops::pulp_import` after
+  every mapped destination and sends nothing when one is missing or is a Content View
+  snapshot (`pulp_tui_cv`). *Import* reads the importer's mapping again, refuses a snapshot
+  destination, and runs `ops::import_check` with it, then `ops::pulp_import` after
   `confirm_prod`, and follows the
   task group like replication. Deletes of exporters and importers load the impact and need
   the typed name.
+* **Limit**: Pulp imports an unmapped repository into the local repository of the same name,
+  and tells which repositories an export has only in the import task (`import-check` and the
+  TOC do not). So pulp-tui cannot refuse a same-name snapshot. Instead the confirmation names
+  every local snapshot whose name is not a mapping source, and then needs the typed importer
+  name (`confirm_danger`).
 * **Content View definitions** (`export-cv`, `import-cv`; format 2, reads format 1; an
   older pulp-tui refuses format 2): views, environments and labels, composites, pins as
   numbers. No secrets, no Pulp state. Versions are not exported, so import turns pins into
