@@ -3194,41 +3194,49 @@ fn package_record_create(app: &mut App, version: String) {
                 let Some((name, rc)) = choices.iter().find(|x| x.0 == f.get("release_component")).cloned() else {
                     return Err("pick a release component".into());
                 };
-                let (package, version) = (f.get("package").trim().to_string(), version.clone());
-                app.job(format!("find package {package}"), move |ctx| async move {
-                    let c = &ctx.client;
-                    let r: Value = c.get(&repo_of_version(&version), &[]).await?;
-                    if let Some(e) = snapshot_refusal(&r) {
-                        bail!(e);
-                    }
-                    let p = deb::package_in(c, &version, &package).await?;
-                    let latest = s(&r, "latest_version_href");
-                    let q = [("repository_version", latest.clone()), ("pulp_href__in", p.clone()), ("fields", "pulp_href".into())];
-                    let back =
-                        !latest.is_empty() && latest != version && c.list::<Value>(&c.api("content/deb/packages/"), &q).await?.count == 0;
-                    ap(move |app| {
-                        let label = format!("create package release component {package} in {name}");
-                        let lines = vec![
-                            format!(
-                                "NOTE: package {package} is not in the LATEST version {} of {}, which gets the record.",
-                                version_number(&latest),
-                                s(&r, "name")
-                            ),
-                            "The new version has the package again.".into(),
-                        ];
-                        let go = move |app: &mut App| {
-                            record_job(app, version, label, move |c, repo| async move {
-                                let prc = deb::package_release_component(&c, &p, &rc).await?;
-                                Ok(ops::add_content(&c, &repo, vec![p, rc, prc]).await?)
-                            })
-                        };
-                        if back { app.confirm("New package release component", lines, go) } else { go(app) }
-                    })
-                });
+                package_record_job(app, version.clone(), f.get("package").trim().to_string(), name, rc);
                 Ok(())
             });
         })
     });
+}
+
+/// Find `package` in `version`, then add its record with release component `rc` (`name`) to the latest version, after
+/// a confirm when the latest version does not have the package.
+fn package_record_job(app: &mut App, version: String, package: String, name: String, rc: String) {
+    app.job(format!("find package {package}"), move |ctx| async move {
+        let c = &ctx.client;
+        let r: Value = c.get(&repo_of_version(&version), &[]).await?;
+        if let Some(e) = snapshot_refusal(&r) {
+            bail!(e);
+        }
+        let p = deb::package_in(c, &version, &package).await?;
+        let latest = s(&r, "latest_version_href");
+        let q = [("repository_version", latest.clone()), ("pulp_href__in", p.clone()), ("fields", "pulp_href".into())];
+        let back = !latest.is_empty() && latest != version && c.list::<Value>(&c.api("content/deb/packages/"), &q).await?.count == 0;
+        ap(move |app| {
+            let label = format!("create package release component {package} in {name}");
+            let lines = vec![
+                format!(
+                    "NOTE: package {package} is not in the LATEST version {} of {}, which gets the record.",
+                    version_number(&latest),
+                    s(&r, "name")
+                ),
+                "The new version has the package again.".into(),
+            ];
+            let go = move |app: &mut App| add_package_record(app, version, label, p, rc);
+            if back { app.confirm("New package release component", lines, go) } else { go(app) }
+        })
+    });
+}
+
+/// Add the package release component of package `p` and release component `rc`, with both, to the repository of
+/// `version`.
+fn add_package_record(app: &mut App, version: String, label: String, p: String, rc: String) {
+    record_job(app, version, label, move |c, repo| async move {
+        let prc = deb::package_release_component(&c, &p, &rc).await?;
+        Ok(ops::add_content(&c, &repo, vec![p, rc, prc]).await?)
+    })
 }
 
 /// Add a release record to the repository of `version`: `send` makes the request after the snapshot check, then the
