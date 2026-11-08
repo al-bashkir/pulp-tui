@@ -2362,6 +2362,40 @@ mod tests {
         assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v.id));
     }
 
+    /// Promote and Rollback differ in the preview (a rollback says what it keeps) and in the job that runs.
+    #[tokio::test]
+    async fn promote_and_rollback_show_their_own_notes_and_job() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        st.create_env("lab", "Dev", lib, false).await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        st.promoted(lib, web, v.id, "active").await.unwrap();
+        let notes = [
+            "",
+            "Rollback only changes bindings; newer versions stay available.",
+            "Files of the replaced publications may stay downloadable for Pulp's",
+            "DISTRIBUTED_PUBLICATION_RETENTION_PERIOD; repository metadata switches immediately.",
+        ];
+        for (mode, env, job, tail) in
+            [(Mode::Promote, "Dev", "promote web v1 -> Dev", &[][..]), (Mode::Rollback, LIBRARY, "rollback web v1 -> Library", &notes[..])]
+        {
+            promote_preview(&mut app, "web".into(), v.id, env.into(), mode);
+            drain(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else {
+                panic!("no confirm: {:?}", last_notice(&app))
+            };
+            assert_eq!(lines[2..].iter().map(String::as_str).collect::<Vec<_>>(), tail, "{env}");
+            yes(&mut app);
+            assert_eq!(app.jobs.last().map(|j| j.label.as_str()), Some(job));
+            drain(&mut app, &mut rx).await;
+            let ok = format!("web v1 active in {env}; served metadata verified");
+            assert!(app.notices.iter().any(|n| n.level == Level::Ok && n.text == ok), "{env}");
+        }
+    }
+
     /// A promotion that fails (a left-out distribution that is not the view's) says that its partial states are recorded.
     #[tokio::test]
     async fn a_failed_promotion_says_that_its_partial_states_are_recorded() {
