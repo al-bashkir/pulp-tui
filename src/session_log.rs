@@ -162,6 +162,11 @@ pub fn redact(v: &mut Value) {
     }
 }
 
+/// `text` as the operator may see it: each URL without its user info (audit F47).
+pub fn masked(text: String) -> String {
+    masked_user_info(&text).unwrap_or(text)
+}
+
 /// `u` with the user info of each URL in it (`scheme://user:password@host`) as `•••`; None when no URL has any. The
 /// user info ends at the last `@` before the path, query, fragment, a quote, `<`, `>` or white space.
 pub fn masked_user_info(u: &str) -> Option<String> {

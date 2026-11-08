@@ -131,8 +131,7 @@ fn col(title: &'static str, width: u16, get: fn(&Value) -> String) -> Col {
 /// A remote's `url` or an Upstream Pulp's `base_url` without its user info (`https://•••@host/`); the row keeps it for
 /// the Edit form.
 pub fn masked_url(v: &Value, k: &str) -> String {
-    let u = s(v, k);
-    crate::session_log::masked_user_info(&u).unwrap_or(u)
+    crate::session_log::masked(s(v, k))
 }
 
 pub fn s(v: &Value, k: &str) -> String {

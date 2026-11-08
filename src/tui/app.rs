@@ -316,9 +316,8 @@ impl App {
     // ---- notifications -------------------------------------------------------------
 
     pub fn notify(&mut self, level: Level, text: impl Into<String>) {
-        let text = text.into();
         // The footer, the Logs row and the log file never show the user info of a URL (audit F47).
-        let text = crate::session_log::masked_user_info(&text).unwrap_or(text);
+        let text = crate::session_log::masked(text.into());
         match level {
             Level::Error => tracing::warn!("{text}"),
             _ => tracing::info!("{text}"),
@@ -506,10 +505,7 @@ impl App {
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
             // Also the text view of the error has no user info of a URL (audit F47).
-            let result = fut.await.map_err(|e| {
-                let e = format!("{e:#}");
-                crate::session_log::masked_user_info(&e).unwrap_or(e)
-            });
+            let result = fut.await.map_err(|e| crate::session_log::masked(format!("{e:#}")));
             let _ = tx.send(Msg::JobDone { id, result });
         });
         self.jobs.push(Job { id, label, progress: String::new(), started: Instant::now(), abort: handle.abort_handle(), is_load });
@@ -589,7 +585,7 @@ impl App {
                 Ok(t) => self.task_update(t, false, None),
                 Err(e) if e.is_not_found() => self.task_gone(&href),
                 Err(e) if e.status() == Some(401) => self.task_unauthorized(&href),
-                Err(e) => self.tasks.poll_failed(&href, e.to_string()),
+                Err(e) => self.tasks.poll_failed(&href, crate::session_log::masked(e.to_string())),
             },
         }
         if self.list.kind == Kind::Tasks && self.screen == Screen::List(Kind::Tasks) {
@@ -1020,7 +1016,7 @@ impl App {
                 self.spawn("load list".into(), true, async move {
                     let e = match fut.await {
                         Ok(apply) => return Ok(apply),
-                        Err(e) => format!("{e:#}"),
+                        Err(e) => crate::session_log::masked(format!("{e:#}")),
                     };
                     ap(move |app| {
                         if app.list.generation == generation {
@@ -2846,6 +2842,27 @@ mod tests {
         let caps = Capabilities { versions: [("rpm".into(), "3.39.3".into())].into(), ..Default::default() };
         app.conn = Some(Conn { client, caps: Arc::new(caps), scope: "lab".into() });
         app
+    }
+
+    /// Audit F47: the error line of a failed list load and a failed task poll show Pulp's error text without the user
+    /// info of a URL in it.
+    #[tokio::test]
+    async fn a_failed_load_or_poll_shows_no_user_info_of_a_url() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let refused = ResponseTemplate::new(400).set_body_json(serde_json::json!({ "detail": "proxy http://u:p@h/ refused" }));
+        Mock::given(method("GET")).and(path("/pulp/api/v3/repositories/rpm/rpm/")).respond_with(refused).mount(&server).await;
+        let mut app = on_rpm_repos(&server).await;
+        let mut rx = app.rx.take().unwrap();
+        app.reload();
+        settle(&mut app, &mut rx).await;
+        assert!(app.list.error.as_deref().is_some_and(|e| e.contains("proxy http://•••@h/ refused")), "{:?}", app.list.error);
+        app.track_task("/t/1/", "sync", None);
+        let failed = crate::pulp::PulpError::Api { status: 502, message: "proxy http://u:p@h/ refused".into() };
+        app.handle_msg(Msg::TaskPolled { href: "/t/1/".into(), result: Err(failed) });
+        let error = app.tasks.items[0].error.clone().unwrap_or_default();
+        assert!(error.contains("proxy http://•••@h/ refused"), "{error}");
     }
 
     #[tokio::test]
