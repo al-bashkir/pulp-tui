@@ -418,6 +418,12 @@ PostgreSQL, so SQL must be portable. Store calls are `async` and run in jobs.
 | 6      | `binding_repos.env_id` foreign key (drops orphan rows)                |
 | 7      | `promotions`; `bindings` keeps only served (active) rows, no `state`  |
 | 8      | `cv_versions.token` (lock token of the publish that runs it)          |
+| 9      | served version of a row that 7 left with an attempt only (see below)  |
+
+Migration 9: an environment with an attempt and no served version gets back the one
+published version, other than the attempt, whose publications are exactly those that its
+served rows (`binding_repos`) record. A mixed set (a partial promotion) gives none; the
+versions it serves in part stay in use (`Store::partly_served`).
 
 `cv_components` has no cascade, so the database refuses to delete a view or version that a
 composite uses. `bindings.env_id`, `promotions.env_id` and `binding_repos.env_id` have no cascade either: the

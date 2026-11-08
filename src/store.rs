@@ -124,6 +124,22 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE bindings DROP COLUMN state;",
     // 8: the lock token of the publish workflow that runs a version: after a lost lock it writes only its own rows.
     "ALTER TABLE cv_versions ADD COLUMN token TEXT NOT NULL DEFAULT '';",
+    // 9: a view with an attempt and no served version in an environment (migration 7 of an old row that was not
+    // active) gets back the served version: the one published version, not the attempt, whose publications are
+    // exactly those that its served rows record. A mixed set (a partial promotion) gives none.
+    "INSERT INTO bindings(env_id, cv_id, version_id, updated_at)
+        SELECT m.env_id, m.cv_id, MIN(m.version_id), MIN(m.updated_at) FROM (
+            SELECT br.env_id, br.cv_id, vr.version_id, p.updated_at FROM binding_repos br
+            JOIN promotions p ON p.env_id = br.env_id AND p.cv_id = br.cv_id
+            JOIN cv_version_repos vr ON vr.repo_href = br.repo_href AND vr.publication = br.publication
+            JOIN cv_versions v ON v.id = vr.version_id AND v.cv_id = br.cv_id AND v.state = 'published'
+            WHERE vr.version_id <> p.version_id
+              AND NOT EXISTS (SELECT 1 FROM bindings b WHERE b.env_id = br.env_id AND b.cv_id = br.cv_id)
+            GROUP BY br.env_id, br.cv_id, vr.version_id, p.updated_at
+            HAVING COUNT(*) = (SELECT COUNT(*) FROM binding_repos x
+                               WHERE x.env_id = br.env_id AND x.cv_id = br.cv_id AND x.publication IS NOT NULL)
+               AND COUNT(*) = (SELECT COUNT(*) FROM cv_version_repos y WHERE y.version_id = vr.version_id AND y.publication IS NOT NULL)
+        ) m GROUP BY m.env_id, m.cv_id HAVING COUNT(*) = 1;",
 ];
 
 /// `MIGRATIONS` for PostgreSQL: every integer is BIGINT (sqlx `Any` reads SQLite integers as
@@ -218,6 +234,20 @@ pub const PG_MIGRATIONS: &[&str] = &[
      ALTER TABLE bindings DROP COLUMN state;",
     // 8: the lock token of the publish workflow that runs a version (see `MIGRATIONS`)
     "ALTER TABLE cv_versions ADD COLUMN token TEXT NOT NULL DEFAULT '';",
+    // 9: the served version of an old row that was not active (see `MIGRATIONS`)
+    "INSERT INTO bindings(env_id, cv_id, version_id, updated_at)
+        SELECT m.env_id, m.cv_id, MIN(m.version_id), MIN(m.updated_at) FROM (
+            SELECT br.env_id, br.cv_id, vr.version_id, p.updated_at FROM binding_repos br
+            JOIN promotions p ON p.env_id = br.env_id AND p.cv_id = br.cv_id
+            JOIN cv_version_repos vr ON vr.repo_href = br.repo_href AND vr.publication = br.publication
+            JOIN cv_versions v ON v.id = vr.version_id AND v.cv_id = br.cv_id AND v.state = 'published'
+            WHERE vr.version_id <> p.version_id
+              AND NOT EXISTS (SELECT 1 FROM bindings b WHERE b.env_id = br.env_id AND b.cv_id = br.cv_id)
+            GROUP BY br.env_id, br.cv_id, vr.version_id, p.updated_at
+            HAVING COUNT(*) = (SELECT COUNT(*) FROM binding_repos x
+                               WHERE x.env_id = br.env_id AND x.cv_id = br.cv_id AND x.publication IS NOT NULL)
+               AND COUNT(*) = (SELECT COUNT(*) FROM cv_version_repos y WHERE y.version_id = vr.version_id AND y.publication IS NOT NULL)
+        ) m GROUP BY m.env_id, m.cv_id HAVING COUNT(*) = 1;",
 ];
 
 /// A Content View lock not renewed for this long is expired; the next operator takes it over.
@@ -2564,6 +2594,48 @@ mod tests {
             s.bindings_for_cv(1).await.unwrap(),
             [Binding { env_id: 1, cv_id: 1, served: Some(2), attempt: None }, Binding { env_id: 2, cv_id: 1, served: None, attempt }]
         );
+    }
+
+    /// Schema 9: a view with an attempt and no served version in an environment (what migration 7 made of a v0.5.0 row
+    /// that was not active) gets back the version whose publications are exactly those of its served rows.
+    #[tokio::test]
+    async fn migration_9_restores_the_served_version_of_an_old_failed_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pulp-tui.db");
+        {
+            // A v0.5.0 database (schema 6): v2 failed in Dev, where Pulp serves v1; v2 is partial in QA (os serves v2).
+            let s = Store::open_at_version(&path, 6).await.unwrap();
+            sqlx::raw_sql(
+                "INSERT INTO content_views(id, profile, name, created_at) VALUES (1, 'old', 'web', 't');
+                 INSERT INTO cv_versions(id, cv_id, number, state, created_at) VALUES (1, 1, 1, 'published', 't'), (2, 1, 2, 'published', 't');
+                 INSERT INTO cv_version_repos(version_id, repo_href, repo_name, repo_type, filters, publication) VALUES
+                    (1, '/r/os/', 'os', 'rpm', '[]', '/p/os/1/'), (1, '/r/docs/', 'docs', 'file', '[]', '/p/docs/1/'),
+                    (2, '/r/os/', 'os', 'rpm', '[]', '/p/os/2/'), (2, '/r/docs/', 'docs', 'file', '[]', '/p/docs/2/');
+                 INSERT INTO environments(id, profile, name, prior_id, label)
+                    VALUES (1, 'old', 'Library', NULL, 'library'), (2, 'old', 'Dev', 1, 'dev'), (3, 'old', 'QA', 1, 'qa');
+                 INSERT INTO bindings VALUES (1, 1, 2, 'active', 't1'), (2, 1, 2, 'failed', 't2'), (3, 1, 2, 'partial', 't3');
+                 INSERT INTO binding_repos VALUES
+                    (2, 1, '/r/os/', 'os', 'rpm', '/d/1/', 'dev/web/os', '/p/os/1/'),
+                    (2, 1, '/r/docs/', 'docs', 'file', '/d/2/', 'dev/web/docs', '/p/docs/1/'),
+                    (3, 1, '/r/os/', 'os', 'rpm', '/d/3/', 'qa/web/os', '/p/os/2/'),
+                    (3, 1, '/r/docs/', 'docs', 'file', '/d/4/', 'qa/web/docs', '/p/docs/1/');",
+            )
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let s = Store::open(&path).await.unwrap();
+        let attempt = |state: &str| Some(Attempt { version_id: 2, state: state.into() });
+        assert_eq!(
+            s.bindings_for_cv(1).await.unwrap(),
+            [
+                Binding { env_id: 1, cv_id: 1, served: Some(2), attempt: None },
+                Binding { env_id: 2, cv_id: 1, served: Some(1), attempt: attempt("failed") },
+                Binding { env_id: 3, cv_id: 1, served: None, attempt: attempt("partial") },
+            ]
+        );
+        // v1 is the rollback target in Dev, and QA still serves its docs: it cannot be deleted.
+        assert_eq!(s.version_in_use(1).await.unwrap(), ["Dev", "QA (served in part)"]);
     }
 
     /// A served row needs its environment, and the database refuses to drop an environment that still has one.
