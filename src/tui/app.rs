@@ -552,9 +552,12 @@ impl App {
                     }
                     Err(e) => {
                         self.error(format!("{}: {e}", job.label));
-                        // A notice shows one line: an error of several (a list of failures) opens in the text view too.
+                        // A notice shows one line: an error of several (a list of failures) opens in the text view too,
+                        // as a job result (`applying`): behind an open dialog.
                         if e.contains('\n') {
+                            self.applying = true;
                             self.text(format!("{} failed", job.label), e.lines().map(str::to_string).collect());
+                            self.applying = false;
                         }
                         // A failed operation can have changed state (a version is `failed` now): show it, as after a task.
                         if !job.is_load && matches!(self.screen, Screen::List(_)) {
@@ -2363,6 +2366,22 @@ mod tests {
         app.spawn("delete x".into(), false, async { anyhow::bail!("refused") });
         app.handle_msg(rx.recv().await.unwrap());
         assert!(app.modal.is_none(), "one line: the notice only");
+    }
+
+    /// The text view of a failed job never replaces the dialog that the operator fills in: it waits behind it.
+    #[tokio::test]
+    async fn a_job_error_view_waits_for_the_open_dialog() {
+        let mut app = app_on(Kind::Profiles).await;
+        let mut rx = app.rx.take().unwrap();
+        app.form(Form::new("typing", vec![super::super::form::Field::text("name", "Name")]), |_, _| Ok(()));
+        app.spawn("replicate up".into(), false, async { anyhow::bail!("2 failed:\n  a\n  b") });
+        app.handle_msg(rx.recv().await.unwrap());
+        assert!(matches!(app.modal, Some(Modal::Form { .. })), "the form stays open");
+        assert_eq!(app.queued.len(), 1);
+        app.handle_key(key(KeyCode::Esc)); // ends editing the field
+        app.handle_key(key(KeyCode::Esc)); // closes the form
+        assert!(matches!(&app.modal, Some(Modal::Text { title, .. }) if title == "replicate up failed"), "then the error view");
+        assert!(app.guard_until.is_some(), "it ignores the keys typed before it opened");
     }
 
     #[tokio::test]
