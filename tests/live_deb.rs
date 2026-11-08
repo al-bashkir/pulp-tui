@@ -409,6 +409,55 @@ async fn the_tui_creates_release_records_that_a_publication_serves() {
     cleanup(&c, &[&dist, &repo]).await;
 }
 
+/// Create (c) of a package release component on the Content screen of an older version: the record goes into the
+/// latest version, which removed the package and its release component, so the confirm names both before any change
+/// (audit F33, F50). After yes, the new version has them again, with the record.
+#[tokio::test]
+async fn a_package_release_component_of_an_older_version_confirms_what_comes_back_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::Deb, unique("it-deb-back"));
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let file = fixtures().join("upstream/deb/pool/main/f/fixture-alpha/fixture-alpha_1.0-1_amd64.deb");
+    let up = deb::Upload::Package { distribution: Some(name.clone()), component: Some("main".into()) };
+    deb::upload(&c, &up, &file, Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
+    let v1 = latest(&c, &repo).await;
+    // Version 2 lacks the package, its release component and its record.
+    let units = async |v: &str| -> Vec<String> {
+        let mut hrefs = vec![];
+        for path in ["content/deb/packages/", "content/deb/release_components/", "content/deb/package_release_components/"] {
+            let q = [("repository_version", v.to_string()), ("fields", "pulp_href".into())];
+            hrefs.extend(c.list::<Value>(&c.api(path), &q).await.unwrap().results.iter().map(|x| s(x, "pulp_href")));
+        }
+        hrefs.sort();
+        hrefs
+    };
+    let gone = units(&v1).await;
+    assert_eq!(gone.len(), 3, "{gone:?}");
+    ops::settle(&c, ops::remove_content(&c, &repo, gone.clone()).await.unwrap(), &no_progress).await.unwrap();
+    let v2 = latest(&c, &repo).await;
+    assert!(v2.ends_with("/versions/2/"), "{v2}");
+
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Content { version: v1, ctype: 11 };
+    run(&mut app, Act::Create, Value::Null);
+    settle(&mut app, &mut rx).await; // the release components of version 1
+    let component = format!("{name}/main");
+    fill(&mut app, &[("package", "fixture-alpha"), ("release_component", &component)]);
+    settle(&mut app, &mut rx).await;
+    assert_eq!(latest(&c, &repo).await, v2, "nothing changes before the confirm");
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed, None);
+    let note = |what: &str| format!("NOTE: {what} is not in the LATEST version 2 of {name}, which gets the record.");
+    assert_eq!(lines[..2], [note("package fixture-alpha"), note(&format!("release component {component}"))], "{lines:?}");
+    settle_tasks(&mut app, &mut rx).await;
+    let v3 = latest(&c, &repo).await;
+    assert!(v3.ends_with("/versions/3/"), "{v3}: {:?}", texts(&app));
+    assert_eq!(units(&v3).await, gone, "the package, its release component and the record");
+    cleanup(&c, &[&repo]).await;
+}
+
 /// An operator repository with its own signing service: a publication without one is signed by the
 /// repository's service, and after the edit form clears it (`signing_service: null`) it is not.
 #[tokio::test]
