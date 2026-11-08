@@ -336,19 +336,27 @@ async fn the_tui_uploads_a_udeb_a_source_package_and_generic_content_as_their_ty
     assert_eq!(files.len(), 3, "{files:?}");
     assert!(files.iter().all(|f| f.starts_with("pool/")) && files.iter().any(|f| f.ends_with("/fixture-src_1.0-1.dsc")), "{files:?}");
 
-    // A rebuilt .dsc of the same Source and Version (other bytes): pulp_deb would add the kept package, so the
-    // upload is refused before any change (audit F35).
-    let dir = tempfile::tempdir().unwrap();
+    // A rebuilt .dsc of the same Source and Version (other bytes, new in each run) into a fresh repository: pulp_deb
+    // would upload its artifact and add the kept package, so the upload is refused before any change (audit F35).
+    let (fresh_name, dir) = (format!("{name}-fresh"), tempfile::tempdir().unwrap());
+    let fresh = create(&c, t.repositories(), json!({ "name": fresh_name }), "/repositories/").await;
     let rebuilt = dir.path().join("fixture-src_1.0-1.dsc");
-    std::fs::write(&rebuilt, format!("{}\n", std::fs::read_to_string(&dsc).unwrap())).unwrap();
-    let before = latest(&c, &repo).await;
-    run(&mut app, Act::Upload, json!({ "pulp_href": repo, "name": name }));
+    std::fs::write(&rebuilt, format!("{}Homepage: https://example.com/{name}\n", std::fs::read_to_string(&dsc).unwrap())).unwrap();
+    let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(std::fs::read(&rebuilt).unwrap()));
+    let artifacts = async || c.list::<Value>(&c.api("artifacts/"), &[("sha256", sha.clone())]).await.unwrap().count;
+    let pair = [("source", "fixture-src".to_string()), ("version", "1.0-1".into()), ("fields", "pulp_href,artifacts".into())];
+    let sources = async || c.list::<Value>(&c.api("content/deb/source_packages/"), &pair).await.unwrap().count;
+    let (before, kept) = (latest(&c, &fresh).await, sources().await);
+    assert_eq!(artifacts().await, 0, "the rebuilt .dsc is new");
+    run(&mut app, Act::Upload, json!({ "pulp_href": fresh, "name": fresh_name }));
     fill(&mut app, &[("path", &rebuilt.display().to_string())]);
     settle(&mut app, &mut rx).await;
+    assert_eq!(latest(&c, &fresh).await, before, "no new version: {:?}", texts(&app));
+    assert_eq!(artifacts().await, 0, "no .dsc artifact: {:?}", texts(&app));
+    assert_eq!(sources().await, kept, "no new source package");
     let last = texts(&app).pop().unwrap_or_default();
     assert!(last.contains("refused: Pulp has source package") && last.contains("new Version"), "{last}");
-    assert_eq!(latest(&c, &repo).await, before, "no new version");
-    cleanup(&c, &[&repo]).await;
+    cleanup(&c, &[&repo, &fresh]).await;
 }
 
 /// Create (c) on the Deb Content screens of a version: a release, a release component and a release architecture, then
