@@ -3474,6 +3474,59 @@ mod tests {
         assert_eq!(audit[0].detail, "Dev: dev -> qa: 2 moved, 2 failed");
     }
 
+    /// The check after a relabel says OK for a File publication without a manifest, with the note that no served file
+    /// was compared: a check that could not run is not drift (audit F32).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_relabel_says_ok_and_no_manifest_compared_for_a_file_publication_without_one() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let docs = CvRepo {
+            repo_href: "/pulp/api/v3/repositories/file/file/1/".into(),
+            repo_name: "docs".into(),
+            repo_type: RepoType::File,
+            filters: vec![],
+        };
+        let v = svc.store.begin_version(cv, "", std::slice::from_ref(&docs)).await.unwrap();
+        let (dv, p) = ("/pulp/api/v3/repositories/file/file/2/versions/1/", "/pulp/api/v3/publications/file/file/1/");
+        let vr = CvVersionRepo {
+            derived_version: Some(dv.into()),
+            publication: Some(p.into()),
+            ..svc.store.version_repos(v.id).await.unwrap().remove(0)
+        };
+        svc.store.save_version_repo(&vr).await.unwrap();
+        svc.store.finish_version(v.id, "published", None).await.unwrap();
+        let lib = svc.store.ensure_library("k").await.unwrap();
+        svc.store.promoted(lib, cv, v.id, "active").await.unwrap();
+        let b = BindingRepo {
+            env_id: lib,
+            cv_id: cv,
+            repo_href: docs.repo_href,
+            repo_name: "docs".into(),
+            repo_type: RepoType::File,
+            distribution: DIST.into(),
+            base_path: "library/web/docs".into(),
+            publication: Some(p.into()),
+        };
+        svc.store.save_binding_repo(&b).await.unwrap();
+        let d = json!({ "pulp_href": DIST, "name": "d", "base_path": b.base_path, "base_url": "http://h/pulp/content/library/web/docs/",
+            "publication": p });
+        let none = json!({ "count": 0, "next": null, "results": [] });
+        for (at, body) in [
+            (DIST, d),
+            (p, json!({ "pulp_href": p, "repository_version": dv, "manifest": null })),
+            (dv, json!({})),
+            ("/pulp/api/v3/distributions/", none),
+        ] {
+            Mock::given(method("GET")).and(path(at)).respond_with(ResponseTemplate::new(200).set_body_json(body)).mount(&server).await;
+        }
+        let (lines, failed) = svc.relabel_env(lib, "library", &|_| {}, &ops::no_progress).await.unwrap();
+        let note = "    docs: the publication has no manifest: served files not compared";
+        assert_eq!((lines.iter().map(String::as_str).collect::<Vec<_>>(), failed), (vec!["no served path changes", "web: OK", note], 0));
+    }
+
     /// Pulp refuses a base path that equals, contains or is inside another one: a label whose served paths would
     /// overlap another distribution is refused before it is stored and before any PATCH.
     #[tokio::test(flavor = "multi_thread")]
