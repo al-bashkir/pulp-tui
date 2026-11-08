@@ -953,6 +953,24 @@ mod tests {
         assert_eq!(epoch_secs("yesterday"), None);
     }
 
+    /// February is the month that the civil-date rule turns on: the end of a leap February reads right, in UTC and with
+    /// an offset. A `finished_at` without a zone, or with one that is not `Z` or `±HH:MM`, never ends a group.
+    #[test]
+    fn the_idle_rule_reads_a_leap_february_and_never_a_time_without_a_zone() {
+        let group = |at: &str| -> TaskGroup {
+            let g = serde_json::json!({ "pulp_href": "/g/8/", "completed": 1, "tasks": [{ "state": "completed", "finished_at": at }] });
+            serde_json::from_value(g).unwrap()
+        };
+        // 2024-02-29T00:00:00Z is 1_709_164_800.
+        let ended = 1_709_164_800 + IDLE_FINAL_SECS;
+        for at in ["2024-02-29T00:00:00Z", "2024-02-29T01:30:00.5+01:30", "2024-02-28T21:00:00-03:00"] {
+            assert!(group(at).idle_long(ended) && !group(at).idle_long(ended - 1), "{at}");
+        }
+        for at in ["2024-02-29T00:00:00", "2024-02-29T00:00:00 UTC", "2024-02-29T00:00:00+0100", "2024-02-29T00:00:00Zulu"] {
+            assert!(!group(at).idle_long(u64::MAX / 2), "{at}");
+        }
+    }
+
     /// No group with tasks is final before a task of it ended; a failed or canceled task ends it also without the flag.
     #[test]
     fn a_group_ends_with_a_failure_and_never_before_a_task_ended() {
