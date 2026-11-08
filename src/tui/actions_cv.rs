@@ -2297,6 +2297,75 @@ mod tests {
         assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v.id));
     }
 
+    /// A left-out row of `web` in Library: repository `n`, at distribution `rpm/rpm/n`.
+    async fn left_out(st: &Store, lib: i64, web: i64, n: &str, publication: Option<&str>) -> crate::store::BindingRepo {
+        let row = crate::store::BindingRepo {
+            env_id: lib,
+            cv_id: web,
+            repo_href: format!("{REPOS}rpm/rpm/{n}/"),
+            repo_name: format!("r{n}"),
+            repo_type: RepoType::Rpm,
+            distribution: format!("/pulp/api/v3/distributions/rpm/rpm/{n}/"),
+            base_path: format!("library/web/r{n}"),
+            publication: publication.map(str::to_string),
+        };
+        st.save_binding_repo(&row).await.unwrap();
+        row
+    }
+
+    /// A promotion to a protected environment asks for the typed environment; what Verify finds then is a warning.
+    #[tokio::test]
+    async fn a_promotion_to_a_protected_environment_is_typed_and_warns_of_what_verify_finds() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        st.set_env_protected(lib, true).await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        // Its distribution is gone: the promotion has nothing to unserve, and Verify names it.
+        let gone = left_out(&st, lib, web, "8", None).await;
+        serve(&server, "GET", gone.distribution.clone(), 404, json!({ "detail": "Not found." })).await;
+        promote_preview(&mut app, web, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", last_notice(&app)) };
+        assert_eq!((title.as_str(), typed.as_deref()), ("Library is protected", Some(LIBRARY)));
+        yes(&mut app);
+        drain(&mut app, &mut rx).await;
+        let warned = app.notices.iter().any(|n| {
+            n.level == Level::Warn
+                && n.text.starts_with("web in Library: bound, verification found: r8: distribution /pulp/api/v3/distributions/rpm/rpm/8/: ")
+        });
+        assert!(warned, "{:?}", app.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
+        assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v.id));
+    }
+
+    /// A promotion that fails (a left-out distribution that is not the view's) says that its partial states are recorded.
+    #[tokio::test]
+    async fn a_failed_promotion_says_that_its_partial_states_are_recorded() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        let old = left_out(&st, lib, web, "9", Some("/pulp/api/v3/publications/rpm/rpm/3/")).await;
+        let theirs = json!({ "pulp_href": old.distribution, "name": "theirs", "base_path": old.base_path, "pulp_labels": {} });
+        serve(&server, "GET", old.distribution.clone(), 200, theirs).await;
+        promote_preview(&mut app, web, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", last_notice(&app)) };
+        assert_eq!(lines[2], "  r9: not part of v1 -> its distribution stops serving (kept for rollback)");
+        yes(&mut app);
+        drain(&mut app, &mut rx).await;
+        let failed = app.notices.iter().any(|n| {
+            n.level == Level::Error
+                && n.text.starts_with("web in Library: failed: unbind r9: ")
+                && n.text.ends_with(" (partial states are recorded; promote again to retry or roll back)")
+        });
+        assert!(failed, "{:?}", app.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
+    }
+
     /// A promotion of a File repository whose publication has no manifest completes OK, as Verify says, and the notice
     /// says that no manifest was compared.
     #[tokio::test]
