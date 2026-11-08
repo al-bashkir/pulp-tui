@@ -1302,28 +1302,27 @@ impl CvService {
         let aliases = self.store.aliases().await?;
         let mut errors = vec![];
         for b in self.store.binding_repos(env.id, cv.id).await? {
-            if vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) {
-                continue;
-            }
-            match self.needs_unbind(&b).await {
-                Ok(true) => {}
+            let unbound = match self.needs_unbind(vrs, &b).await {
+                Ok(true) => self.unbind(&cv.name, env, &b, &aliases, on).await,
                 Ok(false) => continue,
-                Err(e) => {
-                    errors.push(format!("unbind {}: {e}", b.repo_name));
-                    continue;
-                }
-            }
-            match self.unbind(&cv.name, env, &b, &aliases, on).await {
-                Ok(()) => self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await?,
-                Err(e) => errors.push(format!("unbind {}: {e}", b.repo_name)),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = unbound {
+                errors.push(format!("unbind {}: {e}", b.repo_name));
+            } else {
+                self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await?;
             }
         }
         Ok(errors)
     }
 
-    /// Whether `unbind_removed` unserves row `b` of a repository that the version lacks: it records a publication, or
-    /// it records none and Pulp shows that its distribution serves one (set outside pulp-tui). A gone one needs nothing.
-    pub async fn needs_unbind(&self, b: &BindingRepo) -> Result<bool> {
+    /// Whether a promotion of the version with repositories `vrs` unserves row `b` (`unbind_removed`): the version
+    /// lacks its repository, and the row records a publication, or records none and Pulp shows that its distribution
+    /// serves one (set outside pulp-tui). A gone one needs nothing.
+    pub async fn needs_unbind(&self, vrs: &[CvVersionRepo], b: &BindingRepo) -> Result<bool> {
+        if vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) {
+            return Ok(false);
+        }
         if b.publication.is_some() {
             return Ok(true);
         }
@@ -3210,7 +3209,11 @@ mod tests {
                 publication: None,
             };
             svc.store.save_binding_repo(&row).await.unwrap();
-            Mock::given(method("GET")).and(path(row.distribution.as_str())).respond_with(ResponseTemplate::new(status)).mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path(row.distribution.as_str()))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
         }
         let e = svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap_err().to_string();
         assert!(e.starts_with("web in Library: failed: unbind r9: ") && !e.contains("r8"), "{e}");

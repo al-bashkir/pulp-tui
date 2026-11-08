@@ -794,8 +794,7 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
             lines.push(svc.promote_target(&name, &e, vr.repo(), row).await?);
         }
         for b in rows {
-            // The rule of `CvService::unbind_removed`.
-            if vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) || !svc.needs_unbind(&b).await? {
+            if !svc.needs_unbind(&vrs, &b).await? {
                 continue;
             }
             let outside = if b.publication.is_none() { "; Pulp shows that it serves a publication set outside pulp-tui" } else { "" };
