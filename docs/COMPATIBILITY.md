@@ -511,7 +511,11 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   base path that equals another, is a prefix of another (`a` and `a/b`), or is inside another
   gets HTTP 400 `Overlaps with an existing distribution.` (checked on POST and PATCH). The
   relabel therefore refuses a label when another distribution has the label or a path below it
-  as its base path, before it stores anything.
+  as its base path, before it stores anything. A new distribution (promote, replication) gets
+  the same check before the POST, and the promote preview names the distribution
+  (`ops::overlapping_distribution`). It uses the `distributions/` filters `base_path__in` (the
+  path and each path above it) and `base_path__contains` (`<path>/`, then a prefix check);
+  pulpcore 3.63.36 has both.
 * **File mirror sync publishes** (pulp_file 3.123.1, `tasks/synchronizing.py`): a sync with
   `mirror` that makes a version also makes a pass-through publication of it with the upstream
   manifest (live). pulp_deb 3.11.1 mirror makes none. The mirror confirm says so for each File

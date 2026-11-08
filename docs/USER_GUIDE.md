@@ -591,8 +591,10 @@ retry, or roll back to the served version to clear the failed attempt.
   has the pulp-tui path, the promotion fails for it. When it has another path, the promotion makes
   a new distribution at the pulp-tui path, and the renamed one keeps its publication, but pulp-tui
   no longer records it (drift check and unpromote do not see it). In both cases, rename it back
-  first. A new distribution needs a free path: the preview names a distribution that has it, and
-  the promotion then fails for that repository. A repository that the version does not have
+  first. A new distribution needs a free path that is not above or below the base path of another
+  distribution (Pulp refuses overlapping base paths): the preview names a distribution that has
+  the path or overlaps it, and the promotion then fails for that repository, before Pulp is
+  asked. A repository that the version does not have
   stops serving; the preview names it, also when its distribution serves a publication that was
   set outside pulp-tui.
 * **b** rolls an environment back. After Library: only a version older than the newest bound one
@@ -751,7 +753,8 @@ for example `web:v1 (v2 partial)`.
   path below it (`<label>/…`), as its base path: the paths below a label belong to its
   environment, and Pulp refuses overlapping base paths, so a later promotion could fail there.
   The edit refuses such a label and names the distribution, before it changes anything. A new
-  environment gets no such check; a promotion that overlaps fails on that repository only.
+  environment gets no such check; a promotion that overlaps fails on that repository only, and
+  its preview says so.
 * The relabel shows the paths that move (`/old -> /new`), and you type the environment name. Then
   it moves each distribution in place (one task each), and shows the result and the drift check of
   each bound view. It locks every view bound in the environment. A row that fails stays at its old

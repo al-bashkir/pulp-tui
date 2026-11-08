@@ -426,6 +426,49 @@ async fn a_failed_promotion_keeps_the_served_version() {
     cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
 }
 
+/// Pulp refuses a base path that is inside another one or contains one. A distribution outside pulp-tui above the new
+/// Dev path, then one below it: the preview says that the promotion fails, and pulp-tui refuses before Pulp (no 400).
+/// After a clean preview, the promotion completes.
+#[tokio::test]
+async fn a_promotion_to_a_base_path_that_overlaps_another_fails_as_the_preview_says() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvov");
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
+    let cv = store.create_cv(&profile, &id, "").await.unwrap();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    store.set_cv_repo(cv, &docs).await.unwrap();
+    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let lib = store.ensure_library(&profile).await.unwrap();
+    let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
+    let env = store.environments(&profile).await.unwrap().into_iter().find(|e| e.id == dev).unwrap();
+    let (path, name) = (base_path(&id, "dev", "docs"), pulp_tui::cv::distribution_name(&id, "Dev", "docs"));
+    let new = format!("  docs (File): new distribution {name} at /{path}");
+    let foreign = format!("{id}-foreign");
+    for other in [format!("dev/{id}"), format!("{path}/extra")] {
+        let body = json!({ "name": foreign, "base_path": other });
+        let href = create(&c, RepoType::File.distributions(), body, "/distributions/").await;
+        let line = svc.promote_target(&id, &env, &docs, None).await.unwrap();
+        assert_eq!(line, format!("{new}; distribution {foreign} at /{other} overlaps that base path, so the promotion fails for it"));
+        let e = svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap_err().to_string();
+        let want =
+            format!("{id} in Dev: failed: docs: conflict [409]: base path {path} overlaps base path {other} of distribution {foreign}");
+        assert!(e.starts_with(&want), "{e}");
+        cleanup(&c, &[&href]).await;
+    }
+    assert_eq!(svc.promote_target(&id, &env, &docs, None).await.unwrap(), new);
+    svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    assert!(svc.verify(cv, dev).await.unwrap().is_empty());
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
 /// Two databases (stores with different ids) share one Pulp and one Content View name.
 #[tokio::test]
 async fn content_view_owned_by_another_database() {

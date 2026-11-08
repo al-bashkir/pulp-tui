@@ -2246,10 +2246,11 @@ mod tests {
             for t in ["rpm/rpm", "file/file"] {
                 serve(&server, "GET", format!("/pulp/api/v3/distributions/{t}/"), 200, none.clone()).await;
             }
-            let foreign = json!({ "count": 1, "next": null, "results": [{ "name": "foreign", "base_path": "dev/web/docs" }] });
+            let foreign =
+                json!({ "count": 1, "next": null, "results": [{ "pulp_href": "/d/9/", "name": "foreign", "base_path": "dev/web/docs" }] });
             Mock::given(method("GET"))
                 .and(path("/pulp/api/v3/distributions/"))
-                .and(wiremock::matchers::query_param("base_path", "dev/web/docs"))
+                .and(wiremock::matchers::query_param("base_path__in", "dev,dev/web,dev/web/docs"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(foreign))
                 .with_priority(1)
                 .mount(&server)

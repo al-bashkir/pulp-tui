@@ -482,6 +482,49 @@ async fn distribution_without_database_label_is_adopted_even_when_the_publicatio
     server.verify().await;
 }
 
+/// Pulp refuses a base path that is inside another one or contains one (HTTP 400 "Overlaps with an existing
+/// distribution."): a new distribution there is refused before the POST, in both directions. A path that contains the
+/// base path in another place does not overlap.
+#[tokio::test]
+async fn a_new_distribution_at_an_overlapping_base_path_is_refused_before_the_post() {
+    let server = MockServer::start().await;
+    let c = client(&server, |_, _| {});
+    let page = |paths: &[&str]| {
+        let r: Vec<Value> = paths
+            .iter()
+            .map(|p| json!({ "pulp_href": format!("{API}distributions/file/file/{p}/"), "name": format!("x-{p}"), "base_path": p }))
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({ "count": r.len(), "next": null, "results": r }))
+    };
+    let above = "base path dev/web/os overlaps base path dev/web of distribution x-dev/web";
+    let below = "base path dev/web/os overlaps base path dev/web/os/extra of distribution x-dev/web/os/extra";
+    for (at_or_above, contains, want) in [
+        (vec!["dev/web"], vec![], Some(above)),
+        (vec!["dev/web/os"], vec![], Some("base path dev/web/os is used by distribution x-dev/web/os")),
+        (vec![], vec!["other/dev/web/os/x", "dev/web/os/extra"], Some(below)),
+        (vec![], vec!["other/dev/web/os/x"], None),
+    ] {
+        server.reset().await;
+        let none = json!({ "count": 0, "next": null, "results": [] });
+        let named = Mock::given(method("GET")).and(path(format!("{API}distributions/rpm/rpm/")));
+        named.respond_with(ResponseTemplate::new(200).set_body_json(none)).mount(&server).await;
+        let all = || Mock::given(method("GET")).and(path(format!("{API}distributions/")));
+        all().and(query_param("base_path__in", "dev,dev/web,dev/web/os")).respond_with(page(&at_or_above)).mount(&server).await;
+        all().and(query_param("base_path__contains", "dev/web/os/")).respond_with(page(&contains)).mount(&server).await;
+        all().respond_with(page(&[])).with_priority(10).mount(&server).await; // any other query finds nothing
+        let created = json!({ "pulp_href": format!("{API}distributions/rpm/rpm/9/") });
+        let post = Mock::given(method("POST")).respond_with(ResponseTemplate::new(201).set_body_json(created));
+        post.expect(u64::from(want.is_none())).mount(&server).await;
+        let pubn = format!("{API}publications/rpm/rpm/1/");
+        let res = ops::ensure_distribution(&c, RepoType::Rpm, "d", "dev/web/os", Some(&pubn), &json!({}), None, &no_progress).await;
+        match want {
+            Some(want) => assert!(matches!(&res, Err(PulpError::Api { status: 409, message }) if message == want), "{res:?}"),
+            None => assert_eq!(res.unwrap(), format!("{API}distributions/rpm/rpm/9/")),
+        }
+        server.verify().await;
+    }
+}
+
 #[tokio::test]
 async fn file_sync_maps_any_mirror_policy_to_mirror() {
     let server = MockServer::start().await;

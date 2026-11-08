@@ -404,12 +404,13 @@ pub async fn ensure_distribution(
         }
         return Ok(d.pulp_href);
     }
-    let taken: Page<Value> = c.list(&c.api("distributions/"), &[("base_path", base_path.into()), ("limit", "1".into())]).await?;
-    if let Some(o) = taken.results.first() {
-        return Err(PulpError::Api {
-            status: 409,
-            message: format!("base path {base_path} is used by distribution {}", o["name"].as_str().unwrap_or("?")),
-        });
+    if let Some(o) = overlapping_distribution(c, base_path).await? {
+        let message = if o.base_path == base_path {
+            format!("base path {base_path} is used by distribution {}", o.name)
+        } else {
+            format!("base path {base_path} overlaps base path {} of distribution {}", o.base_path, o.name)
+        };
+        return Err(PulpError::Api { status: 409, message });
     }
     let mut labels = labels.clone();
     if let Some((key, id, _)) = db {
@@ -423,6 +424,23 @@ pub async fn ensure_distribution(
         on,
     )
     .await
+}
+
+/// A distribution (any type) whose base path overlaps `base_path`: the same path, a path above it or a path below it.
+/// Pulp refuses a new distribution there (HTTP 400 "Overlaps with an existing distribution.", COMPATIBILITY.md). The
+/// filters `base_path__in` and `base_path__contains` exist in every supported pulpcore.
+pub async fn overlapping_distribution(c: &PulpClient, base_path: &str) -> Result<Option<Distribution>> {
+    let coll = c.api("distributions/");
+    let parts: Vec<&str> = base_path.split('/').collect();
+    // shortcut: `__in` splits at commas, so only Pulp (400) refuses a path above with a comma (a replicated path).
+    let at_or_above = (1..=parts.len()).map(|n| parts[..n].join("/")).collect::<Vec<_>>().join(",");
+    let found: Page<Distribution> = c.list(&coll, &[("base_path__in", at_or_above), ("limit", "1".into())]).await?;
+    if let Some(d) = found.results.into_iter().next() {
+        return Ok(Some(d));
+    }
+    let below = format!("{base_path}/");
+    let found: Vec<Distribution> = c.list_all(&coll, &[("base_path__contains", below.clone())], 100_000).await?;
+    Ok(found.into_iter().find(|d| d.base_path.starts_with(&below)))
 }
 
 /// Pulp refuses a publication or version binding on a checkpoint distribution (HTTP 400, "The 'checkpoint'

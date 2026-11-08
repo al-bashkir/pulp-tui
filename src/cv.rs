@@ -1380,7 +1380,8 @@ impl CvService {
     /// name, or a new one. The one that `row` records, when it still has this view's labels but another name (renamed
     /// outside pulp-tui), is named too: at the derived path the promotion fails on that path; at another path the
     /// promotion makes the new one and the renamed one keeps its publication, unrecorded. A new one fails on a path
-    /// that another distribution has (`ops::ensure_distribution`).
+    /// that another distribution has, contains or is inside of (`ops::overlapping_distribution`, as in
+    /// `ops::ensure_distribution`). An existing one keeps its path, so its re-pointing never overlaps.
     pub async fn promote_target(&self, cv: &str, env: &Environment, repo: &CvRepo, row: Option<&BindingRepo>) -> Result<String> {
         let what = format!("  {} ({})", repo.repo_name, repo.repo_type.label());
         let name = distribution_name(cv, &env.name, &repo.repo_name);
@@ -1396,11 +1397,10 @@ impl CvService {
             ));
         }
         let mut line = format!("{what}: new distribution {name} at /{path}");
-        let c = &self.client;
-        let taken: crate::pulp::client::Page<Value> =
-            c.list(&c.api("distributions/"), &[("base_path", path), ("limit", "1".into())]).await?;
-        if let Some(o) = taken.results.first() {
-            line += &format!("; distribution {} has that base path, so the promotion fails for it", o["name"].as_str().unwrap_or("?"));
+        if let Some(o) = ops::overlapping_distribution(&self.client, &path).await? {
+            let clash =
+                if o.base_path == path { "has that base path".into() } else { format!("at /{} overlaps that base path", o.base_path) };
+            line += &format!("; distribution {} {clash}, so the promotion fails for it", o.name);
         }
         if let Some(d) = renamed {
             line += &format!(
@@ -4353,6 +4353,40 @@ mod tests {
             .await;
         let line = svc.promote_target("web", &env, &repo, Some(&row)).await.unwrap();
         assert_eq!(line, "  os (RPM): new distribution pulp-tui-cv-web-Library-os at /library/web/os");
+    }
+
+    /// Pulp refuses a new base path that is inside another one or contains one, as it refuses a taken one: the preview
+    /// says that the promotion fails, with the rule of `ops::ensure_distribution`, in both directions.
+    #[tokio::test]
+    async fn the_promote_preview_says_a_new_base_path_that_overlaps_another_fails() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (dev, _) = web_in_dev(&svc).await;
+        let env = svc.store.environments("k").await.unwrap().into_iter().find(|e| e.id == dev).unwrap();
+        let repo = CvRepo { repo_href: "/r/1/".into(), repo_name: "os".into(), repo_type: RepoType::Rpm, filters: vec![] };
+        let page = |paths: &[&str]| {
+            let r: Vec<Value> =
+                paths.iter().map(|p| json!({ "pulp_href": format!("/d/{p}/"), "name": "foreign", "base_path": p })).collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "count": r.len(), "next": null, "results": r }))
+        };
+        let new = "  os (RPM): new distribution pulp-tui-cv-web-Dev-os at /dev/web/os";
+        let fails = |clash: &str| format!("; distribution foreign {clash}, so the promotion fails for it");
+        for (at_or_above, below, why) in [
+            (vec!["dev/web"], vec![], fails("at /dev/web overlaps that base path")),
+            (vec![], vec!["dev/web/os/extra"], fails("at /dev/web/os/extra overlaps that base path")),
+            (vec!["dev/web/os"], vec![], fails("has that base path")),
+            (vec![], vec!["x/dev/web/os/y"], String::new()),
+        ] {
+            server.reset().await;
+            let all = || Mock::given(method("GET")).and(path("/pulp/api/v3/distributions/"));
+            all().and(query_param("base_path__in", "dev,dev/web,dev/web/os")).respond_with(page(&at_or_above)).mount(&server).await;
+            all().and(query_param("base_path__contains", "dev/web/os/")).respond_with(page(&below)).mount(&server).await;
+            all().respond_with(page(&[])).with_priority(10).mount(&server).await; // any other query finds nothing
+            Mock::given(method("GET")).and(path("/pulp/api/v3/distributions/rpm/rpm/")).respond_with(page(&[])).mount(&server).await;
+            assert_eq!(svc.promote_target("web", &env, &repo, None).await.unwrap(), format!("{new}{why}"));
+        }
     }
 
     /// A served manifest that lists other files than the snapshot holds: promoting again cannot fix it.
