@@ -6514,15 +6514,17 @@ mod tests {
         let fails = "File: a mirror sync of docs from a Git remote makes the new version, then its task fails \
                      (pulp_file has no manifest to publish for a Git remote). Use additive.";
         let item = |label: &str, note: &str| PickItem { label: label.into(), value: label.into(), note: note.into() };
-        // Untouched: the default Git remote; picked: a File remote, then a Git remote.
-        for (picked, git_line) in [(None, true), (Some("files"), false), (Some("up-git"), true)] {
+        // Untouched: the default Git remote; picked: a File remote, then another Git remote (the default one, picked,
+        // leaves the field untouched).
+        for (picked, git_line) in [(None, true), (Some("files"), false), (Some("other-git"), true)] {
             repo_action(&mut app, RepoType::File, Act::Sync, json!({ "pulp_href": repo, "name": "docs", "remote": git }));
             settle(&mut app, &mut rx).await;
             let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
             set(&mut form, "policy", "mirror");
             if let Some(p) = picked {
                 let field = form.fields.iter_mut().find(|f| f.key == "remote").unwrap();
-                (field.value, field.options) = (p.into(), Some(vec![item("files", ""), item("up-git", "Git")]));
+                let options = vec![item("files", ""), item("up-git", "Git"), item("other-git", "Git")];
+                (field.value, field.options) = (p.into(), Some(options));
             }
             submit(&mut app, &form).unwrap();
             settle(&mut app, &mut rx).await;
