@@ -2,7 +2,8 @@
 //!
 //! Keeps the last `MAX_ROWS` rows (hidden poll rows are dropped first); each stored body is cut at
 //! `MAX_BODY` bytes. JSON keys in `SECRET_KEYS` (`password`, `token`, `secret`, …) and any key ending in
-//! `_<one of them>` are replaced with `•••` at any depth. The Authorization header is
+//! `_<one of them>` are replaced with `•••` at any depth, and so is the user info of a URL in any string
+//! (`http://•••@host/`). The Authorization header is
 //! never recorded (`Request` has no header field) and upload bodies are replaced by their size. The log
 //! lives in memory only and is never written to disk.
 
@@ -151,8 +152,22 @@ pub fn redact(v: &mut Value) {
             }
         }
         Value::Array(a) => a.iter_mut().for_each(redact),
+        // A remote's `url` and `proxy_url`, a domain's S3 `proxies`: the user info of a URL is a secret.
+        Value::String(s) => {
+            if let Some(masked) = masked_user_info(s) {
+                *s = masked;
+            }
+        }
         _ => {}
     }
+}
+
+/// `u` with the user info of its URL (`scheme://user:password@host`) as `•••`; None when it has none. The user
+/// info ends at the last `@` before the path, query or fragment.
+fn masked_user_info(u: &str) -> Option<String> {
+    let (scheme, rest) = u.split_once("://")?;
+    let at = rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())].rfind('@')?;
+    Some(format!("{scheme}://•••{}", &rest[at..]))
 }
 
 /// A GET of one task or task group: the polling a running job does every moment.
@@ -275,6 +290,23 @@ mod tests {
         ] {
             assert_eq!(s[k], "•••", "{k}: {s}");
         }
+    }
+
+    /// A remote's `url` and `proxy_url`, and a domain's S3 `proxies`, are readable on GET: their user info is masked
+    /// (audit F42).
+    #[test]
+    fn redact_masks_the_user_info_of_urls() {
+        let mut v = json!({ "url": "http://u:p@h/x/", "proxy_url": "https://user@proxy.example:3128",
+            "storage_settings": { "proxies": { "http": "http://pu:pp@proxy:3128", "https": "https://proxy:3128" } },
+            "base_url": "https://pulp.example/pulp/content/a@b/", "description": "mail u:p@h" });
+        redact(&mut v);
+        assert_eq!(
+            v,
+            json!({ "url": "http://•••@h/x/", "proxy_url": "https://•••@proxy.example:3128",
+                "storage_settings": { "proxies": { "http": "http://•••@proxy:3128", "https": "https://proxy:3128" } },
+                "base_url": "https://pulp.example/pulp/content/a@b/", "description": "mail u:p@h" }),
+            "an @ in the path, or a text that is not a URL, stays"
+        );
     }
 
     #[test]

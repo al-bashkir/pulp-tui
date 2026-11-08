@@ -526,7 +526,10 @@ client clock).
   readable on GET). A domain's storage settings are one masked field in forms; Inspect,
   Details and Logs mask the S3 and Azure credentials in them (Azure `connection_string`,
   `token_credential` and `sas_token` are readable on GET). The key list is
-  `session_log::SECRET_KEYS`; the repository export uses it too.
+  `session_log::SECRET_KEYS`; the repository export uses it too. They also mask the user
+  info of every URL (`http://•••@host/`): a remote's `url` and `proxy_url` and a domain's
+  S3 `proxies` are readable on GET. The Remotes list column and the Edit form still show the
+  URL as Pulp has it.
 * The Logs screen (`src/session_log.rs`) keeps the last 1000 entries in memory, bodies cut
   at 64 KiB, secret keys redacted (any case), upload bodies replaced by their size. It is
   never written to disk.
