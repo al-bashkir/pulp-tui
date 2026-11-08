@@ -811,14 +811,24 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
                 app.job(format!("{verb} {name} v{} -> {env}", v.number), move |ctx| async move {
                     let svc = ctx.cv()?.locked(cv, &format!("{verb} to {env}")).await?;
                     let res = svc.promote(cv, vid, e.id, mode, &ctx.log(), &ctx.on_task()).await;
-                    let issues = svc.verify(cv, e.id).await.unwrap_or_else(|e| vec![e.to_string()]);
+                    let drift = svc.drift(cv, e.id).await.map_err(|e| e.to_string());
                     ap(move |app| {
-                        match (res, issues.is_empty()) {
-                            (Ok(()), true) => app.ok(format!("{name} v{} active in {env}; served metadata verified", v.number)),
-                            (Ok(()), false) => {
-                                app.notify(Level::Warn, format!("{name} in {env}: bound, verification found: {}", issues.join("; ")))
-                            }
+                        match (res, drift) {
                             (Err(e), _) => app.error(format!("{e:#} (partial states are recorded; promote again to retry or roll back)")),
+                            // `Fix::Unchecked` is not drift, as in the drift check.
+                            (Ok(()), Ok(d)) if d.iter().all(|d| d.fix == Fix::Unchecked) => {
+                                let unchecked: Vec<String> = d.into_iter().map(|d| d.text).collect();
+                                let note = if unchecked.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("; File: no manifest compared ({})", unchecked.join("; "))
+                                };
+                                app.ok(format!("{name} v{} active in {env}; served metadata verified{note}", v.number))
+                            }
+                            (Ok(()), d) => {
+                                let issues = d.map_or_else(|e| e, |d| d.into_iter().map(|d| d.text).collect::<Vec<_>>().join("; "));
+                                app.notify(Level::Warn, format!("{name} in {env}: bound, verification found: {issues}"))
+                            }
                         }
                         app.reload();
                     })
@@ -2245,6 +2255,53 @@ mod tests {
         drain(&mut app, &mut rx).await;
         let notices: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
         assert!(notices.contains(&"web v1 active in Library; served metadata verified"), "{notices:?}");
+        assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v.id));
+    }
+
+    /// A promotion of a File repository whose publication has no manifest completes OK, as Verify says, and the notice
+    /// says that no manifest was compared.
+    #[tokio::test]
+    async fn a_promotion_without_a_file_manifest_is_ok_and_says_no_manifest_compared() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        app.push(Kind::ContentViews);
+        drain(&mut app, &mut rx).await;
+        let lib = st.ensure_library("lab").await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = st.begin_version(web, "", &[cv_repo("docs", "file", "1")]).await.unwrap();
+        let (dv, publication, dist) = (
+            format!("{REPOS}file/file/2/versions/1/"),
+            "/pulp/api/v3/publications/file/file/1/",
+            "/pulp/api/v3/distributions/file/file/3/",
+        );
+        let row = crate::store::CvVersionRepo {
+            derived_version: Some(dv.clone()),
+            publication: Some(publication.into()),
+            ..st.version_repos(v.id).await.unwrap().remove(0)
+        };
+        st.save_version_repo(&row).await.unwrap();
+        st.finish_version(v.id, "published", None).await.unwrap();
+        // The distribution of the derived name already serves the publication: the promotion sends nothing.
+        let labels = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: LIBRARY, crate::cv::LABEL_DB: st.db_id() });
+        let base = format!("{}/pulp/content/library/web/docs/", server.uri());
+        let d = json!({ "pulp_href": dist, "name": crate::cv::distribution_name("web", LIBRARY, "docs"), "base_path": "library/web/docs",
+            "base_url": base, "publication": publication, "pulp_labels": labels });
+        serve(&server, "GET", "/pulp/api/v3/distributions/file/file/".into(), 200, json!({ "count": 1, "next": null, "results": [d] }))
+            .await;
+        serve(&server, "GET", dist.into(), 200, d).await;
+        let p = json!({ "pulp_href": publication, "repository_version": dv, "manifest": null });
+        serve(&server, "GET", publication.into(), 200, p).await;
+        serve(&server, "GET", dv.clone(), 200, json!({ "pulp_href": dv })).await;
+        promote_preview(&mut app, web, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirmation: {:?}", last_notice(&app)) };
+        on_yes.unwrap()(&mut app);
+        drain(&mut app, &mut rx).await;
+        let ok = "web v1 active in Library; served metadata verified; File: no manifest compared (docs: the publication has no \
+                  manifest: served files not compared)";
+        let notices: Vec<(Level, &str)> = app.notices.iter().map(|n| (n.level, n.text.as_str())).collect();
+        assert!(notices.contains(&(Level::Ok, ok)), "{notices:?}");
         assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v.id));
     }
 

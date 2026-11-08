@@ -279,7 +279,8 @@ new version; served files that differ need a repair; a missing `base_url` needs
 * While a workflow holds a live lock on the view, the hint names that workflow: the lock
   refuses Promote and Rollback.
 * `Fix::Unchecked` is not drift: a File publication without a manifest gives nothing to
-  compare. The drift check and the relabel result say `OK` with that note.
+  compare. The drift check, the relabel result and the promotion result say `OK` with that
+  note.
 
 ### Delete
 
