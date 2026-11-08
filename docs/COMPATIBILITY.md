@@ -508,8 +508,8 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   as its base path, before it stores anything.
 * **File mirror sync publishes** (pulp_file 3.123.1, `tasks/synchronizing.py`): a sync with
   `mirror` that makes a version also makes a pass-through publication of it with the upstream
-  manifest (live). pulp_deb 3.11.1 mirror makes none. The mirror confirm names a publication
-  for RPM `mirror_complete` only.
+  manifest (live). pulp_deb 3.11.1 mirror makes none. The mirror confirm says so for each File
+  repository, as it does for RPM `mirror_complete`.
 * **RPM publications.** A `mirror_complete` sync makes its own publication with upstream
   paths, so served-content checks also try `location_href`. The RPM publication has no
   `distributions` field (the File one has) and `distributions/` has no `publication`

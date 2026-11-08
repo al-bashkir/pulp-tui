@@ -1517,13 +1517,15 @@ async fn mirror_sync_through_the_tui(t: RepoType, path: &str, policy: &str) {
     assert_eq!(typed, None, "the retention keeps the current version: {lines:?}");
     assert_eq!(lines[0], "Mirror sync makes the NEW repository version match the upstream exactly:");
     assert_eq!(lines.iter().any(|l| l.starts_with("mirror_complete also publishes")), policy == "mirror_complete", "{lines:?}");
+    let file = format!("File: the mirror sync of {name} also publishes the new version");
+    assert_eq!(lines.iter().any(|l| l.starts_with(&file)), t == RepoType::File, "{lines:?}");
     settle_tasks(&mut app, &mut rx).await;
     shown(&app, &format!("task completed: sync {name} ({policy})"));
     let v3 = latest(&c, &repo).await;
     assert!(v3.ends_with("/versions/3/"), "{v3}");
     let keys = async |v: &str| ops::content_keys(&c, t, Some(v)).await.unwrap();
     assert_eq!(keys(&v3).await, keys(&v1).await, "the upstream content again");
-    // pulp_file 3.123 also publishes a mirror sync (docs/COMPATIBILITY.md); the confirm names only mirror_complete.
+    // pulp_file 3.123 also publishes a mirror sync (docs/COMPATIBILITY.md), as the confirm says.
     let pubs: Vec<Value> = c.list_all(&c.api(t.publications()), &[("repository_version", v3.clone())], 10).await.unwrap();
     assert_eq!(pubs.len(), usize::from(policy == "mirror_complete" || t == RepoType::File), "{pubs:?}");
     // The repository delete takes its publications along.

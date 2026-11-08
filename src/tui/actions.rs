@@ -282,11 +282,15 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl 
     }
     let complete = policy == "mirror_complete";
     app.job("read the retention of the repositories", move |ctx| async move {
-        let mut goes = vec![];
+        let (mut goes, mut files) = (vec![], vec![]);
         for href in repos {
             let r: Value = ctx.client.get(&href, &[]).await?;
             if latest_goes(&ctx, &r, 1).await?.is_some() {
                 goes.push(s(&r, "name"));
+            }
+            // pulp_file publishes the version of a mirror sync (pass-through, upstream manifest); pulp_deb does not.
+            if RepoType::from_href(&href) == Some(RepoType::File) {
+                files.push(s(&r, "name"));
             }
         }
         ap(move |app| {
@@ -301,6 +305,12 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl 
             }
             if complete {
                 lines.push("mirror_complete also publishes the upstream metadata unchanged (a publication is created).".into());
+            }
+            if !files.is_empty() {
+                let names = files.join(", ");
+                lines.push(format!(
+                    "File: the mirror sync of {names} also publishes the new version with the upstream manifest (a publication is created)."
+                ));
             }
             if goes.is_empty() {
                 app.confirm("Confirm mirror sync", lines, go)
@@ -6319,6 +6329,27 @@ mod tests {
         settle(&mut app, &mut rx).await;
         let Some(Modal::Confirm { lines, .. }) = &app.modal else { panic!("no confirm") };
         assert_eq!(lines.len(), 3);
+    }
+
+    /// pulp_file publishes the version of a mirror sync (pass-through, with the upstream manifest); pulp_deb does not.
+    /// The confirm names the File repositories that get a publication.
+    #[tokio::test]
+    async fn mirror_confirm_names_the_publication_of_a_file_mirror_sync() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (file, deb) = (format!("{API}repositories/file/file/docs/"), format!("{API}repositories/deb/apt/apt/"));
+        for (href, name) in [(&file, "docs"), (&deb, "apt")] {
+            get(&server, href, json!({ "pulp_href": href, "name": name, "latest_version_href": format!("{href}versions/1/") })).await;
+        }
+        let (mut app, mut rx) = connected(&server).await;
+        let line = "File: the mirror sync of docs also publishes the new version with the upstream manifest (a publication is created).";
+        for (repos, named) in [(vec![file.clone(), deb.clone()], true), (vec![deb.clone()], false)] {
+            confirm_mirror(&mut app, "mirror", repos, |_| {});
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm") };
+            assert_eq!(lines.iter().any(|l| l == line), named, "{lines:?}");
+            assert!(!lines.iter().any(|l| l.contains("apt also publishes")), "{lines:?}");
+        }
     }
 
     #[test]
