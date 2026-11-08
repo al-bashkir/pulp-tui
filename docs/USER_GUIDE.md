@@ -55,7 +55,8 @@ These rules apply to all screens. The screen sections do not repeat them.
 * **Content View objects** belong to pulp-tui: snapshot repositories (`pulp-tui-cv-<view>-<repo>`,
   label `pulp_tui_cv`) and Content View distributions. The Pulp screens do not edit, sync, upload
   to, copy into, reclaim or restore a snapshot repository, change its content, or delete it, its
-  versions or its publications. Use the Content View actions.
+  versions or its publications. Use the Content View actions of the database that owns the
+  object: the refusal names it (label `pulp_tui_db`).
 * **Dialogs of background jobs** wait until the open dialog closes (the footer shows
   `N dialog(s) waiting`). A new dialog ignores keys for 0.3 s.
 

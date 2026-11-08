@@ -188,15 +188,15 @@ fn cv_owner(item: &Value) -> Option<String> {
     item["pulp_labels"].get(crate::cv::LABEL_CV).and_then(Value::as_str).map(str::to_string)
 }
 
-/// Refuse any change of a Content View snapshot repository, also one of another database (`pulp_tui_db`).
+/// Refuse any change of a Content View snapshot repository, also one of another database (`pulp_tui_db`): the text
+/// names that database as the place to act (the id can be this database, one of its aliases, or another one).
 pub(super) fn snapshot_refusal(repo: &Value) -> Option<String> {
-    let db = repo["pulp_labels"].get(crate::cv::LABEL_DB).and_then(Value::as_str).map(|d| format!(" (database {d})")).unwrap_or_default();
+    let (db, act) = match repo["pulp_labels"].get(crate::cv::LABEL_DB).and_then(Value::as_str) {
+        Some(d) => (format!(" (database {d})"), "of that database"),
+        None => (String::new(), "(publish a new version, delete a version or the view)"),
+    };
     cv_owner(repo).map(|cv| {
-        format!(
-            "refused: {} is a snapshot repository of Content View {cv}{db}; \
-             use the Content View actions (publish a new version, delete a version or the view)",
-            s(repo, "name")
-        )
+        format!("refused: {} is a snapshot repository of Content View {cv}{db}; use the Content View actions {act}", s(repo, "name"))
     })
 }
 
@@ -7059,6 +7059,24 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("other") || l.contains("unbound")), "{lines:?}");
     }
 
+    /// The refusal names the database of the snapshot as the place to act: a snapshot of another database has no view
+    /// in this one, so "use the Content View actions" alone would not work there (audit F51).
+    #[test]
+    fn a_snapshot_refusal_names_the_database_that_owns_the_snapshot() {
+        let repo = |labels: Value| json!({ "name": "snap", "pulp_labels": labels });
+        assert_eq!(
+            snapshot_refusal(&repo(json!({ "pulp_tui_cv": "web", "pulp_tui_db": "other-db" }))).unwrap(),
+            "refused: snap is a snapshot repository of Content View web (database other-db); \
+             use the Content View actions of that database"
+        );
+        assert_eq!(
+            snapshot_refusal(&repo(json!({ "pulp_tui_cv": "web" }))).unwrap(),
+            "refused: snap is a snapshot repository of Content View web; \
+             use the Content View actions (publish a new version, delete a version or the view)"
+        );
+        assert_eq!(snapshot_refusal(&repo(json!({}))), None);
+    }
+
     /// A Content View snapshot repository, also one of another database, is never deleted from the Repositories screen.
     #[tokio::test]
     async fn delete_refuses_a_snapshot_repository_alone_and_marked() {
@@ -7073,7 +7091,7 @@ mod tests {
         let (mut app, mut rx) = connected(&server).await;
         app.list.kind = Kind::Repos(RepoType::File, false);
         let refused = "refused: snap is a snapshot repository of Content View web (database other-db); \
-                       use the Content View actions (publish a new version, delete a version or the view)";
+                       use the Content View actions of that database";
         let last = |app: &App| app.notices.back().map(|n| n.text.clone()).unwrap_or_default();
 
         run(&mut app, Act::Delete, snap_row);
