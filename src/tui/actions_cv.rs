@@ -568,7 +568,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                     app.form(form, move |app, f| {
                         let number: i64 = f.get("version").parse().map_err(|_| "pick a version")?;
                         let vid = versions.iter().find(|v| v.number == number).map(|v| v.id).ok_or("unknown version")?;
-                        promote_preview(app, id, name.clone(), vid, f.get("env").to_string(), mode);
+                        promote_preview(app, name.clone(), vid, f.get("env").to_string(), mode);
                         Ok(())
                     });
                 })
@@ -767,79 +767,20 @@ async fn shown_binding(st: &Store, b: &Binding) -> anyhow::Result<String> {
 }
 
 /// Show the exact distribution changes of a promotion/rollback, then run it.
-fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, mode: Mode) {
+fn promote_preview(app: &mut App, name: String, vid: i64, env: String, mode: Mode) {
     app.job(format!("preview {name} -> {env}"), move |ctx| async move {
         let svc = ctx.cv()?;
-        let st = &svc.store;
-        let envs = st.environments(&svc.scope).await?;
+        let envs = svc.store.environments(&svc.scope).await?;
         let e = envs.into_iter().find(|e| e.name == env).ok_or_else(|| anyhow!("unknown environment {env}"))?;
-        let v = st.version(vid).await?;
-        // The rules of `CvService::promote`, before a preview that the operator would confirm in vain.
-        let refusal = match mode {
-            Mode::Promote => svc.promote_refusal(&v, &e).await?,
-            Mode::Rollback if e.prior_id.is_some() => crate::cv::rollback_refusal(&env, v.number, svc.bound_number(e.id, cv).await?),
-            Mode::Rollback => None,
-        };
-        if let Some(why) = refusal {
+        let v = svc.store.version(vid).await?;
+        if let Some(why) = promotion_refusal(&svc, &e, &v, mode).await? {
             return ap(move |app| app.error(why));
         }
-        let cur_num = match st.binding(e.id, cv).await? {
-            Some(b) => shown_binding(st, &b).await?,
-            None => "nothing".into(),
-        };
-        let mut lines = vec![format!("{name}: {env} now serves {cur_num}; will serve v{}", v.number), String::new()];
-        let (vrs, rows) = (st.version_repos(vid).await?, st.binding_repos(e.id, cv).await?);
-        for vr in &vrs {
-            let row = rows.iter().find(|b| b.repo_href == vr.repo().repo_href);
-            lines.push(svc.promote_target(&name, &e, vr.repo(), row).await?);
-        }
-        for b in rows {
-            if !svc.needs_unbind(&vrs, &b).await? {
-                continue;
-            }
-            let outside = if b.publication.is_none() { "; Pulp shows that it serves a publication set outside pulp-tui" } else { "" };
-            lines.push(format!(
-                "  {}: not part of v{} -> its distribution stops serving (kept for rollback){outside}",
-                b.repo_name, v.number
-            ));
-        }
-        if mode == Mode::Rollback {
-            lines.push(String::new());
-            lines.push("Rollback only changes bindings; newer versions stay available.".into());
-            lines.push("Files of the replaced publications may stay downloadable for Pulp's".into());
-            lines.push("DISTRIBUTED_PUBLICATION_RETENTION_PERIOD; repository metadata switches immediately.".into());
-        }
+        let lines = promote_lines(&svc, &name, &e, &v, mode).await?;
         let protected = e.protected;
         let (title, danger_title, typed) = (format!("{name} -> {env}"), format!("{env} is protected"), env.clone());
         ap(move |app| {
-            let go = move |app: &mut App| {
-                let verb = if mode == Mode::Promote { "promote" } else { "rollback" };
-                app.job(format!("{verb} {name} v{} -> {env}", v.number), move |ctx| async move {
-                    let svc = ctx.cv()?.locked(cv, &format!("{verb} to {env}")).await?;
-                    let res = svc.promote(cv, vid, e.id, mode, &ctx.log(), &ctx.on_task()).await;
-                    let drift = svc.drift(cv, e.id).await.map_err(|e| e.to_string());
-                    ap(move |app| {
-                        match (res, drift) {
-                            (Err(e), _) => app.error(format!("{e:#} (partial states are recorded; promote again to retry or roll back)")),
-                            // `Fix::Unchecked` is not drift, as in the drift check.
-                            (Ok(()), Ok(d)) if d.iter().all(|d| d.fix == Fix::Unchecked) => {
-                                let unchecked: Vec<String> = d.into_iter().map(|d| d.text).collect();
-                                let note = if unchecked.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!("; File: no manifest compared ({})", unchecked.join("; "))
-                                };
-                                app.ok(format!("{name} v{} active in {env}; served metadata verified{note}", v.number))
-                            }
-                            (Ok(()), d) => {
-                                let issues = d.map_or_else(|e| e, |d| d.into_iter().map(|d| d.text).collect::<Vec<_>>().join("; "));
-                                app.notify(Level::Warn, format!("{name} in {env}: bound, verification found: {issues}"))
-                            }
-                        }
-                        app.reload();
-                    })
-                });
-            };
+            let go = move |app: &mut App| run_promotion(app, name, v, e, mode);
             if protected {
                 app.confirm_danger(danger_title, lines, &typed, go);
             } else {
@@ -847,6 +788,86 @@ fn promote_preview(app: &mut App, cv: i64, name: String, vid: i64, env: String, 
             }
         })
     });
+}
+
+/// The rules of `CvService::promote` that refuse the `mode` of version `v` to `e`, before a preview that the operator
+/// would confirm in vain.
+async fn promotion_refusal(svc: &CvService, e: &Environment, v: &CvVersion, mode: Mode) -> anyhow::Result<Option<String>> {
+    Ok(match mode {
+        Mode::Promote => svc.promote_refusal(v, e).await?,
+        Mode::Rollback if e.prior_id.is_some() => crate::cv::rollback_refusal(&e.name, v.number, svc.bound_number(e.id, v.cv_id).await?),
+        Mode::Rollback => None,
+    })
+}
+
+/// The preview of the `mode` of version `v` of view `name` to `e`: what `e` serves now, a line per repository
+/// (`repo_lines`), and what a rollback keeps.
+async fn promote_lines(svc: &CvService, name: &str, e: &Environment, v: &CvVersion, mode: Mode) -> anyhow::Result<Vec<String>> {
+    let now = match svc.store.binding(e.id, v.cv_id).await? {
+        Some(b) => shown_binding(&svc.store, &b).await?,
+        None => "nothing".into(),
+    };
+    let mut lines = vec![format!("{name}: {} now serves {now}; will serve v{}", e.name, v.number), String::new()];
+    lines.extend(repo_lines(svc, name, e, v).await?);
+    if mode == Mode::Rollback {
+        lines.push(String::new());
+        lines.push("Rollback only changes bindings; newer versions stay available.".into());
+        lines.push("Files of the replaced publications may stay downloadable for Pulp's".into());
+        lines.push("DISTRIBUTED_PUBLICATION_RETENTION_PERIOD; repository metadata switches immediately.".into());
+    }
+    Ok(lines)
+}
+
+/// The distribution in `e` of each repository of version `v` (`CvService::promote_target`), then each one that the
+/// version lacks and whose distribution stops serving (`CvService::needs_unbind`).
+async fn repo_lines(svc: &CvService, name: &str, e: &Environment, v: &CvVersion) -> anyhow::Result<Vec<String>> {
+    let (vrs, rows) = (svc.store.version_repos(v.id).await?, svc.store.binding_repos(e.id, v.cv_id).await?);
+    let mut lines = vec![];
+    for vr in &vrs {
+        let row = rows.iter().find(|b| b.repo_href == vr.repo().repo_href);
+        lines.push(svc.promote_target(name, e, vr.repo(), row).await?);
+    }
+    for b in rows {
+        if !svc.needs_unbind(&vrs, &b).await? {
+            continue;
+        }
+        let outside = if b.publication.is_none() { "; Pulp shows that it serves a publication set outside pulp-tui" } else { "" };
+        lines.push(format!("  {}: not part of v{} -> its distribution stops serving (kept for rollback){outside}", b.repo_name, v.number));
+    }
+    Ok(lines)
+}
+
+/// The confirmed `mode` of version `v` of view `name` to `e`, under the view's lock, then what Verify finds.
+fn run_promotion(app: &mut App, name: String, v: CvVersion, e: Environment, mode: Mode) {
+    let (verb, env) = (if mode == Mode::Promote { "promote" } else { "rollback" }, e.name.clone());
+    app.job(format!("{verb} {name} v{} -> {env}", v.number), move |ctx| async move {
+        let svc = ctx.cv()?.locked(v.cv_id, &format!("{verb} to {env}")).await?;
+        let res = svc.promote(v.cv_id, v.id, e.id, mode, &ctx.log(), &ctx.on_task()).await;
+        let drift = svc.drift(v.cv_id, e.id).await.map_err(|e| e.to_string());
+        ap(move |app| {
+            promotion_result(app, &name, &env, v.number, res, drift);
+            app.reload();
+        })
+    });
+}
+
+/// The notice of the promotion of version `number` of view `name` to `env` that ended `res`, after which Verify found
+/// `drift`.
+fn promotion_result(app: &mut App, name: &str, env: &str, number: i64, res: anyhow::Result<()>, drift: Result<Vec<Drift>, String>) {
+    match (res, drift) {
+        (Err(e), _) => app.error(format!("{e:#} (partial states are recorded; promote again to retry or roll back)")),
+        // `Fix::Unchecked` is not drift, as in the drift check.
+        (Ok(()), Ok(d)) if d.iter().all(|d| d.fix == Fix::Unchecked) => {
+            let unchecked: Vec<String> = d.into_iter().map(|d| d.text).collect();
+            let note =
+                if unchecked.is_empty() { String::new() } else { format!("; File: no manifest compared ({})", unchecked.join("; ")) };
+            app.ok(format!("{name} v{number} active in {env}; served metadata verified{note}"))
+        }
+        (Ok(()), d) => {
+            let issues = d.map_or_else(|e| e, |d| d.into_iter().map(|d| d.text).collect::<Vec<_>>().join("; "));
+            app.notify(Level::Warn, format!("{name} in {env}: bound, verification found: {issues}"))
+        }
+    }
 }
 
 /// Show the distributions that unpromoting deletes, then run it.
@@ -963,7 +984,7 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                     app.form(
                         Form::new(format!("v{number} -> environment"), vec![Field::new("env", "Environment", FieldKind::Choice(envs))]),
                         move |app, f| {
-                            promote_preview(app, cv, name.clone(), vid, f.get("env").to_string(), mode);
+                            promote_preview(app, name.clone(), vid, f.get("env").to_string(), mode);
                             Ok(())
                         },
                     )
@@ -2237,7 +2258,7 @@ mod tests {
             let labels = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: "Dev" });
             let renamed = json!({ "pulp_href": os, "name": "os-moved", "base_path": at, "pulp_labels": labels });
             serve(&server, "GET", os.into(), 200, renamed).await;
-            promote_preview(&mut app, web, "web".into(), v.id, "Dev".into(), Mode::Promote);
+            promote_preview(&mut app, "web".into(), v.id, "Dev".into(), Mode::Promote);
             drain(&mut app, &mut rx).await;
             assert_eq!(confirm_lines(&mut app)[2..4], [docs, want], "renamed one at {at}");
         }
@@ -2268,7 +2289,7 @@ mod tests {
         }
         serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/1/".into(), 200, json!({ "publication": "/p/3/" })).await;
         serve(&server, "GET", "/pulp/api/v3/distributions/rpm/rpm/2/".into(), 200, json!({ "publication": null })).await;
-        promote_preview(&mut app, web, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         let old = "  old: not part of v1 -> its distribution stops serving (kept for rollback); Pulp shows that it serves a \
                    publication set outside pulp-tui";
@@ -2286,7 +2307,7 @@ mod tests {
         let lib = st.ensure_library("lab").await.unwrap();
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let v = publish_empty(&st, web).await; // no repositories: nothing to send to Pulp
-        promote_preview(&mut app, web, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirmation: {:?}", last_notice(&app)) };
         on_yes.unwrap()(&mut app);
@@ -2325,9 +2346,11 @@ mod tests {
         // Its distribution is gone: the promotion has nothing to unserve, and Verify names it.
         let gone = left_out(&st, lib, web, "8", None).await;
         serve(&server, "GET", gone.distribution.clone(), 404, json!({ "detail": "Not found." })).await;
-        promote_preview(&mut app, web, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
-        let Some(Modal::Confirm { title, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", last_notice(&app)) };
+        let Some(Modal::Confirm { title, typed, on_yes: Some(yes), .. }) = app.modal.take() else {
+            panic!("no confirm: {:?}", last_notice(&app))
+        };
         assert_eq!((title.as_str(), typed.as_deref()), ("Library is protected", Some(LIBRARY)));
         yes(&mut app);
         drain(&mut app, &mut rx).await;
@@ -2351,7 +2374,7 @@ mod tests {
         let old = left_out(&st, lib, web, "9", Some("/pulp/api/v3/publications/rpm/rpm/3/")).await;
         let theirs = json!({ "pulp_href": old.distribution, "name": "theirs", "base_path": old.base_path, "pulp_labels": {} });
         serve(&server, "GET", old.distribution.clone(), 200, theirs).await;
-        promote_preview(&mut app, web, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", last_notice(&app)) };
         assert_eq!(lines[2], "  r9: not part of v1 -> its distribution stops serving (kept for rollback)");
@@ -2400,7 +2423,7 @@ mod tests {
         let p = json!({ "pulp_href": publication, "repository_version": dv, "manifest": null });
         serve(&server, "GET", publication.into(), 200, p).await;
         serve(&server, "GET", dv.clone(), 200, json!({ "pulp_href": dv })).await;
-        promote_preview(&mut app, web, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirmation: {:?}", last_notice(&app)) };
         on_yes.unwrap()(&mut app);
@@ -2492,7 +2515,7 @@ mod tests {
         st.create_env("lab", "Dev", lib, false).await.unwrap();
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let v = publish_empty(&st, web).await; // not active in Library
-        promote_preview(&mut app, web, "web".into(), v.id, "Dev".into(), Mode::Promote);
+        promote_preview(&mut app, "web".into(), v.id, "Dev".into(), Mode::Promote);
         drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none(), "no preview to confirm");
         assert_eq!(last_notice(&app), (Level::Error, "version 1 is not active in Library; promote it there first (or use rollback)"));
@@ -2515,7 +2538,7 @@ mod tests {
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let v = publish_empty(&st, web).await;
         st.promoted(dev, web, v.id, "promoting").await.unwrap(); // no live lock: the client that ran it ended
-        promote_preview(&mut app, web, "web".into(), v.id, "Dev".into(), Mode::Rollback);
+        promote_preview(&mut app, "web".into(), v.id, "Dev".into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         assert_eq!(confirm_lines(&mut app)[0], "web: Dev now serves nothing (v1 interrupted); will serve v1");
         cv_action(&mut app, "lab", Act::CvDrift, json!({ "id": web, "name": "web" }));
@@ -2635,16 +2658,16 @@ mod tests {
         let dev = st.create_env("lab", "Dev", st.ensure_library("lab").await.unwrap(), false).await.unwrap();
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let (v1, v2) = (publish_empty(&st, web).await, publish_empty(&st, web).await);
-        promote_preview(&mut app, web, "web".into(), v2.id, "Dev".into(), Mode::Rollback);
+        promote_preview(&mut app, "web".into(), v2.id, "Dev".into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none(), "no preview to confirm");
         assert_eq!(last_notice(&app), (Level::Error, "no version is active in Dev; use Promote"));
         st.promoted(dev, web, v1.id, "active").await.unwrap();
-        promote_preview(&mut app, web, "web".into(), v2.id, "Dev".into(), Mode::Rollback);
+        promote_preview(&mut app, "web".into(), v2.id, "Dev".into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none(), "no preview to confirm");
         assert_eq!(last_notice(&app), (Level::Error, "v2 is newer than the active v1 in Dev; use Promote"));
-        promote_preview(&mut app, web, "web".into(), v1.id, "Dev".into(), Mode::Rollback);
+        promote_preview(&mut app, "web".into(), v1.id, "Dev".into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         assert_eq!(confirm_lines(&mut app)[0], "web: Dev now serves v1; will serve v1", "the active version again: a retry");
     }
