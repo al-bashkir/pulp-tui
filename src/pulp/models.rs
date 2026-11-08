@@ -404,6 +404,26 @@ impl Task {
     }
 }
 
+/// Seconds since the epoch of an API time `YYYY-MM-DDTHH:MM:SS[.ffffff](Z|±HH:MM)`: Pulp prints its `TIME_ZONE`.
+fn epoch_secs(t: &str) -> Option<i64> {
+    let n = |s: &str, r: std::ops::Range<usize>| -> Option<i64> { s.get(r)?.parse().ok() };
+    let (m, d) = (n(t, 5..7)?, n(t, 8..10)?);
+    let y = n(t, 0..4)? - i64::from(m <= 2);
+    // Days of the civil date: the inverse of `store::rfc3339`.
+    let (era, doy) = (y.div_euclid(400), (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1);
+    let yoe = y - era * 400;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let zone = t.get(19..)?.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let hm = || Some(n(zone, 1..3)? * 3600 + n(zone, 4..6)? * 60);
+    let offset = match zone.get(..1)? {
+        "Z" if zone.len() == 1 => 0,
+        "+" => hm()?,
+        "-" => -hm()?,
+        _ => return None,
+    };
+    Some(days * 86_400 + n(t, 11..13)? * 3600 + n(t, 14..16)? * 60 + n(t, 17..19)? - offset)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct TaskGroup {
     pub pulp_href: String,
@@ -458,12 +478,11 @@ impl TaskGroup {
                 || self.done() > 0
                     && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh || self.idle_long(now)))
     }
-    /// The newest `finished_at` (Pulp's UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`) is `IDLE_FINAL_SECS` or more before
-    /// `now` (seconds since the epoch, client clock); the same format compares as text.
+    /// The newest `finished_at` (`epoch_secs`) is `IDLE_FINAL_SECS` or more before `now` (seconds since the epoch,
+    /// client clock).
     fn idle_long(&self, now: u64) -> bool {
-        let cutoff = crate::store::rfc3339(now.saturating_sub(IDLE_FINAL_SECS));
-        let newest = self.tasks.iter().filter_map(|t| t["finished_at"].as_str()?.get(..19)).max();
-        newest.is_some_and(|f| f <= &cutoff[..19])
+        let newest = self.tasks.iter().filter_map(|t| epoch_secs(t["finished_at"].as_str()?)).max();
+        newest.is_some_and(|f| f + IDLE_FINAL_SECS as i64 <= now as i64)
     }
     /// How a final group ended: a failed task fails it; a canceled or skipped task is not a success either.
     pub fn outcome(&self) -> &'static str {
@@ -906,6 +925,20 @@ mod tests {
         // The rule starts at exactly IDLE_FINAL_SECS: 2026-01-01T00:20:00Z is 1_767_226_800.
         let ended = group(json!([{ "state": "completed", "finished_at": "2026-01-01T00:10:00.900000Z" }]));
         assert!(ended.idle_long(1_767_226_800) && !ended.idle_long(1_767_226_799));
+    }
+
+    /// Pulp prints times in its `TIME_ZONE` (audit F41): the same instant in UTC and with an offset gives the same rule.
+    #[test]
+    fn the_idle_rule_reads_the_offset_of_finished_at() {
+        use serde_json::json;
+        for at in ["2026-01-01T00:10:00.900000Z", "2026-01-01T05:10:00.900000+05:00", "2025-12-31T17:10:00-07:00"] {
+            let g = json!({ "pulp_href": "/g/7/", "completed": 1, "tasks": [{ "state": "completed", "finished_at": at }] });
+            let g: TaskGroup = serde_json::from_value(g).unwrap();
+            assert!(g.idle_long(1_767_226_800) && !g.idle_long(1_767_226_799), "{at}");
+        }
+        assert_eq!(epoch_secs("2026-01-01T00:20:00Z"), Some(1_767_226_800));
+        assert_eq!(epoch_secs("2000-03-01T00:00:00Z"), Some(951_868_800), "after a leap day");
+        assert_eq!(epoch_secs("yesterday"), None);
     }
 
     /// No group with tasks is final before a task of it ended; a failed or canceled task ends it also without the flag.
