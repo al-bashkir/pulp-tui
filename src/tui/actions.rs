@@ -3202,7 +3202,7 @@ fn package_record_create(app: &mut App, version: String) {
 }
 
 /// Find `package` in `version`, then add its record with release component `rc` (`name`) to the latest version, after
-/// a confirm when the latest version does not have the package.
+/// a confirm when the latest version does not have the package or the release component.
 fn package_record_job(app: &mut App, version: String, package: String, name: String, rc: String) {
     app.job(format!("find package {package}"), move |ctx| async move {
         let c = &ctx.client;
@@ -3212,20 +3212,25 @@ fn package_record_job(app: &mut App, version: String, package: String, name: Str
         }
         let p = deb::package_in(c, &version, &package).await?;
         let latest = s(&r, "latest_version_href");
-        let q = [("repository_version", latest.clone()), ("pulp_href__in", p.clone()), ("fields", "pulp_href".into())];
-        let back = !latest.is_empty() && latest != version && c.list::<Value>(&c.api("content/deb/packages/"), &q).await?.count == 0;
+        let mut back = vec![];
+        if !latest.is_empty() && latest != version {
+            for (path, href, what) in
+                [("packages/", &p, format!("package {package}")), ("release_components/", &rc, format!("release component {name}"))]
+            {
+                let q = [("repository_version", latest.clone()), ("pulp_href__in", href.clone()), ("fields", "pulp_href".into())];
+                if c.list::<Value>(&c.api(&format!("content/deb/{path}")), &q).await?.count == 0 {
+                    back.push(what);
+                }
+            }
+        }
         ap(move |app| {
             let label = format!("create package release component {package} in {name}");
-            let lines = vec![
-                format!(
-                    "NOTE: package {package} is not in the LATEST version {} of {}, which gets the record.",
-                    version_number(&latest),
-                    s(&r, "name")
-                ),
-                "The new version has the package again.".into(),
-            ];
+            let (n, repo) = (version_number(&latest), s(&r, "name"));
+            let mut lines: Vec<String> =
+                back.iter().map(|w| format!("NOTE: {w} is not in the LATEST version {n} of {repo}, which gets the record.")).collect();
+            lines.push(format!("The new version has the {} again.", back.join(" and the ")));
             let go = move |app: &mut App| add_package_record(app, version, label, p, rc);
-            if back { app.confirm("New package release component", lines, go) } else { go(app) }
+            if back.is_empty() { go(app) } else { app.confirm("New package release component", lines, go) }
         })
     });
 }
@@ -5664,6 +5669,50 @@ mod tests {
             }
             assert_eq!(modify().await, if back { 1 } else { 2 }, "{package}: {:?}", app.notices.back().map(|n| &n.text));
         }
+    }
+
+    /// The record also brings back its release component: from an older version, a release component that the latest
+    /// version removed is named in the confirm, and nothing is sent before it (audit F50).
+    #[tokio::test]
+    async fn a_package_release_component_from_an_older_version_confirms_a_release_component_that_comes_back() {
+        use crate::tui::app::{ListState, Modal, Screen};
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let (repo, rcs, pkg, prc) = (
+            format!("{API}repositories/deb/apt/r/"),
+            format!("{API}content/deb/release_components/"),
+            format!("{API}content/deb/packages/1/"),
+            format!("{API}content/deb/package_release_components/"),
+        );
+        let rc = format!("{rcs}1/");
+        let r = json!({ "pulp_href": repo, "name": "r", "latest_version_href": format!("{repo}versions/3/"), "pulp_labels": {} });
+        get(&server, &repo, r).await;
+        // The latest version 3 has the package, but not the release component bookworm/contrib of version 1.
+        let gone = wiremock::ResponseTemplate::new(200).set_body_json(page(json!([])));
+        wiremock::Mock::given(method("GET"))
+            .and(path(&rcs))
+            .and(query_param("pulp_href__in", rc.as_str()))
+            .respond_with(gone)
+            .mount(&server)
+            .await;
+        get(&server, &rcs, page(json!([{ "pulp_href": rc, "distribution": "bookworm", "component": "contrib" }]))).await;
+        get(&server, &format!("{API}content/deb/packages/"), page(json!([{ "pulp_href": pkg }]))).await;
+        get(&server, &prc, page(json!([{ "pulp_href": format!("{prc}1/") }]))).await;
+        answer(&server, "POST", &format!("{repo}modify/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        get(&server, &format!("{API}tasks/1/"), json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed" })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let k = Kind::Content { version: format!("{repo}versions/1/"), ctype: 11 };
+        (app.screen, app.list) = (Screen::List(k.clone()), ListState::new(k));
+        run(&mut app, Act::Create, Value::Null);
+        settle(&mut app, &mut rx).await; // the release components of the version
+        fill_and_submit(&mut app, &[("package", "hello"), ("release_component", "bookworm/contrib")]);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(lines[0], "NOTE: release component bookworm/contrib is not in the LATEST version 3 of r, which gets the record.");
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing is sent before the confirm");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+        assert_eq!(posts_to(&server, &format!("{repo}modify/")).await, [json!({ "add_content_units": [pkg, rc, format!("{prc}1/")] })]);
     }
 
     /// A package release component needs a release component of the version; on a Content View snapshot repository it

@@ -457,8 +457,8 @@ releases, components, indices and more). `/` searches package names or file path
   separated). A package release component lists a package of the version (name, name_version or
   name_version_arch) in one of its release components; pulp-tui reuses an existing record of
   that pair and adds it with its package and release component. From an older version, a package
-  that the latest version does not have comes back into the new version: a confirm says so
-  first. The screen then shows the new version. A structured publication serves the packages of a component in
+  or a release component that the latest version does not have comes back into the new version:
+  a confirm names it first. The screen then shows the new version. A structured publication serves the packages of a component in
   `dists/<distribution>/<component>/`.
 * **x** and **a** send a large selection (above about 27,000 units) in batches, one task after
   the other; each batch makes a new version. The Task Center shows the task of each batch. When
