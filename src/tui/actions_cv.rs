@@ -541,7 +541,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                         })
                     }
                 };
-                confirm_mirror(app, &policy, hrefs, go);
+                confirm_mirror(app, &policy, hrefs, None, go);
                 Ok(())
             });
         }

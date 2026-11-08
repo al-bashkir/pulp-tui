@@ -514,7 +514,11 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
 * **File mirror sync publishes** (pulp_file 3.123.1, `tasks/synchronizing.py`): a sync with
   `mirror` that makes a version also makes a pass-through publication of it with the upstream
   manifest (live). pulp_deb 3.11.1 mirror makes none. The mirror confirm says so for each File
-  repository, as it does for RPM `mirror_complete`.
+  repository, as it does for RPM `mirror_complete`. Only a File remote gives that manifest
+  (`FileFirstStage` fills `metadata_files`, `GitFirstStage` does not): a `mirror` sync from a
+  Git remote makes the new version, then the task fails with `pop from empty list` and makes no
+  publication (pulp_file of pulpcore 3.123.1, live). The mirror confirm says so for a File
+  repository that syncs from a Git remote (the picked one, else its default remote).
 * **RPM publications.** A `mirror_complete` sync makes its own publication with upstream
   paths, so served-content checks also try `location_href`. The RPM publication has no
   `distributions` field (the File one has) and `distributions/` has no `publication`

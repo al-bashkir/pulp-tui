@@ -276,25 +276,29 @@ pub fn sync_policies(caps: Option<&Capabilities>, t: RepoType) -> Vec<String> {
 
 /// Runs `go` at once, or after the operator confirms the mirror warning when `policy` is a mirror policy.
 /// `repos`: the repositories that sync; the confirm is typed when the sync makes Pulp delete a current version.
-pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl FnOnce(&mut App) + Send + 'static) {
+/// `git`: whether the remote that the form picked is a File Git remote; None: each repository's default remote.
+pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, git: Option<bool>, go: impl FnOnce(&mut App) + Send + 'static) {
     if !policy.contains("mirror") {
         return go(app);
     }
     let complete = policy == "mirror_complete";
+    let git_remotes = RepoType::File.alt_remote().map_or("", |a| a.1);
     app.job("read the retention of the repositories", move |ctx| async move {
-        let (mut goes, mut files) = (vec![], vec![]);
+        let (mut goes, mut files, mut gits) = (vec![], vec![], vec![]);
         for href in repos {
             let r: Value = ctx.client.get(&href, &[]).await?;
             if latest_goes(&ctx, &r, 1).await?.is_some() {
                 goes.push(s(&r, "name"));
             }
             // pulp_file publishes the version of a mirror sync (pass-through, upstream manifest); pulp_deb does not.
+            // Only a File remote has that manifest (pulp_file FileFirstStage): a Git mirror sync fails after its version.
             if RepoType::from_href(&href) == Some(RepoType::File) {
-                files.push(s(&r, "name"));
+                let from_git = git.unwrap_or_else(|| s(&r, "remote").contains(git_remotes));
+                if from_git { &mut gits } else { &mut files }.push(s(&r, "name"));
             }
         }
         ap(move |app| {
-            let lines = mirror_lines(&goes, complete, &files);
+            let lines = mirror_lines(&goes, complete, &files, &gits);
             if goes.is_empty() {
                 app.confirm("Confirm mirror sync", lines, go)
             } else {
@@ -305,8 +309,9 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, go: impl 
 }
 
 /// The mirror confirm: `goes` are the repositories whose current version the sync makes Pulp delete, `complete` is
-/// mirror_complete, and `files` are the File repositories (their mirror sync publishes).
-fn mirror_lines(goes: &[String], complete: bool, files: &[String]) -> Vec<String> {
+/// mirror_complete, `files` are the File repositories (their mirror sync publishes), `gits` those that sync from a
+/// Git remote.
+fn mirror_lines(goes: &[String], complete: bool, files: &[String], gits: &[String]) -> Vec<String> {
     let mut lines = vec![
         "Mirror sync makes the NEW repository version match the upstream exactly:".into(),
         "content that is not upstream is removed from the new version.".into(),
@@ -323,6 +328,13 @@ fn mirror_lines(goes: &[String], complete: bool, files: &[String]) -> Vec<String
         let names = files.join(", ");
         lines.push(format!(
             "File: the mirror sync of {names} also publishes the new version with the upstream manifest (a publication is created)."
+        ));
+    }
+    if !gits.is_empty() {
+        let names = gits.join(", ");
+        lines.push(format!(
+            "File: a mirror sync of {names} from a Git remote makes the new version, then its task fails \
+             (pulp_file has no manifest to publish for a Git remote). Use additive."
         ));
     }
     lines
@@ -1252,6 +1264,9 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
             let (href, name, options) = (href.clone(), name.clone(), sync_options(f));
             let repos = vec![href.clone()];
             sync_refusal(&row, &policy, &options, remote.is_some())?;
+            // The picker note of the picked remote names its second type (File: Git).
+            let picked = |r: &String| f.fields.iter().find(|x| x.key == "remote")?.options.as_ref()?.iter().find(|i| &i.value == r);
+            let git = remote.as_ref().map(|r| picked(r).is_some_and(|i| i.note == "Git"));
             let go = move |app: &mut App| {
                 submit(app, format!("sync {name} ({policy})"), move |c| async move {
                     let r = match remote {
@@ -1261,7 +1276,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
                     Ok(ops::sync_with(&c, t, &href, r.as_deref(), &policy, options).await?)
                 })
             };
-            confirm_mirror(app, f.get("policy"), repos, go);
+            confirm_mirror(app, f.get("policy"), repos, git, go);
             Ok(())
         });
     };
@@ -6441,17 +6456,17 @@ mod tests {
         get(&server, &repo, json!({ "pulp_href": repo, "name": "os", "latest_version_href": format!("{repo}versions/3/") })).await;
         let (mut app, mut rx) = connected(&server).await;
         let ran = Arc::new(AtomicBool::new(false));
-        confirm_mirror(&mut app, "additive", vec![repo.clone()], {
+        confirm_mirror(&mut app, "additive", vec![repo.clone()], None, {
             let r = ran.clone();
             move |_| r.store(true, Ordering::Relaxed)
         });
         assert!(ran.load(Ordering::Relaxed) && app.modal.is_none() && app.jobs.is_empty(), "additive: no request, no confirm");
-        confirm_mirror(&mut app, "mirror_complete", vec![repo.clone()], |_| panic!("ran before the confirm"));
+        confirm_mirror(&mut app, "mirror_complete", vec![repo.clone()], None, |_| panic!("ran before the confirm"));
         settle(&mut app, &mut rx).await;
         let Some(Modal::Confirm { title, lines, typed, .. }) = app.modal.take() else { panic!("no confirm") };
         assert_eq!((title.as_str(), lines.len(), typed), ("Confirm mirror sync", 4, None));
         assert_eq!(lines[2], "Older versions are not changed and can still be published (rollback).");
-        confirm_mirror(&mut app, "mirror", vec![repo], |_| {});
+        confirm_mirror(&mut app, "mirror", vec![repo], None, |_| {});
         settle(&mut app, &mut rx).await;
         let Some(Modal::Confirm { lines, .. }) = &app.modal else { panic!("no confirm") };
         assert_eq!(lines.len(), 3);
@@ -6470,11 +6485,50 @@ mod tests {
         let (mut app, mut rx) = connected(&server).await;
         let line = "File: the mirror sync of docs also publishes the new version with the upstream manifest (a publication is created).";
         for (repos, named) in [(vec![file.clone(), deb.clone()], true), (vec![deb.clone()], false)] {
-            confirm_mirror(&mut app, "mirror", repos, |_| {});
+            confirm_mirror(&mut app, "mirror", repos, None, |_| {});
             settle(&mut app, &mut rx).await;
             let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm") };
             assert_eq!(lines.iter().any(|l| l == line), named, "{lines:?}");
             assert!(!lines.iter().any(|l| l.contains("apt also publishes")), "{lines:?}");
+        }
+    }
+
+    /// pulp_file reads an upstream manifest only from a File remote: a mirror sync from a Git remote makes the new
+    /// version, then its task fails ("pop from empty list") with no publication. The confirm says so for the Git
+    /// remote that the sync uses: the picked one, else the default remote of the repository.
+    #[tokio::test]
+    async fn mirror_confirm_of_a_file_repository_with_a_git_remote_says_that_the_task_fails() {
+        use crate::tui::app::Modal;
+        use crate::tui::form::PickItem;
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/file/file/docs/");
+        let git = format!("{API}remotes/file/git/1/");
+        get(
+            &server,
+            &repo,
+            json!({ "pulp_href": repo, "name": "docs", "latest_version_href": format!("{repo}versions/1/"), "remote": git }),
+        )
+        .await;
+        get(&server, &git, json!({ "name": "up-git" })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let fails = "File: a mirror sync of docs from a Git remote makes the new version, then its task fails \
+                     (pulp_file has no manifest to publish for a Git remote). Use additive.";
+        let item = |label: &str, note: &str| PickItem { label: label.into(), value: label.into(), note: note.into() };
+        // Untouched: the default Git remote; picked: a File remote, then a Git remote.
+        for (picked, git_line) in [(None, true), (Some("files"), false), (Some("up-git"), true)] {
+            repo_action(&mut app, RepoType::File, Act::Sync, json!({ "pulp_href": repo, "name": "docs", "remote": git }));
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
+            set(&mut form, "policy", "mirror");
+            if let Some(p) = picked {
+                let field = form.fields.iter_mut().find(|f| f.key == "remote").unwrap();
+                (field.value, field.options) = (p.into(), Some(vec![item("files", ""), item("up-git", "Git")]));
+            }
+            submit(&mut app, &form).unwrap();
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm") };
+            assert_eq!(lines.iter().any(|l| l == fails), git_line, "{picked:?}: {lines:?}");
+            assert_eq!(lines.iter().any(|l| l.contains("upstream manifest")), !git_line, "{picked:?}: {lines:?}");
         }
     }
 
