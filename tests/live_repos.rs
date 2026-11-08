@@ -869,6 +869,7 @@ async fn tui_verify(app: &mut App, rx: &mut UnboundedReceiver<Msg>, row: Value) 
 /// (`path`: its fixture; `file`: a file that each publication serves):
 /// * Publications Create makes a publication of version 1;
 /// * Distributions Create pins one distribution to it (the form reuses it) and binds another to the repository;
+/// * Edit of the content guard (set, clear) and Checkpoint (on, off) of the second one, each after the typed name;
 /// * Edit of the base path, then of the binding (version 2), each after the typed name; the old URL gets 404;
 /// * Rollback (b) back to version 1: the preview names the existing publication, the job re-points and verifies;
 /// * Publications Delete of the version 2 publication names the distribution that serves it and what it serves after;
@@ -906,6 +907,25 @@ async fn publications_and_distributions_through_the_tui(t: RepoType, path: &str,
     let cols = Kind::Distributions(t).columns();
     assert_eq!(((cols[2].get)(&d), (cols[2].get)(&f)), ("pinned".into(), "latest".into()));
     assert!(tui_verify(&mut app, &mut rx, d.clone()).await.starts_with("OK: "), "the pinned distribution serves version 1");
+
+    // Edit the content guard and Checkpoint (audit F26): each after the typed name, with the now / after line.
+    let guard = create(&c, "contentguards/core/rbac/", json!({ "name": format!("{name}-guard") }), "/contentguards/").await;
+    for ((key, value), want, stored) in [
+        (("content_guard", guard.as_str()), format!("  content guard: none -> {guard}"), json!(guard)),
+        (("content_guard", ""), format!("  content guard: {guard} -> none"), Value::Null),
+        (("checkpoint", "true"), "  checkpoint:  off -> on".into(), json!(true)),
+        (("checkpoint", "false"), "  checkpoint:  on -> off".into(), json!(false)),
+    ] {
+        let f = row(&app, "name", &follow).unwrap();
+        run(&mut app, Act::Edit, f);
+        fill(&mut app, &[(key, value)]);
+        settle(&mut app, &mut rx).await;
+        let (lines, typed) = yes(&mut app);
+        assert_eq!(typed.as_deref(), Some(follow.as_str()));
+        assert!(lines.contains(&want), "{lines:?}");
+        settle(&mut app, &mut rx).await;
+        assert_eq!(row(&app, "name", &follow).unwrap()[key], stored, "the list reloads with it: {:?}", texts(&app));
+    }
 
     // Edit the base path: the typed name, then the new path serves and the old one is gone.
     let moved = format!("{pinned}-moved");
@@ -978,7 +998,7 @@ async fn publications_and_distributions_through_the_tui(t: RepoType, path: &str,
         assert!(row(&app, "name", dist).is_none(), "the list reloads without it");
         assert!(c.get::<Value>(&s(&d, "pulp_href"), &[]).await.unwrap_err().is_not_found());
     }
-    cleanup(&c, &[&p1, &repo, &remote]).await;
+    cleanup(&c, &[&p1, &repo, &remote, &guard]).await;
 }
 
 #[tokio::test]

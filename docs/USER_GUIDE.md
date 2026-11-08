@@ -515,9 +515,12 @@ LATEST** (a repository) or **CHECKPOINTS** (a checkpoint distribution of a repos
     "follow repository latest".
   * **Serve config.repo** (RPM): Pulp serves a `.repo` file.
 
-  An edit that changes what it serves (Serve = none, another repository or version) or its
-  base path first shows what it serves now and after, and you type its name. An edit of other
-  fields (labels, flags, content guard) saves at once.
+  An edit that changes what it serves (Serve = none, another repository or version), its base
+  path, its content guard (set, changed or cleared) or **Checkpoint** first shows each value now
+  and after, and you type its name. A cleared guard makes the content public; a new guard gives
+  other clients HTTP 403; with **Checkpoint** on, the base path lists the checkpoints and other
+  paths need a timestamp. An edit of other fields (labels, Hidden, Serve config.repo) saves at
+  once.
 * A Content View distribution: you can edit its base path and its other labels. You cannot
   re-point, re-bind or rename it, or change its `pulp_tui_*` labels. Use promote or roll back.
   You cannot delete it, also not as a marked item. Unpromote the view from the environment.

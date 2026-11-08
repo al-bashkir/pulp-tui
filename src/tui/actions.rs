@@ -3438,7 +3438,7 @@ fn distribution_form(app: &mut App, t: RepoType, current: Option<Value>) {
     let owned_labels = ownership(&v["pulp_labels"]);
     let title = if edit { format!("Edit distribution {}", s(&v, "name")) } else { format!("New {} distribution", t.label()) };
     let mut form = Form::new(title, distribution_fields(app, t, &v))
-        .note("Changing the base path or binding changes what consumers receive at this URL.");
+        .note("Changing the base path, binding, content guard or checkpoint changes what consumers receive at this URL.");
     if let Some(cv) = &owner {
         form = form.note(format!(
             "Content View {cv} owns this distribution: change what it serves with promote or roll back. Later promotions keep a changed base path."
@@ -3457,10 +3457,12 @@ fn distribution_form(app: &mut App, t: RepoType, current: Option<Value>) {
 }
 
 /// Save the distribution form: at once, or after `distribution_edit_confirm` when the edit of `current` changes what
-/// its clients get (the binding or the base path).
+/// its clients get (the binding, the base path, the content guard or the checkpoint flag).
 fn distribution_save(app: &mut App, t: RepoType, current: Option<Value>, b: Value, serve: Serve, label: String) {
-    let (will, path) = (serve_line(&serve), b["base_path"].as_str().map(str::to_string));
-    let edited = current.clone().filter(|_| will.is_some() || path.is_some());
+    let will = serve_line(&serve);
+    // An edit sends only the changed fields.
+    let changes = ["base_path", "content_guard", "checkpoint"].iter().any(|k| b.get(k).is_some());
+    let (edited, shown) = (current.clone().filter(|_| will.is_some() || changes), b.clone());
     let go = move |app: &mut App| {
         app.job(label.clone(), move |ctx| async move {
             save_distribution(&ctx, t, current.as_ref(), b, serve).await?;
@@ -3471,7 +3473,7 @@ fn distribution_save(app: &mut App, t: RepoType, current: Option<Value>, b: Valu
         })
     };
     match edited {
-        Some(d) => distribution_edit_confirm(app, t, d, will, path, go),
+        Some(d) => distribution_edit_confirm(app, t, d, will, shown, go),
         None => go(app),
     }
 }
@@ -3490,13 +3492,14 @@ fn serve_line(serve: &Serve) -> Option<String> {
 }
 
 /// An edit of distribution `d` that changes what its clients get: what it serves now, what it serves after (`will`),
-/// the new base path (`path`), then `go` after the typed name.
+/// the base path, content guard and checkpoint flag now and after (those that the request body `b` changes), then
+/// `go` after the typed name.
 fn distribution_edit_confirm(
     app: &mut App,
     t: RepoType,
     d: Value,
     will: Option<String>,
-    path: Option<String>,
+    b: Value,
     go: impl FnOnce(&mut App) + Send + 'static,
 ) {
     let name = s(&d, "name");
@@ -3509,9 +3512,34 @@ fn distribution_edit_confirm(
         };
         let mut lines = vec![format!("Distribution {name} ({})", s(&d, "base_url")), format!("  now serves:  {now}")];
         lines.extend(will.map(|w| format!("  will serve:  {w}")));
-        if let Some(p) = path {
+        if let Some(p) = b["base_path"].as_str() {
             lines.push(format!("  base path:   {} -> {p}", s(&d, "base_path")));
             lines.push("Clients of the old URL get HTTP 404 after the change.".into());
+        }
+        if let Some(g) = b.get("content_guard") {
+            let guard = |v: &Value| v.as_str().unwrap_or("none").to_string();
+            lines.push(format!("  content guard: {} -> {}", guard(&d["content_guard"]), guard(g)));
+            lines.push(
+                if g.is_null() {
+                    "Anyone with the URL gets the content after the change."
+                } else {
+                    "Clients that the guard does not allow get HTTP 403 after the change."
+                }
+                .into(),
+            );
+        }
+        if let Some(on) = b["checkpoint"].as_bool() {
+            let flag = |on: bool| if on { "on" } else { "off" };
+            lines.push(format!("  checkpoint:  {} -> {}", flag(d["checkpoint"] == true), flag(on)));
+            // pulpcore content/handler.py: a checkpoint distribution serves only `<base path>/<timestamp>/` paths.
+            lines.push(
+                if on {
+                    "The base path then lists the checkpoints; other paths need a timestamp: clients of the old URLs get errors."
+                } else {
+                    "The <base path>/<timestamp>/ URLs stop serving after the change."
+                }
+                .into(),
+            );
         }
         ap(move |app| app.confirm_danger(format!("Edit distribution {name}"), lines, &name.clone(), go))
     });
@@ -7688,6 +7716,58 @@ mod tests {
         assert_eq!(bodies(&server, "PATCH", &d).await.last(), Some(&json!({ "pulp_labels": { "team": "ops" } })));
     }
 
+    /// A content guard that is set, changed or cleared, and Checkpoint on or off, change what clients get at the URL
+    /// (403, public content, a checkpoint listing): each asks for the typed name with the now / after line (audit F26).
+    /// A label or Hidden edit does not.
+    #[tokio::test]
+    async fn distribution_edit_of_the_guard_or_checkpoint_needs_the_typed_name() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let r = format!("{API}repositories/file/file/r/");
+        let d = |n: u32| format!("{API}distributions/file/file/{n}/");
+        let item = |n: u32, guard: Value, checkpoint: bool| {
+            json!({ "pulp_href": d(n), "name": format!("docs{n}"), "base_path": format!("docs{n}"), "base_url": format!("http://h/docs{n}/"),
+                "repository": r, "content_guard": guard, "checkpoint": checkpoint, "hidden": false, "pulp_labels": {} })
+        };
+        let (guarded, plain) = (item(1, json!("/g/1/"), false), item(2, Value::Null, true));
+        for (n, v) in [(1, &guarded), (2, &plain)] {
+            get(&server, &d(n), v.clone()).await;
+            answer(&server, "PATCH", &d(n), 200, json!({ "pulp_href": d(n) })).await;
+        }
+        get(&server, &format!("{API}publications/file/file/"), page(json!([]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let patches = async || bodies(&server, "PATCH", &d(1)).await.len() + bodies(&server, "PATCH", &d(2)).await.len();
+        for (v, change, want, body) in [
+            (&guarded, ("content_guard", ""), "  content guard: /g/1/ -> none", json!({ "content_guard": null })),
+            (&guarded, ("content_guard", "/g/2/"), "  content guard: /g/1/ -> /g/2/", json!({ "content_guard": "/g/2/" })),
+            (&plain, ("content_guard", "/g/1/"), "  content guard: none -> /g/1/", json!({ "content_guard": "/g/1/" })),
+            (&guarded, ("checkpoint", "true"), "  checkpoint:  off -> on", json!({ "checkpoint": true })),
+            (&plain, ("checkpoint", "false"), "  checkpoint:  on -> off", json!({ "checkpoint": false })),
+        ] {
+            let sent = patches().await;
+            distribution_action(&mut app, RepoType::File, Act::Edit, v.clone());
+            fill_and_submit(&mut app, &[change]);
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {change:?}") };
+            assert_eq!(typed.as_deref(), Some(s(v, "name").as_str()), "{change:?}");
+            assert_eq!(lines[1], "  now serves:  nothing", "{change:?}");
+            assert!(lines.iter().any(|l| l == want), "{change:?}: {lines:?}");
+            assert_eq!(patches().await, sent, "nothing is sent before the confirm");
+            yes(&mut app);
+            settle(&mut app, &mut rx).await;
+            assert_eq!(bodies(&server, "PATCH", &s(v, "pulp_href")).await.last(), Some(&body), "{change:?}");
+        }
+
+        for change in [("labels", "team=ops"), ("hidden", "true")] {
+            let sent = patches().await;
+            distribution_action(&mut app, RepoType::File, Act::Edit, guarded.clone());
+            fill_and_submit(&mut app, &[change]);
+            settle(&mut app, &mut rx).await;
+            assert!(app.modal.is_none(), "{change:?}");
+            assert_eq!(patches().await, sent + 1, "{change:?}");
+        }
+    }
+
     #[tokio::test]
     async fn binding_edit_of_a_version_bound_distribution_clears_the_version() {
         use crate::tui::app::Modal;
@@ -7747,6 +7827,8 @@ mod tests {
         let set = |form: &mut Form, k: &str, v: &str| form.fields.iter_mut().find(|f| f.key == k).unwrap().value = v.into();
         let item = json!({ "pulp_href": d, "name": "docs", "base_path": "docs", "repository": "/r/", "hidden": true,
             "checkpoint": false, "pulp_labels": {} });
+        get(&server, &d, item.clone()).await;
+        get(&server, &format!("{API}publications/file/file/"), page(json!([]))).await;
         distribution_action(&mut app, RepoType::File, Act::Edit, item);
         let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no edit form") };
         assert_eq!((form.get("hidden"), form.get("checkpoint")), ("true", "false"), "as stored");
@@ -7755,6 +7837,9 @@ mod tests {
         set(&mut form, "hidden", "false");
         set(&mut form, "checkpoint", "true");
         submit(&mut app, &form).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { on_yes: Some(yes), .. }) = app.modal.take() else { panic!("Checkpoint asks for the typed name") };
+        yes(&mut app);
         settle(&mut app, &mut rx).await;
         // Pulp refuses `checkpoint` without a repository binding (HTTP 400): say it before any request.
         set(&mut form, "mode", "publication of a repository version");
