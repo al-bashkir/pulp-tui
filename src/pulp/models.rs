@@ -409,22 +409,34 @@ impl Task {
 
 /// Seconds since the epoch of an API time `YYYY-MM-DDTHH:MM:SS[.ffffff](Z|±HH:MM)`: Pulp prints its `TIME_ZONE`.
 fn epoch_secs(t: &str) -> Option<i64> {
-    let n = |s: &str, r: std::ops::Range<usize>| -> Option<i64> { s.get(r)?.parse().ok() };
-    let (m, d) = (n(t, 5..7)?, n(t, 8..10)?);
-    let y = n(t, 0..4)? - i64::from(m <= 2);
-    // Days of the civil date: the inverse of `store::rfc3339`.
+    let n = |r| digits(t, r);
+    let days = civil_days(n(0..4)?, n(5..7)?, n(8..10)?);
+    Some(days * 86_400 + n(11..13)? * 3600 + n(14..16)? * 60 + n(17..19)? - utc_offset(t.get(19..)?)?)
+}
+
+/// The number at `r` of `s`.
+fn digits(s: &str, r: std::ops::Range<usize>) -> Option<i64> {
+    s.get(r)?.parse().ok()
+}
+
+/// Days since the epoch of the civil date `y`-`m`-`d`: the inverse of `store::rfc3339`.
+fn civil_days(y: i64, m: i64, d: i64) -> i64 {
+    let y = y - i64::from(m <= 2);
     let (era, doy) = (y.div_euclid(400), (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1);
     let yoe = y - era * 400;
-    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
-    let zone = t.get(19..)?.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
-    let hm = || Some(n(zone, 1..3)? * 3600 + n(zone, 4..6)? * 60);
-    let offset = match zone.get(..1)? {
-        "Z" if zone.len() == 1 => 0,
-        "+" => hm()?,
-        "-" => -hm()?,
+    era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
+}
+
+/// Seconds east of UTC of the end of an API time after its seconds: `[.ffffff]` then `Z` or `±HH:MM`.
+fn utc_offset(rest: &str) -> Option<i64> {
+    let zone = rest.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let sign = match zone.get(..1)? {
+        "Z" if zone.len() == 1 => return Some(0),
+        "+" => 1,
+        "-" => -1,
         _ => return None,
     };
-    Some(days * 86_400 + n(t, 11..13)? * 3600 + n(t, 14..16)? * 60 + n(t, 17..19)? - offset)
+    Some(sign * (digits(zone, 1..3)? * 3600 + digits(zone, 4..6)? * 60))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
