@@ -699,10 +699,12 @@ A composite view joins other Content Views (its **components**). Example: `rocky
   only in the session that runs the publish.
 * The *environments* column names each environment that serves the version, and an attempted
   promotion that did not complete with its state, for example `Dev (failed)`.
-* **d** deletes. Refused while an environment serves the version, while a promotion of it did not
-  complete (`bound to Dev (promotion failed)`), or while a composite uses it. The confirm lists each
-  publication and snapshot version that it deletes, and each one that it keeps (still served by an
-  environment) with the reason.
+  `Dev (served in part)`: a promotion of the version was `partial`, then a later one did not
+  complete, so some repositories in Dev still serve this version.
+* **d** deletes. Refused while an environment serves the version (also in part), while a promotion
+  of it did not complete (`bound to Dev (promotion failed)`), or while a composite uses it. The
+  confirm lists each publication and snapshot version that it deletes, and each one that it keeps
+  (still served by an environment) with the reason.
 * **i** details: source versions, snapshot versions, publications, unit counts, component
   versions.
 

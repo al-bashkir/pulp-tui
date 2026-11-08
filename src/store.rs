@@ -1352,19 +1352,39 @@ impl Store {
         Ok(())
     }
 
-    /// The environments where version `version_id` is served, or promoted without completing (`Dev (promotion failed)`):
-    /// it cannot be deleted.
-    pub async fn version_in_use(&self, version_id: i64) -> Result<Vec<String>> {
+    /// `Dev (served in part)` for each environment where a served row names a publication of version `version_id` that
+    /// neither the served nor the attempted version there has: a partial promotion that a later attempt replaced.
+    pub async fn partly_served(&self, version_id: i64) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar(
-            "SELECT e.name FROM bindings b JOIN environments e ON e.id = b.env_id WHERE b.version_id = $1
-             UNION SELECT e.name || ' (promotion ' || p.state || ')' FROM promotions p JOIN environments e ON e.id = p.env_id
-             WHERE p.version_id = $1
-               AND NOT EXISTS (SELECT 1 FROM bindings b WHERE b.env_id = p.env_id AND b.cv_id = p.cv_id AND b.version_id = $1)
+            "SELECT DISTINCT e.name || ' (served in part)' FROM binding_repos br JOIN environments e ON e.id = br.env_id
+             JOIN cv_version_repos vr ON vr.version_id = $1 AND vr.repo_href = br.repo_href AND vr.publication = br.publication
+             JOIN cv_versions v ON v.id = vr.version_id AND v.cv_id = br.cv_id
+             WHERE NOT EXISTS (SELECT 1 FROM bindings b JOIN cv_version_repos s ON s.version_id = b.version_id
+                               WHERE b.env_id = br.env_id AND b.cv_id = br.cv_id AND s.publication = br.publication)
+               AND NOT EXISTS (SELECT 1 FROM promotions p JOIN cv_version_repos s ON s.version_id = p.version_id
+                               WHERE p.env_id = br.env_id AND p.cv_id = br.cv_id AND s.publication = br.publication)
              ORDER BY 1",
         )
         .bind(version_id)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    /// The environments where version `version_id` is served, promoted without completing (`Dev (promotion failed)`),
+    /// or served in part (`partly_served`): it cannot be deleted.
+    pub async fn version_in_use(&self, version_id: i64) -> Result<Vec<String>> {
+        let mut used: Vec<String> = sqlx::query_scalar(
+            "SELECT e.name FROM bindings b JOIN environments e ON e.id = b.env_id WHERE b.version_id = $1
+             UNION SELECT e.name || ' (promotion ' || p.state || ')' FROM promotions p JOIN environments e ON e.id = p.env_id
+             WHERE p.version_id = $1
+               AND NOT EXISTS (SELECT 1 FROM bindings b WHERE b.env_id = p.env_id AND b.cv_id = p.cv_id AND b.version_id = $1)",
+        )
+        .bind(version_id)
+        .fetch_all(&self.pool)
+        .await?;
+        used.extend(self.partly_served(version_id).await?);
+        used.sort();
+        Ok(used)
     }
 
     // ---- Content View locks (times are client unix seconds) ----------------------------
@@ -2977,6 +2997,56 @@ mod tests {
         assert!(s.binding(dev2, cv).await.unwrap().is_none());
         s.delete_env(dev2).await.unwrap();
         s.delete_cv(cv).await.unwrap();
+    }
+
+    /// Dev serves v1; the promotion of v2 ends partial (os serves v2), then the one of v3 fails: v2 is still served in
+    /// part and stays in use. A publication that the served version shares (docs) does not count.
+    #[tokio::test]
+    async fn a_version_that_an_environment_serves_in_part_stays_in_use() {
+        let s = Store::open_in_memory().await.unwrap();
+        let cv = s.create_cv("lab", "web", "").await.unwrap();
+        let repos = [repo("os", RepoType::Rpm), repo("docs", RepoType::File)];
+        let mut vs = vec![];
+        for n in 1..=3 {
+            let v = s.begin_version(cv, "", &repos).await.unwrap();
+            for mut vr in s.version_repos(v.id).await.unwrap() {
+                let name = vr.repo().repo_name.clone();
+                vr.publication = Some(if name == "docs" { "/p/docs/1/".into() } else { format!("/p/os/{n}/") });
+                s.save_version_repo(&vr).await.unwrap();
+            }
+            s.finish_version(v.id, "published", None).await.unwrap();
+            vs.push(v.id);
+        }
+        let dev = s.create_env("lab", "Dev", s.ensure_library("lab").await.unwrap(), false).await.unwrap();
+        let serve = async |name: &str, t, publication: &str| {
+            let r = repo(name, t);
+            let row = BindingRepo {
+                env_id: dev,
+                cv_id: cv,
+                repo_href: r.repo_href,
+                repo_name: name.into(),
+                repo_type: t,
+                distribution: format!("/d/{name}/"),
+                base_path: format!("dev/web/{name}"),
+                publication: Some(publication.into()),
+            };
+            s.save_binding_repo(&row).await.unwrap();
+        };
+        serve("docs", RepoType::File, "/p/docs/1/").await;
+        serve("os", RepoType::Rpm, "/p/os/2/").await;
+        s.promoted(dev, cv, vs[0], "active").await.unwrap();
+        s.promoted(dev, cv, vs[1], "partial").await.unwrap();
+        assert_eq!(s.version_in_use(vs[1]).await.unwrap(), ["Dev (promotion partial)"]);
+        s.promoted(dev, cv, vs[2], "failed").await.unwrap();
+        assert_eq!(s.version_in_use(vs[0]).await.unwrap(), ["Dev"]);
+        assert_eq!(s.version_in_use(vs[1]).await.unwrap(), ["Dev (served in part)"]);
+        assert_eq!(s.version_in_use(vs[2]).await.unwrap(), ["Dev (promotion failed)"]);
+        assert_eq!(s.partly_served(vs[1]).await.unwrap(), ["Dev (served in part)"]);
+        // Dev serves all of v3: the docs publication that v1 and v2 share with it keeps neither in use.
+        serve("os", RepoType::Rpm, "/p/os/3/").await;
+        s.promoted(dev, cv, vs[2], "active").await.unwrap();
+        assert!(s.version_in_use(vs[0]).await.unwrap().is_empty());
+        assert!(s.version_in_use(vs[1]).await.unwrap().is_empty());
     }
 
     /// The database refuses an attempt state that is not one of a promotion that has not completed.

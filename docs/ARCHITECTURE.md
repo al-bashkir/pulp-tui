@@ -225,6 +225,9 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
 * A version is in use (`Store::version_in_use`, delete refused) while it is served or
   attempted. The screens show `Dev:v1 (v2 failed)`; verify checks the served version and
   reports the attempt. A rollback to the served version clears the attempt.
+* It is also in use while a served row names one of its publications that neither the served
+  nor the attempted version has (`Store::partly_served`, `Dev (served in part)`): a `partial`
+  promotion that a later attempt replaced, so some repositories still serve it.
 * **Unpromote** deletes the view's own distributions in one environment, then the served
   rows, then the binding (last, so a rerun finishes). It is refused while a later
   environment on the path has the view.

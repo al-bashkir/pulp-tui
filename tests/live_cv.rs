@@ -1254,3 +1254,76 @@ async fn environment_relabel_and_definitions_export_import_through_the_tui() {
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &[&repo, &remote]).await;
 }
+
+/// Rename the distributions of view `id` in Dev that `rows` record (`suffix` "" gives back the pulp-tui name).
+async fn rename_dev(c: &PulpClient, id: &str, rows: &[pulp_tui::store::BindingRepo], suffix: &str) {
+    for b in rows {
+        let name = format!("{}{suffix}", pulp_tui::cv::distribution_name(id, "Dev", &b.repo_name));
+        let m = c.patch(&b.distribution, &json!({ "name": name })).await.unwrap();
+        ops::settle(c, m, &no_progress).await.unwrap();
+    }
+}
+
+/// Dev serves v1. The promotion of v2 ends partial (docs serves v2; the distribution of more was renamed outside
+/// pulp-tui), then the one of v3 fails (docs renamed too): docs still serves v2. The Versions screen shows v2 in Dev,
+/// and its Delete (d) is refused before the typed confirmation.
+#[tokio::test]
+async fn a_version_that_dev_serves_in_part_is_not_deleted_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvpart"));
+    let (mut app, mut rx) = app().await;
+    let svc = service(&app, &c);
+    let (st, scope) = (svc.store.clone(), svc.scope.clone());
+    let cv = st.create_cv(&scope, &id, "").await.unwrap();
+    let mut sources = vec![];
+    for name in ["docs", "more"] {
+        let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-{name}"), "file/PULP_MANIFEST", "mirror").await;
+        st.set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: name.into(), repo_type: RepoType::File, filters: vec![] })
+            .await
+            .unwrap();
+        sources.extend([repo, remote]);
+    }
+    let lib = st.ensure_library(&scope).await.unwrap();
+    let dev = st.create_env(&scope, "Dev", lib, false).await.unwrap();
+    // Each version has another docs snapshot (its filter changes); more keeps one publication.
+    let publish = async |filters: &str| {
+        let docs = CvRepo {
+            repo_href: sources[0].clone(),
+            repo_name: "docs".into(),
+            repo_type: RepoType::File,
+            filters: parse_rules(filters, RepoType::File).unwrap(),
+        };
+        st.set_cv_repo(cv, &docs).await.unwrap();
+        svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap().0
+    };
+    let v1 = publish("").await;
+    svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
+    let rows = st.binding_repos(dev, cv).await.unwrap();
+    let more: Vec<_> = rows.iter().filter(|b| b.repo_name == "more").cloned().collect();
+    let v2 = publish("exclude path=isos/*").await;
+    rename_dev(&c, &id, &more, "-moved").await;
+    let e = svc.promote(cv, v2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap_err().to_string();
+    assert!(e.starts_with(&format!("{id} in Dev: partial: more: ")), "{e}");
+    let v3 = publish("exclude path=docs/*").await;
+    rename_dev(&c, &id, &rows, "-moved").await;
+    let e = svc.promote(cv, v3.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap_err().to_string();
+    assert!(e.starts_with(&format!("{id} in Dev: failed: ")), "{e}");
+    assert_eq!(cv_row(&mut app, &mut rx, &id).await["bound"], "Library:v3  Dev:v1 (v3 failed)");
+
+    // Versions (v): v2 is served in part; its Delete (d) is refused.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvVersions, r);
+    settle(&mut app, &mut rx).await;
+    let v2_row = app.list.items.iter().find(|v| v["number"] == 2).cloned().unwrap();
+    assert_eq!(v2_row["environments"], "Dev (served in part)");
+    run(&mut app, Act::Delete, v2_row);
+    settle(&mut app, &mut rx).await;
+    assert!(app.modal.is_none(), "no delete confirmation");
+    shown(&app, &format!("read what deleting {id} v2 removes: version 2 is bound to Dev (served in part)"));
+    assert_eq!(st.version(v2.id).await.unwrap().state, "published");
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
+}

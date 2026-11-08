@@ -1172,7 +1172,8 @@ pub async fn load(
             let mut out = vec![];
             for v in store.versions(*cv).await? {
                 let state = crate::cv::shown_state(&v.state, running);
-                let in_envs: Vec<String> = bindings.iter().filter_map(|b| version_env(b, &envs, v.id, running)).collect();
+                let mut in_envs: Vec<String> = bindings.iter().filter_map(|b| version_env(b, &envs, v.id, running)).collect();
+                in_envs.extend(store.partly_served(v.id).await?);
                 let repos: Vec<Value> = store
                     .version_repos(v.id)
                     .await?
