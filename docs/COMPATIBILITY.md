@@ -2,7 +2,7 @@
 
 ## Tested versions
 
-All live tests (`tests/run-live.sh`, `real` included) passed on 2026-11-04 on fresh
+All live tests (`tests/run-live.sh`, `real` included) passed on 2026-11-08 on fresh
 containers of `quay.io/pulp/pulp:latest`:
 
 | Component                             | Version                                             |
@@ -10,25 +10,28 @@ containers of `quay.io/pulp/pulp:latest`:
 | pulpcore, pulp_file                   | 3.123.1                                             |
 | pulp_rpm                              | 3.39.5                                              |
 | pulp_deb                              | 3.11.1                                              |
-| PostgreSQL (optional shared database) | 16.15 (`docker.io/library/postgres:16`), sqlx 0.8.6 |
+| PostgreSQL (optional shared database) | 16.15 (`docker.io/library/postgres:16`), sqlx 0.9.0 |
 | Client OS                             | Fedora 44 (Linux 7.2), Rust 1.99.1                  |
 
-On 2026-11-04, all live scenarios, `real` included (Debian `main`, Rocky 9 BaseOS and
-AppStream), passed on fresh containers of these images:
+On 2026-11-08, all live scenarios, `real` included (Debian `main`, Rocky 9 BaseOS and
+AppStream), passed on fresh containers of these images: 649 unit, 50 mock HTTP, 145 live
+and 3 `real` tests on each.
 
 | Image                       | pulpcore / pulp_file | pulp_rpm | pulp_deb | `real` |
 | --------------------------- | -------------------- | -------- | -------- | ------ |
-| `quay.io/pulp/pulp:3.63.36` | 3.63.36              | 3.27.12  | 3.5.4    | 826 s  |
-| `quay.io/pulp/pulp:3.95.3`  | 3.95.3               | 3.34.0   | 3.8.1    | 807 s  |
-| `quay.io/pulp/pulp:latest`  | 3.123.1              | 3.39.5   | 3.11.1   | 644 s  |
+| `quay.io/pulp/pulp:3.63.36` | 3.63.36              | 3.27.12  | 3.5.4    | 817 s  |
+| `quay.io/pulp/pulp:3.95.3`  | 3.95.3               | 3.34.0   | 3.8.1    | 814 s  |
+| `quay.io/pulp/pulp:latest`  | 3.123.1              | 3.39.5   | 3.11.1   | 626 s  |
 
-* On 3.63.36, `content` first failed in `acs_lifecycle`, a test newer than the 2026-10-30
-  run on this image: pulp_deb 3.5.4 has no `acs/deb/deb/`, and the RPM refresh sets
-  `all_tasks_dispatched`. The test now skips an ACS type without the endpoint and checks the
-  flag only from 3.95; `content` then passed on all three images.
-
-* On 3.95.3, one `native_replication` run failed once with "connection closed before
-  message completed" on `POST upstream-pulps/`. The next two runs passed.
+* On 3.95.3 and 3.63.36, four TUI tests new in audit 3 first failed. Each one used a field
+  or a guard type that only newer servers have: File sync `optimize` (pulp_file 3.95.3),
+  distribution `checkpoint` (pulpcore 3.63.36), Deb repository
+  `package_signing_fingerprint_release_overrides` (pulp_deb 3.8.1) and the
+  `core/envvar_header` guard (pulpcore 3.95.3 answers 404). The TUI hides each one on a
+  server without it. The tests now use only what the form shows; `deb` and `admin` then
+  passed on 3.95.3 in a second run on fresh containers.
+* On 2026-11-04, on 3.95.3, one `native_replication` run failed once with "connection closed
+  before message completed" on `POST upstream-pulps/`. The next two runs passed.
 * The nginx of the 3.63.36 image listens on IPv4 only. With rootless podman (pasta),
   `localhost` goes to `::1` and the connection is reset, so the tests use `127.0.0.1`.
 
@@ -912,7 +915,7 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
 
 ### Database TLS and `ca_cert`
 
-pulp-tui uses sqlx 0.8.6 with `tls-rustls-aws-lc-rs`.
+pulp-tui uses sqlx 0.9.0 with `tls-rustls-aws-lc-rs` (it still takes `webpki-roots`).
 
 * **The trust anchors are the Mozilla roots in the binary (`webpki-roots`), not the OS
   store.** `ca_cert` (`sslrootcert`) adds to them (sqlx `tls_rustls.rs`; read in the source,
