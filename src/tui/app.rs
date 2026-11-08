@@ -725,8 +725,8 @@ impl App {
         let text = format!("task {state}: {label}{}", err.map(|e| format!(": {e}")).unwrap_or_default());
         match state {
             "completed" => self.ok(format!("task completed: {label}")),
-            // Not a success, and not an error that Pulp reports.
-            "canceled" | "skipped" => self.notify(Level::Warn, text),
+            // Not a success, and not an error that Pulp reports (`GONE`: a group whose tasks were purged).
+            "canceled" | "skipped" | super::tasks::GONE => self.notify(Level::Warn, text),
             _ => self.error(text),
         }
         // Refresh the visible list or Dashboard once when a task finishes (not on every tick). A
@@ -2326,6 +2326,24 @@ mod tests {
         let m = rx.recv().await.unwrap();
         app.handle_msg(m);
         assert_eq!(loads(&app), 1, "the list shows what the failed operation left");
+    }
+
+    /// A task group whose tasks were purged ends `gone` in the Task Center: final, stored so, a warning, never a success.
+    #[tokio::test]
+    async fn a_task_group_whose_tasks_were_purged_ends_gone() {
+        use super::super::tasks::GONE;
+        let mut app = app_on(Kind::Profiles).await;
+        let mut rx = app.rx.take().unwrap();
+        app.track_task("/g/1/", "import dvd", None);
+        let group = serde_json::json!({ "pulp_href": "/g/1/", "description": "Import of /x-toc.json", "tasks": [] });
+        let task = serde_json::from_value::<crate::pulp::models::TaskGroup>(group).unwrap().as_task();
+        app.handle_msg(Msg::TaskPolled { href: "/g/1/".into(), result: Ok(task) });
+        settle(&mut app, &mut rx).await;
+        let row = app.tasks.items.iter().find(|t| t.href == "/g/1/").unwrap();
+        assert!(row.is_final() && row.state == GONE, "{}", row.state);
+        let notices: Vec<(Level, &str)> = app.notices.iter().map(|n| (n.level, n.text.as_str())).collect();
+        assert_eq!(notices, [(Level::Warn, "task gone: import dvd: its tasks were purged")]);
+        assert_eq!(app.store.tasks("lab", 10).await.unwrap()[0].state, GONE, "a restart does not re-attach it");
     }
 
     /// A notice shows one line: a job error of several lines (the failure list of an ImportRepos) also opens in the

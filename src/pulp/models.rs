@@ -383,6 +383,9 @@ pub struct Task {
 
 pub const TASK_FINAL_STATES: [&str; 4] = ["completed", "failed", "canceled", "skipped"];
 
+/// pulp-tui's final state of a task, or a task group, that Pulp no longer has (purged): how it ended is unknown.
+pub const GONE: &str = "gone";
+
 /// An idle task group whose newest task ended this long ago is final (`TaskGroup::is_final`). Long enough for a
 /// client clock that is some minutes ahead of Pulp's; a parent task dispatches its children before it ends.
 const IDLE_FINAL_SECS: u64 = 600;
@@ -472,11 +475,14 @@ impl TaskGroup {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         // shortcut: a group has no time in Pulp's answer, so an empty one ends at once, not after IDLE_FINAL_SECS; one
         // seen in the instant between its create and its first dispatch ends too. Wait when Pulp shows `pulp_created`.
-        let purged = self.tasks.is_empty() && self.done() == 0;
-        self.active() == 0
-            && (purged
-                || self.done() > 0
-                    && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh || self.idle_long(now)))
+        self.purged()
+            || self.active() == 0
+                && self.done() > 0
+                && (self.all_tasks_dispatched || self.failed + self.canceled > 0 || finalized || refresh || self.idle_long(now))
+    }
+    /// No task and no count: a purge deleted the tasks, and how they ended is unknown.
+    fn purged(&self) -> bool {
+        self.tasks.is_empty() && self.done() + self.active() == 0
     }
     /// The newest `finished_at` (`epoch_secs`) is `IDLE_FINAL_SECS` or more before `now` (seconds since the epoch,
     /// client clock).
@@ -484,9 +490,12 @@ impl TaskGroup {
         let newest = self.tasks.iter().filter_map(|t| epoch_secs(t["finished_at"].as_str()?)).max();
         newest.is_some_and(|f| f + IDLE_FINAL_SECS as i64 <= now as i64)
     }
-    /// How a final group ended: a failed task fails it; a canceled or skipped task is not a success either.
+    /// How a final group ended: a failed task fails it; a canceled or skipped task is not a success either, nor is
+    /// a group whose tasks were purged (`GONE`).
     pub fn outcome(&self) -> &'static str {
-        if self.failed > 0 {
+        if self.purged() {
+            GONE
+        } else if self.failed > 0 {
             "failed"
         } else if self.canceled > 0 {
             "canceled"
@@ -515,7 +524,10 @@ impl TaskGroup {
             state: state.into(),
             name: self.description.clone(),
             progress_reports: vec![progress],
-            error: (self.is_final() && state != "completed").then(|| serde_json::json!({ "description": self.counts() })),
+            error: (self.is_final() && state != "completed").then(|| {
+                let why = if state == GONE { "its tasks were purged".into() } else { self.counts() };
+                serde_json::json!({ "description": why })
+            }),
             ..Default::default()
         }
     }
@@ -952,13 +964,16 @@ mod tests {
     }
 
     /// Purge deletes tasks and `Task.task_group` is `SET_NULL`: the group stays with no task and no count (audit F36).
+    /// It is final, but how it ended is unknown (a purge can delete failed tasks too): `gone`, never a success.
     #[test]
-    fn a_group_whose_tasks_were_purged_is_final() {
+    fn a_group_whose_tasks_were_purged_is_final_and_gone() {
         let group = |g: Value| -> TaskGroup { serde_json::from_value(g).unwrap() };
         for flag in [false, true] {
             let purged = group(serde_json::json!({ "pulp_href": "/g/6/", "description": "Import of /x-toc.json",
                 "all_tasks_dispatched": flag, "tasks": [] }));
-            assert_eq!((purged.is_final(), purged.as_task().state.as_str()), (true, "completed"), "{flag}");
+            assert_eq!((purged.is_final(), purged.outcome()), (true, GONE), "{flag}");
+            let t = purged.as_task();
+            assert_eq!((t.state.as_str(), t.error_message().as_deref()), (GONE, Some("its tasks were purged")), "{flag}");
         }
         let waiting = group(serde_json::json!({ "pulp_href": "/g/6/", "waiting": 1, "tasks": [] }));
         assert!(!waiting.is_final(), "a count says a task waits");

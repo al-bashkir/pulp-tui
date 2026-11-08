@@ -21,8 +21,9 @@ pub struct Tracked {
     driven_until: Option<Instant>,
 }
 
-/// State of a task the server does not have (purged, or a reference of another server); final.
-pub const GONE: &str = "gone";
+/// State of a task the server does not have (purged, or a reference of another server), or of a task group whose
+/// tasks were purged; final.
+pub use crate::pulp::models::GONE;
 
 /// State of a task whose poll got 401: final in this session only. The stored reference stays unfinished,
 /// so a Connect with good credentials re-attaches the task.
