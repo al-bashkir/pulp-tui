@@ -226,7 +226,7 @@ async fn postgres_migration_7_moves_unfinished_bindings_to_promotions() {
     let st = s.open().await;
     let shown: Vec<_> = st.bindings_for_cv(1).await.unwrap().into_iter().map(|b| (b.served, b.attempt.map(|a| a.state))).collect();
     assert_eq!(shown, [(Some(2), None), (None, Some("partial".to_string()))]);
-    assert_eq!(st.version_in_use(2).await.unwrap(), ["Dev (promotion partial)", "Library"]);
+    assert_eq!(st.version_in_use(2).await.unwrap(), ["Dev (partial)", "Library"]);
     s.drop_schema().await;
 }
 
@@ -367,8 +367,8 @@ async fn store_methods_on_postgres() {
     st.finish_promotion(dev, cv, v2.id, "failed", "t3").await.unwrap();
     let b = st.binding(dev, cv).await.unwrap().unwrap();
     assert_eq!((b.served, b.attempt.map(|a| (a.version_id, a.state))), (Some(v1.id), Some((v2.id, "failed".to_string()))));
-    assert_eq!(st.version_in_use(v1.id).await.unwrap(), ["Dev", "Prod (promotion partial)"]);
-    assert_eq!(st.version_in_use(v2.id).await.unwrap(), ["Dev (promotion failed)"]);
+    assert_eq!(st.version_in_use(v1.id).await.unwrap(), ["Dev", "Prod (partial)"]);
+    assert_eq!(st.version_in_use(v2.id).await.unwrap(), ["Dev (failed)"]);
     // PostgreSQL refuses an attempt state that is not one of an unfinished promotion too.
     st.start_promotion(dev, cv, v2.id, "t3").await.unwrap();
     let e = st.finish_promotion(dev, cv, v2.id, "done", "t3").await.unwrap_err();

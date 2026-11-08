@@ -1411,24 +1411,28 @@ impl Store {
         .await?)
     }
 
-    /// The environments where version `version_id` is served, promoted without completing (`Dev (promotion failed)`),
-    /// or served in part (`partly_served`): it cannot be deleted. A `promoting` attempt is `running` under a live lock
-    /// (`lock_live`), else `interrupted`, as the screens show it.
+    /// The environments where version `version_id` is served, promoted without completing (`Dev (failed)`), or served
+    /// in part (`partly_served`): it cannot be deleted. An attempt shows as the screens show it (`cv::shown_state`): a
+    /// `promoting` one is `interrupted` without a live lock (`lock_live`).
     pub async fn version_in_use(&self, version_id: i64) -> Result<Vec<String>> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-        let mut used: Vec<String> = sqlx::query_scalar(
-            "SELECT e.name FROM bindings b JOIN environments e ON e.id = b.env_id WHERE b.version_id = $1
-             UNION SELECT e.name || ' (promotion ' || CASE WHEN p.state <> 'promoting' THEN p.state
-                    WHEN EXISTS (SELECT 1 FROM locks l WHERE l.cv_id = p.cv_id AND l.renewed_at >= $2) THEN 'running'
-                    ELSE 'interrupted' END || ')'
-             FROM promotions p JOIN environments e ON e.id = p.env_id
+        let mut used: Vec<String> =
+            sqlx::query_scalar("SELECT e.name FROM bindings b JOIN environments e ON e.id = b.env_id WHERE b.version_id = $1")
+                .bind(version_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let attempts = sqlx::query(
+            "SELECT e.name, p.state, p.cv_id FROM promotions p JOIN environments e ON e.id = p.env_id
              WHERE p.version_id = $1
                AND NOT EXISTS (SELECT 1 FROM bindings b WHERE b.env_id = p.env_id AND b.cv_id = p.cv_id AND b.version_id = $1)",
         )
         .bind(version_id)
-        .bind(now - LOCK_TTL_SECS)
         .fetch_all(&self.pool)
         .await?;
+        for r in attempts {
+            let (env, state): (String, String) = (r.try_get(0)?, r.try_get(1)?);
+            let running = self.lock_live(r.try_get(2)?, crate::cv::unix_now()).await?;
+            used.push(format!("{env} ({})", crate::cv::shown_state(&state, running)));
+        }
         used.extend(self.partly_served(version_id).await?);
         used.sort();
         Ok(used)
@@ -3068,7 +3072,7 @@ mod tests {
         assert_eq!((b.served, b.attempt.clone(), b.active()), (Some(v1.id), attempt("failed"), None));
         // Neither can be deleted; Dev cannot either.
         assert_eq!(s.version_in_use(v1.id).await.unwrap(), ["Dev"]);
-        assert_eq!(s.version_in_use(v2.id).await.unwrap(), ["Dev (promotion failed)"]);
+        assert_eq!(s.version_in_use(v2.id).await.unwrap(), ["Dev (failed)"]);
         assert_eq!(s.cv_env_ids(cv).await.unwrap(), [dev]);
         assert!(s.delete_env(dev).await.unwrap_err().to_string().contains("in use"));
         // A failed retry of the served version: it shows once.
@@ -3088,7 +3092,8 @@ mod tests {
         s.delete_cv(cv).await.unwrap();
     }
 
-    /// A `promoting` attempt is `interrupted`, as the screens show it, unless a live lock holds the view.
+    /// A `promoting` attempt is `interrupted` unless a live lock holds the view, in the words of the screens
+    /// (`cv::shown_state`).
     #[tokio::test]
     async fn a_promoting_attempt_without_a_live_lock_is_interrupted() {
         let s = Store::open_in_memory().await.unwrap();
@@ -3096,10 +3101,10 @@ mod tests {
         let v = s.begin_version(cv, "", &[]).await.unwrap();
         let dev = s.create_env("lab", "Dev", s.ensure_library("lab").await.unwrap(), false).await.unwrap();
         s.promoted(dev, cv, v.id, "promoting").await.unwrap();
-        assert_eq!(s.version_in_use(v.id).await.unwrap(), ["Dev (promotion interrupted)"]);
+        assert_eq!(s.version_in_use(v.id).await.unwrap(), ["Dev (interrupted)"]);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
         s.try_lock(cv, "bob@ws2", "tok", "promote to Dev", now).await.unwrap().unwrap();
-        assert_eq!(s.version_in_use(v.id).await.unwrap(), ["Dev (promotion running)"]);
+        assert_eq!(s.version_in_use(v.id).await.unwrap(), ["Dev (promoting)"]);
     }
 
     /// Dev serves v1; the promotion of v2 ends partial (os serves v2), then the one of v3 fails: v2 is still served in
@@ -3139,11 +3144,11 @@ mod tests {
         serve("os", RepoType::Rpm, "/p/os/2/").await;
         s.promoted(dev, cv, vs[0], "active").await.unwrap();
         s.promoted(dev, cv, vs[1], "partial").await.unwrap();
-        assert_eq!(s.version_in_use(vs[1]).await.unwrap(), ["Dev (promotion partial)"]);
+        assert_eq!(s.version_in_use(vs[1]).await.unwrap(), ["Dev (partial)"]);
         s.promoted(dev, cv, vs[2], "failed").await.unwrap();
         assert_eq!(s.version_in_use(vs[0]).await.unwrap(), ["Dev"]);
         assert_eq!(s.version_in_use(vs[1]).await.unwrap(), ["Dev (served in part)"]);
-        assert_eq!(s.version_in_use(vs[2]).await.unwrap(), ["Dev (promotion failed)"]);
+        assert_eq!(s.version_in_use(vs[2]).await.unwrap(), ["Dev (failed)"]);
         assert_eq!(s.partly_served(vs[1]).await.unwrap(), ["Dev (served in part)"]);
         // Dev serves all of v3: the docs publication that v1 and v2 share with it keeps neither in use.
         serve("os", RepoType::Rpm, "/p/os/3/").await;
