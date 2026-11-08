@@ -2368,6 +2368,22 @@ mod tests {
         assert!(app.modal.is_none(), "one line: the notice only");
     }
 
+    /// The text view of a failed job waits behind dialogs only for itself: a dialog that the operator opens after it
+    /// takes the keys typed at once.
+    #[tokio::test]
+    async fn after_a_job_error_view_a_dialog_of_the_operator_takes_keys_at_once() {
+        let mut app = app_on(Kind::Profiles).await;
+        let mut rx = app.rx.take().unwrap();
+        app.spawn("replicate up".into(), false, async { anyhow::bail!("2 failed:\n  a\n  b") });
+        app.handle_msg(rx.recv().await.unwrap());
+        assert!(matches!(&app.modal, Some(Modal::Text { title, .. }) if title == "replicate up failed"));
+        (app.modal, app.guard_until) = (None, None); // the operator read it and closed it
+        app.form(Form::new("next", vec![super::super::form::Field::text("name", "Name")]), |_, _| Ok(()));
+        app.handle_key(ch('x'));
+        let Some(Modal::Form { form, .. }) = &app.modal else { panic!("no form") };
+        assert_eq!(form.get("name"), "x");
+    }
+
     /// The text view of a failed job never replaces the dialog that the operator fills in: it waits behind it.
     #[tokio::test]
     async fn a_job_error_view_waits_for_the_open_dialog() {
