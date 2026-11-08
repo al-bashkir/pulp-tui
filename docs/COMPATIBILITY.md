@@ -554,6 +554,11 @@ Read in pulpcore 3.123.1 (models and serializers in `pulpcore/app/`) and live on
   names); the role is `core.rbaccontentguard_downloader`. The user that creates the guard
   gets that role at once, and `add_role/` refuses a role that the user already has (400).
 * **`header_value` of a header guard is readable on GET.** pulp-tui masks it like a secret.
+* **An env var header guard needs an allowed variable.** `env_var` must be in the server
+  setting `ENVVAR_HEADER_CONTENT_GUARD_ALLOWED_VARS`, empty by default (`settings.py`): else
+  400 "Environment variable '...' is not in ENVVAR_HEADER_CONTENT_GUARD_ALLOWED_VARS." (live).
+  The other types (RBAC, redirect, composite, x509, RHSM with a self-signed CA) are created
+  through the TUI in `live_admin`.
 * `description` and `jq_filter` take `null`, not an empty string (`minLength` 1). The
   certguard types take the PEM text of the CA certificate in `ca_certificate`.
 * `contentguards/` lists every type with name and description only; the type is in the

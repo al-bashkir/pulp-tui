@@ -1007,3 +1007,166 @@ async fn store_secret_in_the_keyring_through_the_tui() {
     entry(&name).and_then(|e| e.delete_credential()).unwrap_or_else(|e| panic!("the secret was not stored: {e}; {notices:?}"));
     assert!(notices.contains(&"secret stored in keyring".to_string()) && connected, "{notices:?}");
 }
+
+/// Create (c) of each content guard type of the server other than core/header (it has its own test): the type form,
+/// then the fields of that type; Pulp has the guard with them. The type choice offers only the types of the server.
+#[tokio::test]
+async fn content_guards_of_the_other_types_are_created_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    use pulp_tui::tui::form::FieldKind;
+    let c = client();
+    let name = unique("admin-guards");
+    let dir = tempfile::tempdir().unwrap();
+    let pem = dir.path().join("ca.pem");
+    // A throw-away self-signed CA: Pulp checks the certificate with OpenSSL. The key is not kept.
+    let made = std::process::Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1"])
+        .args(["-subj", "/CN=pulp-tui test CA", "-keyout", "/dev/null", "-out"])
+        .arg(&pem)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "openssl: {}", String::from_utf8_lossy(&made.stderr));
+    let (ca, pem) = (std::fs::read_to_string(&pem).unwrap(), pem.display().to_string());
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::ContentGuards;
+    let caps = app.conn.as_ref().unwrap().caps.clone();
+    let has = |t: &str| caps.has_endpoint(&format!("contentguards/{t}/"));
+
+    run(&mut app, Act::Create, Value::Null);
+    let Some(Modal::Form { form, .. }) = app.modal.take() else { panic!("no type form: {:?}", texts(&app)) };
+    let FieldKind::Choice(offered) = form.fields[0].kind.clone() else { panic!("no type choice") };
+    let all =
+        ["core/rbac", "core/header", "core/envvar_header", "core/content_redirect", "core/composite", "certguard/x509", "certguard/rhsm"];
+    assert_eq!(offered, all.into_iter().filter(|t| has(t)).collect::<Vec<_>>());
+
+    // The type form, then the form of the type; the last notice, and the guard as Pulp has it.
+    let make = async |app: &mut App, rx: &mut UnboundedReceiver<Msg>, t: &str, values: &[(&str, &str)]| {
+        let gname = format!("{name}-{}", t.rsplit('/').next().unwrap());
+        run(app, Act::Create, Value::Null);
+        fill(app, &[("type", t)]);
+        fill(app, &[&[("name", gname.as_str())], values].concat());
+        settle(app, rx).await;
+        let found: Option<Value> = ops::find_by_name(&c, &c.api(&format!("contentguards/{t}/")), &gname).await.unwrap();
+        (texts(app).pop().unwrap_or_default(), found)
+    };
+    let made_ok = async |app: &mut App, rx: &mut UnboundedReceiver<Msg>, t: &str, values: &[(&str, &str)]| -> Value {
+        let (said, found) = make(app, rx, t, values).await;
+        assert!(said.ends_with(": done"), "{t}: {said}");
+        found.unwrap_or_else(|| panic!("{t} not created: {said}"))
+    };
+    let rbac = made_ok(&mut app, &mut rx, "core/rbac", &[]).await;
+    let redirect = made_ok(&mut app, &mut rx, "core/content_redirect", &[]).await;
+    let composite = made_ok(&mut app, &mut rx, "core/composite", &[("guards", &s(&rbac, "pulp_href"))]).await;
+    assert_eq!(composite["guards"], json!([rbac["pulp_href"]]));
+    let mut made = vec![composite, rbac, redirect];
+    for t in ["certguard/x509", "certguard/rhsm"].into_iter().filter(|t| has(t)) {
+        let g = made_ok(&mut app, &mut rx, t, &[("ca_certificate", &pem)]).await;
+        assert_eq!(g["ca_certificate"].as_str().map(str::trim), Some(ca.trim()), "{t}: the file's certificate");
+        made.push(g);
+    }
+    match make(&mut app, &mut rx, "core/envvar_header", &[("header_name", "X-Org"), ("env_var", "PULP_TUI_ORG")]).await {
+        (_, Some(env)) => {
+            assert_eq!((s(&env, "header_name"), s(&env, "env_var")), ("X-Org".into(), "PULP_TUI_ORG".into()));
+            made.push(env);
+        }
+        // pulpcore allows no variable by default (`ENVVAR_HEADER_CONTENT_GUARD_ALLOWED_VARS = []`), so the form's
+        // request gets Pulp's refusal of that variable.
+        (said, None) => {
+            let refused =
+                "rejected [400]: env_var: Environment variable 'PULP_TUI_ORG' is not in ENVVAR_HEADER_CONTENT_GUARD_ALLOWED_VARS.";
+            assert!(said.ends_with(refused), "{said}");
+        }
+    }
+    let hrefs: Vec<String> = made.iter().map(|g| s(g, "pulp_href")).collect();
+    cleanup(&c, &hrefs.iter().map(String::as_str).collect::<Vec<_>>()).await;
+}
+
+/// Track (a) and Watch (W) on the Task groups screen (audit E01): the ACS refresh group of this test is tracked under
+/// its description, Watch opens its live view, and the Task Center polls it to its end; the view follows.
+#[tokio::test]
+async fn task_groups_screen_tracks_and_watches_a_group() {
+    if !live_enabled() {
+        return;
+    }
+    use pulp_tui::pulp::Mutation;
+    let c = client();
+    let name = unique("admin-track");
+    let body = json!({ "name": name, "url": format!("{}/file/PULP_MANIFEST", upstream()), "policy": "on_demand" });
+    let remote = create(&c, RepoType::File.remotes(), body, "/remotes/").await;
+    let acs = create(&c, RepoType::File.acs(), json!({ "name": name, "remote": remote }), "/acs/").await;
+    let Mutation::TaskGroup(group) = c.post(&format!("{acs}refresh/"), &json!({})).await.unwrap() else { panic!("no task group") };
+
+    let (mut app, mut rx) = app().await;
+    app.open(Screen::List(Kind::TaskGroups));
+    settle(&mut app, &mut rx).await;
+    let row = app.list.items.iter().find(|g| g["pulp_href"] == group.as_str()).cloned();
+    let row = row.unwrap_or_else(|| panic!("the group is not on the first page: {:?}", app.list.error));
+    let description = s(&row, "description");
+    run(&mut app, Act::TrackTask, row.clone());
+    shown(&app, "tracking task");
+    assert_eq!(app.tasks.items.iter().find(|t| t.href == group).map(|t| t.label.clone()), Some(description.clone()));
+    run(&mut app, Act::WatchTask, row);
+    let Some(Modal::Text { title, watch, .. }) = &app.modal else { panic!("no watch: {:?}", texts(&app)) };
+    assert_eq!((title.as_str(), watch.as_deref()), (format!("Watch task {description}").as_str(), Some(group.as_str())));
+
+    settle_tasks(&mut app, &mut rx).await;
+    assert_eq!(app.tasks.items.iter().find(|t| t.href == group).unwrap().state, "completed", "{:?}", texts(&app));
+    shown(&app, &format!("task completed: {description}"));
+    let Some(Modal::Text { lines, .. }) = &app.modal else { panic!("the watch closed: {:?}", texts(&app)) };
+    assert!(lines.iter().any(|l| l.contains("completed")), "the view follows the group: {lines:?}");
+    cleanup(&c, &[&acs, &remote]).await;
+}
+
+/// The Task Center keeps its task references in the local file: a Sync (s) submitted in one session that quits before
+/// a poll is re-attached by the Connect of the next session on the same file and polled there to its end. A third
+/// session shows it as ended and does not re-attach it.
+#[tokio::test]
+async fn task_center_reattaches_a_task_of_a_previous_session() {
+    if !live_enabled() {
+        return;
+    }
+    use pulp_tui::pulp::Mutation;
+    let c = client();
+    let t = RepoType::File;
+    let name = unique("admin-reattach");
+    let body = json!({ "name": name, "url": format!("{}/file/PULP_MANIFEST", upstream()), "policy": "immediate" });
+    let remote = create(&c, t.remotes(), body, "/remotes/").await;
+    let repo = create(&c, t.repositories(), json!({ "name": name, "remote": remote }), "/repositories/").await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pulp-tui.db");
+    // A session on the local file `db`: Connect reads its task references.
+    let session = async || {
+        let (mut app, mut rx) = app().await;
+        app.store = Arc::new(Store::open(&db).await.unwrap());
+        app.connect("pulp1");
+        settle(&mut app, &mut rx).await;
+        (app, rx)
+    };
+
+    let (mut app, mut rx) = session().await;
+    app.list.kind = Kind::Repos(t, false);
+    run(&mut app, Act::Sync, c.get::<Value>(&repo, &[]).await.unwrap());
+    settle(&mut app, &mut rx).await;
+    fill(&mut app, &[]);
+    settle(&mut app, &mut rx).await; // the POST, then the stored reference
+    let first = app.tasks.items.first().unwrap_or_else(|| panic!("no task: {:?}", texts(&app)));
+    let (href, label) = (first.href.clone(), first.label.clone());
+    assert_eq!(first.state, "waiting", "quit before a poll");
+    drop((app, rx));
+    ops::settle(&c, Mutation::Task(href.clone()), &no_progress).await.unwrap(); // the task ends while no session runs
+
+    let (mut app, mut rx) = session().await;
+    shown(&app, "re-attached to 1 unfinished task(s) from a previous session");
+    let state = |app: &App| app.tasks.items.iter().find(|r| r.href == href).map(|r| (r.label.clone(), r.state.clone()));
+    assert_eq!(state(&app), Some((label.clone(), "waiting".into())));
+    settle_tasks(&mut app, &mut rx).await;
+    shown(&app, &format!("task completed: {label}"));
+    drop((app, rx));
+
+    let (app, _rx) = session().await;
+    assert!(!texts(&app).iter().any(|t| t.starts_with("re-attached")), "{:?}", texts(&app));
+    assert_eq!(state(&app), Some((label, "completed".into())), "stored as ended");
+    cleanup(&c, &[&repo, &remote]).await;
+}
