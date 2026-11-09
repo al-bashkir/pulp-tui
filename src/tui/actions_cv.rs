@@ -845,10 +845,10 @@ async fn left_out_lines(
         let what = match svc.left_out(name, e, vrs, &b).await? {
             None => continue,
             Some(LeftOut::Forget(why)) => why,
-            Some(LeftOut::Unbind) if b.publication.is_none() => {
-                "its distribution stops serving (kept for rollback); Pulp shows that it serves a publication set outside pulp-tui".into()
+            Some(LeftOut::Unbind(_)) if b.publication.is_none() => {
+                "its distribution stops serving (kept for rollback); Pulp shows that it serves content set outside pulp-tui".into()
             }
-            Some(LeftOut::Unbind) => "its distribution stops serving (kept for rollback)".into(),
+            Some(LeftOut::Unbind(_)) => "its distribution stops serving (kept for rollback)".into(),
         };
         lines.push(format!("  {}: not part of {version} -> {what}", b.repo_name));
     }
@@ -1965,7 +1965,7 @@ mod tests {
         drain(&mut app, &mut rx).await;
         let lines = confirm_lines(&mut app);
         let r1 = "  r1: not part of the new version -> its distribution stops serving (kept for rollback); Pulp shows that it \
-                  serves a publication set outside pulp-tui";
+                  serves content set outside pulp-tui";
         let r2 = "  r2: not part of the new version -> its distribution d2 is not labeled pulp_tui_cv=rocky9 (changed outside \
                   pulp-tui): pulp-tui leaves it as it is and forgets it";
         assert_eq!(lines[lines.len() - 3..], ["In Library:", r1, r2], "{lines:?}");
@@ -2509,8 +2509,8 @@ mod tests {
         let gone = "  gone: not part of v1 -> its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it";
         let mine = "  mine: not part of v1 -> its distribution d is not labeled pulp_tui_cv=web (changed outside pulp-tui): \
                     pulp-tui leaves it as it is and forgets it";
-        let old = "  old: not part of v1 -> its distribution stops serving (kept for rollback); Pulp shows that it serves a \
-                   publication set outside pulp-tui";
+        let old = "  old: not part of v1 -> its distribution stops serving (kept for rollback); Pulp shows that it serves \
+                   content set outside pulp-tui";
         assert_eq!(confirm_lines(&mut app)[2..6], [gone, mine, old, ""]);
     }
 

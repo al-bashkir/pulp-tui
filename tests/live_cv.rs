@@ -564,6 +564,47 @@ async fn publish_leaves_alone_a_kept_library_distribution_taken_over_outside_pul
     cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
 }
 
+/// F60: v2 leaves out `more`, so Library keeps its distribution, serving nothing. Outside pulp-tui it is bound to the
+/// source repository (follow latest). Verify reports it, and the next Publish (its Library step) points it at nothing
+/// again: Pulp accepts the unbind.
+#[tokio::test]
+async fn a_kept_library_distribution_bound_to_a_repository_is_reported_and_unbound() {
+    if !live_enabled() {
+        return;
+    }
+    let c = client();
+    let id = unique("cvrb");
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let profile = c.profile().to_string();
+    let svc = CvService { client: c.clone(), store: store.clone(), scope: profile.clone(), actor: "test@live".into(), lock: None };
+    let cv = store.create_cv(&profile, &id, "").await.unwrap();
+    let mut sources = vec![];
+    for name in ["docs", "more"] {
+        let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-{name}"), "file/PULP_MANIFEST", "mirror").await;
+        let r = CvRepo { repo_href: repo.clone(), repo_name: name.into(), repo_type: RepoType::File, filters: vec![] };
+        store.set_cv_repo(cv, &r).await.unwrap();
+        sources.extend([repo, remote]);
+    }
+    svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let lib = store.ensure_library(&profile).await.unwrap();
+    let more = store.binding_repos(lib, cv).await.unwrap().into_iter().find(|b| b.repo_name == "more").unwrap();
+    store.remove_cv_repo(cv, &more.repo_href).await.unwrap();
+    svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let m = c.patch(&more.distribution, &json!({ "repository": more.repo_href })).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+
+    let found = svc.verify(cv, lib).await.unwrap();
+    assert_eq!(found, [format!("more: distribution serves {}, expected nothing", more.repo_href)]);
+    let (_, note) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    assert_eq!(note, None, "the Library step completes");
+    let d: Value = c.get(&more.distribution, &[]).await.unwrap();
+    assert_eq!((&d["publication"], &d["repository"]), (&Value::Null, &Value::Null), "unbound");
+    assert!(svc.verify(cv, lib).await.unwrap().is_empty());
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
+}
+
 /// Two databases (stores with different ids) share one Pulp and one Content View name.
 #[tokio::test]
 async fn content_view_owned_by_another_database() {

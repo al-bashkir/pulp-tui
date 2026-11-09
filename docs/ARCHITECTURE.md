@@ -276,9 +276,10 @@ rerun of the relabel moves its row.
 
 ### Verify and drift
 
-Verify checks for every binding that the distribution serves the expected publication, the
-publication belongs to the snapshot, the snapshot exists, and a served sample matches (not every
-file; the OK line of the drift check says so):
+Verify checks for every binding that the distribution serves the expected publication (and no
+repository or repository version, which Pulp also lets a distribution serve), the publication
+belongs to the snapshot, the snapshot exists, and a served sample matches (not every file; the OK
+line of the drift check says so):
 
 | Type | Served check                                                                                  |
 | ---- | --------------------------------------------------------------------------------------------- |
@@ -293,8 +294,9 @@ new version; served files that differ need a repair; a missing `base_url` needs
 `CONTENT_ORIGIN`; retention must be cleared outside pulp-tui.
 
 * A promotion re-points also a repository that the version lacks when Pulp shows that its
-  distribution serves a publication (`unbind_removed` reads the distribution of a row that
-  records none, `CvService::left_out`), so the "promote again" hint fixes that drift too.
+  distribution serves a publication, a repository or a repository version (`unbind_removed`
+  reads the distribution of a row that records none, `CvService::left_out`; the unbind clears
+  all three, and the checkpoint flag), so the "promote again" hint fixes that drift too.
   The promote and Publish previews use the same rule, so they name that change.
 * While a workflow holds a live lock on the view, the drift check gives one hint per
   environment with drift, which names that workflow, and no other: the lock refuses Publish,

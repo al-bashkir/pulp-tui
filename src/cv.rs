@@ -314,8 +314,8 @@ pub fn component_lines(old: &[UsedVersion], new: &[UsedVersion]) -> Vec<String> 
 /// What a promotion does to the served row of a repository that the promoted version lacks (`CvService::left_out`).
 #[derive(Debug, PartialEq)]
 pub enum LeftOut {
-    /// Point its distribution at no publication; the distribution is kept for rollback.
-    Unbind,
+    /// Point its distribution at nothing with this PATCH body (`unbind_body`); the distribution is kept for rollback.
+    Unbind(Value),
     /// Forget the row and send nothing: the text says why (`its distribution is gone ...`).
     Forget(String),
 }
@@ -1332,7 +1332,7 @@ impl CvService {
     /// deleted (and logged).
     async fn record_left_out(&self, b: BindingRepo, what: LeftOut, log: Log<'_>) -> Result<()> {
         match what {
-            LeftOut::Unbind => self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await,
+            LeftOut::Unbind(_) => self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await,
             LeftOut::Forget(why) => {
                 log(format!("{}: {why}", b.repo_name));
                 self.store.delete_binding_repo(b.env_id, b.cv_id, &b.repo_href).await
@@ -1353,7 +1353,7 @@ impl CvService {
     ) -> Result<Option<LeftOut>> {
         let what = self.left_out(cv, env, vrs, b).await?;
         match &what {
-            Some(LeftOut::Unbind) => self.unbind(cv, env, b, aliases, on).await?,
+            Some(LeftOut::Unbind(body)) => self.unbind(cv, env, b, body, aliases, on).await?,
             Some(LeftOut::Forget(_)) => self.alive()?,
             None => {}
         }
@@ -1378,7 +1378,7 @@ impl CvService {
             }
             Err(e) => return Err(e.into()),
         };
-        if b.publication.is_none() && !d["publication"].is_string() {
+        if b.publication.is_none() && !serves(&d) {
             return Ok(None);
         }
         Ok(Some(self.unbind_or_forget(cv, env, b, &d).await?))
@@ -1389,7 +1389,7 @@ impl CvService {
     async fn unbind_or_forget(&self, cv: &str, env: &Environment, b: &BindingRepo, d: &Value) -> Result<LeftOut> {
         let aliases = self.store.aliases().await?;
         Ok(match self.not_ours(&b.distribution, &dist_labels(cv, &env.name), &aliases).await? {
-            None => LeftOut::Unbind,
+            None => LeftOut::Unbind(unbind_body(d)),
             Some(why) => LeftOut::Forget(format!(
                 "its distribution {} is {why} (changed outside pulp-tui): pulp-tui leaves it as it is and forgets it",
                 d["name"].as_str().unwrap_or("?")
@@ -1397,13 +1397,13 @@ impl CvService {
         })
     }
 
-    /// Point the distribution of `b` at no publication; refused unless it is ours.
-    async fn unbind(&self, cv: &str, env: &Environment, b: &BindingRepo, aliases: &[String], on: OnTask<'_>) -> Result<()> {
+    /// Point the distribution of `b` at nothing with PATCH `body` (`unbind_body`); refused unless it is ours.
+    async fn unbind(&self, cv: &str, env: &Environment, b: &BindingRepo, body: &Value, aliases: &[String], on: OnTask<'_>) -> Result<()> {
         if let Some(why) = self.not_ours(&b.distribution, &dist_labels(cv, &env.name), aliases).await? {
             bail!("distribution {} is {why}", distribution_name(cv, &env.name, &b.repo_name));
         }
         self.alive()?;
-        let m = self.client.patch(&b.distribution, &json!({ "publication": null })).await?;
+        let m = self.client.patch(&b.distribution, body).await?;
         ops::settle(&self.client, m, on).await?;
         self.alive() // before the checkpoint in unbind_removed
     }
@@ -1719,8 +1719,10 @@ impl CvService {
             // A promotion makes a distribution that is gone again.
             Err(e) => return vec![Drift::new(format!("{}: distribution {}: {e}", br.repo_name, br.distribution), Fix::Bind)],
         };
-        if d.publication != want {
-            let (has, want) = (d.publication.as_deref().unwrap_or("nothing"), want.as_deref().unwrap_or("nothing"));
+        // Pulp lets a distribution serve one of these (outside pulp-tui: a repository or a repository version).
+        let has = d.publication.as_deref().or(d.repository.as_deref()).or(d.repository_version.as_deref());
+        if has != want.as_deref() {
+            let (has, want) = (has.unwrap_or("nothing"), want.as_deref().unwrap_or("nothing"));
             return vec![Drift::new(format!("{}: distribution serves {has}, expected {want}", br.repo_name), Fix::Bind)];
         }
         let Some(vr) = vr else { return vec![] };
@@ -2051,6 +2053,24 @@ fn row_objects(
         objects.push((vr.repo().repo_name.clone(), href.clone(), keep));
     }
     objects
+}
+
+/// Whether distribution `d` serves something: a publication, or (set outside pulp-tui) a repository or a repository version.
+fn serves(d: &Value) -> bool {
+    ["publication", "repository", "repository_version"].iter().any(|k| d[k].is_string())
+}
+
+/// The PATCH that makes distribution `d` serve nothing: no publication, no repository or repository version (set outside
+/// pulp-tui), and not a checkpoint distribution (Pulp allows one only with a repository).
+fn unbind_body(d: &Value) -> Value {
+    let mut body = json!({ "publication": null });
+    for k in ["repository", "repository_version"].into_iter().filter(|k| d[k].is_string()) {
+        body[k] = Value::Null;
+    }
+    if d["checkpoint"] == true {
+        body["checkpoint"] = false.into();
+    }
+    body
 }
 
 /// "served by <distribution> (<why>), …" for the distributions that `ops::protecting` gives; `None` when there are none.
@@ -3266,46 +3286,58 @@ mod tests {
         svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap();
     }
 
-    /// A repository that the version lacks serves a publication again (changed outside pulp-tui): the drift names a
-    /// new promotion, and that promotion points the distribution at nothing again.
+    /// A repository that the version lacks serves again (changed outside pulp-tui): a publication, or (F60) a repository
+    /// (also as a checkpoint distribution) or a repository version. The drift names a new promotion, and that promotion
+    /// points the distribution at nothing again.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_promotion_unbinds_a_left_out_repository_that_serves_again() {
         use wiremock::matchers::{body_json, method, path};
         use wiremock::{Mock, ResponseTemplate};
-        let server = wiremock::MockServer::start().await;
-        let svc = mock_service(&server).await;
-        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
-        let v = svc.store.begin_version(cv, "", &[]).await.unwrap();
-        svc.store.finish_version(v.id, "published", None).await.unwrap();
-        let lib = svc.store.ensure_library("k").await.unwrap();
-        svc.store.promoted(lib, cv, v.id, "active").await.unwrap();
-        let old = BindingRepo {
-            env_id: lib,
-            cv_id: cv,
-            repo_href: "/pulp/api/v3/repositories/rpm/rpm/9/".into(),
-            repo_name: "old".into(),
-            repo_type: RepoType::Rpm,
-            distribution: DIST.into(),
-            base_path: "library/web/old".into(),
-            publication: None,
-        };
-        svc.store.save_binding_repo(&old).await.unwrap();
-        let p = "/pulp/api/v3/publications/rpm/rpm/3/";
-        let d = json!({ "pulp_href": DIST, "name": "d", "base_path": "library/web/old", "publication": p,
-            "pulp_labels": { LABEL_CV: "web", LABEL_ENV: LIBRARY, LABEL_DB: svc.store.db_id() } });
-        Mock::given(method("GET")).and(path(DIST)).respond_with(ResponseTemplate::new(200).set_body_json(d)).mount(&server).await;
-        let drift: Vec<_> = svc.drift(cv, lib).await.unwrap().into_iter().map(|d| (d.text, d.fix)).collect();
-        assert_eq!(drift, [(format!("old: distribution serves {p}, expected nothing"), Fix::Bind)]);
-        let task = json!({ "task": "/pulp/api/v3/tasks/1/" });
-        let patch = Mock::given(method("PATCH")).and(path(DIST)).and(body_json(json!({ "publication": null })));
-        patch.respond_with(ResponseTemplate::new(202).set_body_json(task)).expect(1).mount(&server).await;
-        let done = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "completed", "name": "update" });
-        Mock::given(method("GET"))
-            .and(path("/pulp/api/v3/tasks/1/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(done))
-            .mount(&server)
-            .await;
-        svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap();
+        let (r, rv) = ("/pulp/api/v3/repositories/rpm/rpm/9/", "/pulp/api/v3/repositories/rpm/rpm/9/versions/2/");
+        // (what the distribution serves, the PATCH that unbinds it)
+        let cases = [
+            (json!({ "publication": "/pulp/api/v3/publications/rpm/rpm/3/" }), json!({ "publication": null })),
+            (json!({ "repository": r, "checkpoint": true }), json!({ "publication": null, "repository": null, "checkpoint": false })),
+            (json!({ "repository_version": rv }), json!({ "publication": null, "repository_version": null })),
+        ];
+        for (serves, unbind) in cases {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+            let v = svc.store.begin_version(cv, "", &[]).await.unwrap();
+            svc.store.finish_version(v.id, "published", None).await.unwrap();
+            let lib = svc.store.ensure_library("k").await.unwrap();
+            svc.store.promoted(lib, cv, v.id, "active").await.unwrap();
+            let old = BindingRepo {
+                env_id: lib,
+                cv_id: cv,
+                repo_href: r.into(),
+                repo_name: "old".into(),
+                repo_type: RepoType::Rpm,
+                distribution: DIST.into(),
+                base_path: "library/web/old".into(),
+                publication: None,
+            };
+            svc.store.save_binding_repo(&old).await.unwrap();
+            let mut d = json!({ "pulp_href": DIST, "name": "d", "base_path": "library/web/old",
+                "pulp_labels": { LABEL_CV: "web", LABEL_ENV: LIBRARY, LABEL_DB: svc.store.db_id() } });
+            d.as_object_mut().unwrap().extend(serves.as_object().unwrap().clone());
+            Mock::given(method("GET")).and(path(DIST)).respond_with(ResponseTemplate::new(200).set_body_json(d)).mount(&server).await;
+            let drift: Vec<_> = svc.drift(cv, lib).await.unwrap().into_iter().map(|d| (d.text, d.fix)).collect();
+            let href = serves.as_object().unwrap().values().find_map(Value::as_str).unwrap();
+            assert_eq!(drift, [(format!("old: distribution serves {href}, expected nothing"), Fix::Bind)]);
+            let task = json!({ "task": "/pulp/api/v3/tasks/1/" });
+            let patch = Mock::given(method("PATCH")).and(path(DIST)).and(body_json(unbind));
+            patch.respond_with(ResponseTemplate::new(202).set_body_json(task)).expect(1).mount(&server).await;
+            let done = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "completed", "name": "update" });
+            Mock::given(method("GET"))
+                .and(path("/pulp/api/v3/tasks/1/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(done))
+                .mount(&server)
+                .await;
+            svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap();
+            server.verify().await;
+        }
     }
 
     /// A left-out row that records no publication is checked in Pulp: a gone distribution is forgotten (the row), and

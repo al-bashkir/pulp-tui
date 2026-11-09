@@ -620,7 +620,8 @@ retry, or roll back to the served version to clear the failed attempt.
   distribution (Pulp refuses overlapping base paths): the preview names a distribution that has
   the path or overlaps it, and the promotion then fails for that repository, before Pulp is
   asked. A repository that the version does not have stops serving; the preview names it, also
-  when its distribution serves a publication that was set outside pulp-tui. When its distribution
+  when its distribution serves content that was set outside pulp-tui (a publication, a repository
+  or a repository version; the drift check reports it too). When its distribution
   was deleted outside pulp-tui, the promotion sends nothing for it and forgets it; the preview
   says so. When its distribution no longer has the labels of the view (someone took it over), the
   promotion does not change it and forgets it too; the preview says so. When it still serves a
