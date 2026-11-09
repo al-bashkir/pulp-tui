@@ -856,15 +856,27 @@ async fn left_out_lines(
     Ok(lines)
 }
 
-/// What the Library step of a Publish of view `id` (`name`) does, under a heading: the repositories of the draft that it
-/// fails for (`refused_lines`) and the rows that it changes (`left_out_lines`).
-async fn library_lines(svc: &CvService, id: i64, name: &str) -> anyhow::Result<Vec<String>> {
+/// What the Library step of view `id` (`name`) does when it promotes a version with the repositories `vrs` (named
+/// `version`), under a heading: the repositories that it fails for (`refused_lines`) and the rows that it changes
+/// (`left_out_lines`). Publish passes the draft (`CvService::draft_rows`), Resume the version.
+async fn library_lines(svc: &CvService, id: i64, name: &str, vrs: &[CvVersionRepo], version: &str) -> anyhow::Result<Vec<String>> {
     let lib = svc.store.ensure_library(&svc.scope).await?; // as the Library step does
     let Some(lib) = svc.store.environments(&svc.scope).await?.into_iter().find(|e| e.id == lib) else { return Ok(vec![]) };
-    let (draft, rows) = (svc.draft_rows(id).await?, svc.store.binding_repos(lib.id, id).await?);
-    let mut lines = refused_lines(svc, name, &lib, &draft).await?;
-    lines.extend(left_out_lines(svc, name, &lib, &draft, rows, "the new version").await?);
+    let rows = svc.store.binding_repos(lib.id, id).await?;
+    let mut lines = refused_lines(svc, name, &lib, vrs).await?;
+    lines.extend(left_out_lines(svc, name, &lib, vrs, rows, version).await?);
     Ok(if lines.is_empty() { lines } else { std::iter::once("In Library:".to_string()).chain(lines).collect() })
+}
+
+/// `library_lines` of a Resume of version `v` of view `name`, after a blank line: none when the Library step does not
+/// run (only the auto publish is left, `CvService::resume`) or a newer version is published (`CvService::bind_library`).
+async fn resume_library_lines(svc: &CvService, name: &str, v: &CvVersion) -> anyhow::Result<Vec<String>> {
+    let newer = svc.store.versions(v.cv_id).await?.iter().any(|n| n.state == "published" && n.number > v.number);
+    if newer || (v.state == "published" && !svc.library_interrupted(v).await?) {
+        return Ok(vec![]);
+    }
+    let lines = library_lines(svc, v.cv_id, name, &svc.store.version_repos(v.id).await?, &format!("v{}", v.number)).await?;
+    Ok(if lines.is_empty() { lines } else { std::iter::once(String::new()).chain(lines).collect() })
 }
 
 /// A line for each repository of `vrs` (of view `name`) that the Library step `e` fails for (`CvService::bind_target`).
@@ -967,7 +979,7 @@ fn cv_publish(app: &mut App, id: i64, name: String, deb: bool) {
             let mut lines = svc.preview(id, latest).await?;
             lines.insert(0, "Publishing creates a new immutable version and makes it active in Library.".into());
             lines.insert(1, String::new());
-            lines.extend(library_lines(&svc, id, &name).await?);
+            lines.extend(library_lines(&svc, id, &name, &svc.draft_rows(id).await?, "the new version").await?);
             let protected = svc.library_protected().await?;
             ap(move |app| {
                 guard_library(app, protected, lines, Some(format!("Publish {name}")), move |app| {
@@ -1067,7 +1079,11 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                 if svc.store.version_repos(vid).await?.iter().any(|r| r.repo().repo_type == RepoType::Deb) {
                     ctx.caps.require(crate::pulp::Feature::DebCopy)?;
                 }
-                ap(move |app| guard_library(app, protected, lines, None, move |app| resume(app, cv, name, vid, number)))
+                // A confirmation names what the Library step changes; with no change an open Library resumes at once.
+                let library = resume_library_lines(&svc, &name, &v).await?;
+                let title = (!library.is_empty()).then(|| format!("Resume {name} v{number}"));
+                let lines: Vec<String> = lines.into_iter().chain(library).collect();
+                ap(move |app| guard_library(app, protected, lines, title, move |app| resume(app, cv, name, vid, number)))
             });
         }
         Act::Delete => app.load_job(format!("read what deleting {name} v{number} removes"), move |ctx| async move {
@@ -1879,6 +1895,10 @@ mod tests {
         app.push(Kind::CvVersions { cv: extras, name: "extras".into() });
         version_action(&mut app, "lab", extras, "extras".into(), Act::Resume, json!({ "id": v1.id, "number": 1, "state": "failed" }));
         drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", last_notice(&app)) };
+        assert_eq!(lines[2..], ["In Library:", "  old: not part of v1 -> its distribution stops serving (kept for rollback)"]);
+        yes(&mut app);
+        drain(&mut app, &mut rx).await;
         let (level, text) = last_notice(&app);
         assert_eq!(level, Level::Warn);
         assert!(text.starts_with("extras v1 published; Library step failed: extras in Library: failed: unbind old: "), "{text}");
@@ -2105,11 +2125,47 @@ mod tests {
         assert_eq!(lines[lines.len() - 2..], ["In Library:", r1], "{lines:?}");
     }
 
+    /// F58: the Library step of a Resume changes the Library rows of the repositories that the version lacks, as the one
+    /// of Publish does. The Resume confirmation names each change under "In Library:" (an open Library too), and nothing
+    /// runs before it. A newer published version keeps Library: then there is no such line.
     #[tokio::test]
-    async fn a_failed_resume_shows_the_failed_version_without_a_reload() {
-        let server = MockServer::start().await; // 404 for everything: the derived repository cannot be found
+    async fn the_resume_confirmation_names_what_the_library_step_changes() {
+        let server = MockServer::start().await;
         let (mut app, mut rx, st) = composite_app().await;
         app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let lib = st.ensure_library("lab").await.unwrap();
+        let old = left_out(&st, lib, web, "2", Some("/p/2/")).await;
+        let ours = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: LIBRARY, crate::cv::LABEL_DB: st.db_id() });
+        serve(&server, "GET", old.distribution, 200, json!({ "name": "d2", "publication": "/p/2/", "pulp_labels": ours })).await;
+        let v = st.begin_version(web, "", &[]).await.unwrap();
+        st.finish_version(v.id, "failed", None).await.unwrap();
+        let resume = |app: &mut App| {
+            version_action(app, "lab", web, "web".into(), Act::Resume, json!({ "id": v.id, "number": v.number, "state": "failed" }))
+        };
+        resume(&mut app);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, typed: None, .. }) = app.modal.take() else {
+            panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text))
+        };
+        let first = "Resume web v1: it becomes active in Library unless a newer version is published.";
+        let r2 = "  r2: not part of v1 -> its distribution stops serving (kept for rollback)";
+        assert_eq!((title.as_str(), lines), ("Resume web v1", vec![first.into(), String::new(), "In Library:".into(), r2.into()]));
+        assert_eq!(st.version(v.id).await.unwrap().state, "failed", "nothing before the confirmation");
+
+        let newer = publish_empty(&st, web).await;
+        assert!(newer.number > v.number);
+        resume(&mut app);
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "Library keeps v{}: no Library line, no confirmation", newer.number);
+    }
+
+    #[tokio::test]
+    async fn a_failed_resume_shows_the_failed_version_without_a_reload() {
+        let server = MockServer::start().await; // 404 for the rest: the derived repository cannot be found
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        serve_distributions(&server, &[], None).await; // the Library target of os (Resume preview): nothing refuses it
         let web = st.create_cv("lab", "web", "").await.unwrap();
         st.begin_version(web, "", &[cv_repo("os", "rpm", "1")]).await.unwrap();
         app.push(Kind::CvVersions { cv: web, name: "web".into() });

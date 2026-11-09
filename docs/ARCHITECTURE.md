@@ -212,7 +212,8 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
 * It is a promotion, so it also unbinds or forgets the Library rows of repositories that the
   new version lacks (`CvService::left_out`). The Publish preview names each one under
   `In Library:`, compared with the repositories of the draft (`CvService::draft_rows`), and each
-  repository of the draft that the step fails for (`CvService::bind_target`).
+  repository of the draft that the step fails for (`CvService::bind_target`). The Resume
+  confirmation names the same for the resumed version, when its Library step runs.
 * A failed Library step is a warning; the version stays published and auto publish runs.
 * A stop in this step leaves the promotion `(version, promoting)`; under the view's lock such
   a row is an interrupted one (`CvService::library_interrupted`). Resume of that version
@@ -227,7 +228,7 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
   `CvService::bind_target` runs the checks of `bind_repo`: `named_distribution`, then
   `ops::distribution_target` (the reads and refusals of `ops::ensure_distribution`: base path,
   labels, database id, checkpoint, overlap). For a left-out row, `CvService::left_out` decides
-  what the run does. The Promote and Publish previews use both.
+  what the run does. The Promote, Publish and Resume previews use both.
 * **Promote** binds a version to an environment. The version must be active in the prior
   environment. Each distribution is re-pointed to the version's publication. Bound
   repositories that the version lacks get `publication: null`; the distribution stays. When

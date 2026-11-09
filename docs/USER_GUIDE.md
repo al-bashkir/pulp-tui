@@ -749,7 +749,8 @@ A composite view joins other Content Views (its **components**). Example: `rocky
   `interrupted` Library step, it runs the Library step and auto publish again. For the newest
   published version, it runs the auto publish of each composite that does not have it yet. Auto
   publish does not run while Library is protected: when only that is left, **R** refuses and names
-  the composites to publish yourself.
+  the composites to publish yourself. When its Library step changes Library distributions (as
+  **P** does), **R** asks first and names each change under `In Library:`.
 * **W** watches the task of the copy step or the publication step. Other steps show their tasks
   only in the session that runs the publish.
 * The *environments* column names each environment that serves the version, and an attempted
