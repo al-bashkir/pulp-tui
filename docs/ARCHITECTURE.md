@@ -354,7 +354,9 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
   pinned distribution with the same name and path, labeled
   `pulp_tui_replica=<source profile>`.
   * A dry run shows CREATE / SYNC / SKIP. The run checks the label again.
-  * Objects without the label are conflicts and are skipped.
+  * Objects without the label are conflicts and are skipped. The dry run asks the distribution
+    checks of the run (`ops::distribution_target`): a base path that overlaps another
+    distribution, or a replica distribution at another base path, is a conflict too.
   * A File item without a readable served manifest is skipped (no URL guess).
   * A checkpoint distribution: the remote URL is its newest checkpoint publication at
     `<base>/<timestamp>/` (`ops::served_url`); the bare base path only lists the timestamps.

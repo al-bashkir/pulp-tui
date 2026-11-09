@@ -823,8 +823,11 @@ Native Upstream Pulp objects (tech preview).
     replica syncs the newest checkpoint at the time of the run (the row names its timestamp); a
     later run moves the replica to the checkpoint that is newest then. An upstream checkpoint
     distribution without a checkpoint publication is a `SKIP` row.
-  * It does not follow an upstream base path change: the row shows a 409 conflict. Delete or move
-    the replica distribution by hand.
+  * The dry run does the distribution checks of the run. A local distribution with the base path,
+    or a base path above or below it (Pulp refuses overlapping base paths), makes the row a
+    conflict (`SKIP`), before anything is created.
+  * It does not follow an upstream base path change: the dry run row is a conflict
+    (`... serves <old> instead of <new>`). Delete or move the replica distribution by hand.
 
 ### Exporters
 

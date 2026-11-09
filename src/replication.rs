@@ -187,22 +187,8 @@ pub async fn plan(
             };
             let repo = ops::find_by_name::<Repository>(dst, &dst.api(t.repositories()), &d.name).await?;
             let remote = ops::find_by_name::<Value>(dst, &dst.api(t.remotes()), &d.name).await?;
-            let dist = ops::find_by_name::<Distribution>(dst, &dst.api(t.distributions()), &d.name).await?;
-            let path_owner: Option<Value> = dst
-                .list::<Value>(&dst.api("distributions/"), &[("base_path", d.base_path.clone()), ("limit", "1".into())])
-                .await?
-                .results
-                .into_iter()
-                .next();
-            let foreign = [
-                repo.as_ref().filter(|r| !owned(&r.pulp_labels, src_name)).map(|_| "repository"),
-                remote.as_ref().filter(|r| !owned(&labels_of(r), src_name)).map(|_| "remote"),
-                dist.as_ref().filter(|x| !owned(&x.pulp_labels, src_name)).map(|_| "distribution"),
-            ];
-            if let Some(kind) = foreign.into_iter().flatten().next() {
-                it.note = format!("conflict: a local {kind} named {} exists and is not managed by this replication", d.name);
-            } else if let Some(o) = path_owner.filter(|o| o["name"].as_str() != Some(d.name.as_str())) {
-                it.note = format!("conflict: base path used by local distribution {}", o["name"].as_str().unwrap_or("?"));
+            if let Some(why) = conflict(dst, t, &d, src_name, repo.as_ref(), remote.as_ref()).await? {
+                it.note = format!("conflict: {why}");
             } else if repo.is_some() {
                 it.action = PlanAction::Update;
                 it.note = "re-sync existing replica".into();
@@ -225,6 +211,33 @@ pub async fn plan(
         }
     }
     Ok(out)
+}
+
+/// Why the run stops for the replica of upstream distribution `d` (type `t`) on `dst`, before it changes anything: a
+/// local `repo` or `remote` of that name without the label of `src`, or the refusal of the distribution step
+/// (`ops::distribution_target`, as in `ops::ensure_distribution`: labels, base path, checkpoint, and a base path that
+/// overlaps another one for a new distribution). `None`: the run can make or update the replica.
+async fn conflict(
+    dst: &PulpClient,
+    t: RepoType,
+    d: &Distribution,
+    src: &str,
+    repo: Option<&Repository>,
+    remote: Option<&Value>,
+) -> Result<Option<String>> {
+    let foreign = [
+        repo.filter(|r| !owned(&r.pulp_labels, src)).map(|_| "repository"),
+        remote.filter(|r| !owned(&labels_of(r), src)).map(|_| "remote"),
+    ];
+    if let Some(kind) = foreign.into_iter().flatten().next() {
+        return Ok(Some(format!("a local {kind} named {} exists and is not managed by this replication", d.name)));
+    }
+    match ops::distribution_target(dst, t, &d.name, &d.base_path, &json!({ LABEL_REPLICA: src }), None).await {
+        Ok(_) => Ok(None),
+        // `distribution_target` only reads; a 409 is its refusal.
+        Err(PulpError::Api { status: 409, message }) => Ok(Some(message)),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// What the Deb replica of the upstream publication `p` (the one its distribution serves) syncs and how it publishes:

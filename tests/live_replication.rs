@@ -220,6 +220,41 @@ async fn fallback_replication() {
     assert!(plan.iter().all(|p| p.action == PlanAction::Skip && p.note.contains("loop")), "{plan:?}");
 }
 
+/// F57: a local distribution outside the replication is above the replica base paths (Pulp refuses an overlapping base
+/// path). The dry run names it as a conflict (SKIP), with the refusal of the run, and the run creates nothing. Once the
+/// path is free, the dry run says CREATE.
+#[tokio::test]
+async fn the_fallback_plan_names_a_base_path_that_overlaps_a_local_distribution() {
+    if !live_enabled() {
+        return;
+    }
+    let (dst, up) = (client(), upstream_client());
+    let prefix = unique("fbov");
+    upstream_content(&up, &prefix).await;
+    let store = Store::open_in_memory().await.unwrap();
+    let foreign = format!("{prefix}-local");
+    let local = create(&dst, RepoType::File.distributions(), json!({ "name": foreign, "base_path": prefix }), "/distributions/").await;
+
+    let plan = replication::plan(&up, &dst, &RepoType::ALL, &prefix, None).await.unwrap();
+    let notes: Vec<_> = plan.iter().map(|p| (p.action.clone(), p.note.clone())).collect();
+    let conflict = |path: &str| format!("conflict: base path {path} overlaps base path {prefix} of distribution {foreign}");
+    assert_eq!(
+        notes,
+        [(PlanAction::Skip, conflict(&format!("{prefix}/os"))), (PlanAction::Skip, conflict(&format!("{prefix}/docs")))],
+        "nothing is created before the overlap is named"
+    );
+    let res = replication::run(&dst, &store, up.profile(), &plan, false, &|_| {}, &no_progress).await.unwrap();
+    assert!(res.is_empty(), "{res:?}");
+    for t in [RepoType::Rpm, RepoType::File] {
+        assert!(ops::find_by_name::<Value>(&dst, &dst.api(t.remotes()), &format!("{prefix}-os")).await.unwrap().is_none());
+        assert!(ops::find_by_name::<Value>(&dst, &dst.api(t.remotes()), &format!("{prefix}-docs")).await.unwrap().is_none());
+    }
+
+    cleanup(&dst, &[&local]).await;
+    let plan = replication::plan(&up, &dst, &RepoType::ALL, &prefix, None).await.unwrap();
+    assert!(plan.iter().all(|p| p.action == PlanAction::Create), "{plan:?}");
+}
+
 /// Deb fallback replication: a structured and a simple publication of one synced repository on pulp2. Each replica
 /// on pulp1 syncs the dists that its upstream serves, publishes in the same mode and serves the packages; a rerun
 /// re-syncs.

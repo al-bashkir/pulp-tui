@@ -2082,6 +2082,25 @@ mod tests {
         assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "reads only");
     }
 
+    /// F57: a distribution outside pulp-tui at `library/web` is above the new Library path of r1, so Pulp refuses the new
+    /// distribution (`ops::overlapping_distribution`). The Publish preview names it for the Library step.
+    #[tokio::test]
+    async fn the_publish_preview_names_a_library_base_path_that_overlaps_another() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let r1 = cv_repo("r1", "rpm", "1");
+        st.set_cv_repo(web, &r1).await.unwrap();
+        serve(&server, "GET", r1.repo_href.clone(), 200, json!({ "pulp_href": r1.repo_href, "name": "r1" })).await;
+        let foreign = json!({ "pulp_href": "/d/9/", "name": "foreign", "base_path": "library/web" });
+        serve_distributions(&server, &[], Some(("library,library/web,library/web/r1", foreign))).await;
+        let lines = publish_preview_lines(&mut app, &mut rx, web).await;
+        let r1 = "  r1 (RPM): the Library step fails for it: base path library/web/r1 overlaps base path library/web of distribution \
+                  foreign";
+        assert_eq!(lines[lines.len() - 2..], ["In Library:", r1], "{lines:?}");
+    }
+
     #[tokio::test]
     async fn a_failed_resume_shows_the_failed_version_without_a_reload() {
         let server = MockServer::start().await; // 404 for everything: the derived repository cannot be found
