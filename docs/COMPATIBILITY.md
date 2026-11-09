@@ -576,7 +576,10 @@ Read in pulpcore 3.123.1 (models and serializers in `pulpcore/app/`) and live on
   `on_delete=SET_NULL`. The delete answers 204 at once (no task).
 * **A composite without guards allows everyone** (`CompositeContentGuard.permit`). Its
   `guards` is a many-to-many field, so a deleted member just leaves the composite. Pulp does
-  not refuse a composite that lists itself; the form never offers it.
+  not refuse a composite that lists itself; the form never offers it. A member can be another
+  composite (the serializer takes any guard type), so an edit of a guard changes access at the
+  distributions of each composite that contains it, at any depth. The edit confirm follows
+  that chain (`guard_reach`).
 * **RBAC guard `users` and `groups`** are the holders of `core.download_rbaccontentguard` on
   the guard. `add_role/` and `remove_role/` take `{role, users, groups}` (user and group
   names); the role is `core.rbaccontentguard_downloader`. The user that creates the guard

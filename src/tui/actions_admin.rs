@@ -1,7 +1,7 @@
 //! Users, groups, roles (Pulp RBAC), replication, and export and import actions.
 
 use super::actions::{ap, caps, group_progress, snapshot_refusal, submit, unmark_when_deleted, url_with_scheme};
-use super::app::{App, Level};
+use super::app::{App, Ctx, Level};
 use super::form::{Field, FieldKind, Form, Source, format_labels, parse_labels};
 use super::kinds::{Act, Kind, guard_type, masked_url, s, short};
 use crate::pulp::client::Page;
@@ -10,6 +10,7 @@ use crate::replication::{self, PlanAction};
 use anyhow::{Context, bail};
 use futures::future::try_join_all;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 pub fn run(app: &mut App, act: Act, item: Value) {
     match app.list.kind.clone() {
@@ -502,8 +503,7 @@ fn guard_action(app: &mut App, act: Act, item: Value) {
         }),
         Act::GuardAccess => guard_access(app, href, name),
         Act::Delete => app.job(format!("impact of deleting content guard {name}"), move |ctx| async move {
-            let c = &ctx.client;
-            let used = ops::guarded_distributions(c).await?;
+            let (used, all) = guard_use(&ctx).await?;
             let mut lines = vec![format!("Delete content guard {name} ({}).", guard_type(&href))];
             match used.get(&href) {
                 // pulpcore: `Distribution.content_guard` is `on_delete=SET_NULL`.
@@ -516,10 +516,8 @@ fn guard_action(app: &mut App, act: Act, item: Value) {
                 }
                 None => lines.push("No distribution uses it.".into()),
             }
-            let composites = "contentguards/core/composite/";
-            let all = if ctx.caps.has_endpoint(composites) { c.list_all::<Value>(&c.api(composites), &[], 100_000).await? } else { vec![] };
             for g in all {
-                let members: Vec<&str> = g["guards"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                let members = guard_members(&g);
                 let (cname, also) = (s(&g, "name"), used.get(&s(&g, "pulp_href")).map(|ds| format!(", also on {}", ds.join(", "))));
                 lines.extend(match members.len() {
                     _ if !members.contains(&href.as_str()) => None,
@@ -548,7 +546,7 @@ fn guard_form(app: &mut App, t: String, v: Value) {
     let Some((_, schema, extra)) = GUARD_TYPES.iter().find(|(x, ..)| *x == t) else {
         return app.error(format!("unknown content guard type {t}"));
     };
-    let (caps, href) = (caps(app), s(&v, "pulp_href"));
+    let (caps, href, now) = (caps(app), s(&v, "pulp_href"), s(&v, "name"));
     let keep = |f: Field| if edit { f.help("empty = unchanged") } else { f.required() };
     let mut fields = vec![
         Field::text("name", "Name").required().value(s(&v, "name")),
@@ -584,15 +582,80 @@ fn guard_form(app: &mut App, t: String, v: Value) {
                 (k, val) => b[k] = val.into(),
             }
         }
+        // Fields other than name and description decide who can download.
+        let access = edit && (cert.is_some() || b.as_object().is_some_and(|o| o.keys().any(|k| k != "name" && k != "description")));
+        let open = b["guards"].as_array().is_some_and(Vec::is_empty);
         let (href, collection) = (href.clone(), format!("contentguards/{t}/"));
-        submit(app, format!("{} content guard {}", if edit { "update" } else { "create" }, f.get("name")), move |c| async move {
-            if let Some(path) = cert {
-                b["ca_certificate"] = tokio::fs::read_to_string(&path).await.with_context(|| format!("read {path}"))?.into();
-            }
-            Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api(&collection), &b).await? })
-        });
+        let (target, label) = (href.clone(), format!("{} content guard {}", if edit { "update" } else { "create" }, f.get("name")));
+        let go = move |app: &mut App| {
+            submit(app, label, move |c| async move {
+                if let Some(path) = cert {
+                    b["ca_certificate"] = tokio::fs::read_to_string(&path).await.with_context(|| format!("read {path}"))?.into();
+                }
+                Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api(&collection), &b).await? })
+            })
+        };
+        if access {
+            confirm_guard_edit(app, target, now.clone(), open, go)
+        } else {
+            go(app)
+        }
         Ok(())
     });
+}
+
+/// Run `go` at once, or after the typed guard name when a distribution uses content guard `href` (`name`), directly
+/// or through a composite guard: an edit of a field that decides access changes at once who can download from it.
+/// `open`: the edit leaves a composite guard with no guards (pulpcore `CompositeContentGuard.permit`: then allowed).
+fn confirm_guard_edit(app: &mut App, href: String, name: String, open: bool, go: impl FnOnce(&mut App) + Send + 'static) {
+    app.job(format!("impact of editing content guard {name}"), move |ctx| async move {
+        let (used, all) = guard_use(&ctx).await?;
+        let mut lines = guard_reach(&href, &used, &all);
+        if lines.is_empty() {
+            return ap(go);
+        }
+        let first =
+            format!("The edit of content guard {name} ({}) changes at once who can download from these distributions:", guard_type(&href));
+        lines.insert(0, first);
+        if open {
+            lines.push(format!(
+                "WARNING: composite guard {name} has no guards after the edit: anyone can download from these distributions."
+            ));
+        }
+        ap(move |app| app.confirm_danger(format!("Edit content guard {name}"), lines, &name.clone(), go))
+    });
+}
+
+/// Distribution names by content guard href (`ops::guarded_distributions`), and all composite guards (none when the
+/// server has no composite guards).
+async fn guard_use(ctx: &Ctx) -> anyhow::Result<(BTreeMap<String, Vec<String>>, Vec<Value>)> {
+    let c = &ctx.client;
+    let used = ops::guarded_distributions(c).await?;
+    let composites = "contentguards/core/composite/";
+    let all = if ctx.caps.has_endpoint(composites) { c.list_all::<Value>(&c.api(composites), &[], 100_000).await? } else { vec![] };
+    Ok((used, all))
+}
+
+/// The member guard hrefs of composite guard `g`.
+fn guard_members(g: &Value) -> Vec<&str> {
+    g["guards"].as_array().into_iter().flatten().filter_map(Value::as_str).collect()
+}
+
+/// The distributions (`used`: names by guard href) where an edit of guard `href` changes who can download, as confirm
+/// lines: those that use it, and those that use a composite guard of `all` that has it as a member, at any depth.
+fn guard_reach(href: &str, used: &BTreeMap<String, Vec<String>>, all: &[Value]) -> Vec<String> {
+    let mut reach = vec![(href.to_string(), String::new())];
+    let mut i = 0;
+    while let Some((h, _)) = reach.get(i).cloned() {
+        for g in all.iter().filter(|g| guard_members(g).contains(&h.as_str())) {
+            let gh = s(g, "pulp_href");
+            if !reach.iter().any(|(x, _)| *x == gh) {
+                reach.push((gh, format!(" (through composite guard {})", s(g, "name"))));
+            }
+        }
+        i += 1;
+    }
+    reach.iter().flat_map(|(h, way)| used.get(h).into_iter().flatten().map(move |d| format!("  {d}{way}"))).collect()
 }
 
 /// Give or take the download role of an RBAC guard (`add_role/`, `remove_role/`); the form shows who has it now.
@@ -3398,6 +3461,10 @@ mod tests {
         serve(&server, "PATCH", HDR, 200, json!({ "pulp_href": HDR })).await;
         serve(&server, "GET", COMP, 200, json!({ "pulp_href": COMP, "name": "any", "guards": [RBAC, HDR] })).await;
         serve(&server, "PATCH", COMP, 200, json!({ "pulp_href": COMP })).await;
+        // No distribution uses a guard: the edits save at once.
+        let none = json!({ "count": 0, "next": null, "results": [] });
+        serve(&server, "GET", "/pulp/api/v3/distributions/", 200, none.clone()).await;
+        serve(&server, "GET", "/pulp/api/v3/contentguards/core/composite/", 200, none).await;
         let (mut app, mut rx) = on_guards(&server).await;
 
         let mut f = loaded_form(&mut app, &mut rx, Act::Edit, json!({ "pulp_href": HDR, "name": "token" })).await;
@@ -3425,6 +3492,79 @@ mod tests {
             [
                 ("PATCH".into(), HDR.into(), json!({ "header_name": "X-Key", "jq_filter": null })),
                 ("PATCH".into(), COMP.into(), json!({ "guards": [RBAC] })),
+            ]
+        );
+    }
+
+    /// Content guard Edit of a field that decides access, on a guard that a distribution uses directly or through a
+    /// composite guard (at any depth): the confirm lists those distributions and asks for the guard name; nothing is
+    /// sent before it. A composite left with no guards gets a WARNING (pulpcore `CompositeContentGuard.permit`: no
+    /// guards = allowed). A description edit, and an edit of a guard that no distribution uses, save at once.
+    #[tokio::test]
+    async fn a_content_guard_edit_that_changes_access_needs_the_typed_name() {
+        use crate::tui::kinds::Act;
+        let (inner, spare) = ("/pulp/api/v3/contentguards/core/composite/5/", "/pulp/api/v3/contentguards/core/header/9/");
+        let server = MockServer::start().await;
+        guarded(&server).await;
+        // edge uses `any`, which has the RBAC guard and `inner`, which has the header guard.
+        let comps = json!({ "count": 2, "next": null, "results": [
+            { "name": "any", "pulp_href": COMP, "guards": [RBAC, inner] }, { "name": "inner", "pulp_href": inner, "guards": [HDR] }] });
+        serve(&server, "GET", "/pulp/api/v3/contentguards/core/composite/", 200, comps).await;
+        let hdr = json!({ "pulp_href": HDR, "name": "token", "header_name": "X-Token", "jq_filter": null });
+        serve(&server, "GET", HDR, 200, hdr).await;
+        serve(&server, "GET", COMP, 200, json!({ "pulp_href": COMP, "name": "any", "guards": [RBAC, inner] })).await;
+        serve(&server, "GET", spare, 200, json!({ "pulp_href": spare, "name": "spare", "header_name": "X-Token" })).await;
+        for g in [HDR, COMP, spare] {
+            serve(&server, "PATCH", g, 200, json!({ "pulp_href": g })).await;
+        }
+        let (mut app, mut rx) = on_guards(&server).await;
+
+        let mut f = loaded_form(&mut app, &mut rx, Act::Edit, json!({ "pulp_href": HDR, "name": "token" })).await;
+        set(&mut f, "header_name", "X-Key");
+        submit_open(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, typed, .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
+        assert_eq!((title.as_str(), typed.as_deref()), ("Edit content guard token", Some("token")));
+        assert_eq!(
+            lines,
+            [
+                "The edit of content guard token (core/header) changes at once who can download from these distributions:",
+                "  edge (through composite guard any)",
+            ]
+        );
+        assert!(sent(&server).await.is_empty(), "Esc: nothing sent");
+
+        let mut f = loaded_form(&mut app, &mut rx, Act::Edit, json!({ "pulp_href": COMP, "name": "any" })).await;
+        set(&mut f, "guards", "");
+        submit_open(&mut app, &f).unwrap();
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm") };
+        assert_eq!(typed.as_deref(), Some("any"));
+        assert_eq!(
+            lines,
+            [
+                "The edit of content guard any (core/composite) changes at once who can download from these distributions:",
+                "  edge",
+                "WARNING: composite guard any has no guards after the edit: anyone can download from these distributions.",
+            ]
+        );
+        assert!(sent(&server).await.is_empty(), "nothing sent before the confirm");
+        yes(&mut app);
+        settle(&mut app, &mut rx).await;
+
+        for (g, k, val) in [(HDR, "description", "new"), (spare, "header_name", "X-Key")] {
+            let mut f = loaded_form(&mut app, &mut rx, Act::Edit, json!({ "pulp_href": g })).await;
+            set(&mut f, k, val);
+            submit_open(&mut app, &f).unwrap();
+            settle(&mut app, &mut rx).await;
+            assert!(app.modal.is_none(), "{k}: no dialog");
+        }
+        assert_eq!(
+            sent(&server).await,
+            [
+                ("PATCH".into(), COMP.into(), json!({ "guards": [] })),
+                ("PATCH".into(), HDR.into(), json!({ "description": "new" })),
+                ("PATCH".into(), spare.into(), json!({ "header_name": "X-Key" })),
             ]
         );
     }

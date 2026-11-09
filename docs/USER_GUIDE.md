@@ -570,7 +570,11 @@ the distributions that use it. **i** full JSON.
     pulp-tui sends its content.
   * `core/rbac`, `core/content_redirect`: name and description only.
 * **e** edits a guard. The header value and the CA certificate are not shown: empty keeps
-  them.
+  them. An edit of a field other than name and description changes at once who can download.
+  When a distribution uses the guard, directly or through a composite guard (at any depth),
+  the confirm lists those distributions and you type the guard name; Esc sends nothing. A
+  composite that you leave with no guards gets a WARNING: anyone can then download. A new
+  guard, a guard that no distribution uses and a name or description edit save at once.
 * **a** (RBAC guard): download access. The form shows the users and groups that may download
   now, then allows or removes the users and groups that you pick (the role
   `core.rbaccontentguard_downloader`). The user that created the guard is in the list too.

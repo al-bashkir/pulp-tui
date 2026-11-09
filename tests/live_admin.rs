@@ -417,12 +417,29 @@ async fn content_guard_create_edit_and_delete_name_its_distribution() {
     let cells: Vec<String> = Kind::ContentGuards.columns().iter().map(|col| (col.get)(&row)).collect();
     assert_eq!(cells, [name.clone(), "core/header".into(), name.clone()]);
 
-    run(&mut app, Act::Edit, row.clone());
-    settle(&mut app, &mut rx).await;
-    fill(&mut app, &[("header_name", "X-Other")]);
-    settle(&mut app, &mut rx).await;
+    // The header decides access and the distribution uses the guard: the confirm names it and asks for the guard name.
+    for confirm in [false, true] {
+        run(&mut app, Act::Edit, row.clone());
+        settle(&mut app, &mut rx).await;
+        fill(&mut app, &[("header_name", "X-Other")]);
+        settle(&mut app, &mut rx).await; // the impact
+        let Some(Modal::Confirm { lines, typed, on_yes: Some(go), .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(&app)) };
+        assert_eq!((lines[1].clone(), typed), (format!("  {name}"), Some(name.clone())), "{lines:?}");
+        assert_eq!(c.get::<Value>(&href, &[]).await.unwrap()["header_name"], "X-Pulp-Tui", "nothing sent before the confirm");
+        if confirm {
+            go(&mut app);
+            settle(&mut app, &mut rx).await;
+        }
+    }
     let g: Value = c.get(&href, &[]).await.unwrap();
     assert_eq!((g["header_name"].as_str(), g["header_value"].as_str()), (Some("X-Other"), Some("s3cret")), "{:?}", texts(&app));
+    // A description does not decide access: it saves at once.
+    run(&mut app, Act::Edit, row.clone());
+    settle(&mut app, &mut rx).await;
+    fill(&mut app, &[("description", "no access change")]);
+    settle(&mut app, &mut rx).await;
+    assert!(app.modal.is_none(), "no dialog: {:?}", texts(&app));
+    assert_eq!(c.get::<Value>(&href, &[]).await.unwrap()["description"], "no access change", "{:?}", texts(&app));
 
     run(&mut app, Act::Delete, row);
     settle(&mut app, &mut rx).await;

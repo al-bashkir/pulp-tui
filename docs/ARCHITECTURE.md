@@ -580,6 +580,7 @@ client clock).
   space, a domain storage migration, a server repair, an access policy reset, a
   distribution edit that changes its binding or base path, a Distribute (**D**) that
   re-points an existing distribution, a repository edit whose retention deletes versions
-  or clears checkpoints and a new checkpoint publication that clears older checkpoints need
+  or clears checkpoints, a content guard edit that changes who can download from a
+  distribution and a new checkpoint publication that clears older checkpoints need
   the typed name. Production
   profiles show a red banner and a warning line.
