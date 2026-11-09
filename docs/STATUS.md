@@ -428,13 +428,17 @@ Not run again on 2026-11-09 (the results below are older):
   build of the Linux binary): a static-pie x86_64 binary with keyring; it reads the host's
   Secret Service over D-Bus. Only the release workflow builds the aarch64 binary.
 
-`cargo audit` (2026-11-08): 0 vulnerabilities and 4 allowed warnings, all only through the
-optional `keyring` feature (`--no-default-features` builds, such as the container image, do
-not contain them): `zvariant`, `zvariant_derive` and `zbus_names` are unmaintained
+`cargo audit` (2026-11-09): 0 vulnerabilities that are not ignored, and 4 allowed warnings,
+all only through the optional `keyring` feature (`--no-default-features` builds, such as the
+container image, do not contain them): `zvariant`, `zvariant_derive` and `zbus_names` are unmaintained
 (RUSTSEC-2026-0370/0371/0372), and `async-executor` 1.14.0 is yanked. `.cargo/audit.toml`
 ignores RUSTSEC-2023-0071 (`rsa`): it is in `Cargo.lock` only because sqlx `any` names the
 optional `sqlx-mysql` driver, and it is never compiled (`cargo tree -i rsa --target all` is
-empty).
+empty). It also ignores RUSTSEC-2026-0459 (bundled SQLite before 3.54.0: a crafted database
+file and its `-wal` file can make queries return stale process memory). No fix can be
+installed yet: the fix is in libsqlite3-sys 0.39, and sqlx 0.9.0 requires a version below
+0.38. pulp-tui is exposed only when it opens a SQLite file that a less trusted party can
+write (see `.cargo/audit.toml`).
 
 ## Limitations
 
