@@ -562,6 +562,7 @@ client clock).
 * Destructive operations show the impact first. Deletes of repositories, distributions,
   users, roles, content guards, domains, Content Views, ACSs and protected promotions, reclaim
   space, a domain storage migration, a server repair, an access policy reset, a
-  distribution edit that changes its binding or base path and a repository edit whose
-  retention deletes versions or clears checkpoints need the typed name. Production
+  distribution edit that changes its binding or base path, a Distribute (**D**) that
+  re-points an existing distribution and a repository edit whose retention deletes versions
+  or clears checkpoints need the typed name. Production
   profiles show a red banner and a warning line.

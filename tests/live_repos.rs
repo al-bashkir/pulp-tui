@@ -1526,6 +1526,57 @@ async fn rpm_serve_from_versions_through_the_tui() {
     }
 }
 
+/// Distribute (D) with the form defaults through the TUI (audit F54), on a repository of type `t` with versions 1 and
+/// 2 (`path`: its fixture): D on version 2 makes the distribution of the repository name with no confirm. D on version
+/// 1 hits that distribution: the confirm shows what it serves now and after and asks for its name. After Esc it still
+/// serves version 2; after the typed name it serves version 1.
+async fn distribute_re_points_after_the_typed_name_through_the_tui(t: RepoType, path: &str) {
+    let (c, name) = (client(), unique(&format!("it-redist-{}", t.component())));
+    let (repo, remote, [v1, v2]) = two_versions(&c, t, &name, path).await;
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Versions(Some((repo.clone(), name.clone()))), "").await;
+    let distribute = async |app: &mut App, rx: &mut UnboundedReceiver<Msg>, number: i64| {
+        run(app, Act::Distribute, version_row(app, number));
+        settle(app, rx).await; // the repository name
+        fill(app, &[]);
+        settle(app, rx).await; // the distribution of that name, and what it serves
+    };
+    distribute(&mut app, &mut rx, 2).await;
+    assert!(app.modal.is_none(), "a new distribution: no confirm");
+    assert_eq!(pinned_version(&c, t, &name).await.1, v2, "{:?}", texts(&app));
+    for confirm in [false, true] {
+        distribute(&mut app, &mut rx, 1).await;
+        let Some(Modal::Confirm { lines, typed, .. }) = &app.modal else { panic!("no confirm: {:?}", texts(&app)) };
+        assert_eq!(typed.as_deref(), Some(name.as_str()));
+        assert!(lines[1].starts_with(&format!("  now serves:  {} (pinned to publication ", short(&v2))), "{lines:?}");
+        assert_eq!(lines[2], format!("  will serve:  a publication of version 1 of repository {name} (pinned)"));
+        if confirm {
+            yes(&mut app);
+            settle(&mut app, &mut rx).await;
+        } else {
+            app.modal = None; // Esc
+            assert_eq!(pinned_version(&c, t, &name).await.1, v2, "nothing changed");
+        }
+    }
+    assert_eq!(pinned_version(&c, t, &name).await.1, v1, "re-pointed: {:?}", texts(&app));
+    let d: Value = ops::find_by_name(&c, &c.api(t.distributions()), &name).await.unwrap().unwrap();
+    cleanup(&c, &[s(&d, "pulp_href").as_str(), &repo, &remote]).await;
+}
+
+#[tokio::test]
+async fn file_distribute_re_points_after_the_typed_name_through_the_tui() {
+    if live_enabled() {
+        distribute_re_points_after_the_typed_name_through_the_tui(RepoType::File, "file/PULP_MANIFEST").await;
+    }
+}
+
+#[tokio::test]
+async fn deb_distribute_re_points_after_the_typed_name_through_the_tui() {
+    if live_enabled() {
+        distribute_re_points_after_the_typed_name_through_the_tui(RepoType::Deb, "deb/").await;
+    }
+}
+
 /// Sync (s) of type `t` with the mirror `policy` through the TUI (audit T02), on a repository whose version 2 lacks one
 /// unit of the upstream (`path`): the mirror confirm says that the new version matches the upstream (mirror_complete:
 /// and is published), then the Task Center follows the sync; version 3 has the upstream content again.

@@ -2214,7 +2214,7 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
     }
     let form = Form::new(format!("Distribute {name}"), fields)
         .note("Pinned: serves exactly one immutable publication. Following latest: serves the newest publication (RPM: use autopublish).")
-        .note("An existing distribution with this name is re-pointed; base paths of other distributions are never taken over.");
+        .note("An existing distribution with this name is re-pointed after the typed name; base paths of other distributions are never taken over.");
     app.form(form, move |app, f| {
         let (dist, bp) = (f.get("dist").to_string(), f.get("base_path").trim_matches('/').to_string());
         let binding = match (f.get("mode").starts_with("follow"), &publication) {
@@ -2225,20 +2225,51 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
                 .map(|v| Binding::Version(v, f.opt("signing_service").map(str::to_string)))
                 .ok_or_else(|| anyhow!("repository has no versions")),
         };
-        app.job(format!("distribute {dist}"), move |ctx| async move {
-            let href = distribute(&ctx, t, &dist, &bp, binding).await?;
-            let d: Value = ctx.client.get(&href, &[]).await?;
-            let url = s(&d, "base_url");
-            ap(move |app| {
-                app.ok(format!("distribution {dist} serves {url}"));
-                app.reload();
+        let (shown, target, path) = (binding.as_ref().ok().cloned(), dist.clone(), bp.clone());
+        let go = move |app: &mut App| {
+            app.job(format!("distribute {dist}"), move |ctx| async move {
+                let href = distribute(&ctx, t, &dist, &bp, binding).await?;
+                let d: Value = ctx.client.get(&href, &[]).await?;
+                let url = s(&d, "base_url");
+                ap(move |app| {
+                    app.ok(format!("distribution {dist} serves {url}"));
+                    app.reload();
+                })
             })
-        });
+        };
+        confirm_distribute(app, t, target, path, shown, name.clone(), go);
         Ok(())
     });
 }
 
+/// Run `go` at once for a new distribution `dist`. Distribute re-points an existing one: first the refusals of
+/// `distribute` that need no write (a Content View owns it, it serves another base path than `bp`, a pin of a
+/// checkpoint distribution), then what it serves now and after (`distribution_edit_confirm`) and the typed name.
+/// `binding`: None when the form has nothing to bind (`go` reports it); `repo`: the repository name.
+fn confirm_distribute(
+    app: &mut App,
+    t: RepoType,
+    dist: String,
+    bp: String,
+    binding: Option<Binding>,
+    repo: String,
+    go: impl FnOnce(&mut App) + Send + 'static,
+) {
+    app.job(format!("distribute {dist}"), move |ctx| async move {
+        let (Some(d), Some(b)) = (existing_distribution(&ctx.client, t, &dist).await?, binding) else { return ap(go) };
+        if s(&d, "base_path") != bp {
+            bail!("distribution {dist} serves {} instead of {bp}", s(&d, "base_path"));
+        }
+        if !matches!(b, Binding::Follow(_)) {
+            ops::refuse_checkpoint(&dist, d["checkpoint"] == true)?;
+        }
+        let will = b.line(&repo);
+        ap(move |app| distribution_edit_confirm(app, t, d, Some(will), json!({}), vec![], go))
+    });
+}
+
 /// What Distribute binds a distribution to.
+#[derive(Clone)]
 enum Binding {
     /// Follows the repository (href): serves its newest publication.
     Follow(String),
@@ -2247,6 +2278,17 @@ enum Binding {
     /// Pinned to a publication of this version, in the mode that the distribution serves now; with the
     /// picked signing service, if any.
     Version(String, Option<String>),
+}
+
+impl Binding {
+    /// What a distribution serves after Distribute binds it; `repo`: the repository name.
+    fn line(&self, repo: &str) -> String {
+        match self {
+            Binding::Follow(_) => format!("the newest publication of repository {repo} (follows it)"),
+            Binding::Publication(p) => format!("publication {} of repository {repo} (pinned)", short(p)),
+            Binding::Version(v, _) => format!("a publication of version {} of repository {repo} (pinned)", version_number(v)),
+        }
+    }
 }
 
 /// Create or re-point distribution `dist` at base path `bp`, and return its href. `binding` is an error
@@ -8957,7 +8999,7 @@ mod tests {
         let (dists, d, pubs) =
             (format!("{API}distributions/rpm/rpm/"), format!("{API}distributions/rpm/rpm/1/"), format!("{API}publications/rpm/rpm/"));
         let repo = json!({ "pulp_href": r, "name": "r", "latest_version_href": format!("{r}versions/2/") });
-        // Distribute `repo` in `mode` while the distributions list is `existing`.
+        // Distribute `repo` in `mode` while the distributions list is `existing` (re-pointed after the typed name).
         let run = async |server: &wiremock::MockServer, existing: Value, mode: &str| {
             get(server, &dists, page(existing)).await;
             get(server, &format!("{API}distributions/"), page(json!([]))).await;
@@ -8970,6 +9012,11 @@ mod tests {
             set(&mut form, "mode", mode);
             submit(&mut app, &form).unwrap();
             settle(&mut app, &mut rx).await;
+            if let Some(Modal::Confirm { typed, on_yes: Some(yes), .. }) = app.modal.take() {
+                assert_eq!(typed.as_deref(), Some("r"));
+                yes(&mut app);
+                settle(&mut app, &mut rx).await;
+            }
             app.notices.back().map(|n| n.text.clone()).unwrap_or_default()
         };
         let follow = "follow repository latest";
@@ -9003,6 +9050,50 @@ mod tests {
         let mode = json!({ "repository_version": format!("{r}versions/2/"), "layout": "flat", "checksum_type": "sha256" });
         assert_eq!(bodies(&server, "POST", &pubs).await, [mode]);
         assert_eq!(bodies(&server, "PATCH", &d).await, [json!({ "publication": format!("{pubs}2/"), "repository": null })]);
+    }
+
+    /// Distribute (D) with the defaults on a publication of an older version re-points the distribution of that name
+    /// (audit F54): the confirm shows what it serves now and after and asks for its name. Nothing is sent before it
+    /// (Esc); after the typed name the distribution serves the publication.
+    #[tokio::test]
+    async fn distribute_to_an_existing_distribution_needs_the_typed_name() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (r, dists, pubs) =
+            (format!("{API}repositories/file/file/r/"), format!("{API}distributions/file/file/"), format!("{API}publications/file/file/"));
+        let (d, p1, p2) = (format!("{dists}1/"), format!("{pubs}1/"), format!("{pubs}2/"));
+        let served =
+            json!({ "pulp_href": d, "name": "r", "base_path": "r", "base_url": "http://h/r/", "publication": p2, "pulp_labels": {} });
+        get(&server, &dists, page(json!([served]))).await;
+        get(&server, &d, served.clone()).await;
+        get(&server, &p2, json!({ "pulp_href": p2, "repository_version": format!("{r}versions/2/") })).await;
+        get(&server, &r, json!({ "name": "r" })).await;
+        answer(&server, "PATCH", &d, 200, json!({ "pulp_href": d })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        for confirm in [false, true] {
+            publication_action(
+                &mut app,
+                RepoType::File,
+                Act::Distribute,
+                json!({ "pulp_href": p1, "repository_version": format!("{r}versions/1/") }),
+            );
+            settle(&mut app, &mut rx).await; // the repository name
+            fill_and_submit(&mut app, &[]);
+            settle(&mut app, &mut rx).await; // the impact
+            let Some(Modal::Confirm { lines, typed, on_yes, .. }) = app.modal.take() else {
+                panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text))
+            };
+            assert_eq!(typed.as_deref(), Some("r"));
+            let change = ["  now serves:  r@v2 (pinned to publication 2)", "  will serve:  publication 1 of repository r (pinned)"];
+            assert_eq!(lines[1..3], change, "{lines:?}");
+            assert_eq!((bodies(&server, "PATCH", &d).await, bodies(&server, "POST", &dists).await), (vec![], vec![]), "nothing sent");
+            if confirm {
+                on_yes.unwrap()(&mut app);
+                settle(&mut app, &mut rx).await;
+            }
+        }
+        assert_eq!(bodies(&server, "PATCH", &d).await, [json!({ "publication": p1, "repository": null })]);
+        assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("distribution r serves http://h/r/"));
     }
 
     #[tokio::test]

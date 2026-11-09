@@ -253,6 +253,10 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   before.
 * **D** distributes: pin the latest version (publication), or follow the repository latest. Pulp
   cannot pin a checkpoint distribution: **D** refuses it before any change (see Distributions).
+  The form fills in the repository name, so a second **D** (also on Versions and Publications)
+  hits the distribution that the first one made. When a distribution with that name exists, the
+  confirm shows what it serves now and what it will serve; type the distribution name to
+  re-point it. Esc changes nothing. A new distribution needs no confirm.
 * **P** and **D** on Deb ask for an optional signing service (empty = the keys of the repository).
   **P** also asks for the kind: `apt`, or `verbatim` (see Publications).
   **D** reuses a publication only when its signing service is the same. On RPM, **D** never
