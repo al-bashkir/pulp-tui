@@ -547,61 +547,86 @@ fn guard_form(app: &mut App, t: String, v: Value) {
         return app.error(format!("unknown content guard type {t}"));
     };
     let (caps, href, now) = (caps(app), s(&v, "pulp_href"), s(&v, "name"));
-    let keep = |f: Field| if edit { f.help("empty = unchanged") } else { f.required() };
-    let mut fields = vec![
-        Field::text("name", "Name").required().value(s(&v, "name")),
-        Field::text("description", "Description").value(s(&v, "description")),
-    ];
-    for &k in extra.iter().filter(|k| caps.as_ref().is_none_or(|c| c.has_field(schema, k))) {
-        fields.push(match k {
-            "header_name" => Field::text(k, "Header name").required().value(s(&v, k)),
-            "header_value" => keep(Field::new(k, "Header value", FieldKind::Secret)),
-            "jq_filter" => Field::text(k, "jq filter").value(s(&v, k)).help("applied to the header (JSON) first, e.g. .identity.org_id"),
-            "env_var" => Field::text(k, "Environment variable").required().value(s(&v, k)).help("its name on the Pulp server"),
-            "guards" => {
-                let guards: Vec<&str> = v[k].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-                let mut f = Field::pick(k, "Guards", Source::ContentGuards).multi().value(guards.join("\n")).exclude(vec![href.clone()]);
-                if !guards.is_empty() {
-                    f.shown = format!("{} selected", guards.len());
-                }
-                f.help("one that allows is enough; none = everyone may download")
-            }
-            _ => keep(Field::text(k, "CA certificate (PEM file path)")),
-        });
-    }
+    let fields = guard_fields(&v, schema, extra, caps.as_deref(), &href);
     let title = if edit { format!("Edit content guard {}", s(&v, "name")) } else { format!("New {t} content guard") };
     app.form(Form::new(title, fields), move |app, f| {
-        let (mut b, mut cert) = (json!({}), None);
-        for fld in f.fields.iter().filter(|x| !edit || x.changed()) {
-            match (fld.key.as_str(), f.get(&fld.key)) {
-                ("ca_certificate", path) => cert = Some(path.to_string()),
-                ("guards", g) => b["guards"] = g.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>().into(),
-                // Pulp refuses an empty string; null clears an optional field.
-                (k, "") if edit => b[k] = Value::Null,
-                (_, "") => {}
-                (k, val) => b[k] = val.into(),
-            }
-        }
+        let (b, cert) = guard_body(f, edit);
         // Fields other than name and description decide who can download.
         let access = edit && (cert.is_some() || b.as_object().is_some_and(|o| o.keys().any(|k| k != "name" && k != "description")));
         let open = b["guards"].as_array().is_some_and(Vec::is_empty);
-        let (href, collection) = (href.clone(), format!("contentguards/{t}/"));
-        let (target, label) = (href.clone(), format!("{} content guard {}", if edit { "update" } else { "create" }, f.get("name")));
-        let go = move |app: &mut App| {
-            submit(app, label, move |c| async move {
-                if let Some(path) = cert {
-                    b["ca_certificate"] = tokio::fs::read_to_string(&path).await.with_context(|| format!("read {path}"))?.into();
-                }
-                Ok(if edit { c.patch(&href, &b).await? } else { c.post(&c.api(&collection), &b).await? })
-            })
-        };
+        let (saved, collection) = (edit.then(|| href.clone()), format!("contentguards/{t}/"));
+        let label = format!("{} content guard {}", if edit { "update" } else { "create" }, f.get("name"));
+        let go = move |app: &mut App| guard_save(app, label, saved, collection, b, cert);
         if access {
-            confirm_guard_edit(app, target, now.clone(), open, go)
+            confirm_guard_edit(app, href.clone(), now.clone(), open, go)
         } else {
             go(app)
         }
         Ok(())
     });
+}
+
+/// The fields of the content guard form: `schema` with its `extra` fields that the server has (`caps`), filled from
+/// guard `v` (`href`; null: a new guard).
+fn guard_fields(v: &Value, schema: &str, extra: &[&str], caps: Option<&Capabilities>, href: &str) -> Vec<Field> {
+    let edit = !v.is_null();
+    let keep = |f: Field| if edit { f.help("empty = unchanged") } else { f.required() };
+    let mut fields = vec![
+        Field::text("name", "Name").required().value(s(v, "name")),
+        Field::text("description", "Description").value(s(v, "description")),
+    ];
+    for &k in extra.iter().filter(|k| caps.is_none_or(|c| c.has_field(schema, k))) {
+        fields.push(match k {
+            "header_name" => Field::text(k, "Header name").required().value(s(v, k)),
+            "header_value" => keep(Field::new(k, "Header value", FieldKind::Secret)),
+            "jq_filter" => Field::text(k, "jq filter").value(s(v, k)).help("applied to the header (JSON) first, e.g. .identity.org_id"),
+            "env_var" => Field::text(k, "Environment variable").required().value(s(v, k)).help("its name on the Pulp server"),
+            "guards" => guards_field(v, href),
+            _ => keep(Field::text(k, "CA certificate (PEM file path)")),
+        });
+    }
+    fields
+}
+
+/// The member guards field of composite guard `v` (`href`: never its own member).
+fn guards_field(v: &Value, href: &str) -> Field {
+    let guards = guard_members(v);
+    let mut f = Field::pick("guards", "Guards", Source::ContentGuards).multi().value(guards.join("\n")).exclude(vec![href.into()]);
+    if !guards.is_empty() {
+        f.shown = format!("{} selected", guards.len());
+    }
+    f.help("one that allows is enough; none = everyone may download")
+}
+
+/// The body of the content guard form `f` (`edit`: only the changed fields, an emptied one null) and the path of the
+/// CA certificate file to send.
+fn guard_body(f: &Form, edit: bool) -> (Value, Option<String>) {
+    let (mut b, mut cert) = (json!({}), None);
+    for fld in f.fields.iter().filter(|x| !edit || x.changed()) {
+        match (fld.key.as_str(), f.get(&fld.key)) {
+            ("ca_certificate", path) => cert = Some(path.to_string()),
+            ("guards", g) => b["guards"] = g.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>().into(),
+            // Pulp refuses an empty string; null clears an optional field.
+            (k, "") if edit => b[k] = Value::Null,
+            (_, "") => {}
+            (k, val) => b[k] = val.into(),
+        }
+    }
+    (b, cert)
+}
+
+/// Save content guard body `b`, with the CA certificate file `cert` read into it: PATCH the guard `href`, else (None)
+/// POST to `collection`.
+fn guard_save(app: &mut App, label: String, href: Option<String>, collection: String, mut b: Value, cert: Option<String>) {
+    submit(app, label, move |c| async move {
+        if let Some(path) = cert {
+            b["ca_certificate"] = tokio::fs::read_to_string(&path).await.with_context(|| format!("read {path}"))?.into();
+        }
+        Ok(match href {
+            Some(h) => c.patch(&h, &b).await?,
+            None => c.post(&c.api(&collection), &b).await?,
+        })
+    })
 }
 
 /// Run `go` at once, or after the typed guard name when a distribution uses content guard `href` (`name`), directly
