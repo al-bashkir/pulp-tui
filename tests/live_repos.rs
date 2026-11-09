@@ -820,7 +820,8 @@ async fn remote_timeouts_keep_decimal_seconds_through_the_tui() {
 }
 
 /// A Content View snapshot repository of another database (labels set with the API) is not deleted from the
-/// Repositories screen, alone or marked (audit F02): the refusal names the view and the database, and nothing is sent.
+/// Repositories screen, alone or marked (audit F02): the refusal names the view and the database, and says to use the
+/// Content View actions of that database (audit F51, T04); nothing is sent.
 #[tokio::test]
 async fn snapshot_repository_of_another_database_is_not_deleted_through_the_tui() {
     if !live_enabled() {
@@ -832,7 +833,9 @@ async fn snapshot_repository_of_another_database_is_not_deleted_through_the_tui(
     let (mut app, mut rx) = app().await;
     app.list.kind = Kind::Repos(RepoType::File, false);
     let item: Value = c.get(&repo, &[]).await.unwrap();
-    let refused = format!("refused: {name} is a snapshot repository of Content View foreignview (database another-database-id); ");
+    let refused = format!(
+        "refused: {name} is a snapshot repository of Content View foreignview (database another-database-id); use the Content View actions of that database"
+    );
     run(&mut app, Act::Delete, item.clone());
     settle(&mut app, &mut rx).await;
     assert!(app.modal.is_none() && texts(&app).last().unwrap().starts_with(&refused), "{:?}", texts(&app));
@@ -847,7 +850,7 @@ async fn snapshot_repository_of_another_database_is_not_deleted_through_the_tui(
 /// The versions and publications of a Content View snapshot repository of another database are not deleted from the
 /// Versions screens (one repository, all versions) or the Publications screen (audit F25), and its content is not
 /// removed on the Content screen (audit F34): each is refused before any dialog, nothing is sent, and the versions and
-/// the publication stay.
+/// the publication stay. The refusal ends "use the Content View actions of that database" (audit F51, T04).
 #[tokio::test]
 async fn snapshot_versions_publications_and_content_of_another_database_are_not_changed_through_the_tui() {
     if !live_enabled() {
@@ -860,7 +863,9 @@ async fn snapshot_versions_publications_and_content_of_another_database_are_not_
     let publication = ops::create_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
     let mark = pulp_tui::session_log::last_id();
     let (mut app, mut rx) = app().await;
-    let refused = format!("refused: {name} is a snapshot repository of Content View foreignview (database another-database-id); ");
+    let refused = format!(
+        "refused: {name} is a snapshot repository of Content View foreignview (database another-database-id); use the Content View actions of that database"
+    );
     let p: Value = c.get(&publication, &[]).await.unwrap();
     for (kind, item) in [
         (Kind::Versions(Some((repo.clone(), name.clone()))), c.get::<Value>(&v1, &[]).await.unwrap()),
