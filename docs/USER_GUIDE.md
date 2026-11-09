@@ -940,7 +940,8 @@ server tasks → task groups → workers.
 
 Server tasks:
 
-* **a** tracks the task. **W** tracks it and opens the live view.
+* **a** tracks the task. **W** tracks it and opens the live view. A task that the Task Center
+  has already keeps its row: its label and a final state stay.
 * **F** filters on the server: state, name contains, resource href (the tasks that locked an
   object), started at or after (`2026-11-01` or `2026-11-01T08:00:00Z`). The title shows the
   filters.

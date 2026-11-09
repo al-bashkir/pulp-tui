@@ -70,9 +70,9 @@ impl TaskCenter {
         Self { items: vec![], min, max, max_in_flight: 3 }
     }
 
+    /// A row that exists keeps its label: the operation names it better than a later Track of Pulp's task name.
     pub fn track(&mut self, href: &str, label: &str, state: &str) {
-        if let Some(t) = self.items.iter_mut().find(|t| t.href == href) {
-            t.label = label.into();
+        if self.items.iter().any(|t| t.href == href) {
             return;
         }
         self.items.insert(
@@ -101,12 +101,15 @@ impl TaskCenter {
     /// a workflow reports it for the first time already final.
     pub fn update(&mut self, task: Task, driven: bool) -> bool {
         let now = Instant::now();
-        if !self.items.iter().any(|t| t.href == task.pulp_href) {
-            self.track(&task.pulp_href, &task.name, "waiting");
-        }
+        self.track(&task.pulp_href, &task.name, "waiting");
         let (min, max) = (self.min, self.max);
         let Some(t) = self.items.iter_mut().find(|t| t.href == task.pulp_href) else { return false };
         let was_final = t.is_final();
+        // An older snapshot (a stale Server tasks row, a late poll answer): a task never leaves a final state.
+        if was_final && !is_final_state(&task.state) {
+            t.in_flight = false;
+            return false;
+        }
         let changed = t.task.as_ref() != Some(&task);
         t.state = task.state.clone();
         t.error = task.error_message();

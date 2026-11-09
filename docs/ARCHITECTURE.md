@@ -69,6 +69,8 @@ Pulp tasks are the source of truth.
 * It polls each unfinished task: the interval starts at `poll_min_ms`, grows 1.5x while
   nothing changes, resets on a change, has ±20 % jitter. At most three polls run at a time.
   A task that a workflow waits on is not polled twice.
+* A final row stays final: an older snapshot (a Server tasks row loaded while the task ran,
+  a late poll answer) does not change it. A tracked row keeps its label.
 * A workflow takes only `completed` as done (`ops::wait_task`). `failed`, `canceled` and
   `skipped` stop the step with the state as the error. `ops::settle` does the same for a
   task group: it is done only when every task completed.

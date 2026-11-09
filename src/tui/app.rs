@@ -2634,6 +2634,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_final_task_row_never_goes_back_to_running() {
+        let mut app = app_on(Kind::ServerTasks(vec![])).await;
+        let snapshot =
+            |state: &str| serde_json::json!({ "pulp_href": "/t/1/", "name": "pulpcore.app.tasks.base.general_update", "state": state });
+        let row = |app: &App| app.tasks.items.iter().find(|t| t.href == "/t/1/").map(|t| (t.state.clone(), t.label.clone()));
+        app.track_task("/t/1/", "update repository web", None);
+        app.handle_msg(Msg::Task(serde_json::from_value(snapshot("completed")).unwrap(), None));
+        // Track on a Server tasks row that was loaded while the task ran.
+        super::super::actions::run(&mut app, Act::TrackTask, snapshot("running"));
+        assert_eq!(row(&app), Some(("completed".into(), "update repository web".into())));
+        // A poll answer that was in flight when the workflow reported the end.
+        app.handle_msg(Msg::TaskPolled { href: "/t/1/".into(), result: Ok(serde_json::from_value(snapshot("running")).unwrap()) });
+        app.handle_msg(Msg::TaskPolled { href: "/t/1/".into(), result: Ok(serde_json::from_value(snapshot("completed")).unwrap()) });
+        assert_eq!(row(&app), Some(("completed".into(), "update repository web".into())));
+        assert_eq!(texts(&app), ["task completed: update repository web", "tracking task"], "one completed notice");
+        assert!(app.tasks.due().is_empty(), "a final row is not polled");
+    }
+
+    #[tokio::test]
     async fn a_finished_task_reloads_the_dashboard_counts_once() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
