@@ -483,6 +483,41 @@ async fn distribution_without_database_label_is_adopted_even_when_the_publicatio
     server.verify().await;
 }
 
+/// An existing distribution of the name is re-pointed to the publication with one PATCH that also clears what it
+/// served instead (a repository, a repository version); one that serves the publication already gets no PATCH.
+#[tokio::test]
+async fn an_existing_distribution_is_re_pointed_only_when_it_serves_something_else() {
+    let (p1, p2) = (format!("{API}publications/rpm/rpm/1/"), format!("{API}publications/rpm/rpm/2/"));
+    let (repo, version) = (format!("{API}repositories/rpm/rpm/1/"), format!("{API}repositories/rpm/rpm/1/versions/3/"));
+    // (what the distribution serves, the PATCH that re-points it to p2)
+    let cases = [
+        (json!({ "publication": p1 }), Some(json!({ "publication": p2, "repository": null }))),
+        (json!({ "publication": null, "repository": repo }), Some(json!({ "publication": p2, "repository": null }))),
+        (
+            json!({ "publication": null, "repository_version": version }),
+            Some(json!({ "publication": p2, "repository": null, "repository_version": null })),
+        ),
+        (json!({ "publication": p2 }), None),
+    ];
+    for (serves, patch) in cases {
+        let server = MockServer::start().await;
+        let mut d = dist(json!({ "pulp_tui_cv": "web" }));
+        d.as_object_mut().unwrap().extend(serves.as_object().unwrap().clone());
+        serve_dist(&server, d).await;
+        let sent = Mock::given(method("PATCH")).and(path(format!("{API}distributions/rpm/rpm/1/")));
+        let sent = match &patch {
+            Some(body) => sent.and(body_json(body)).respond_with(ResponseTemplate::new(200).set_body_json(json!({}))).expect(1),
+            None => sent.respond_with(ResponseTemplate::new(200)).expect(0),
+        };
+        sent.mount(&server).await;
+        let c = client(&server, |_, _| {});
+        let labels = json!({ "pulp_tui_cv": "web" });
+        let href = ops::ensure_distribution(&c, RepoType::Rpm, "d", "bp", Some(&p2), &labels, None, &no_progress).await.unwrap();
+        assert_eq!(href, format!("{API}distributions/rpm/rpm/1/"));
+        server.verify().await;
+    }
+}
+
 /// Pulp refuses a base path that is inside another one or contains one (HTTP 400 "Overlaps with an existing
 /// distribution."): a new distribution there is refused before the POST, in both directions. A path that contains the
 /// base path in another place does not overlap.
