@@ -2125,6 +2125,27 @@ mod tests {
         assert_eq!(lines[lines.len() - 2..], ["In Library:", r1], "{lines:?}");
     }
 
+    /// A view without repositories: Publish refuses it, so its preview says that refusal, not the Library rows that a
+    /// Library step would change.
+    #[tokio::test]
+    async fn the_publish_preview_of_a_view_without_repositories_says_that_publish_refuses_it() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let lib = st.ensure_library("lab").await.unwrap();
+        let old = left_out(&st, lib, web, "2", Some("/p/2/")).await;
+        serve(&server, "GET", old.distribution, 200, json!({ "name": "d2", "publication": "/p/2/" })).await;
+        cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": web, "name": "web" }));
+        drain(&mut app, &mut rx).await;
+        let (form, mut submit) = open_form(&mut app);
+        submit(&mut app, &form).unwrap();
+        drain(&mut app, &mut rx).await;
+        assert!(app.modal.is_none(), "no confirmation");
+        let (level, text) = last_notice(&app);
+        assert_eq!((level, text), (Level::Error, "preview web: content view web has no repositories"));
+    }
+
     /// F58: the Library step of a Resume changes the Library rows of the repositories that the version lacks, as the one
     /// of Publish does. The Resume confirmation names each change under "In Library:" (an open Library too), and nothing
     /// runs before it. A newer published version keeps Library: then there is no such line.

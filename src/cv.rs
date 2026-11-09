@@ -642,10 +642,7 @@ impl CvService {
         if cv.composite {
             return self.publish_composite(&cv, notes, log, on).await;
         }
-        let repos = self.store.cv_repos(cv_id).await?;
-        if repos.is_empty() {
-            bail!("content view {} has no repositories", cv.name);
-        }
+        let repos = self.view_repos(&cv).await?;
         check_repo_clash(&[(cv.name.clone(), repos.clone())])?;
         // Snapshot all source versions first so the view is consistent in time.
         let mut sources = vec![];
@@ -1805,8 +1802,18 @@ impl CvService {
         if cv.composite {
             return Ok(self.resolve_components(&cv).await?.into_iter().flat_map(|(_, _, rows)| rows).collect());
         }
-        let repos = self.store.cv_repos(cv_id).await?;
+        let repos = self.view_repos(&cv).await?;
         Ok(repos.into_iter().map(|r| CvVersionRepo { repo: Some(r), ..Default::default() }).collect())
+    }
+
+    /// The repositories of view `cv` (not a composite) that `publish` snapshots; refused when it has none, so the
+    /// Publish preview (`draft_rows`) says the refusal too.
+    async fn view_repos(&self, cv: &ContentView) -> Result<Vec<CvRepo>> {
+        let repos = self.store.cv_repos(cv.id).await?;
+        if repos.is_empty() {
+            bail!("content view {} has no repositories", cv.name);
+        }
+        Ok(repos)
     }
 
     /// Exact content the current definition would select, compared to a published version.
