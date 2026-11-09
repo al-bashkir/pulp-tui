@@ -1974,6 +1974,36 @@ mod tests {
         assert_eq!(st.version(v2.id).await.unwrap().state, "published");
     }
 
+    /// The Publish preview says first what Publish does, then compares the draft with the newest published version (of a
+    /// composite: its components).
+    #[tokio::test]
+    async fn the_publish_preview_compares_the_draft_with_the_newest_published_version() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        // A composite of a version without repositories: preview and publish send nothing to Pulp.
+        let os = st.create_cv("lab", "os", "").await.unwrap();
+        publish_empty(&st, os).await;
+        let c = st.create_composite("lab", "rocky9", "").await.unwrap();
+        st.set_component(c, os, None).await.unwrap();
+        app.push(Kind::ContentViews);
+        let mut heads = vec![];
+        for _ in 0..2 {
+            cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": c, "name": "rocky9", "composite": true }));
+            drain(&mut app, &mut rx).await;
+            let (form, mut submit) = open_form(&mut app);
+            submit(&mut app, &form).unwrap();
+            drain(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirmation") };
+            heads.push(lines[..4].to_vec());
+            yes(&mut app);
+            drain(&mut app, &mut rx).await;
+        }
+        let first = "Publishing creates a new immutable version and makes it active in Library.";
+        let head = |os: &str| vec![first.to_string(), String::new(), "== components".into(), os.into()];
+        assert_eq!(heads, [head("  os: added (v1)"), head("  os: v1 (unchanged)")]);
+    }
+
     /// F46: the Library step of Publish changes the Library rows of repositories that the new version lacks, as a
     /// promotion does: the Publish preview names each change before the confirmation. A kept distribution that serves
     /// a publication again stops serving; one that lost the labels of the view is left as it is and forgotten.
@@ -2164,7 +2194,8 @@ mod tests {
 
     /// F58: the Library step of a Resume changes the Library rows of the repositories that the version lacks, as the one
     /// of Publish does. The Resume confirmation names each change under "In Library:" (an open Library too), and nothing
-    /// runs before it. A newer published version keeps Library: then there is no such line.
+    /// runs before it: for a failed version, and for a published one whose Library step was interrupted. An older
+    /// published version does not change that; a newer one keeps Library: then there is no such line.
     #[tokio::test]
     async fn the_resume_confirmation_names_what_the_library_step_changes() {
         let server = MockServer::start().await;
@@ -2175,24 +2206,32 @@ mod tests {
         let old = left_out(&st, lib, web, "2", Some("/p/2/")).await;
         let ours = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: LIBRARY, crate::cv::LABEL_DB: st.db_id() });
         serve(&server, "GET", old.distribution, 200, json!({ "name": "d2", "publication": "/p/2/", "pulp_labels": ours })).await;
+        publish_empty(&st, web).await; // v1
         let v = st.begin_version(web, "", &[]).await.unwrap();
         st.finish_version(v.id, "failed", None).await.unwrap();
-        let resume = |app: &mut App| {
-            version_action(app, "lab", web, "web".into(), Act::Resume, json!({ "id": v.id, "number": v.number, "state": "failed" }))
+        let resume = |app: &mut App, state: &str| {
+            version_action(app, "lab", web, "web".into(), Act::Resume, json!({ "id": v.id, "number": v.number, "state": state }))
         };
-        resume(&mut app);
-        drain(&mut app, &mut rx).await;
-        let Some(Modal::Confirm { title, lines, typed: None, .. }) = app.modal.take() else {
-            panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text))
-        };
-        let first = "Resume web v1: it becomes active in Library unless a newer version is published.";
-        let r2 = "  r2: not part of v1 -> its distribution stops serving (kept for rollback)";
-        assert_eq!((title.as_str(), lines), ("Resume web v1", vec![first.into(), String::new(), "In Library:".into(), r2.into()]));
-        assert_eq!(st.version(v.id).await.unwrap().state, "failed", "nothing before the confirmation");
+        let first = "Resume web v2: it becomes active in Library unless a newer version is published.";
+        let r2 = "  r2: not part of v2 -> its distribution stops serving (kept for rollback)";
+        let want = vec![first.to_string(), String::new(), "In Library:".into(), r2.into()];
+        for state in ["failed", "published"] {
+            if state == "published" {
+                st.finish_version(v.id, state, None).await.unwrap();
+                st.promoted(lib, web, v.id, "promoting").await.unwrap(); // the client stopped in the Library step
+            }
+            resume(&mut app, state);
+            drain(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { title, lines, typed: None, .. }) = app.modal.take() else {
+                panic!("{state}: no confirm: {:?}", app.notices.back().map(|n| &n.text))
+            };
+            assert_eq!((title.as_str(), &lines), ("Resume web v2", &want), "{state}");
+            assert_eq!(st.version(v.id).await.unwrap().state, state, "nothing before the confirmation");
+        }
 
         let newer = publish_empty(&st, web).await;
         assert!(newer.number > v.number);
-        resume(&mut app);
+        resume(&mut app, "published");
         drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none(), "Library keeps v{}: no Library line, no confirmation", newer.number);
     }
@@ -2606,6 +2645,28 @@ mod tests {
         let old = "  old: not part of v1 -> its distribution stops serving (kept for rollback); Pulp shows that it serves \
                    content set outside pulp-tui";
         assert_eq!(confirm_lines(&mut app)[2..6], [gone, mine, old, ""]);
+    }
+
+    /// F59: the distribution of a left-out row that records a publication answers 404, and the user is not a Pulp
+    /// administrator (403 on `access_policies/`): it can be hidden by RBAC. The preview says that the step fails for the
+    /// row, why, and what to do.
+    #[tokio::test]
+    async fn the_promote_preview_says_that_the_step_fails_for_a_distribution_the_user_may_not_view() {
+        let server = MockServer::start().await; // 404 for the rest: the distribution of r5
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        left_out(&st, lib, web, "5", Some("/p/5/")).await;
+        serve(&server, "GET", "/pulp/api/v3/access_policies/".into(), 403, json!({ "detail": "no" })).await;
+        promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        let refused = "  r5: not part of v1 -> the step fails for it: Pulp answers 404 for its distribution \
+                       /pulp/api/v3/distributions/rpm/rpm/5/: it was deleted, or this Pulp user may not view it. pulp-tui \
+                       keeps the row, so the version that it serves stays protected: run the step again as a Pulp \
+                       administrator, or give this user the view permission on the distribution";
+        assert_eq!(confirm_lines(&mut app)[2..4], [refused, ""]);
     }
 
     /// A confirmed promotion says what it verified: the served metadata, not every file.
