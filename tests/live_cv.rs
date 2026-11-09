@@ -991,8 +991,8 @@ async fn cv_row(app: &mut App, rx: &mut UnboundedReceiver<Msg>, name: &str) -> V
     row(app, "name", name).unwrap_or_else(|| panic!("no view {name}: {:?}", app.list.items))
 }
 
-/// Publish (P) of view `name`: the form, the preview, the confirmation, the job.
-async fn tui_publish(app: &mut App, rx: &mut UnboundedReceiver<Msg>, name: &str, notes: &str) {
+/// Publish (P) of view `name`: the form, the preview (its lines), the confirmation, the job.
+async fn tui_publish(app: &mut App, rx: &mut UnboundedReceiver<Msg>, name: &str, notes: &str) -> Vec<String> {
     let r = cv_row(app, rx, name).await;
     run(app, Act::CvPublish, r);
     settle(app, rx).await; // the repositories are read before the form
@@ -1001,6 +1001,7 @@ async fn tui_publish(app: &mut App, rx: &mut UnboundedReceiver<Msg>, name: &str,
     let (lines, typed) = yes(app);
     assert_eq!((typed, lines[0].as_str()), (None, "Publishing creates a new immutable version and makes it active in Library."));
     settle(app, rx).await;
+    lines
 }
 
 /// Promote (M) or Rollback (b) of view `name` to version `number` in `env`: the form, the preview (its lines), the job.
@@ -1670,6 +1671,139 @@ async fn a_partial_promotion_and_what_the_screens_show_through_the_tui() {
     shown(&app, &format!("{id} v1 active in Dev; served metadata verified"));
     assert_eq!(cv_row(&mut app, &mut rx, &id).await["bound"], "Library:v1  Dev:v1");
 
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
+}
+
+/// A view `id` of the File repositories `names` (synced from the fixtures), with Library and Dev, for the TUI tests:
+/// the service, the view id, and the hrefs of the source repositories and remotes.
+async fn tui_view(app: &App, c: &PulpClient, id: &str, names: &[&str]) -> (CvService, i64, Vec<String>) {
+    let svc = service(app, c);
+    let (st, scope) = (svc.store.clone(), svc.scope.clone());
+    let cv = st.create_cv(&scope, id, "").await.unwrap();
+    let mut sources = vec![];
+    for name in names {
+        let (repo, remote) = synced_repo(c, RepoType::File, &format!("{id}-{name}"), "file/PULP_MANIFEST", "mirror").await;
+        let r = CvRepo { repo_href: repo.clone(), repo_name: name.to_string(), repo_type: RepoType::File, filters: vec![] };
+        st.set_cv_repo(cv, &r).await.unwrap();
+        sources.extend([repo, remote]);
+    }
+    let lib = st.ensure_library(&scope).await.unwrap();
+    st.create_env(&scope, "Dev", lib, false).await.unwrap();
+    (svc, cv, sources)
+}
+
+/// T04, F44 through the TUI: a distribution outside pulp-tui at `dev/<view>` is above the Dev path of docs (Pulp
+/// refuses overlapping base paths). The Promote (M) preview names the overlap; the confirmed promotion fails for docs
+/// before Pulp is asked, and creates no distribution. Once the path is free, Promote completes.
+#[tokio::test]
+async fn a_promotion_to_an_overlapping_base_path_is_named_and_creates_nothing_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvot"));
+    let (mut app, mut rx) = app().await;
+    let (svc, cv, sources) = tui_view(&app, &c, &id, &["docs"]).await;
+    tui_publish(&mut app, &mut rx, &id, "").await;
+    let (above, path, foreign_name) = (format!("dev/{id}"), base_path(&id, "dev", "docs"), format!("{id}-foreign"));
+    let foreign = create(&c, RepoType::File.distributions(), json!({ "name": foreign_name, "base_path": above }), "/distributions/").await;
+
+    let lines = tui_promote(&mut app, &mut rx, &id, Act::Promote, "1", "Dev").await;
+    let name = pulp_tui::cv::distribution_name(&id, "Dev", "docs");
+    let refusal = format!("base path {path} overlaps base path {above} of distribution {foreign_name}");
+    let warn = format!("  docs (File): new distribution {name} at /{path}; the promotion fails for it: {refusal}");
+    assert!(lines.contains(&warn), "{lines:?}");
+    let failed = format!("{id} in Dev: failed: docs: conflict [409]: {refusal}");
+    assert!(texts(&app).iter().any(|t| t.starts_with(&failed)), "{:?}", texts(&app));
+    let made = ops::find_by_name::<Value>(&c, &c.api(RepoType::File.distributions()), &name).await.unwrap();
+    assert!(made.is_none(), "no distribution is created: {made:?}");
+
+    cleanup(&c, &[&foreign]).await;
+    tui_promote(&mut app, &mut rx, &id, Act::Promote, "1", "Dev").await;
+    shown(&app, &format!("{id} v1 active in Dev; served metadata verified"));
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
+}
+
+/// T04, F45 through the TUI: Dev serves v1 (docs, more). The Dev distribution of more is deleted outside pulp-tui, and
+/// v2 has no more. The Promote (M) preview of v2 says that pulp-tui forgets that row; the promotion completes, and v1
+/// can then be deleted on the Versions screen (d).
+#[tokio::test]
+async fn a_left_out_distribution_deleted_outside_pulp_tui_is_forgotten_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvgt"));
+    let (mut app, mut rx) = app().await;
+    let (svc, cv, sources) = tui_view(&app, &c, &id, &["docs", "more"]).await;
+    let st = svc.store.clone();
+    tui_publish(&mut app, &mut rx, &id, "").await;
+    tui_promote(&mut app, &mut rx, &id, Act::Promote, "1", "Dev").await;
+    let dev = st.environments(&svc.scope).await.unwrap().into_iter().find(|e| e.name == "Dev").unwrap().id;
+    let more = st.binding_repos(dev, cv).await.unwrap().into_iter().find(|b| b.repo_name == "more").unwrap();
+    cleanup(&c, &[&more.distribution]).await;
+    st.remove_cv_repo(cv, &more.repo_href).await.unwrap();
+    tui_publish(&mut app, &mut rx, &id, "").await;
+
+    let lines = tui_promote(&mut app, &mut rx, &id, Act::Promote, "2", "Dev").await;
+    let forget = "  more: not part of v2 -> its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it".to_string();
+    assert!(lines.contains(&forget), "{lines:?}");
+    shown(&app, &format!("{id} v2 active in Dev; served metadata verified"));
+    let rows: Vec<_> = st.binding_repos(dev, cv).await.unwrap().into_iter().map(|b| b.repo_name).collect();
+    assert_eq!(rows, ["docs"]);
+
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvVersions, r);
+    settle(&mut app, &mut rx).await;
+    let v1_row = app.list.items.iter().find(|v| v["number"] == 1).cloned().unwrap();
+    run(&mut app, Act::Delete, v1_row.clone());
+    settle(&mut app, &mut rx).await;
+    let (_, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some("v1"));
+    settle(&mut app, &mut rx).await;
+    shown(&app, "version deleted");
+    assert_eq!(st.version(v1_row["id"].as_i64().unwrap()).await.unwrap().state, "deleted");
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
+}
+
+/// T04, F46 through the TUI: v2 leaves out more, so Library keeps its distribution, serving nothing. An operator
+/// points it at the v1 publication and removes the labels of the view (takes it over). The Publish (P) preview of v3
+/// names it under "In Library:" as left alone and forgotten; the publish completes and does not change it.
+#[tokio::test]
+async fn a_kept_library_distribution_taken_over_outside_pulp_tui_is_left_alone_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvtt"));
+    let (mut app, mut rx) = app().await;
+    let (svc, cv, sources) = tui_view(&app, &c, &id, &["docs", "more"]).await;
+    let st = svc.store.clone();
+    tui_publish(&mut app, &mut rx, &id, "").await;
+    let lib = st.ensure_library(&svc.scope).await.unwrap();
+    let more = st.binding_repos(lib, cv).await.unwrap().into_iter().find(|b| b.repo_name == "more").unwrap();
+    st.remove_cv_repo(cv, &more.repo_href).await.unwrap();
+    tui_publish(&mut app, &mut rx, &id, "").await;
+    let m = c.patch(&more.distribution, &json!({ "publication": more.publication, "pulp_labels": {} })).await.unwrap();
+    ops::settle(&c, m, &no_progress).await.unwrap();
+
+    let lines = tui_publish(&mut app, &mut rx, &id, "").await;
+    let name = pulp_tui::cv::distribution_name(&id, "Library", "more");
+    let left = format!(
+        "  more: not part of the new version -> its distribution {name} is not labeled pulp_tui_cv={} (changed outside \
+         pulp-tui): pulp-tui leaves it as it is and forgets it",
+        pulp_tui::cv::slug(&id)
+    );
+    assert_eq!(lines[lines.len() - 2..], ["In Library:".to_string(), left], "{lines:?}");
+    shown(&app, &format!("{id} version 3 published and active in Library"));
+    let d: Value = c.get(&more.distribution, &[]).await.unwrap();
+    assert_eq!((&d["publication"], &d["pulp_labels"]), (&json!(more.publication), &json!({})), "not changed");
+    let rows: Vec<_> = st.binding_repos(lib, cv).await.unwrap().into_iter().map(|b| b.repo_name).collect();
+    assert_eq!(rows, ["docs"], "the row is forgotten");
+
+    cleanup(&c, &[&more.distribution]).await;
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
 }
