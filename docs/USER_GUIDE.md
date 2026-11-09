@@ -206,8 +206,9 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   and sends nothing. Edit sends the remote only when you change it. A mirror policy
   shows a warning first. It also says when the sync makes a publication: RPM `mirror_complete`
   and File `mirror` (Deb `mirror` makes none). A File `mirror` sync from a Git remote makes the
-  new version, then its task fails (pulp_file has no manifest to publish): the warning says so;
-  use `additive`. With **Retain versions** 1, Pulp deletes the current version after the
+  new version, then its task fails (pulp_file has no manifest to publish): the warning says so,
+  also for a remote name that you typed because the picker could not load (pulp-tui finds the
+  remote by name, as the sync does); use `additive`. With **Retain versions** 1, Pulp deletes the current version after the
   sync, unless a distribution serves it: then the warning says so and you type the repository
   name (on a Content View sync, the names of those repositories). Options:
   * **Optimize** (default on): turn it off for a full re-sync.

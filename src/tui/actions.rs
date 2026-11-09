@@ -276,8 +276,15 @@ pub fn sync_policies(caps: Option<&Capabilities>, t: RepoType) -> Vec<String> {
 
 /// Runs `go` at once, or after the operator confirms the mirror warning when `policy` is a mirror policy.
 /// `repos`: the repositories that sync; the confirm is typed when the sync makes Pulp delete a current version.
-/// `git`: whether the remote that the form picked is a File Git remote; None: each repository's default remote.
-pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, git: Option<bool>, go: impl FnOnce(&mut App) + Send + 'static) {
+/// `picked`: the remote that the form names (its collections, its name) and the sync resolves (`remote_href`), also a
+/// name typed when the picker options did not load; None: each repository's default remote.
+pub fn confirm_mirror(
+    app: &mut App,
+    policy: &str,
+    repos: Vec<String>,
+    picked: Option<(Vec<&'static str>, String)>,
+    go: impl FnOnce(&mut App) + Send + 'static,
+) {
     if !policy.contains("mirror") {
         return go(app);
     }
@@ -285,6 +292,10 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, git: Opti
     let git_remotes = RepoType::File.alt_remote().map_or("", |a| a.1);
     app.job("read the retention of the repositories", move |ctx| async move {
         let (mut goes, mut files, mut gits) = (vec![], vec![], vec![]);
+        let picked = match picked {
+            Some((colls, name)) => Some(remote_href(&ctx.client, &colls, &name).await?),
+            None => None,
+        };
         for href in repos {
             let r: Value = ctx.client.get(&href, &[]).await?;
             if latest_goes(&ctx, &r, 1).await?.is_some() {
@@ -293,7 +304,7 @@ pub fn confirm_mirror(app: &mut App, policy: &str, repos: Vec<String>, git: Opti
             // pulp_file publishes the version of a mirror sync (pass-through, upstream manifest); pulp_deb does not.
             // Only a File remote has that manifest (pulp_file FileFirstStage): a Git mirror sync fails after its version.
             if RepoType::from_href(&href) == Some(RepoType::File) {
-                let from_git = git.unwrap_or_else(|| s(&r, "remote").contains(git_remotes));
+                let from_git = picked.clone().unwrap_or_else(|| s(&r, "remote")).contains(git_remotes);
                 if from_git { &mut gits } else { &mut files }.push(s(&r, "name"));
             }
         }
@@ -1374,8 +1385,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
             let (href, name, options) = (href.clone(), name.clone(), sync_options(f));
             let repos = vec![href.clone()];
             sync_refusal(&row, &policy, &options, remote.is_some())?;
-            // The picker note of the picked remote names its second type (File: Git).
-            let git = remote.is_some().then(|| f.picked("remote").iter().any(|i| i.note == "Git"));
+            let picked = remote.clone().map(|r| (remotes.clone(), r));
             let go = move |app: &mut App| {
                 submit(app, format!("sync {name} ({policy})"), move |c| async move {
                     let r = match remote {
@@ -1385,7 +1395,7 @@ fn repo_sync(app: &mut App, t: RepoType, href: String, name: String, item: &Valu
                     Ok(ops::sync_with(&c, t, &href, r.as_deref(), &policy, options).await?)
                 })
             };
-            confirm_mirror(app, f.get("policy"), repos, git, go);
+            confirm_mirror(app, f.get("policy"), repos, picked, go);
             Ok(())
         });
     };
@@ -1975,7 +1985,9 @@ fn reclaim(app: &mut App, repo: String) {
             let remote = match r["remote"].as_str() {
                 Some(h) => {
                     let v: Value = c.get(h, &[("fields", "name,policy".into())]).await?;
-                    format!("Default remote: {} (policy {}).", s(&v, "name"), s(&v, "policy"))
+                    // A File Git remote has no download policy.
+                    let policy = v["policy"].as_str().map(|p| format!(" (policy {p})")).unwrap_or_default();
+                    format!("Default remote: {}{policy}.", s(&v, "name"))
                 }
                 None => "No default remote: a file comes again from the remote of the sync that added it.".into(),
             };
@@ -6834,11 +6846,13 @@ mod tests {
 
     /// pulp_file reads an upstream manifest only from a File remote: a mirror sync from a Git remote makes the new
     /// version, then its task fails ("pop from empty list") with no publication. The confirm says so for the Git
-    /// remote that the sync uses: the picked one, else the default remote of the repository.
+    /// remote that the sync uses: the picked one, else the default remote of the repository. The picked name is
+    /// resolved as the sync resolves it, also when it was typed because the picker options did not load (audit F63).
     #[tokio::test]
     async fn mirror_confirm_of_a_file_repository_with_a_git_remote_says_that_the_task_fails() {
         use crate::tui::app::Modal;
         use crate::tui::form::PickItem;
+        use wiremock::matchers::{method, path, query_param};
         let server = wiremock::MockServer::start().await;
         let repo = format!("{API}repositories/file/file/docs/");
         let git = format!("{API}remotes/file/git/1/");
@@ -6849,13 +6863,22 @@ mod tests {
         )
         .await;
         get(&server, &git, json!({ "name": "up-git" })).await;
+        // The remotes by name: `files` is a File remote, `other-git` a Git remote.
+        for (coll, name, found) in [("file/file", "files", "1"), ("file/git", "other-git", "2")] {
+            let hit = page(json!([{ "pulp_href": format!("{API}remotes/{coll}/{found}/"), "name": name }]));
+            let m = wiremock::Mock::given(method("GET")).and(path(format!("{API}remotes/{coll}/"))).and(query_param("name", name));
+            m.respond_with(wiremock::ResponseTemplate::new(200).set_body_json(hit)).with_priority(1).mount(&server).await;
+            get(&server, &format!("{API}remotes/{coll}/"), page(json!([]))).await;
+        }
         let (mut app, mut rx) = connected(&server).await;
         let fails = "File: a mirror sync of docs from a Git remote makes the new version, then its task fails \
                      (pulp_file has no manifest to publish for a Git remote). Use additive.";
         let item = |label: &str, note: &str| PickItem { label: label.into(), value: label.into(), note: note.into() };
         // Untouched: the default Git remote; picked: a File remote, then another Git remote (the default one, picked,
-        // leaves the field untouched).
-        for (picked, git_line) in [(None, true), (Some("files"), false), (Some("other-git"), true)] {
+        // leaves the field untouched); then that Git remote typed, with no options loaded.
+        for (picked, loaded, git_line) in
+            [(None, true, true), (Some("files"), true, false), (Some("other-git"), true, true), (Some("other-git"), false, true)]
+        {
             repo_action(&mut app, RepoType::File, Act::Sync, json!({ "pulp_href": repo, "name": "docs", "remote": git }));
             settle(&mut app, &mut rx).await;
             let Some(Modal::Form { mut form, mut submit }) = app.modal.take() else { panic!("no form") };
@@ -6863,7 +6886,7 @@ mod tests {
             if let Some(p) = picked {
                 let field = form.fields.iter_mut().find(|f| f.key == "remote").unwrap();
                 let options = vec![item("files", ""), item("up-git", "Git"), item("other-git", "Git")];
-                (field.value, field.options) = (p.into(), Some(options));
+                (field.value, field.options) = (p.into(), loaded.then_some(options));
             }
             submit(&mut app, &form).unwrap();
             settle(&mut app, &mut rx).await;
@@ -10028,6 +10051,25 @@ mod tests {
         run(&mut app, Act::Reclaim, item.clone());
         assert!(app.modal.is_none());
         assert_eq!(last(&app), "not supported by this server: reclaim space (repositories/reclaim_space/)");
+    }
+
+    /// A File Git remote has no download policy: the Reclaim confirm names the remote alone (audit F63 polish).
+    #[tokio::test]
+    async fn reclaim_space_of_a_repository_with_a_default_git_remote_names_no_policy() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (repo, remote) = (format!("{API}repositories/file/file/r/"), format!("{API}remotes/file/git/1/"));
+        let item = json!({ "pulp_href": repo, "name": "docs", "remote": remote });
+        get(&server, &repo, item.clone()).await;
+        get(&server, &remote, json!({ "pulp_href": remote, "name": "up-git" })).await;
+        get(&server, &format!("{repo}versions/"), page(json!([{ "number": 0 }]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Repos(RepoType::File, false);
+        run(&mut app, Act::Reclaim, item);
+        fill_and_submit(&mut app, &[]);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert_eq!(lines[3], "Default remote: up-git.");
     }
 
     /// pulpcore 3.123 repairs every artifact of the domain for a version without content: such a version is refused.

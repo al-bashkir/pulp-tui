@@ -500,6 +500,38 @@ async fn file_git_remote_syncs_a_repository_with_the_prefilled_form() {
     cleanup(&c, &[&repo, &href]).await;
 }
 
+/// Sync (s) with the mirror policy from a File Git remote through the TUI (audit T04, F63): the name is typed into
+/// the Remote field without loading the picker options (as when they fail to load). The confirm says that the task
+/// fails (pulp_file has no manifest of a Git remote); Esc sends nothing.
+#[tokio::test]
+async fn file_mirror_sync_from_a_typed_git_remote_name_warns_that_the_task_fails_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::File, unique("it-gitmirror"));
+    let (mut app, mut rx) = app().await;
+    if let Some(e) = Kind::Remotes(t, true).unsupported(&app.conn.as_ref().unwrap().caps) {
+        eprintln!("skipping: {e}");
+        return;
+    }
+    let remote =
+        create(&c, "remotes/file/git/", json!({ "name": name, "url": format!("{}/git/files.git", upstream()) }), "/remotes/").await;
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    app.list.kind = Kind::Repos(t, false);
+    run(&mut app, Act::Sync, c.get::<Value>(&repo, &[]).await.unwrap());
+    fill(&mut app, &[("remote", &name), ("policy", "mirror")]);
+    settle(&mut app, &mut rx).await; // the remote by name, and the retention of the repository
+    let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", texts(&app)) };
+    let fails = format!(
+        "File: a mirror sync of {name} from a Git remote makes the new version, then its task fails \
+         (pulp_file has no manifest to publish for a Git remote). Use additive."
+    );
+    assert!(lines.contains(&fails), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("upstream manifest")), "{lines:?}");
+    assert!(latest(&c, &repo).await.ends_with("/versions/0/"), "Esc: no sync");
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
 /// Prune through the TUI on a repository synced from `rpm2` (fixture-alpha 1.0 and 1.1): with keep_days 0 the
 /// dry run reports the older alpha and changes nothing; after the typed name, the new version lacks it (on a server
 /// whose new version still lists it, the result says so).
