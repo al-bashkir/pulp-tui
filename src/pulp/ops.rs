@@ -374,16 +374,8 @@ pub async fn ensure_distribution(
     db: Option<(&str, &str, &[String])>,
     on: OnTask<'_>,
 ) -> Result<String> {
-    let coll = c.api(t.distributions());
-    if let Some(d) = find_by_name::<Distribution>(c, &coll, name).await? {
-        if d.base_path != base_path {
-            return Err(PulpError::Api {
-                status: 409,
-                message: format!("distribution {name} serves {} instead of {base_path}", d.base_path),
-            });
-        }
-        let adopt = owner_check(&d, labels, db)?;
-        refuse_checkpoint(name, d.checkpoint)?;
+    if let Some(d) = distribution_target(c, t, name, base_path, labels, db).await? {
+        let adopt = owner_check(&d, labels, db)?; // passed in `distribution_target`; this gives the label to adopt
         let repoint = d.publication.as_deref() != publication || d.repository.is_some() || d.repository_version.is_some();
         if repoint || adopt.is_some() {
             let mut body = json!({});
@@ -404,19 +396,42 @@ pub async fn ensure_distribution(
         }
         return Ok(d.pulp_href);
     }
-    refuse_overlap(c, base_path).await?;
     let mut labels = labels.clone();
     if let Some((key, id, _)) = db {
         labels[key] = id.into();
     }
     create(
         c,
-        &coll,
+        &c.api(t.distributions()),
         &json!({ "name": name, "base_path": base_path, "publication": publication, "pulp_labels": labels }),
         "/distributions/",
         on,
     )
     .await
+}
+
+/// What `ensure_distribution` does with distribution `name` at `base_path`, read from Pulp before any write: re-point
+/// the one of that name (`Some`), or create one (`None`). `Err` (409) is its refusal: the one of that name serves
+/// another base path, lacks the ownership `labels`, belongs to another database (`db`) or is a checkpoint distribution;
+/// a new one overlaps the base path of another one (`refuse_overlap`). A preview that calls it says what the run does.
+pub async fn distribution_target(
+    c: &PulpClient,
+    t: RepoType,
+    name: &str,
+    base_path: &str,
+    labels: &Value,
+    db: Option<(&str, &str, &[String])>,
+) -> Result<Option<Distribution>> {
+    let Some(d) = find_by_name::<Distribution>(c, &c.api(t.distributions()), name).await? else {
+        refuse_overlap(c, base_path).await?;
+        return Ok(None);
+    };
+    if d.base_path != base_path {
+        return Err(PulpError::Api { status: 409, message: format!("distribution {name} serves {} instead of {base_path}", d.base_path) });
+    }
+    owner_check(&d, labels, db)?;
+    refuse_checkpoint(name, d.checkpoint)?;
+    Ok(Some(d))
 }
 
 /// Refuse a new distribution at `base_path` that another distribution has, contains or is inside of
@@ -466,11 +481,18 @@ fn owner_check(d: &Distribution, labels: &Value, db: Option<(&str, &str, &[Strin
     let name = &d.name;
     let owned = labels.as_object().into_iter().flatten().all(|(k, v)| d.pulp_labels.get(k).map(String::as_str) == v.as_str());
     if !owned {
-        return Err(PulpError::Api { status: 409, message: format!("distribution {name} exists but lacks ownership labels {labels}") });
+        let message = format!(
+            "distribution {name} exists but lacks ownership labels {labels}: restore them or delete the distribution, then try again"
+        );
+        return Err(PulpError::Api { status: 409, message });
     }
     let Some((key, id, aliases)) = db else { return Ok(None) };
-    let adopt = label_owner(&d.pulp_labels, key, id, aliases)
-        .map_err(|o| PulpError::Api { status: 409, message: format!("distribution {name} is owned by another pulp-tui database ({o})") })?;
+    let adopt = label_owner(&d.pulp_labels, key, id, aliases).map_err(|o| PulpError::Api {
+        status: 409,
+        message: format!(
+            "distribution {name} is owned by another pulp-tui database ({o}): use that database, or delete the distribution, then try again"
+        ),
+    })?;
     Ok(adopt.then(|| (key.to_string(), id.to_string())))
 }
 

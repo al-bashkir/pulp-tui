@@ -855,12 +855,26 @@ async fn left_out_lines(
     Ok(lines)
 }
 
-/// What the Library step of a Publish of view `id` (`name`) changes (`left_out_lines`), under a heading.
+/// What the Library step of a Publish of view `id` (`name`) does, under a heading: the repositories of the draft that it
+/// fails for (`refused_lines`) and the rows that it changes (`left_out_lines`).
 async fn library_lines(svc: &CvService, id: i64, name: &str) -> anyhow::Result<Vec<String>> {
-    let Some(lib) = svc.store.environments(&svc.scope).await?.into_iter().find(|e| e.name == LIBRARY) else { return Ok(vec![]) };
-    let rows = svc.store.binding_repos(lib.id, id).await?;
-    let lines = left_out_lines(svc, name, &lib, &svc.draft_rows(id).await?, rows, "the new version").await?;
+    let lib = svc.store.ensure_library(&svc.scope).await?; // as the Library step does
+    let Some(lib) = svc.store.environments(&svc.scope).await?.into_iter().find(|e| e.id == lib) else { return Ok(vec![]) };
+    let (draft, rows) = (svc.draft_rows(id).await?, svc.store.binding_repos(lib.id, id).await?);
+    let mut lines = refused_lines(svc, name, &lib, &draft).await?;
+    lines.extend(left_out_lines(svc, name, &lib, &draft, rows, "the new version").await?);
     Ok(if lines.is_empty() { lines } else { std::iter::once("In Library:".to_string()).chain(lines).collect() })
+}
+
+/// A line for each repository of `vrs` (of view `name`) that the Library step `e` fails for (`CvService::bind_target`).
+async fn refused_lines(svc: &CvService, name: &str, e: &Environment, vrs: &[CvVersionRepo]) -> anyhow::Result<Vec<String>> {
+    let mut lines = vec![];
+    for r in vrs.iter().map(CvVersionRepo::repo) {
+        if let (_, Some(why)) = svc.bind_target(name, e, r).await? {
+            lines.push(format!("  {} ({}): the Library step fails for it: {why}", r.repo_name, r.repo_type.label()));
+        }
+    }
+    Ok(lines)
 }
 
 /// The confirmed `mode` of version `v` of view `name` to `e`, under the view's lock, then what Verify finds.
@@ -1972,6 +1986,7 @@ mod tests {
         serve(&server, "GET", kept.repo_href.clone(), 200, json!({ "pulp_href": kept.repo_href, "name": "r1" })).await;
         let dropped = left_out(&st, lib, web, "2", Some("/p/2/")).await;
         serve(&server, "GET", dropped.distribution, 200, json!({ "name": "d2", "publication": "/p/2/" })).await;
+        serve_distributions(&server, &[], None).await; // the Library target of r1: nothing refuses it
         cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": web, "name": "web" }));
         drain(&mut app, &mut rx).await;
         let (form, mut submit) = open_form(&mut app);
@@ -1980,6 +1995,91 @@ mod tests {
         let lines = confirm_lines(&mut app);
         let r2 = "  r2: not part of the new version -> its distribution stops serving (kept for rollback)";
         assert_eq!(lines[lines.len() - 2..], ["In Library:", r2], "{lines:?}");
+    }
+
+    /// Mock answers for distribution `name` (the `name` filter of the RPM distributions) and for the overlap lists of
+    /// `distributions/`: `found` for each, else nothing.
+    async fn serve_distributions(server: &MockServer, named: &[(String, Value)], overlap: Option<(&str, Value)>) {
+        let none = json!({ "count": 0, "next": null, "results": [] });
+        let page = |d: Value| json!({ "count": 1, "next": null, "results": [d] });
+        for (name, d) in named {
+            Mock::given(method("GET"))
+                .and(path("/pulp/api/v3/distributions/rpm/rpm/"))
+                .and(wiremock::matchers::query_param("name", name.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page(d.clone())))
+                .with_priority(1)
+                .mount(server)
+                .await;
+        }
+        if let Some((at_or_above, d)) = overlap {
+            Mock::given(method("GET"))
+                .and(path("/pulp/api/v3/distributions/"))
+                .and(wiremock::matchers::query_param("base_path__in", at_or_above))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page(d)))
+                .with_priority(1)
+                .mount(server)
+                .await;
+        }
+        for p in ["/pulp/api/v3/distributions/rpm/rpm/", "/pulp/api/v3/distributions/"] {
+            serve(server, "GET", p.into(), 200, none.clone()).await;
+        }
+    }
+
+    /// The lines of the Publish preview of view `web` (`id`).
+    async fn publish_preview_lines(
+        app: &mut App,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::tui::app::Msg>,
+        id: i64,
+    ) -> Vec<String> {
+        cv_action(app, "lab", Act::CvPublish, json!({ "id": id, "name": "web" }));
+        drain(app, rx).await;
+        let (form, mut submit) = open_form(app);
+        submit(app, &form).unwrap();
+        drain(app, rx).await;
+        confirm_lines(app)
+    }
+
+    /// F55: the distribution of the derived name of r1 lost the labels of the view (an operator took it over), so the run
+    /// refuses it (`ops::ensure_distribution`). The Publish preview (its Library step) and the Promote preview name that
+    /// refusal and the way out, before anything is sent.
+    #[tokio::test]
+    async fn the_previews_name_a_taken_over_derived_distribution_that_the_promotion_refuses() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let r1 = cv_repo("r1", "rpm", "1");
+        st.set_cv_repo(web, &r1).await.unwrap();
+        serve(&server, "GET", r1.repo_href.clone(), 200, json!({ "pulp_href": r1.repo_href, "name": "r1" })).await;
+        let lib = st.ensure_library("lab").await.unwrap();
+        st.create_env("lab", "Dev", lib, false).await.unwrap();
+        let theirs = |env: &str| {
+            let name = crate::cv::distribution_name("web", env, "r1");
+            let d = json!({ "pulp_href": "/pulp/api/v3/distributions/rpm/rpm/5/", "name": name,
+                "base_path": format!("{}/web/r1", env.to_lowercase()), "pulp_labels": { "team": "x" } });
+            (name, d)
+        };
+        serve_distributions(&server, &[theirs(LIBRARY), theirs("Dev")], None).await;
+        let refused = |env: &str| {
+            format!(
+                "distribution pulp-tui-cv-web-{env}-r1 exists but lacks ownership labels {{\"pulp_tui_cv\":\"web\",\"pulp_tui_env\":\"{env}\"}}: \
+                 restore them or delete the distribution, then try again"
+            )
+        };
+
+        let lines = publish_preview_lines(&mut app, &mut rx, web).await;
+        let library = format!("  r1 (RPM): the Library step fails for it: {}", refused(LIBRARY));
+        assert_eq!(lines[lines.len() - 2..], ["In Library:".to_string(), library], "{lines:?}");
+        assert!(st.versions(web).await.unwrap().is_empty(), "nothing before the confirmation");
+
+        let v = st.begin_version(web, "", std::slice::from_ref(&r1)).await.unwrap();
+        st.finish_version(v.id, "published", None).await.unwrap();
+        st.promoted(lib, web, v.id, "active").await.unwrap();
+        promote_preview(&mut app, "web".into(), v.id, "Dev".into(), Mode::Promote);
+        drain(&mut app, &mut rx).await;
+        let dev = format!("  r1 (RPM): distribution pulp-tui-cv-web-Dev-r1 at /dev/web/r1; the promotion fails for it: {}", refused("Dev"));
+        assert_eq!(confirm_lines(&mut app)[2], dev);
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "reads only");
     }
 
     #[tokio::test]
@@ -2323,8 +2423,8 @@ mod tests {
         };
         st.save_binding_repo(&row).await.unwrap();
         let none = json!({ "count": 0, "next": null, "results": [] });
-        let docs = "  docs (File): new distribution pulp-tui-cv-web-Dev-docs at /dev/web/docs; distribution foreign has that base \
-                    path, so the promotion fails for it";
+        let docs = "  docs (File): new distribution pulp-tui-cv-web-Dev-docs at /dev/web/docs; the promotion fails for it: base path \
+                    dev/web/docs is used by distribution foreign";
         let at_derived = "  os (RPM): distribution os-moved at /dev/web/os was renamed outside pulp-tui; the promotion looks for \
                           pulp-tui-cv-web-Dev-os and fails: rename it back";
         let elsewhere = "  os (RPM): new distribution pulp-tui-cv-web-Dev-os at /dev/web/os; os-moved at /custom/os (renamed outside \

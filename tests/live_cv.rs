@@ -454,7 +454,10 @@ async fn a_promotion_to_a_base_path_that_overlaps_another_fails_as_the_preview_s
         let body = json!({ "name": foreign, "base_path": other });
         let href = create(&c, RepoType::File.distributions(), body, "/distributions/").await;
         let line = svc.promote_target(&id, &env, &docs, None).await.unwrap();
-        assert_eq!(line, format!("{new}; distribution {foreign} at /{other} overlaps that base path, so the promotion fails for it"));
+        assert_eq!(
+            line,
+            format!("{new}; the promotion fails for it: base path {path} overlaps base path {other} of distribution {foreign}")
+        );
         let e = svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap_err().to_string();
         let want =
             format!("{id} in Dev: failed: docs: conflict [409]: base path {path} overlaps base path {other} of distribution {foreign}");
@@ -1587,8 +1590,8 @@ async fn a_partial_promotion_and_what_the_screens_show_through_the_tui() {
     let lines = tui_promote(&mut app, &mut rx, &id, Act::Promote, "1", "Dev").await;
     let more_dist = pulp_tui::cv::distribution_name(&id, "Dev", "more");
     let warn = format!(
-        "  more (File): new distribution {more_dist} at /{more_path}; distribution {foreign_name} has that base path, so the \
-         promotion fails for it"
+        "  more (File): new distribution {more_dist} at /{more_path}; the promotion fails for it: base path {more_path} is used by \
+         distribution {foreign_name}"
     );
     assert!(lines.contains(&warn), "{lines:?}");
     assert!(texts(&app).iter().any(|t| t.starts_with(&format!("{id} in Dev: partial: more: "))), "{:?}", texts(&app));

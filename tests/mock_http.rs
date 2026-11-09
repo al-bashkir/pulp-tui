@@ -459,7 +459,8 @@ async fn distribution_of_another_database_is_refused() {
     let pubn = format!("{API}publications/rpm/rpm/1/");
     let db = Some(("pulp_tui_db", "me", &[][..]));
     let err = ops::ensure_distribution(&c, RepoType::Rpm, "d", "bp", Some(&pubn), &labels, db, &no_progress).await.unwrap_err();
-    let want = "distribution d is owned by another pulp-tui database (other)";
+    let want =
+        "distribution d is owned by another pulp-tui database (other): use that database, or delete the distribution, then try again";
     assert!(matches!(&err, PulpError::Api { status: 409, message } if message == want), "{err}");
     server.verify().await;
 }

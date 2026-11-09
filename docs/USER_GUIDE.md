@@ -601,12 +601,17 @@ retry, or roll back to the served version to clear the failed attempt.
   active in Library. When the Library step fails, the version stays published:
   `Library step failed: …; promote v4 to Library`. The Library step changes the Library
   distributions of repositories that the new version does not have, as **M** does; the preview
-  names each one under `In Library:`.
+  names each one under `In Library:`. It also names there each repository that the Library step
+  fails for, with the same reason and way out as the **M** preview.
 * **P** refuses a view that holds a snapshot repository. Remove it (**x**) and add its source. To
   use the content of another view, make a composite.
 * **v** versions. **i** full JSON.
 * **M** promotes a version to an environment, with a preview of every distribution. The preview
-  reads the distributions from Pulp. A distribution of the view that was renamed outside pulp-tui
+  reads the distributions from Pulp and does the checks of the promotion. When the distribution of
+  the pulp-tui name lost the labels of the view, belongs to another database or is a checkpoint
+  distribution, the preview says that the promotion fails for that repository, and how to fix it
+  (for example: restore the labels or delete the distribution, then try again). A distribution of
+  the view that was renamed outside pulp-tui
   shows with its real name. The promotion looks for the pulp-tui name. When the renamed one still
   has the pulp-tui path, the promotion fails for it. When it has another path, the promotion makes
   a new distribution at the pulp-tui path, and the renamed one keeps its publication, but pulp-tui

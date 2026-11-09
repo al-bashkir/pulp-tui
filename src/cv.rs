@@ -1443,17 +1443,36 @@ impl CvService {
         Ok(Some(d))
     }
 
+    /// What a promotion does for `repo` of view `cv` in `env` (`bind_repo`), read from Pulp before any write: the
+    /// distribution of the derived name that it re-points (`None`: it makes one), and why it fails for `repo` (`None`:
+    /// it does not). The checks are those of the run: `named_distribution` (in `served_path`), then
+    /// `ops::distribution_target` (in `ops::ensure_distribution`). So a preview says what the run does.
+    pub async fn bind_target(&self, cv: &str, env: &Environment, repo: &CvRepo) -> Result<(Option<Distribution>, Option<String>)> {
+        let named = self.named_distribution(cv, env, repo).await?;
+        let path = named.as_ref().map_or_else(|| base_path(cv, &env.label, &repo.repo_name), |d| d.base_path.clone());
+        let (name, aliases) = (distribution_name(cv, &env.name, &repo.repo_name), self.store.aliases().await?);
+        let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice()));
+        let refusal = match ops::distribution_target(&self.client, repo.repo_type, &name, &path, &dist_labels(cv, &env.name), db).await {
+            Ok(_) => None,
+            // `distribution_target` only reads; a 409 is its refusal (Pulp answers no read with 409).
+            Err(PulpError::Api { status: 409, message }) => Some(message),
+            Err(e) => return Err(e.into()),
+        };
+        Ok((named, refusal))
+    }
+
     /// The preview line of the promotion of `repo` (view `cv`) to `env`, read from Pulp: the distribution of the derived
-    /// name, or a new one. The one that `row` records, when it still has this view's labels but another name (renamed
-    /// outside pulp-tui), is named too: at the derived path the promotion fails on that path; at another path the
-    /// promotion makes the new one and the renamed one keeps its publication, unrecorded. A new one fails on a path
-    /// that another distribution has, contains or is inside of (`ops::overlapping_distribution`, as in
-    /// `ops::ensure_distribution`). An existing one keeps its path, so its re-pointing never overlaps.
+    /// name, or a new one, and why the promotion fails for it (`bind_target`). The one that `row` records, when it still
+    /// has this view's labels but another name (renamed outside pulp-tui), is named too: at the derived path the
+    /// promotion fails on that path; at another path the promotion makes the new one and the renamed one keeps its
+    /// publication, unrecorded.
     pub async fn promote_target(&self, cv: &str, env: &Environment, repo: &CvRepo, row: Option<&BindingRepo>) -> Result<String> {
         let what = format!("  {} ({})", repo.repo_name, repo.repo_type.label());
         let name = distribution_name(cv, &env.name, &repo.repo_name);
-        if let Some(d) = self.named_distribution(cv, env, repo).await? {
-            return Ok(format!("{what}: distribution {} at /{}", d.name, d.base_path));
+        let (named, refusal) = self.bind_target(cv, env, repo).await?;
+        let fails = refusal.map(|why| format!("; the promotion fails for it: {why}")).unwrap_or_default();
+        if let Some(d) = named {
+            return Ok(format!("{what}: distribution {} at /{}{fails}", d.name, d.base_path));
         }
         let path = base_path(cv, &env.label, &repo.repo_name);
         let renamed = self.recorded_distribution(cv, env, row).await?;
@@ -1463,12 +1482,7 @@ impl CvService {
                 d.name
             ));
         }
-        let mut line = format!("{what}: new distribution {name} at /{path}");
-        if let Some(o) = ops::overlapping_distribution(&self.client, &path).await? {
-            let clash =
-                if o.base_path == path { "has that base path".into() } else { format!("at /{} overlaps that base path", o.base_path) };
-            line += &format!("; distribution {} {clash}, so the promotion fails for it", o.name);
-        }
+        let mut line = format!("{what}: new distribution {name} at /{path}{fails}");
         if let Some(d) = renamed {
             line += &format!(
                 "; {} at /{} (renamed outside pulp-tui) keeps its publication, and pulp-tui no longer records it: rename it back \
@@ -3941,7 +3955,7 @@ mod tests {
         let other = "web in Library: failed: b-c: distribution pulp-tui-cv-web-Library-b-c belongs to content view web-Library in \
                      environment b (labels pulp_tui_cv=web-Library, pulp_tui_env=b): view web in environment Library with \
                      repository b-c derives the same name; refusing to modify it";
-        let unlabeled = r#"web in Library: failed: b-c: conflict [409]: distribution pulp-tui-cv-web-Library-b-c exists but lacks ownership labels {"pulp_tui_cv":"web","pulp_tui_env":"Library"}"#;
+        let unlabeled = r#"web in Library: failed: b-c: conflict [409]: distribution pulp-tui-cv-web-Library-b-c exists but lacks ownership labels {"pulp_tui_cv":"web","pulp_tui_env":"Library"}: restore them or delete the distribution, then try again"#;
         for (labels, want) in [(json!({ LABEL_CV: "web-Library", LABEL_ENV: "b" }), other), (json!({}), unlabeled)] {
             let server = wiremock::MockServer::start().await;
             let svc = mock_service(&server).await;
@@ -4527,11 +4541,11 @@ mod tests {
             ResponseTemplate::new(200).set_body_json(json!({ "count": r.len(), "next": null, "results": r }))
         };
         let new = "  os (RPM): new distribution pulp-tui-cv-web-Dev-os at /dev/web/os";
-        let fails = |clash: &str| format!("; distribution foreign {clash}, so the promotion fails for it");
+        let fails = |clash: &str| format!("; the promotion fails for it: base path dev/web/os {clash} distribution foreign");
         for (at_or_above, below, why) in [
-            (vec!["dev/web"], vec![], fails("at /dev/web overlaps that base path")),
-            (vec![], vec!["dev/web/os/extra"], fails("at /dev/web/os/extra overlaps that base path")),
-            (vec!["dev/web/os"], vec![], fails("has that base path")),
+            (vec!["dev/web"], vec![], fails("overlaps base path dev/web of")),
+            (vec![], vec!["dev/web/os/extra"], fails("overlaps base path dev/web/os/extra of")),
+            (vec!["dev/web/os"], vec![], fails("is used by")),
             (vec![], vec!["x/dev/web/os/y"], String::new()),
         ] {
             server.reset().await;
