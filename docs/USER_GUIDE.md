@@ -623,9 +623,13 @@ retry, or roll back to the served version to clear the failed attempt.
   when its distribution serves content that was set outside pulp-tui (a publication, a repository
   or a repository version; the drift check reports it too). When its distribution
   was deleted outside pulp-tui, the promotion sends nothing for it and forgets it; the preview
-  says so. When its distribution no longer has the labels of the view (someone took it over), the
-  promotion does not change it and forgets it too; the preview says so. When it still serves a
-  publication of the view, a version delete keeps that publication and its snapshot.
+  says so. Pulp hides a distribution that your user may not view (404), as if it were deleted.
+  So when your Pulp user is not an administrator and pulp-tui records a publication there, it
+  keeps the row and the promotion fails for it: run it again as a Pulp administrator, or get
+  the view permission. When its distribution no longer has the labels of the view (someone took
+  it over), the promotion does not change it and forgets it too; the preview says so. When it
+  still serves a publication of the view, a version delete keeps that publication and its
+  snapshot.
 * **b** rolls an environment back. After Library: only a version older than the newest bound one
   (served or attempted), or that one again (a retry). For a newer version, or an environment
   without a version, use Promote. In Library: any published version.

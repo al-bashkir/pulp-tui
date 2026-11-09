@@ -463,6 +463,17 @@ pub async fn overlapping_distribution(c: &PulpClient, base_path: &str) -> Result
     Ok(found.into_iter().find(|d| d.base_path.starts_with(&below)))
 }
 
+/// Whether the user of `c` is a Pulp administrator (superuser), whose reads Pulp does not scope. Only an administrator
+/// may list `access_policies/` (pulpcore's default policy, "principal": "admin", in 3.63 to 3.123). pulpcore scopes the
+/// reads of other users by view permission, so for them a 404 can also mean "no permission". Any HTTP refusal: not one.
+pub async fn sees_everything(c: &PulpClient) -> Result<bool> {
+    match c.get::<Value>(&c.api("access_policies/"), &[("limit", "1".into())]).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.status().is_some() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Pulp refuses a publication or version binding on a checkpoint distribution (HTTP 400, "The 'checkpoint'
 /// attribute may only be used with the 'repository' attribute"): refuse it before any write, and say what to do.
 pub fn refuse_checkpoint(name: &str, checkpoint: bool) -> Result<()> {

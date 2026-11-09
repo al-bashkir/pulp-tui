@@ -845,6 +845,7 @@ async fn left_out_lines(
         let what = match svc.left_out(name, e, vrs, &b).await? {
             None => continue,
             Some(LeftOut::Forget(why)) => why,
+            Some(LeftOut::Refuse(why)) => format!("the step fails for it: {why}"),
             Some(LeftOut::Unbind(_)) if b.publication.is_none() => {
                 "its distribution stops serving (kept for rollback); Pulp shows that it serves content set outside pulp-tui".into()
             }

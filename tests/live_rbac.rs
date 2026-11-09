@@ -4,9 +4,12 @@
 mod common;
 
 use common::*;
-use pulp_tui::pulp::RepoType;
+use pulp_tui::cv::{CvService, LeftOut};
 use pulp_tui::pulp::ops::{self, no_progress};
+use pulp_tui::pulp::{PulpClient, RepoType};
+use pulp_tui::store::{BindingRepo, Store};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 #[tokio::test]
 async fn rbac_is_enforced_and_not_bypassed() {
@@ -72,4 +75,48 @@ async fn rbac_is_enforced_and_not_bypassed() {
     assert_eq!(e.status(), Some(403), "{e}");
 
     cleanup(&admin, &[&repo, &group, &user, &user2]).await;
+}
+
+/// F59: pulpcore scopes reads by view permission, so a distribution that a user may not view answers 404 to that user,
+/// as a deleted one does. `ops::sees_everything` tells a Pulp administrator from that user. For a left-out Content View
+/// row that records a publication, the user's 404 keeps the row (`LeftOut::Refuse`); only the administrator's 404
+/// (the distribution is gone) forgets it.
+#[tokio::test]
+async fn a_404_of_a_hidden_distribution_keeps_a_content_view_row_for_a_user() {
+    if !live_enabled() {
+        return;
+    }
+    let admin = client();
+    let name = unique("rbac404");
+    let password = "Rbac-test-Pw-9a!";
+    let user = create(&admin, "users/", json!({ "username": name, "password": password }), "/users/").await;
+    let u = user_client(&name, password);
+    let dist = create(&admin, RepoType::File.distributions(), json!({ "name": name, "base_path": name }), "/distributions/").await;
+    assert_eq!(u.get::<Value>(&dist, &[]).await.unwrap_err().status(), Some(404), "hidden from the user");
+    assert!(ops::sees_everything(&admin).await.unwrap());
+    assert!(!ops::sees_everything(&u).await.unwrap());
+
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let scope = admin.profile().to_string();
+    let lib = store.ensure_library(&scope).await.unwrap();
+    let env = store.environments(&scope).await.unwrap().into_iter().find(|e| e.id == lib).unwrap();
+    let row = BindingRepo {
+        env_id: lib,
+        cv_id: 1,
+        repo_href: "/pulp/api/v3/repositories/file/file/0/".into(),
+        repo_name: "docs".into(),
+        repo_type: RepoType::File,
+        distribution: dist.clone(),
+        base_path: name.clone(),
+        publication: Some("/pulp/api/v3/publications/file/file/0/".into()),
+    };
+    let svc = |c: &PulpClient| CvService { client: c.clone(), store: store.clone(), scope: scope.clone(), actor: "t".into(), lock: None };
+    let refused = |what: Option<LeftOut>| matches!(what, Some(LeftOut::Refuse(why)) if why.contains("this Pulp user may not view it"));
+    assert!(refused(svc(&u).left_out("web", &env, &[], &row).await.unwrap()), "hidden: the row stays");
+    cleanup(&admin, &[&dist]).await;
+    assert!(refused(svc(&u).left_out("web", &env, &[], &row).await.unwrap()), "gone, but the user cannot tell");
+    let gone = LeftOut::Forget("its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it".into());
+    assert_eq!(svc(&admin).left_out("web", &env, &[], &row).await.unwrap(), Some(gone));
+
+    cleanup(&admin, &[&user]).await;
 }

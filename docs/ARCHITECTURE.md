@@ -233,7 +233,11 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
   repositories that the version lacks get `publication: null`; the distribution stays. When
   that distribution is gone (deleted outside pulp-tui), the promotion sends nothing and
   forgets the row (`CvService::left_out`): it keeps nothing for rollback, and a row that
-  stays would fail every later promotion and keep its version in use.
+  stays would fail every later promotion and keep its version in use. pulpcore hides an
+  object without view permission (404) from a user who is not an administrator
+  (`ops::sees_everything`). For such a user a row that records a publication stays on a 404,
+  and the step fails for it with why: forgotten, a version delete could remove the
+  publication that the hidden distribution serves (`served_in_pulp` cannot see it either).
 * **Rollback** promotes an earlier version without the prior-environment check. After
   Library, `promote` accepts only a lower number than the highest bound one (served or
   attempted, `CvService::bound_number`), or that one (a retry or drift repair);

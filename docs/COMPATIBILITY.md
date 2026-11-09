@@ -219,6 +219,14 @@ next section.
 * **RBAC**: 401 for a wrong password (any authenticated endpoint; 3.63 has no `login/`), 403
   without a role, no self-escalation, model-level creator role, group object role, role
   removal.
+* **404 that RBAC gives** (pulpcore `NamedModelViewSet.scope_queryset`): reads of a user that
+  is not a superuser, retrieve too, see only objects with the view permission, so a hidden
+  distribution answers 404, as a deleted one does. `login/` and `users/` do not show
+  `is_superuser` (`is_staff` does not bypass RBAC). `access_policies/` has no own policy, so it
+  takes the default "principal": "admin" (superuser) in 3.63.36, 3.95.3 and 3.123.1:
+  `ops::sees_everything` reads it to know if a 404 is certain. A left-out Content View row
+  that records a publication is forgotten on a 404 only for an administrator
+  (`live_rbac` `a_404_of_a_hidden_distribution_keeps_a_content_view_row_for_a_user`).
 * **Administration** (`live_admin`, 3.123.1): group rename (`PATCH name`); task filters
   (state, name, reserved repository href, start date; a bad date shows Pulp's error); task
   delete (then 404); purge with `finished_before` 2000-01-01 (count 0, typed profile name,

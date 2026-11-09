@@ -318,6 +318,8 @@ pub enum LeftOut {
     Unbind(Value),
     /// Forget the row and send nothing: the text says why (`its distribution is gone ...`).
     Forget(String),
+    /// Keep the row and send nothing; the step fails for it: the text says why and what to do.
+    Refuse(String),
 }
 
 /// What reconciles one kind of drift (`CvService::drift`).
@@ -1329,7 +1331,7 @@ impl CvService {
     }
 
     /// The store part of `unbind_removed` for row `b`: an unbound row records no publication, a forgotten one is
-    /// deleted (and logged).
+    /// deleted (and logged), a refused one stays.
     async fn record_left_out(&self, b: BindingRepo, what: LeftOut, log: Log<'_>) -> Result<()> {
         match what {
             LeftOut::Unbind(_) => self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await,
@@ -1337,11 +1339,12 @@ impl CvService {
                 log(format!("{}: {why}", b.repo_name));
                 self.store.delete_binding_repo(b.env_id, b.cv_id, &b.repo_href).await
             }
+            LeftOut::Refuse(_) => Ok(()), // `leave_out` gives its error first
         }
     }
 
     /// The Pulp part of `unbind_removed` for row `b`: what `left_out` says, done. An unbind is sent; a forget sends
-    /// nothing.
+    /// nothing; a refusal is the row's error.
     async fn leave_out(
         &self,
         cv: &str,
@@ -1355,6 +1358,7 @@ impl CvService {
         match &what {
             Some(LeftOut::Unbind(body)) => self.unbind(cv, env, b, body, aliases, on).await?,
             Some(LeftOut::Forget(_)) => self.alive()?,
+            Some(LeftOut::Refuse(why)) => bail!("{why}"),
             None => {}
         }
         Ok(what)
@@ -1373,15 +1377,29 @@ impl CvService {
         }
         let d: Value = match self.client.get(&b.distribution, &[]).await {
             Ok(d) => d,
-            Err(e) if e.is_not_found() => {
-                return Ok(Some(LeftOut::Forget("its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it".into())));
-            }
+            Err(e) if e.is_not_found() => return Ok(Some(self.not_found(b).await?)),
             Err(e) => return Err(e.into()),
         };
         if b.publication.is_none() && !serves(&d) {
             return Ok(None);
         }
         Ok(Some(self.unbind_or_forget(cv, env, b, &d).await?))
+    }
+
+    /// The distribution of left-out row `b` answers 404 (`left_out`). For a Pulp administrator it is gone: forget the
+    /// row. pulpcore scopes the reads of other users by view permission, so for them it may also be hidden: a row that
+    /// records a publication then stays, so that a version delete keeps that publication (`served_in_pulp` does not see
+    /// a hidden distribution either), and the step fails for it. A row that records none protects nothing: forget it.
+    async fn not_found(&self, b: &BindingRepo) -> Result<LeftOut> {
+        if b.publication.is_some() && !ops::sees_everything(&self.client).await? {
+            return Ok(LeftOut::Refuse(format!(
+                "Pulp answers 404 for its distribution {}: it was deleted, or this Pulp user may not view it. pulp-tui keeps \
+                 the row, so the version that it serves stays protected: run the step again as a Pulp administrator, or give \
+                 this user the view permission on the distribution",
+                b.distribution
+            )));
+        }
+        Ok(LeftOut::Forget("its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it".into()))
     }
 
     /// Row `b` of view `cv` in `env` records a publication, or Pulp shows that its distribution `d` serves one
@@ -3417,40 +3435,66 @@ mod tests {
         assert_eq!(svc.drift(cv, lib).await.unwrap(), [], "no drift: the distribution is not the view's");
     }
 
-    /// F45: the distribution of a left-out row that records a publication was deleted outside pulp-tui. The promotion
-    /// sends nothing for it and forgets the row, so it completes, and the version of that publication can be deleted.
+    /// F45: the distribution of a left-out row that records a publication answers 404: deleted outside pulp-tui. For a
+    /// Pulp administrator (`access_policies/` answers 200) the promotion sends nothing for it and forgets the row, so it
+    /// completes, and the version of that publication can be deleted. F59: for another user (403 there) the 404 can also
+    /// mean "no view permission" (pulpcore scopes reads by it): the row and its protection stay, and the step fails for
+    /// it with why, as the preview says.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_left_out_distribution_deleted_outside_pulp_tui_is_forgotten() {
-        let server = wiremock::MockServer::start().await;
-        let svc = mock_service(&server).await;
-        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
-        let lib = svc.store.ensure_library("k").await.unwrap();
-        let v1 = svc.store.begin_version(cv, "", &[]).await.unwrap();
-        svc.store.finish_version(v1.id, "published", None).await.unwrap();
-        svc.store.promoted(lib, cv, v1.id, "active").await.unwrap();
-        // v2 (with os) was promoted in part: os serves v2.
-        let v2 = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
-        svc.store.promoted(lib, cv, v2.id, "partial").await.unwrap();
-        let os = BindingRepo {
-            env_id: lib,
-            cv_id: cv,
-            repo_href: "/pulp/api/v3/repositories/rpm/rpm/1/".into(),
-            repo_name: "os".into(),
-            repo_type: RepoType::Rpm,
-            distribution: DIST.into(),
-            base_path: "library/web/os".into(),
-            publication: svc.store.version_repos(v2.id).await.unwrap()[0].publication.clone(),
-        };
-        svc.store.save_binding_repo(&os).await.unwrap();
-        let v3 = svc.store.begin_version(cv, "", &[]).await.unwrap();
-        svc.store.finish_version(v3.id, "published", None).await.unwrap();
-        // DIST answers 404: deleted outside pulp-tui.
-        svc.promote(cv, v3.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap();
-        assert_none(&server, "PATCH").await;
-        assert!(svc.store.binding_repos(lib, cv).await.unwrap().is_empty(), "the row is forgotten");
-        let b = svc.store.binding(lib, cv).await.unwrap().unwrap();
-        assert_eq!((b.served, b.attempt), (Some(v3.id), None));
-        assert!(svc.store.version_in_use(v2.id).await.unwrap().is_empty(), "v2 can be deleted");
+    async fn a_left_out_distribution_that_answers_404_is_forgotten_only_for_an_administrator() {
+        for admin in [true, false] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+            let lib = svc.store.ensure_library("k").await.unwrap();
+            let v1 = svc.store.begin_version(cv, "", &[]).await.unwrap();
+            svc.store.finish_version(v1.id, "published", None).await.unwrap();
+            svc.store.promoted(lib, cv, v1.id, "active").await.unwrap();
+            // v2 (with os) was promoted in part: os serves v2.
+            let v2 = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
+            svc.store.promoted(lib, cv, v2.id, "partial").await.unwrap();
+            let os = BindingRepo {
+                env_id: lib,
+                cv_id: cv,
+                repo_href: "/pulp/api/v3/repositories/rpm/rpm/1/".into(),
+                repo_name: "os".into(),
+                repo_type: RepoType::Rpm,
+                distribution: DIST.into(),
+                base_path: "library/web/os".into(),
+                publication: svc.store.version_repos(v2.id).await.unwrap()[0].publication.clone(),
+            };
+            svc.store.save_binding_repo(&os).await.unwrap();
+            let v3 = svc.store.begin_version(cv, "", &[]).await.unwrap();
+            svc.store.finish_version(v3.id, "published", None).await.unwrap();
+            // DIST answers 404.
+            wiremock::Mock::given(wiremock::matchers::path("/pulp/api/v3/access_policies/"))
+                .respond_with(wiremock::ResponseTemplate::new(if admin { 200 } else { 403 }).set_body_json(json!({ "results": [] })))
+                .mount(&server)
+                .await;
+            let env = svc.store.environments("k").await.unwrap().remove(0);
+            let what = svc.left_out("web", &env, &[], &os).await.unwrap();
+            let res = svc.promote(cv, v3.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await;
+            assert_none(&server, "PATCH").await;
+            let b = svc.store.binding(lib, cv).await.unwrap().unwrap();
+            if admin {
+                assert_eq!(what, Some(LeftOut::Forget("its distribution is gone (deleted outside pulp-tui): pulp-tui forgets it".into())));
+                res.unwrap();
+                assert!(svc.store.binding_repos(lib, cv).await.unwrap().is_empty(), "the row is forgotten");
+                assert_eq!((b.served, b.attempt), (Some(v3.id), None));
+                assert!(svc.store.version_in_use(v2.id).await.unwrap().is_empty(), "v2 can be deleted");
+            } else {
+                let why = format!(
+                    "Pulp answers 404 for its distribution {DIST}: it was deleted, or this Pulp user may not view it. pulp-tui \
+                     keeps the row, so the version that it serves stays protected: run the step again as a Pulp administrator, \
+                     or give this user the view permission on the distribution"
+                );
+                assert_eq!(what, Some(LeftOut::Refuse(why.clone())));
+                assert!(res.unwrap_err().to_string().ends_with(&format!("unbind os: {why}")));
+                assert_eq!(svc.store.binding_repos(lib, cv).await.unwrap(), [os], "the row stays");
+                assert_eq!(b.attempt.unwrap().state, "failed");
+                assert!(!svc.store.version_in_use(v2.id).await.unwrap().is_empty(), "v2 stays protected");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
