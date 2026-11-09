@@ -1,6 +1,6 @@
 # Implementation status
 
-Date: 2026-11-08. Tested against pulpcore 3.123.1, pulp_rpm 3.39.5, pulp_file 3.123.1,
+Date: 2026-11-09. Tested against pulpcore 3.123.1, pulp_rpm 3.39.5, pulp_file 3.123.1,
 pulp_deb 3.11.1 (`quay.io/pulp/pulp:latest`) and PostgreSQL 16. pulpcore 3.95.3 and 3.63.36
 are also tested. See [COMPATIBILITY.md](COMPATIBILITY.md) for their plugin versions.
 
@@ -51,6 +51,9 @@ a test path stand for several tests, for example `{file,rpm}_x` for `file_x` and
   all versions offers the repository name.
   `live_repos::re_point_checks_the_version_and_warns_about_another_repository`,
   `live_repos::distribute_from_all_versions_offers_the_repository_name`
+* Distribute (D) to an existing distribution of the same name (File, Deb): the dialog says
+  what it serves now and what it will serve; Esc changes nothing; the typed name re-points it.
+  `live_repos::{file,deb}_distribute_re_points_after_the_typed_name_through_the_tui`
 * Versions screen (File, RPM, Deb): compare, restore, repair, delete, reclaim space.
   `live_repos::{file,rpm,deb}_version_actions_through_the_tui`
 * Mirror sync (File, RPM, Deb): the confirmation says that the new version matches the
@@ -77,6 +80,9 @@ a test path stand for several tests, for example `{file,rpm}_x` for `file_x` and
   `live_repos::file_repository_edit_through_the_tui`,
   `live_repos::rpm_retain_package_versions_cleared_through_the_tui`,
   `live_repos::rpm_osv_config_survives_a_label_edit_through_the_tui`
+* A lower *Retain versions*: the dialog lists the versions that Pulp deletes; Esc keeps
+  them; after the typed name Pulp deletes exactly those.
+  `live_repos::a_lower_retain_versions_deletes_versions_only_after_the_typed_name_through_the_tui`
 * RPM: Prune with a dry run, then a real prune; Scan; a filtered copy takes the advisory
   only of the chosen packages. `live_repos::rpm_prune_dry_run_then_prune_through_the_tui`,
   `live_repos::rpm_version_scan_through_the_tui`,
@@ -88,6 +94,9 @@ a test path stand for several tests, for example `{file,rpm}_x` for `file_x` and
   `live_repos::remote_timeouts_keep_decimal_seconds_through_the_tui`,
   `live_repos::uln_remote_create_edit_and_delete_through_the_tui`,
   `live_repos::file_git_remote_syncs_a_repository_with_the_prefilled_form`
+* A File mirror sync from a Git remote typed by name (the picker has no options): the
+  confirmation says that the sync task fails.
+  `live_repos::file_mirror_sync_from_a_typed_git_remote_name_warns_that_the_task_fails_through_the_tui`
 
 ### Deb
 
@@ -124,7 +133,7 @@ a test path stand for several tests, for example `{file,rpm}_x` for `file_x` and
   component. `live_deb::the_tui_creates_release_records_that_a_publication_serves`
 * A package release component created on the Content screen of an older version goes into
   the latest version; the confirm names the package and the release component that come
-  back. `live_deb::a_package_release_component_of_an_older_version_confirms_what_comes_back_through_the_tui`
+  back, and a release architecture that the latest version lacks. `live_deb::a_package_release_component_of_an_older_version_confirms_what_comes_back_through_the_tui`
 * Deb Content View: filter, preview, publish signed, promote to Dev, publish unsigned
   (`none`), Resume of a signed version, a composite with this view.
   `live_deb::deb_content_view`
@@ -165,6 +174,16 @@ a test path stand for several tests, for example `{file,rpm}_x` for `file_x` and
   not block the environment: the promotion or the Publish forgets its row and completes.
   `live_cv::a_left_out_distribution_deleted_outside_pulp_tui_does_not_block_the_environment`,
   `live_cv::publish_leaves_alone_a_kept_library_distribution_taken_over_outside_pulp_tui`
+* The same three cases through the TUI: the Promote preview names the overlapping base path
+  and nothing is created; the Promote preview says that pulp-tui forgets the deleted
+  distribution, the promotion completes and the old version can be deleted; the Publish
+  preview names the taken-over distribution and Publish leaves it alone.
+  `live_cv::a_promotion_to_an_overlapping_base_path_is_named_and_creates_nothing_through_the_tui`,
+  `live_cv::a_left_out_distribution_deleted_outside_pulp_tui_is_forgotten_through_the_tui`,
+  `live_cv::a_kept_library_distribution_taken_over_outside_pulp_tui_is_left_alone_through_the_tui`
+* A kept Library distribution bound outside pulp-tui to a repository: Verify reports it, and
+  the next Library step points it at nothing again.
+  `live_cv::a_kept_library_distribution_bound_to_a_repository_is_reported_and_unbound`
 * `export-cv` on pulp2 and `import-cv` on pulp1 map repositories by name and type; one
   missing repository refuses the whole import.
   `live_cv::import_cv_maps_repositories_by_name_to_the_target_server`
@@ -218,6 +237,11 @@ Through the TUI:
   `live_replication::native_replication_through_the_tui`,
   `live_replication::fallback_replication_through_the_tui`,
   `live_replication::deb_fallback_replication_through_the_tui`
+* The fallback dry run names a base path that overlaps a local distribution as a conflict.
+  `live_replication::the_fallback_plan_names_a_base_path_that_overlaps_a_local_distribution`
+* An Upstream Pulp whose base URL has user info: the list, Details, the Replicate
+  confirmation, the failure text, the Task Center and the Logs show `•••@`, never the user
+  or the password. `live_replication::upstream_base_url_user_info_never_shows_through_the_tui`
 
 ### Export and import
 
@@ -286,7 +310,8 @@ Through the TUI:
   `live_admin::group_create_roles_and_delete_through_the_tui`,
   `live_admin::custom_role_create_edit_and_delete_through_the_tui`,
   `live_admin::object_roles_add_and_remove_a_viewer_on_a_repository`
-* Content guards: a header guard used by a distribution (list, edit, delete impact), an RBAC
+* Content guards: a header guard used by a distribution (list, an edit of its value with the
+  typed name, delete impact), an RBAC
   guard with download access, and the other guard types of the server.
   `live_admin::content_guard_create_edit_and_delete_name_its_distribution`,
   `live_admin::rbac_guard_access_allows_and_removes_a_user`,
@@ -314,6 +339,9 @@ Through the TUI:
 
 * 401, 403, no self-escalation, creator role, group object role, revoke.
   `live_rbac::rbac_is_enforced_and_not_bypassed`
+* A user who cannot see a distribution gets 404 for it: a left-out Content View row of that
+  distribution stays, with its protection; only an administrator's 404 forgets the row.
+  `live_rbac::a_404_of_a_hidden_distribution_keeps_a_content_view_row_for_a_user`
 * Server-side cancel of waiting and running tasks, 409 for completed tasks.
   `live_failures::cancel_waiting_and_running_tasks`
 * TLS errors are reported and never downgraded.
@@ -375,24 +403,24 @@ probed packages download.
 
 ## Test results (last run)
 
-Run of 2026-11-08 at f530b17 on fresh containers (`tests/env/pulp-env.sh down-all`, then
-`tests/run-live.sh` and `tests/run-live.sh real`). The counts below are for
-`quay.io/pulp/pulp:latest` (pulpcore 3.123.1; the whole run took 2221 s). The images 3.95.3
+Run of 2026-11-09 at 6d64485 on fresh containers (`tests/env/pulp-env.sh down-all`, then
+`tests/run-live.sh <scenario>` for each scenario and for `real`). The counts below are for
+`quay.io/pulp/pulp:latest` (pulpcore 3.123.1; the whole run took 2814 s). The images 3.95.3
 and 3.63.36 ran the same number of tests and passed (see COMPATIBILITY.md).
 
 | Check                                         | Result           |
 | --------------------------------------------- | ---------------- |
-| `cargo test --lib`                            | 649 passed       |
-| `cargo test --test mock_http`                 | 50 passed        |
-| live `repos` / `cv` / `rbac` / `failures`     | 39 / 20 / 1 / 3  |
-| live `replication` / `shared_db` / `deb`      | 10 / 9 / 15      |
+| `cargo test --lib`                            | 685 passed       |
+| `cargo test --test mock_http`                 | 53 passed        |
+| live `repos` / `cv` / `rbac` / `failures`     | 44 / 27 / 2 / 3  |
+| live `replication` / `shared_db` / `deb`      | 12 / 10 / 16     |
 | live `export` / `content` / `admin`           | 8 / 11 / 29      |
-| live total, all scenarios except `real`       | 145 passed       |
-| live `real`                                   | 3 passed (624 s) |
+| live total, all scenarios except `real`       | 162 passed       |
+| live `real`                                   | 3 passed (644 s) |
 | `cargo fmt --check`, `dprint check`           | clean            |
 | `cargo clippy -D warnings`, both feature sets | clean            |
 
-Not run again on 2026-11-08 (the results below are older):
+Not run again on 2026-11-09 (the results below are older):
 
 * `podman build -f Containerfile .` (2026-10-27): built (31.0 MB image, no keyring, with
   the PostgreSQL driver; `pulp-tui --version` runs).

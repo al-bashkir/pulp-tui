@@ -2,7 +2,7 @@
 
 ## Tested versions
 
-All live tests (`tests/run-live.sh`, `real` included) passed on 2026-11-08 on fresh
+All live tests (`tests/run-live.sh`, `real` included) passed on 2026-11-09 on fresh
 containers of `quay.io/pulp/pulp:latest`:
 
 | Component                             | Version                                             |
@@ -13,15 +13,15 @@ containers of `quay.io/pulp/pulp:latest`:
 | PostgreSQL (optional shared database) | 16.15 (`docker.io/library/postgres:16`), sqlx 0.9.0 |
 | Client OS                             | Fedora 44 (Linux 7.2), Rust 1.99.1                  |
 
-On 2026-11-08, all live scenarios, `real` included (Debian `main`, Rocky 9 BaseOS and
-AppStream), passed on fresh containers of these images: 649 unit, 50 mock HTTP, 145 live
+On 2026-11-09, all live scenarios, `real` included (Debian `main`, Rocky 9 BaseOS and
+AppStream), passed on fresh containers of these images: 685 unit, 53 mock HTTP, 162 live
 and 3 `real` tests on each.
 
 | Image                       | pulpcore / pulp_file | pulp_rpm | pulp_deb | `real` |
 | --------------------------- | -------------------- | -------- | -------- | ------ |
-| `quay.io/pulp/pulp:3.63.36` | 3.63.36              | 3.27.12  | 3.5.4    | 817 s  |
-| `quay.io/pulp/pulp:3.95.3`  | 3.95.3               | 3.34.0   | 3.8.1    | 814 s  |
-| `quay.io/pulp/pulp:latest`  | 3.123.1              | 3.39.5   | 3.11.1   | 626 s  |
+| `quay.io/pulp/pulp:3.63.36` | 3.63.36              | 3.27.12  | 3.5.4    | 836 s  |
+| `quay.io/pulp/pulp:3.95.3`  | 3.95.3               | 3.34.0   | 3.8.1    | 816 s  |
+| `quay.io/pulp/pulp:latest`  | 3.123.1              | 3.39.5   | 3.11.1   | 644 s  |
 
 * On 3.95.3 and 3.63.36, four TUI tests new in audit 3 first failed. Each one used a field
   or a guard type that only newer servers have: File sync `optimize` (pulp_file 3.95.3),
