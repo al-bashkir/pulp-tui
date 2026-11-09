@@ -622,10 +622,9 @@ retry, or roll back to the served version to clear the failed attempt.
   asked. A repository that the version does not have stops serving; the preview names it, also
   when its distribution serves a publication that was set outside pulp-tui. When its distribution
   was deleted outside pulp-tui, the promotion sends nothing for it and forgets it; the preview
-  says so. When its distribution serves a publication that was set outside pulp-tui and no longer
-  has the labels of the view (someone took it over), the promotion does not change it and forgets
-  it too. When pulp-tui still records a publication of the view there, the promotion refuses it
-  instead (that publication stays protected): add the labels again.
+  says so. When its distribution no longer has the labels of the view (someone took it over), the
+  promotion does not change it and forgets it too; the preview says so. When it still serves a
+  publication of the view, a version delete keeps that publication and its snapshot.
 * **b** rolls an environment back. After Library: only a version older than the newest bound one
   (served or attempted), or that one again (a retry). For a newer version, or an environment
   without a version, use Promote. In Library: any published version.

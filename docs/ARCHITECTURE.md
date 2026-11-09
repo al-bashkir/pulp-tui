@@ -146,11 +146,11 @@ Katello: they live in the store of the profile and are built from Pulp objects.
 * `pulp_tui_db=<database id>` (`Store::db_id`) of another database is refused: publish and
   promote stop, delete keeps the object and logs it.
 * The checks also run on hrefs recorded earlier (`CvService::not_ours`): Resume, version
-  delete and unbind skip or refuse such objects. A left-out row that records no publication,
-  whose distribution serves one and is not ours any more, is forgotten, not changed
-  (`CvService::left_out`): nothing of the view is served there, and a refusal would fail every
-  later promotion and Library step. A row that records a publication stays refused: forgotten,
-  a version delete could remove the publication that the distribution serves.
+  delete and unbind skip or refuse such objects. A left-out row whose distribution is not ours
+  any more is forgotten, not changed (`CvService::left_out`): a refusal would fail every later
+  promotion and Library step. When that distribution still serves a publication of the view, a
+  version delete keeps it: it reads the distributions in Pulp (`CvService::served_in_pulp`), not
+  only the binding rows.
 * An object without `pulp_tui_db`, or with an id in the aliases (`meta` key `alias:<id>`),
   is adopted: the workflow sets this database's id when it touches the object.
 

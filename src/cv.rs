@@ -1361,12 +1361,12 @@ impl CvService {
     }
 
     /// What a promotion of the version with repositories `vrs` does to row `b` of view `cv` in `env` (`unbind_removed`),
-    /// read from Pulp: the version lacks its repository, and the row records a publication, or records none and Pulp
-    /// shows that its distribution serves one (set outside pulp-tui): unbind. A gone distribution keeps nothing for
-    /// rollback and serves nothing: forget the row. So does one that records no publication and is not ours any more
-    /// (`not_ours`, an operator took it over): it is never changed, and it must not fail every later promotion. One that
-    /// records a publication and is not ours stays refused (`unbind`): forgetting it would let a version delete remove
-    /// the publication that it serves.
+    /// read from Pulp. The preview line and the run both come from it. The version lacks its repository, and the row
+    /// records a publication, or records none and Pulp shows that its distribution serves one (set outside pulp-tui):
+    /// unbind. A gone distribution keeps nothing for rollback and serves nothing: forget the row. So does one that is
+    /// not ours any more (`not_ours`, an operator took it over): it is never changed, and it must not fail every later
+    /// promotion. A publication of the view that it still serves stays protected: a version delete reads the
+    /// distributions in Pulp (`served_in_pulp`) and keeps it.
     pub async fn left_out(&self, cv: &str, env: &Environment, vrs: &[CvVersionRepo], b: &BindingRepo) -> Result<Option<LeftOut>> {
         if vrs.iter().any(|vr| vr.repo().repo_href == b.repo_href) {
             return Ok(None);
@@ -1378,18 +1378,15 @@ impl CvService {
             }
             Err(e) => return Err(e.into()),
         };
-        if b.publication.is_some() {
-            return Ok(Some(LeftOut::Unbind));
-        }
-        if !d["publication"].is_string() {
+        if b.publication.is_none() && !d["publication"].is_string() {
             return Ok(None);
         }
-        Ok(Some(self.served_again(cv, env, b, &d).await?))
+        Ok(Some(self.unbind_or_forget(cv, env, b, &d).await?))
     }
 
-    /// Row `b` of view `cv` in `env` records no publication, but Pulp shows that its distribution `d` serves one
+    /// Row `b` of view `cv` in `env` records a publication, or Pulp shows that its distribution `d` serves one
     /// (`left_out`): unbind it, or forget the row when the distribution is not ours any more.
-    async fn served_again(&self, cv: &str, env: &Environment, b: &BindingRepo, d: &Value) -> Result<LeftOut> {
+    async fn unbind_or_forget(&self, cv: &str, env: &Environment, b: &BindingRepo, d: &Value) -> Result<LeftOut> {
         let aliases = self.store.aliases().await?;
         Ok(match self.not_ours(&b.distribution, &dist_labels(cv, &env.name), &aliases).await? {
             None => LeftOut::Unbind,
@@ -2240,9 +2237,24 @@ mod tests {
     }
 
     async fn serve_labels(server: &wiremock::MockServer, href: &str, labels: Value) {
+        serve_json(server, href, json!({ "pulp_labels": labels })).await;
+    }
+
+    /// `DIST` is the Library distribution of view `web` of this database, and Pulp refuses its PATCH (403).
+    async fn refuse_unbind(svc: &CvService, server: &wiremock::MockServer) {
+        serve_labels(server, DIST, json!({ LABEL_CV: "web", LABEL_ENV: LIBRARY, LABEL_DB: svc.store.db_id() })).await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path(DIST))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_json(json!({ "detail": "no" })))
+            .mount(server)
+            .await;
+    }
+
+    /// GET of `href` answers `body`.
+    async fn serve_json(server: &wiremock::MockServer, href: &str, body: Value) {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(href))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_labels": labels })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
             .mount(server)
             .await;
     }
@@ -3160,8 +3172,12 @@ mod tests {
         assert_none(&server, "DELETE").await;
     }
 
+    /// F56: Library serves the publication of v1 that the row of `old` records, from a distribution that is not the
+    /// view's any more (another database, or the labels of another environment). The promotion of v2 (without `old`)
+    /// sends nothing to it, logs why and forgets the row. v1 can then be deleted, but its publication and snapshot stay:
+    /// Pulp shows that the distribution serves them (`served_in_pulp`).
     #[tokio::test(flavor = "multi_thread")]
-    async fn unbind_does_not_touch_a_distribution_the_view_does_not_own() {
+    async fn a_left_out_distribution_the_view_does_not_own_is_forgotten_and_what_it_serves_is_kept() {
         // (environment label, database ID label: `None` = this database, why)
         let cases = [
             (LIBRARY, Some("other"), "is owned by another pulp-tui database (other)"),
@@ -3171,9 +3187,12 @@ mod tests {
             let server = wiremock::MockServer::start().await;
             let svc = mock_service(&server).await;
             let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+            let v1 = published(&svc, cv, "old", "/pulp/api/v3/repositories/rpm/rpm/9/").await;
+            let row = svc.store.version_repos(v1.id).await.unwrap().remove(0);
+            let (p, dv) = (row.publication.unwrap(), row.derived_version.unwrap());
             // A version without repositories: the bound repository "old" is no longer part of it.
-            let v = svc.store.begin_version(cv, "", &[]).await.unwrap();
-            svc.store.finish_version(v.id, "published", None).await.unwrap();
+            let v2 = svc.store.begin_version(cv, "", &[]).await.unwrap();
+            svc.store.finish_version(v2.id, "published", None).await.unwrap();
             let lib = svc.store.ensure_library("k").await.unwrap();
             let old = BindingRepo {
                 env_id: lib,
@@ -3183,15 +3202,28 @@ mod tests {
                 repo_type: RepoType::Rpm,
                 distribution: DIST.into(),
                 base_path: "cv/library/web/old".into(),
-                publication: Some("/pulp/api/v3/publications/rpm/rpm/3/".into()),
+                publication: Some(p.clone()),
             };
             svc.store.save_binding_repo(&old).await.unwrap();
-            serve_labels(&server, DIST, json!({ LABEL_CV: "web", LABEL_ENV: env, LABEL_DB: db.unwrap_or(svc.store.db_id()) })).await;
-            let e = svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap_err();
-            let want = format!("unbind old: distribution {} {why}", distribution_name("web", LIBRARY, "old"));
-            assert!(e.to_string().ends_with(&want), "{e}");
+            let labels = json!({ LABEL_CV: "web", LABEL_ENV: env, LABEL_DB: db.unwrap_or(svc.store.db_id()) });
+            let theirs =
+                json!({ "pulp_href": DIST, "name": "theirs", "base_path": old.base_path, "publication": p, "pulp_labels": labels });
+            serve_json(&server, DIST, theirs.clone()).await;
+            let logs = Mutex::new(vec![]);
+            svc.promote(cv, v2.id, lib, Mode::Rollback, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+            let forgot =
+                format!("old: its distribution theirs {why} (changed outside pulp-tui): pulp-tui leaves it as it is and forgets it");
+            assert!(logs.into_inner().unwrap().contains(&forgot), "{env}");
             assert_none(&server, "PATCH").await;
-            assert_eq!(svc.store.binding_repos(lib, cv).await.unwrap()[0].publication, old.publication, "still recorded as served");
+            assert!(svc.store.binding_repos(lib, cv).await.unwrap().is_empty(), "the row is forgotten");
+
+            serve_labels(&server, DERIVED, json!({ LABEL_CV: "web", LABEL_DB: svc.store.db_id() })).await;
+            serve_snapshot(&server, json!([{ "pulp_href": p, "repository_version": dv }]), json!([theirs])).await;
+            let logs = Mutex::new(vec![]);
+            svc.delete_version(v1.id, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+            let kept = |h: &str| format!("keeping {h}: served by theirs (pinned to a publication of this version)");
+            assert_eq!(logs.into_inner().unwrap(), [kept(&p), kept(&dv)]);
+            assert_none(&server, "DELETE").await;
         }
     }
 
@@ -3406,7 +3438,7 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [os] })))
             .mount(&server)
             .await;
-        // "old" is no longer part of the version, and its distribution belongs to another database.
+        // "old" is no longer part of the version, and Pulp refuses the unbind of its distribution.
         let old = BindingRepo {
             env_id: lib,
             cv_id: cv,
@@ -3418,7 +3450,7 @@ mod tests {
             publication: Some("/pulp/api/v3/publications/rpm/rpm/3/".into()),
         };
         svc.store.save_binding_repo(&old).await.unwrap();
-        serve_owner(&server, DIST, "other").await;
+        refuse_unbind(&svc, &server).await;
         let e = svc.promote(cv, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap_err();
         assert!(e.to_string().starts_with("web in Library: partial: unbind old"), "{e}");
         assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().attempt.unwrap().state, "partial", "os is served: not failed");
@@ -4304,7 +4336,7 @@ mod tests {
         assert_eq!(r[2], Err("web: not published: Library is protected (publish it yourself)".to_string()));
         assert_eq!(s.versions(web).await.unwrap().len(), 1);
 
-        // Library still serves "old" of web, through a distribution of another database: the Library step fails.
+        // Library still serves "old" of web, and Pulp refuses its unbind: the Library step fails.
         s.set_env_protected(lib, false).await.unwrap();
         let old = BindingRepo {
             env_id: lib,
@@ -4317,7 +4349,7 @@ mod tests {
             publication: Some("/pulp/api/v3/publications/rpm/rpm/3/".into()),
         };
         s.save_binding_repo(&old).await.unwrap();
-        serve_owner(&server, DIST, "other").await;
+        refuse_unbind(&svc, &server).await;
         let r = svc.auto_publish(os, &|_| {}, &ops::no_progress).await;
         let e = r[2].as_ref().unwrap_err();
         assert!(e.starts_with("web v2 published; Library step failed: ") && e.ends_with("; promote v2 to Library"), "{e}");

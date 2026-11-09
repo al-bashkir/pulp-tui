@@ -1858,7 +1858,7 @@ mod tests {
         let c = st.create_composite("lab", "rocky9", "").await.unwrap();
         st.set_component(c, extras, None).await.unwrap();
         st.set_auto_publish(c, true).await.unwrap();
-        // Library still serves "old" of extras; its distribution belongs to another database, so the unbind fails.
+        // Library still serves "old" of extras, and Pulp refuses the unbind of its distribution.
         let lib = st.ensure_library("lab").await.unwrap();
         let dist = "/pulp/api/v3/distributions/rpm/rpm/1/";
         let row = crate::store::BindingRepo {
@@ -1872,7 +1872,9 @@ mod tests {
             publication: Some("/p/1/".into()),
         };
         st.save_binding_repo(&row).await.unwrap();
-        serve(&server, "GET", dist.into(), 200, json!({ "pulp_labels": { crate::cv::LABEL_DB: "other" } })).await;
+        let labels = json!({ crate::cv::LABEL_CV: "extras", crate::cv::LABEL_ENV: LIBRARY, crate::cv::LABEL_DB: st.db_id() });
+        serve(&server, "GET", dist.into(), 200, json!({ "pulp_labels": labels })).await;
+        serve(&server, "PATCH", dist.into(), 403, json!({ "detail": "no" })).await;
         app.push(Kind::CvVersions { cv: extras, name: "extras".into() });
         version_action(&mut app, "lab", extras, "extras".into(), Act::Resume, json!({ "id": v1.id, "number": 1, "state": "failed" }));
         drain(&mut app, &mut rx).await;
@@ -1985,7 +1987,8 @@ mod tests {
         st.set_cv_repo(web, &r1).await.unwrap();
         serve(&server, "GET", kept.repo_href.clone(), 200, json!({ "pulp_href": kept.repo_href, "name": "r1" })).await;
         let dropped = left_out(&st, lib, web, "2", Some("/p/2/")).await;
-        serve(&server, "GET", dropped.distribution, 200, json!({ "name": "d2", "publication": "/p/2/" })).await;
+        let ours = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: LIBRARY, crate::cv::LABEL_DB: st.db_id() });
+        serve(&server, "GET", dropped.distribution, 200, json!({ "name": "d2", "publication": "/p/2/", "pulp_labels": ours })).await;
         serve_distributions(&server, &[], None).await; // the Library target of r1: nothing refuses it
         cv_action(&mut app, "lab", Act::CvPublish, json!({ "id": web, "name": "web" }));
         drain(&mut app, &mut rx).await;
@@ -2615,7 +2618,39 @@ mod tests {
         }
     }
 
-    /// A promotion that fails (a left-out distribution that is not the view's) says that its partial states are recorded.
+    /// F56: Library serves the r9 publication that its row records, from a distribution that an operator took over (the
+    /// labels of the view removed). The preview says that pulp-tui leaves it as it is and forgets the row, and the run
+    /// does that: no PATCH, the row is gone, the promotion completes. (A version delete still keeps that publication:
+    /// Pulp shows that the distribution serves it, `CvService::served_in_pulp`.)
+    #[tokio::test]
+    async fn a_taken_over_left_out_distribution_with_a_recorded_publication_is_forgotten_as_the_preview_says() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let lib = st.ensure_library("lab").await.unwrap();
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        let p = "/pulp/api/v3/publications/rpm/rpm/3/";
+        let old = left_out(&st, lib, web, "9", Some(p)).await;
+        let theirs =
+            json!({ "pulp_href": old.distribution, "name": "theirs", "base_path": old.base_path, "publication": p, "pulp_labels": {} });
+        serve(&server, "GET", old.distribution.clone(), 200, theirs).await;
+        promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", last_notice(&app)) };
+        let forget = "  r9: not part of v1 -> its distribution theirs is not labeled pulp_tui_cv=web (changed outside pulp-tui): \
+                      pulp-tui leaves it as it is and forgets it";
+        assert_eq!(lines[2], forget);
+        yes(&mut app);
+        drain(&mut app, &mut rx).await;
+        let notices: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+        assert!(notices.contains(&"web v1 active in Library; served metadata verified"), "{notices:?}");
+        assert!(st.binding_repos(lib, web).await.unwrap().is_empty(), "the row is forgotten");
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing is changed");
+    }
+
+    /// A promotion that fails (Pulp refuses the unbind of a left-out distribution) says that its partial states are
+    /// recorded.
     #[tokio::test]
     async fn a_failed_promotion_says_that_its_partial_states_are_recorded() {
         let server = MockServer::start().await;
@@ -2625,8 +2660,10 @@ mod tests {
         let web = st.create_cv("lab", "web", "").await.unwrap();
         let v = publish_empty(&st, web).await;
         let old = left_out(&st, lib, web, "9", Some("/pulp/api/v3/publications/rpm/rpm/3/")).await;
-        let theirs = json!({ "pulp_href": old.distribution, "name": "theirs", "base_path": old.base_path, "pulp_labels": {} });
-        serve(&server, "GET", old.distribution.clone(), 200, theirs).await;
+        let labels = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: LIBRARY, crate::cv::LABEL_DB: st.db_id() });
+        let ours = json!({ "pulp_href": old.distribution, "name": "d", "base_path": old.base_path, "pulp_labels": labels });
+        serve(&server, "GET", old.distribution.clone(), 200, ours).await;
+        serve(&server, "PATCH", old.distribution.clone(), 403, json!({ "detail": "no" })).await;
         promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", last_notice(&app)) };
