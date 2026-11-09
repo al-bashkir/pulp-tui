@@ -283,9 +283,15 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   version still has them. Upgrade pulp_rpm to fix it.
 * **c** / **e** / **d** create / edit / delete. Delete names each distribution that serves the
   repository, a version or a publication of it.
+* **e** with a lower **Retain versions**: Pulp deletes old versions and their publications as soon
+  as it saves the value. It keeps the versions that a distribution serves and the newest others.
+  The confirm lists the versions that go; type the repository name to save. Esc sends nothing. A
+  higher value that deletes nothing, an empty value and an edit of other fields save at once.
 
 All types have **Retain checkpoints**: the number of checkpoint publications that Pulp keeps (empty
-= all).
+= all). A lower value clears the checkpoint flag of the older ones as soon as Pulp saves it: a
+checkpoint distribution no longer serves them at `<base path>/<timestamp>/`. The confirm lists
+them, as for **Retain versions**.
 
 RPM fields:
 

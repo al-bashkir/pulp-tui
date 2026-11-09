@@ -324,7 +324,12 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   `null` keeps all. So with 1, the next version deletes the current one, unless a
   distribution serves it. The remove content and mirror sync confirms check this
   (`latest_goes`): the content that leaves then stays only in served versions, or it is
-  orphaned.
+  orphaned. Pulp also runs it when a PATCH changes `retain_repo_versions` (an `AFTER_UPDATE`
+  hook, `:473`), and `cleanup_old_checkpoints` when it changes `retain_checkpoints` (`:499`):
+  the checkpoint publications after the newest N (by creation) lose the checkpoint flag. Both
+  run when the value is above 0. The checkpoint hook runs first (django-lifecycle orders hooks
+  by name), so a version of a cleared checkpoint publication can go in the same request. The
+  repository edit confirm computes both (`retain_impact`).
 * **Publications and repositories are not protected** (read in the source of 3.123.1:
   `PublicationViewSet` is a plain `DestroyModelMixin`, `Distribution.publication` is
   `on_delete=SET_NULL`). A served publication is deleted without an error: a distribution

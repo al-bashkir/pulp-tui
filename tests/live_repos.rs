@@ -1714,3 +1714,43 @@ async fn file_repository_edit_through_the_tui() {
     }
     cleanup(&c, &[&repo, &remote]).await;
 }
+
+/// The version numbers of repository `repo`, newest first.
+async fn version_numbers(c: &PulpClient, repo: &str) -> Vec<u64> {
+    let all: Vec<Value> = c.list_all(&format!("{repo}versions/"), &[("fields", "number".into())], 1000).await.unwrap();
+    all.iter().filter_map(|v| v["number"].as_u64()).collect()
+}
+
+/// Repository Edit (e) of a lower Retain versions through the TUI (audit F53), on a repository with versions 0, 1 and
+/// 2: the confirm names versions 1 and 0 (Pulp keeps the newest one) and asks for the repository name. After Esc the
+/// versions stay; after the typed name Pulp deletes exactly the named versions.
+#[tokio::test]
+async fn a_lower_retain_versions_deletes_versions_only_after_the_typed_name_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, name) = (client(), RepoType::File, unique("it-retain"));
+    let (repo, remote, _) = two_versions(&c, t, &name, "file/PULP_MANIFEST").await;
+    let (mut app, mut rx) = app().await;
+    app.list.kind = Kind::Repos(t, false);
+    for confirm in [false, true] {
+        run(&mut app, Act::Edit, c.get(&repo, &[]).await.unwrap());
+        settle(&mut app, &mut rx).await; // the name of the default remote
+        fill(&mut app, &[("retain_repo_versions", "1")]);
+        settle(&mut app, &mut rx).await; // the impact
+        let Some(Modal::Confirm { lines, typed, .. }) = &app.modal else { panic!("no confirm: {:?}", texts(&app)) };
+        assert_eq!(typed.as_deref(), Some(name.as_str()));
+        assert_eq!(lines[1], "  1, 0", "{lines:?}");
+        if confirm {
+            yes(&mut app);
+            settle_tasks(&mut app, &mut rx).await;
+            shown(&app, &format!("task completed: update repository {name}"));
+        } else {
+            app.modal = None; // Esc
+            assert_eq!(version_numbers(&c, &repo).await, [2, 1, 0], "nothing sent");
+            assert_eq!(c.get::<Value>(&repo, &[]).await.unwrap()["retain_repo_versions"], Value::Null);
+        }
+    }
+    assert_eq!(version_numbers(&c, &repo).await, [2], "the named versions are gone");
+    cleanup(&c, &[&repo, &remote]).await;
+}

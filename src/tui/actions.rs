@@ -7,7 +7,7 @@ use super::kinds::{Act, Kind, s, short};
 use crate::config::{AuthMethod, Database, LOCAL_DATABASE, Profile};
 use crate::filters::{FilterRule, Selector, filter_help, parse_rules};
 use crate::pulp::client::Page;
-use crate::pulp::models::{Distribution, RepoVersion, TASK_FINAL_STATES, Task, TaskGroup};
+use crate::pulp::models::{Distribution, Publication, RepoVersion, TASK_FINAL_STATES, Task, TaskGroup};
 use crate::pulp::ops::{self, repo_of_version, version_number};
 use crate::pulp::{Capabilities, Feature, Mutation, PulpClient, PulpError, RepoType, deb, file, rpm};
 use crate::store::Store;
@@ -1009,7 +1009,10 @@ fn repo_extra_fields(t: RepoType, caps: Option<&Capabilities>, v: &Value) -> Vec
     }
     if has("retain_checkpoints") {
         let f = Field::new("retain_checkpoints", "Retain checkpoints", FieldKind::Number);
-        fields.push(f.value(s(v, "retain_checkpoints")).help("checkpoint publications to keep; empty = all"));
+        fields.push(
+            f.value(s(v, "retain_checkpoints"))
+                .help("checkpoint publications to keep; empty = all; a lower number clears the flag of older ones at once"),
+        );
     }
     fields
 }
@@ -1080,7 +1083,7 @@ fn repo_form(t: RepoType, caps: Option<&Capabilities>, item: Option<&Value>, rem
         Field::pick("remote", "Remote", Source::SyncRemotes(t)).help("default remote for sync; empty = none").value(remote),
         Field::new("retain_repo_versions", "Retain versions", FieldKind::Number)
             .value(s(&v, "retain_repo_versions"))
-            .help("empty = keep all versions"),
+            .help("empty = keep all versions; a lower number deletes old versions at once (they are named first)"),
         Field::new("autopublish", "Autopublish", FieldKind::Bool).value(if v["autopublish"] == true { "true" } else { "false" }),
         Field::text("labels", "Labels (k=v,...)").value(format_labels(&labels)),
     ];
@@ -1144,7 +1147,7 @@ fn repo_body(f: &Form, edit: bool) -> Result<Value, String> {
 fn repo_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
     let (href, name) = (s(&item, "pulp_href"), s(&item, "name"));
     let current = item["remote"].as_str().filter(|_| edit).map(str::to_string);
-    let (caps, remotes) = (caps(app), sync_remote_paths(app, t));
+    let (caps, remotes, reading) = (caps(app), sync_remote_paths(app, t), format!("remote of {name}"));
     let open = move |app: &mut App, remote: String| {
         let form = repo_form(t, caps.as_deref(), edit.then_some(&item), &remote);
         app.form(form, move |app, f| {
@@ -1154,40 +1157,122 @@ fn repo_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
             // and `pulp_labels` alone drops the OSV label: a label edit goes alone, then the OSV config is set again.
             let osv = (edit && body.get("pulp_labels").is_some() && f.fields.iter().any(|x| x.key == "osv_config"))
                 .then(|| body.as_object_mut().and_then(|b| b.remove("osv_config")));
-            let (href, remotes) = (href.clone(), remotes.clone());
+            // An edit of the retention can make Pulp delete versions at once: those are named first.
+            let retention = if edit { body.clone() } else { Value::Null };
+            let (href, remotes, name) = (href.clone(), remotes.clone(), name.clone());
             let label = format!("{} repository {}", if edit { "update" } else { "create" }, f.get("name"));
-            submit(app, label, move |c| async move {
-                if let Some(r) = remote {
-                    body["remote"] = remote_href(&c, &remotes, &r).await?.into();
-                }
-                if !edit {
-                    return Ok(c.post(&c.api(t.repositories()), &body).await?);
-                }
-                let osv = match osv {
-                    // Unchanged in the form: the server's config of now (the list row can be old).
-                    Some(None) => c.get::<Value>(&href, &[("fields", "osv_config".into())]).await?["osv_config"].clone(),
-                    Some(Some(v)) => v,
-                    None => Value::Null,
-                };
-                let m = c.patch(&href, &body).await?;
-                if osv.is_null() {
-                    return Ok(m);
-                }
-                ops::settle(&c, m, &ops::no_progress).await?;
-                Ok(c.patch(&href, &json!({ "osv_config": osv })).await?)
-            });
+            let target = href.clone();
+            let go = move |app: &mut App| {
+                submit(app, label, move |c| async move {
+                    if let Some(r) = remote {
+                        body["remote"] = remote_href(&c, &remotes, &r).await?.into();
+                    }
+                    if !edit {
+                        return Ok(c.post(&c.api(t.repositories()), &body).await?);
+                    }
+                    let osv = match osv {
+                        // Unchanged in the form: the server's config of now (the list row can be old).
+                        Some(None) => c.get::<Value>(&href, &[("fields", "osv_config".into())]).await?["osv_config"].clone(),
+                        Some(Some(v)) => v,
+                        None => Value::Null,
+                    };
+                    let m = c.patch(&href, &body).await?;
+                    if osv.is_null() {
+                        return Ok(m);
+                    }
+                    ops::settle(&c, m, &ops::no_progress).await?;
+                    Ok(c.patch(&href, &json!({ "osv_config": osv })).await?)
+                })
+            };
+            confirm_retain(app, t, target, name, retention, go);
             Ok(())
         });
     };
     match current {
         // The picker holds names: read the current remote's name so the field shows it, as Sync does.
-        Some(r) => app.job(format!("remote of {name}"), move |ctx| async move {
+        Some(r) => app.job(reading, move |ctx| async move {
             let v = ctx.client.get::<Value>(&r, &[("fields", "name".into())]).await;
             let current = v.map(|v| s(&v, "name")).unwrap_or_default();
             ap(move |app| open(app, current))
         }),
         None => open(app, String::new()),
     }
+}
+
+/// The retention that edit body `b` sets in `key`: pulpcore cleans up when the value changes to one above 0.
+fn retain_keep(b: &Value, key: &str) -> Option<usize> {
+    b[key].as_u64().filter(|n| *n > 0).map(|n| n as usize)
+}
+
+/// Run `go` at once, or after the typed name when the edit body `b` of repository `href` (`name`) makes Pulp delete
+/// versions or clear checkpoint flags at once (`retain_impact`).
+fn confirm_retain(app: &mut App, t: RepoType, href: String, name: String, b: Value, go: impl FnOnce(&mut App) + Send + 'static) {
+    if retain_keep(&b, "retain_repo_versions").is_none() && retain_keep(&b, "retain_checkpoints").is_none() {
+        return go(app);
+    }
+    app.job(format!("impact of editing {name}"), move |ctx| async move {
+        let lines = retain_impact(&ctx, t, &href, &name, &b).await?;
+        if lines.is_empty() {
+            return ap(go);
+        }
+        ap(move |app| app.confirm_danger(format!("Edit repository {name}"), lines, &name.clone(), go))
+    });
+}
+
+/// What the retention of edit body `b` makes Pulp do at once after the PATCH (pulpcore `AFTER_UPDATE` hooks, in this
+/// order: `cleanup_old_checkpoints`, then `cleanup_old_versions`), as confirm lines; empty when nothing changes.
+async fn retain_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str, b: &Value) -> anyhow::Result<Vec<String>> {
+    let c = &ctx.client;
+    let pubs = ops::publications_where(c, &ctx.caps, t, ("repository", href)).await?;
+    let mut pubs: Vec<Publication> = serde_json::from_value(pubs.into())?;
+    let mut lines = vec![];
+    if let Some(k) = retain_keep(b, "retain_checkpoints") {
+        let version = |p: &Publication| version_number(p.repository_version.as_deref().unwrap_or_default());
+        let created = |p: &Publication| p.pulp_created.clone().unwrap_or_default();
+        let line = |p: &Publication| format!("  {} (version {}, {})", short(&p.pulp_href), version(p), created(p));
+        let dropped: Vec<String> = checkpoints_dropped(&mut pubs, k).iter().map(line).collect();
+        if !dropped.is_empty() {
+            lines.push(format!("Retain checkpoints {k}: these checkpoint publications of {name} lose the checkpoint flag at once:"));
+            lines.extend(dropped);
+            lines.push("A checkpoint distribution then no longer serves them at <base path>/<timestamp>/, and their versions lose that protection.".into());
+        }
+    }
+    if let Some(k) = retain_keep(b, "retain_repo_versions") {
+        let versions: Vec<Value> = c.list_all(&format!("{href}versions/"), &[("fields", "pulp_href".into())], 100_000).await?;
+        let versions: Vec<String> = versions.iter().map(|v| s(v, "pulp_href")).collect();
+        let gone = retain_deletes(&versions, &pubs, &ops::distributions(c, t).await?, k);
+        if !gone.is_empty() {
+            let numbers: Vec<String> = gone.iter().map(|v| version_number(v).to_string()).collect();
+            lines.push(format!("Retain versions {k}: Pulp deletes these versions of {name} at once, with their publications:"));
+            lines.push(format!("  {}", numbers.join(", ")));
+            lines.push("Pulp keeps the versions that a distribution serves and the newest others. A deleted version is no rollback point any more.".into());
+        }
+    }
+    Ok(lines)
+}
+
+/// pulpcore `cleanup_old_versions`: of `versions` (one repository), Pulp keeps those that a distribution protects
+/// (`ops::protecting`) and the newest `keep` others, and deletes the rest. A distribution that the client cannot see
+/// (another type, no view permission) can only add versions to the result, never drop one.
+fn retain_deletes(versions: &[String], pubs: &[Publication], ds: &[Distribution], keep: usize) -> Vec<String> {
+    let mut free: Vec<&String> = versions.iter().filter(|v| ops::protecting(v, pubs, ds).is_empty()).collect();
+    free.sort_by_key(|v| std::cmp::Reverse(version_number(v)));
+    free.into_iter().skip(keep).cloned().collect()
+}
+
+/// pulpcore `cleanup_old_checkpoints`: the checkpoint publications of `pubs` (one repository) after the newest `keep`
+/// (by creation) lose the flag. Clears it in `pubs` and returns them.
+fn checkpoints_dropped(pubs: &mut [Publication], keep: usize) -> Vec<Publication> {
+    let mut flagged: Vec<&mut Publication> = pubs.iter_mut().filter(|p| p.checkpoint).collect();
+    flagged.sort_by(|a, b| b.pulp_created.cmp(&a.pulp_created));
+    flagged
+        .into_iter()
+        .skip(keep)
+        .map(|p| {
+            p.checkpoint = false;
+            p.clone()
+        })
+        .collect()
 }
 
 /// Sync options, each shown when the server's sync request has it. They start at the server defaults.
@@ -4425,6 +4510,85 @@ mod tests {
             caps.schemas.insert(t.repository_schema().into(), ["name"].map(String::from).into());
             assert!(repo_form(t, Some(&caps), None, "").fields.iter().all(|f| f.key != "retain_checkpoints"), "{t:?}");
         }
+    }
+
+    /// pulpcore `protected_versions`, then `cleanup_old_versions` and `cleanup_old_checkpoints` (audit F53): Pulp keeps
+    /// the versions that a distribution protects and the newest `keep` others; checkpoint publications lose the flag
+    /// (and with it the protection of a checkpoint distribution) before the versions go.
+    #[test]
+    fn a_lower_retention_deletes_the_versions_that_no_distribution_protects() {
+        let v = |n: u32| format!("/r/versions/{n}/");
+        let p = |n: u32, checkpoint: bool| crate::pulp::models::Publication {
+            pulp_href: format!("/p/{n}/"),
+            repository_version: Some(v(n)),
+            repository: Some("/r/".into()),
+            pulp_created: Some(format!("2026-01-0{n}T00:00:00Z")),
+            signing_service: None,
+            manifest: None,
+            checkpoint,
+        };
+        let d = |k: &str, h: &str, checkpoint: bool| -> Distribution {
+            serde_json::from_value(json!({ "pulp_href": "/d/", "name": "d", "base_path": "d", k: h, "checkpoint": checkpoint })).unwrap()
+        };
+        let versions: Vec<String> = (0..5).map(v).collect();
+        let pubs = vec![p(1, true), p(2, false), p(3, true)];
+        assert_eq!(retain_deletes(&versions, &pubs, &[], 2), [v(2), v(1), v(0)], "no distribution: the newest 2 stay");
+        let pinned = d("publication", "/p/2/", false);
+        assert_eq!(retain_deletes(&versions, &pubs, &[pinned], 1), [v(3), v(1), v(0)], "pinned to version 2");
+        let follow = d("repository", "/r/", false);
+        assert_eq!(retain_deletes(&versions, &pubs, &[follow], 1), [v(2), v(1), v(0)], "follows: its newest published version 3");
+        let checkpoint = d("repository", "/r/", true);
+        assert_eq!(retain_deletes(&versions, &pubs, std::slice::from_ref(&checkpoint), 1), [v(2), v(0)], "checkpoints 1 and 3");
+        let mut pubs = pubs;
+        let dropped: Vec<String> = checkpoints_dropped(&mut pubs, 1).iter().map(|p| p.pulp_href.clone()).collect();
+        assert_eq!(dropped, ["/p/1/"], "the newest checkpoint stays");
+        assert_eq!(retain_deletes(&versions, &pubs, &[checkpoint], 1), [v(2), v(1), v(0)], "version 1 lost its checkpoint");
+    }
+
+    /// Repository Edit of a lower Retain versions or Retain checkpoints (audit F53): the confirm names the versions
+    /// that Pulp deletes, or the checkpoint publications that lose the flag, and asks for the repository name; Esc
+    /// sends nothing. A higher value that deletes nothing, and a label edit, save at once.
+    #[tokio::test]
+    async fn a_repository_edit_that_deletes_versions_needs_the_typed_name() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (r, pubs) = (format!("{API}repositories/file/file/r/"), format!("{API}publications/file/file/"));
+        let v = |n: u32| format!("{r}versions/{n}/");
+        let p = |n: u32| {
+            let created = format!("2026-01-0{n}T00:00:00Z");
+            json!({ "pulp_href": format!("{pubs}{n}/"), "repository_version": v(n), "repository": r, "pulp_created": created, "checkpoint": true })
+        };
+        get(&server, &pubs, page(json!([p(1), p(2)]))).await;
+        let d = json!({ "pulp_href": format!("{API}distributions/file/file/1/"), "name": "docs", "base_path": "docs", "publication": p(1)["pulp_href"] });
+        get(&server, &format!("{API}distributions/file/file/"), page(json!([d]))).await;
+        get(&server, &format!("{r}versions/"), page(json!([3, 2, 1, 0].map(|n| json!({ "pulp_href": v(n), "number": n }))))).await;
+        answer(&server, "PATCH", &r, 202, json!({ "task": format!("{API}tasks/1/") })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let item = json!({ "pulp_href": r, "name": "docs", "retain_repo_versions": 2, "pulp_labels": {} });
+
+        repo_action(&mut app, RepoType::File, Act::Edit, item.clone());
+        fill_and_submit(&mut app, &[("retain_repo_versions", "1")]);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, typed, .. }) = app.modal.take() else {
+            panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text))
+        };
+        assert_eq!((title.as_str(), typed.as_deref()), ("Edit repository docs", Some("docs")));
+        assert_eq!(lines[..2], ["Retain versions 1: Pulp deletes these versions of docs at once, with their publications:", "  2, 0"]);
+        repo_action(&mut app, RepoType::File, Act::Edit, item.clone());
+        fill_and_submit(&mut app, &[("retain_checkpoints", "1")]);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, typed, .. }) = app.modal.take() else { panic!("no confirm") };
+        let first = "Retain checkpoints 1: these checkpoint publications of docs lose the checkpoint flag at once:";
+        assert_eq!((&lines[..2], typed.as_deref()), (&[first.into(), "  1 (version 1, 2026-01-01T00:00:00Z)".into()][..], Some("docs")));
+        assert_eq!(bodies(&server, "PATCH", &r).await, Vec::<Value>::new(), "Esc: nothing sent");
+
+        for (k, value) in [("retain_repo_versions", "5"), ("labels", "a=b")] {
+            repo_action(&mut app, RepoType::File, Act::Edit, item.clone());
+            fill_and_submit(&mut app, &[(k, value)]);
+            settle(&mut app, &mut rx).await;
+            assert!(app.modal.is_none(), "{k}: no dialog");
+        }
+        assert_eq!(bodies(&server, "PATCH", &r).await, [json!({ "retain_repo_versions": 5 }), json!({ "pulp_labels": { "a": "b" } })]);
     }
 
     #[test]
