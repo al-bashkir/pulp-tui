@@ -107,7 +107,6 @@ impl TaskCenter {
         let was_final = t.is_final();
         // An older snapshot (a stale Server tasks row, a late poll answer): a task never leaves a final state.
         if was_final && !is_final_state(&task.state) {
-            t.in_flight = false;
             return false;
         }
         let changed = t.task.as_ref() != Some(&task);
