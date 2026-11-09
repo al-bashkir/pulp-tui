@@ -1320,21 +1320,24 @@ impl CvService {
         for b in self.store.binding_repos(env.id, cv.id).await? {
             match self.leave_out(&cv.name, env, vrs, &b, &aliases, on).await {
                 Err(e) => errors.push(format!("unbind {}: {e}", b.repo_name)),
-                Ok(Some(what)) => self.record_left_out(b, what, log).await?,
+                Ok(Some(what)) => self.record_left_out(&format!("{} in {}", cv.name, env.name), b, what, log).await?,
                 Ok(None) => {}
             }
         }
         Ok(errors)
     }
 
-    /// The store part of `unbind_removed` for row `b`: an unbound row records no publication, a forgotten one is
-    /// deleted (and logged), a refused one stays.
-    async fn record_left_out(&self, b: BindingRepo, what: LeftOut, log: Log<'_>) -> Result<()> {
+    /// The store part of `unbind_removed` for row `b` (`at`: "<view> in <environment>"): an unbound row records no
+    /// publication, a forgotten one is deleted (logged, and written to the audit trail), a refused one stays.
+    async fn record_left_out(&self, at: &str, b: BindingRepo, what: LeftOut, log: Log<'_>) -> Result<()> {
         match what {
             LeftOut::Unbind(_) => self.store.save_binding_repo(&BindingRepo { publication: None, ..b }).await,
             LeftOut::Forget(why) => {
-                log(format!("{}: {why}", b.repo_name));
-                self.store.delete_binding_repo(b.env_id, b.cv_id, &b.repo_href).await
+                let line = format!("{}: {why}", b.repo_name);
+                log(line.clone());
+                self.store.delete_binding_repo(b.env_id, b.cv_id, &b.repo_href).await?;
+                self.audit("cv.forget", &format!("{at}: {line}")).await;
+                Ok(())
             }
             LeftOut::Refuse(_) => Ok(()), // `leave_out` gives its error first
         }
@@ -3437,6 +3440,8 @@ mod tests {
         let logged = Mutex::new(vec![]);
         svc.promote(cv, v.id, lib, Mode::Rollback, &|l| logged.lock().unwrap().push(l), &ops::no_progress).await.unwrap();
         assert!(logged.lock().unwrap().contains(&format!("old: {why}")), "the workflow log says so");
+        let trail: Vec<(String, String)> = svc.store.audit_log("k", 10).await.unwrap().into_iter().map(|a| (a.action, a.detail)).collect();
+        assert!(trail.contains(&("cv.forget".into(), format!("web in Library: old: {why}"))), "the audit trail says so: {trail:?}");
         assert_none(&server, "PATCH").await;
         assert!(svc.store.binding_repos(lib, cv).await.unwrap().is_empty(), "the row is forgotten");
         assert_eq!(svc.drift(cv, lib).await.unwrap(), [], "no drift: the distribution is not the view's");
