@@ -871,12 +871,18 @@ async fn library_lines(svc: &CvService, id: i64, name: &str, vrs: &[CvVersionRep
 /// `library_lines` of a Resume of version `v` of view `name`, after a blank line: none when the Library step does not
 /// run (only the auto publish is left, `CvService::resume`) or a newer version is published (`CvService::bind_library`).
 async fn resume_library_lines(svc: &CvService, name: &str, v: &CvVersion) -> anyhow::Result<Vec<String>> {
-    let newer = svc.store.versions(v.cv_id).await?.iter().any(|n| n.state == "published" && n.number > v.number);
-    if newer || (v.state == "published" && !svc.library_interrupted(v).await?) {
+    if !resume_library_step(svc, v).await? {
         return Ok(vec![]);
     }
     let lines = library_lines(svc, v.cv_id, name, &svc.store.version_repos(v.id).await?, &format!("v{}", v.number)).await?;
     Ok(if lines.is_empty() { lines } else { std::iter::once(String::new()).chain(lines).collect() })
+}
+
+/// Whether a Resume of version `v` runs the Library step: `v` is not published or its Library step was interrupted,
+/// and no newer version is published.
+async fn resume_library_step(svc: &CvService, v: &CvVersion) -> anyhow::Result<bool> {
+    let newer = svc.store.versions(v.cv_id).await?.iter().any(|n| n.state == "published" && n.number > v.number);
+    Ok(!newer && (v.state != "published" || svc.library_interrupted(v).await?))
 }
 
 /// A line for each repository of `vrs` (of view `name`) that the Library step `e` fails for (`CvService::bind_target`).
@@ -965,40 +971,50 @@ fn cv_publish(app: &mut App, id: i64, name: String, deb: bool) {
     }
     let form = Form::new(format!("Publish {name}"), fields).note("A preview of the exact content is shown before anything is created.");
     app.form(form, move |app, f| {
-        let notes = f.get("notes").to_string();
-        // Stored with the version (`CvVersionRepo::signing`): "" = same as source.
-        let signing = match f.get("signing") {
-            "none" => "none".to_string(),
-            "service" => f.opt("signing_service").ok_or("pick a signing service")?.to_string(),
-            _ => String::new(),
-        };
+        let (notes, signing) = (f.get("notes").to_string(), publish_signing(f)?);
         let name = name.clone();
         app.job(format!("preview {name}"), move |ctx| async move {
-            let svc = ctx.cv()?;
-            let latest = svc.store.versions(id).await?.into_iter().find(|v| v.state == "published").map(|v| v.id);
-            let mut lines = svc.preview(id, latest).await?;
-            lines.insert(0, "Publishing creates a new immutable version and makes it active in Library.".into());
-            lines.insert(1, String::new());
-            lines.extend(library_lines(&svc, id, &name, &svc.draft_rows(id).await?, "the new version").await?);
-            let protected = svc.library_protected().await?;
+            let (lines, protected) = publish_preview(&ctx.cv()?, id, &name).await?;
             ap(move |app| {
-                guard_library(app, protected, lines, Some(format!("Publish {name}")), move |app| {
-                    app.job(format!("publish {name}"), move |ctx| async move {
-                        let (v, note) =
-                            ctx.cv()?.locked(id, "publish").await?.publish(id, &notes, &signing, &ctx.log(), &ctx.on_task()).await?;
-                        // After the lock of this view is released; composites take their own locks.
-                        let auto = ctx.cv()?.auto_publish(id, &ctx.log(), &ctx.on_task()).await;
-                        ap(move |app| {
-                            let active = if note.is_none() { " and active in Library" } else { "" };
-                            let (level, text) = auto_notice(format!("{name} version {} published{active}", v.number), note, auto);
-                            app.notify(level, text);
-                            app.reload();
-                        })
-                    });
-                })
+                guard_library(app, protected, lines, Some(format!("Publish {name}")), move |app| run_publish(app, id, name, notes, signing))
             })
         });
         Ok(())
+    });
+}
+
+/// The Deb signing of the Publish form, stored with the version (`CvVersionRepo::signing`): "" = same as source.
+fn publish_signing(f: &Form) -> Result<String, String> {
+    Ok(match f.get("signing") {
+        "none" => "none".to_string(),
+        "service" => f.opt("signing_service").ok_or("pick a signing service")?.to_string(),
+        _ => String::new(),
+    })
+}
+
+/// The Publish preview of view `id` (`name`): the content against the newest published version and what the Library
+/// step changes (`library_lines`); and whether Library is protected.
+async fn publish_preview(svc: &CvService, id: i64, name: &str) -> anyhow::Result<(Vec<String>, bool)> {
+    let latest = svc.store.versions(id).await?.into_iter().find(|v| v.state == "published").map(|v| v.id);
+    let mut lines = svc.preview(id, latest).await?;
+    lines.insert(0, "Publishing creates a new immutable version and makes it active in Library.".into());
+    lines.insert(1, String::new());
+    lines.extend(library_lines(svc, id, name, &svc.draft_rows(id).await?, "the new version").await?);
+    Ok((lines, svc.library_protected().await?))
+}
+
+/// The confirmed Publish of view `id` (`name`) under its lock, then the auto publish of the composites that use it.
+fn run_publish(app: &mut App, id: i64, name: String, notes: String, signing: String) {
+    app.job(format!("publish {name}"), move |ctx| async move {
+        let (v, note) = ctx.cv()?.locked(id, "publish").await?.publish(id, &notes, &signing, &ctx.log(), &ctx.on_task()).await?;
+        // After the lock of this view is released; composites take their own locks.
+        let auto = ctx.cv()?.auto_publish(id, &ctx.log(), &ctx.on_task()).await;
+        ap(move |app| {
+            let active = if note.is_none() { " and active in Library" } else { "" };
+            let (level, text) = auto_notice(format!("{name} version {} published{active}", v.number), note, auto);
+            app.notify(level, text);
+            app.reload();
+        })
     });
 }
 
