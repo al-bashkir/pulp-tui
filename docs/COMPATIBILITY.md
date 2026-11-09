@@ -835,8 +835,9 @@ Source: pulpcore 3.123.1 `tasks/export.py`, `tasks/importer.py` and their serial
   pulp-tui sends a file that ends in `.json` as `toc`, any other as `path` (live).
 * **Import** answers 202 with a task group `Import of <toc>`: `pulp_import` checks the chunks,
   imports the artifacts and dispatches one `import_repository_version` per repository,
-  which sets the exact exported content. Only a cancel sets `all_tasks_dispatched` (live), so
-  `TaskGroup::is_final` ends it when `pulp_import` completed and no task waits or runs.
+  which sets the exact exported content (`new_version()`, so `cleanup_old_versions` runs after
+  it and a destination with `retain_repo_versions` loses its old versions; the import confirm
+  says so). Only a cancel sets `all_tasks_dispatched` (live), so `TaskGroup::is_final` ends it when `pulp_import` completed and no task waits or runs.
 * **Import mapping.** The destination is the `repo_mapping` pair, else the same name; a
   missing one is skipped with only a log line (no repository task). An unknown destination gets 400 "Failed to find
   repositories from repo_mapping" on create, but 500 on PATCH, and `repo_mapping` is then

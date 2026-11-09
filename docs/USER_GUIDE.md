@@ -884,8 +884,10 @@ Disconnected import of a Pulp export. Copy the export files to a directory in th
 * **I** imports: type the path of the `-toc.json` file on the server, or of the `.tar` of an
   export without chunks (for example one that came without its TOC). pulp-tui first runs the
   import check and shows its result. When the check fails, nothing is imported. Each imported
-  repository gets a new version with exactly the exported content. When Pulp finds no destination
-  repository, pulp-tui gives a warning.
+  repository gets a new version with exactly the exported content. Older versions stay, but a
+  destination with **Retain versions** N then keeps only the versions that a distribution serves
+  and the newest N others: Pulp deletes the rest, with their publications. When Pulp finds no
+  destination repository, pulp-tui gives a warning.
 * A mapping (also one set outside pulp-tui) to a Content View snapshot is refused. Pulp does not
   tell before the import which repositories the export has, so pulp-tui cannot refuse an
   unmapped repository with the name of a snapshot. The confirmation then names every snapshot

@@ -1737,7 +1737,13 @@ fn confirm_import(app: &mut App, href: String, name: String, toc: String, mappin
     lines.push("Each repository of the export gets a new version in its destination repository:".into());
     lines.extend(mapping.as_object().into_iter().flatten().map(|(src, dst)| format!("  {src} -> {}", dst.as_str().unwrap_or_default())));
     lines.push("  any other: the repository of the same name (Pulp skips it when there is none)".into());
-    lines.push("The new version holds exactly the exported content; older versions stay.".into());
+    lines.push("The new version holds exactly the exported content.".into());
+    // pulpcore runs `cleanup_old_versions` after each new version (`RepositoryVersion.__exit__`).
+    lines.push(
+        "Older versions stay. Exception: a destination with Retain versions N keeps only the versions that a distribution \
+         serves and the newest N others; Pulp deletes the rest, with their publications."
+            .into(),
+    );
     let warn = !snapshots.is_empty();
     if warn {
         lines.push(String::new());
@@ -3147,7 +3153,16 @@ mod tests {
         settle(&mut app, &mut rx).await;
         let Some(Modal::Confirm { lines, on_yes: Some(yes), .. }) = app.modal.take() else { panic!("no confirm: {:?}", notices(&app)) };
         assert_eq!(lines[..2], ["toc: valid", "repo_mapping: valid"]);
-        assert!(lines.contains(&"  web -> web-copy".to_string()), "{lines:?}");
+        let i = lines.iter().position(|l| l == "  web -> web-copy").unwrap_or_else(|| panic!("{lines:?}"));
+        // pulpcore `RepositoryVersion.__exit__` runs `cleanup_old_versions` after the new version.
+        assert_eq!(
+            lines[i + 2..],
+            [
+                "The new version holds exactly the exported content.",
+                "Older versions stay. Exception: a destination with Retain versions N keeps only the versions that a distribution \
+                 serves and the newest N others; Pulp deletes the rest, with their publications."
+            ]
+        );
         assert_eq!(sent(&server).await.len(), 1, "only the check before the confirmation");
         yes(&mut app);
         settle(&mut app, &mut rx).await;
