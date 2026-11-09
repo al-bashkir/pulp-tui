@@ -329,7 +329,10 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   the checkpoint publications after the newest N (by creation) lose the checkpoint flag. Both
   run when the value is above 0. The checkpoint hook runs first (django-lifecycle orders hooks
   by name), so a version of a cleared checkpoint publication can go in the same request. The
-  repository edit confirm computes both (`retain_impact`).
+  repository edit confirm computes both (`retain_impact`). A new checkpoint publication runs
+  `cleanup_old_checkpoints` too (`Publication.finalize`, `models/publication.py:264`): the
+  Publications create confirm names the checkpoints that lose the flag
+  (`confirm_new_checkpoint`).
 * **Publications and repositories are not protected** (read in the source of 3.123.1:
   `PublicationViewSet` is a plain `DestroyModelMixin`, `Distribution.publication` is
   `on_delete=SET_NULL`). A served publication is deleted without an error: a distribution

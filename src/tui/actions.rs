@@ -1199,7 +1199,7 @@ fn repo_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
     }
 }
 
-/// The retention that edit body `b` sets in `key`: pulpcore cleans up when the value changes to one above 0.
+/// The retention in `key` of `b` (an edit body, or a repository): pulpcore cleans up only for a value above 0.
 fn retain_keep(b: &Value, key: &str) -> Option<usize> {
     b[key].as_u64().filter(|n| *n > 0).map(|n| n as usize)
 }
@@ -1223,19 +1223,11 @@ fn confirm_retain(app: &mut App, t: RepoType, href: String, name: String, b: Val
 /// order: `cleanup_old_checkpoints`, then `cleanup_old_versions`), as confirm lines; empty when nothing changes.
 async fn retain_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str, b: &Value) -> anyhow::Result<Vec<String>> {
     let c = &ctx.client;
-    let pubs = ops::publications_where(c, &ctx.caps, t, ("repository", href)).await?;
-    let mut pubs: Vec<Publication> = serde_json::from_value(pubs.into())?;
+    let mut pubs = repo_publications(ctx, t, href).await?;
     let mut lines = vec![];
     if let Some(k) = retain_keep(b, "retain_checkpoints") {
-        let version = |p: &Publication| version_number(p.repository_version.as_deref().unwrap_or_default());
-        let created = |p: &Publication| p.pulp_created.clone().unwrap_or_default();
-        let line = |p: &Publication| format!("  {} (version {}, {})", short(&p.pulp_href), version(p), created(p));
-        let dropped: Vec<String> = checkpoints_dropped(&mut pubs, k).iter().map(line).collect();
-        if !dropped.is_empty() {
-            lines.push(format!("Retain checkpoints {k}: these checkpoint publications of {name} lose the checkpoint flag at once:"));
-            lines.extend(dropped);
-            lines.push("A checkpoint distribution then no longer serves them at <base path>/<timestamp>/, and their versions lose that protection.".into());
-        }
+        let head = format!("Retain checkpoints {k}: these checkpoint publications of {name} lose the checkpoint flag at once:");
+        lines.extend(checkpoint_lines(&mut pubs, k, head));
     }
     if let Some(k) = retain_keep(b, "retain_repo_versions") {
         let versions: Vec<Value> = c.list_all(&format!("{href}versions/"), &[("fields", "pulp_href".into())], 100_000).await?;
@@ -1249,6 +1241,39 @@ async fn retain_impact(ctx: &Ctx, t: RepoType, href: &str, name: &str, b: &Value
         }
     }
     Ok(lines)
+}
+
+/// The publications of repository `href` (Deb verbatim ones too).
+async fn repo_publications(ctx: &Ctx, t: RepoType, href: &str) -> anyhow::Result<Vec<Publication>> {
+    let pubs = ops::publications_where(&ctx.client, &ctx.caps, t, ("repository", href)).await?;
+    Ok(serde_json::from_value(pubs.into())?)
+}
+
+/// The confirm lines, under `head`, when the checkpoint publications of `pubs` after the newest `keep` lose the flag
+/// (`checkpoints_dropped`); none when no publication loses it.
+fn checkpoint_lines(pubs: &mut [Publication], keep: usize, head: String) -> Vec<String> {
+    let version = |p: &Publication| version_number(p.repository_version.as_deref().unwrap_or_default());
+    let line =
+        |p: &Publication| format!("  {} (version {}, {})", short(&p.pulp_href), version(p), p.pulp_created.as_deref().unwrap_or_default());
+    let dropped: Vec<String> = checkpoints_dropped(pubs, keep).iter().map(line).collect();
+    if dropped.is_empty() {
+        return dropped;
+    }
+    let tail = "A checkpoint distribution then no longer serves them at <base path>/<timestamp>/, and their versions lose that protection.";
+    [vec![head], dropped, vec![tail.into()]].concat()
+}
+
+/// Run `go` at once, or after the typed name when a new checkpoint publication of repository `r` makes Pulp clear the
+/// checkpoint flag of older ones: `Publication.finalize` runs `cleanup_old_checkpoints` (Retain checkpoints).
+async fn confirm_new_checkpoint(ctx: &Ctx, t: RepoType, r: &Value, go: impl FnOnce(&mut App) + Send + 'static) -> anyhow::Result<Apply> {
+    let Some(k) = retain_keep(r, "retain_checkpoints") else { return ap(go) };
+    let name = s(r, "name");
+    let head = format!("Retain checkpoints {k}: the new checkpoint publication of {name} makes these lose the checkpoint flag:");
+    let lines = checkpoint_lines(&mut repo_publications(ctx, t, &s(r, "pulp_href")).await?, k - 1, head);
+    if lines.is_empty() {
+        return ap(go);
+    }
+    ap(move |app| app.confirm_danger(format!("Checkpoint publication of {name}"), lines, &name.clone(), go))
 }
 
 /// pulpcore `cleanup_old_versions`: of `versions` (one repository), Pulp keeps those that a distribution protects
@@ -3455,11 +3480,17 @@ fn publication_create(app: &mut App, t: RepoType) {
                 body.as_object_mut().expect("an object").remove("repository_version");
                 body["repository"] = s(&r, "pulp_href").into();
             }
-            let p = ops::create(c, &c.api(ops::publications_for(t, &options)), &body, "/publications/", &ctx.on_task()).await?;
-            ap(move |app| {
-                app.ok(format!("publication {} of {}", short(&p), short(&v)));
-                app.reload();
-            })
+            let go = move |app: &mut App| {
+                app.job(format!("publish {repo}"), move |ctx| async move {
+                    let c = &ctx.client;
+                    let p = ops::create(c, &c.api(ops::publications_for(t, &options)), &body, "/publications/", &ctx.on_task()).await?;
+                    ap(move |app| {
+                        app.ok(format!("publication {} of {}", short(&p), short(&v)));
+                        app.reload();
+                    })
+                })
+            };
+            if checkpoint { confirm_new_checkpoint(&ctx, t, &r, go).await } else { ap(go) }
         });
         Ok(())
     });
@@ -9094,6 +9125,40 @@ mod tests {
         }
         assert_eq!(bodies(&server, "PATCH", &d).await, [json!({ "publication": p1, "repository": null })]);
         assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("distribution r serves http://h/r/"));
+    }
+
+    /// A new checkpoint publication makes pulpcore clear the checkpoint flag of the older ones beyond Retain
+    /// checkpoints (`Publication.finalize` runs `cleanup_old_checkpoints`): the confirm names them and asks for the
+    /// repository name; Esc sends nothing. Without the retention the publication is made at once.
+    #[tokio::test]
+    async fn a_checkpoint_publication_that_clears_older_checkpoints_needs_the_typed_name() {
+        use crate::tui::app::Modal;
+        let server = wiremock::MockServer::start().await;
+        let (r, pubs) = (format!("{API}repositories/rpm/rpm/r/"), format!("{API}publications/rpm/rpm/"));
+        let repo = json!({ "pulp_href": r, "name": "r", "latest_version_href": format!("{r}versions/2/"), "retain_checkpoints": 1 });
+        get(&server, &format!("{API}repositories/rpm/rpm/"), page(json!([repo]))).await;
+        let old = json!({ "pulp_href": format!("{pubs}1/"), "repository_version": format!("{r}versions/1/"), "repository": r,
+                          "pulp_created": "2026-01-01T00:00:00Z", "checkpoint": true });
+        get(&server, &pubs, page(json!([old]))).await;
+        answer(&server, "POST", &pubs, 201, json!({ "pulp_href": format!("{pubs}2/") })).await;
+        let (mut app, mut rx) = connected(&server).await;
+        for confirm in [false, true] {
+            publication_action(&mut app, RepoType::Rpm, Act::Create, Value::Null);
+            fill_and_submit(&mut app, &[("repo", "r"), ("checkpoint", "true")]);
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { lines, typed, on_yes, .. }) = app.modal.take() else {
+                panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text))
+            };
+            assert_eq!(typed.as_deref(), Some("r"));
+            let head = "Retain checkpoints 1: the new checkpoint publication of r makes these lose the checkpoint flag:";
+            assert_eq!(lines[..2], [head, "  1 (version 1, 2026-01-01T00:00:00Z)"], "{lines:?}");
+            assert_eq!(bodies(&server, "POST", &pubs).await, Vec::<Value>::new(), "nothing sent");
+            if confirm {
+                on_yes.unwrap()(&mut app);
+                settle(&mut app, &mut rx).await;
+            }
+        }
+        assert_eq!(bodies(&server, "POST", &pubs).await, [json!({ "repository": r, "checkpoint": true })]);
     }
 
     #[tokio::test]

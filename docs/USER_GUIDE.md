@@ -505,7 +505,9 @@ releases, components, indices and more). `/` searches package names or file path
   * **Legacy Release files** (Deb): also the `Release` file of each component and architecture.
   * **Publish upstream Release fields**, **Excluded package metadata fields** (Deb).
   * **Checkpoint**: a checkpoint publication. Pulp then publishes the latest version, so the form
-    refuses a version number.
+    refuses a version number. When the repository has **Retain checkpoints**, the new checkpoint
+    makes Pulp clear the flag of the oldest ones: the confirm lists them, and you type the
+    repository name.
 * **d** deletes. It names the distributions that serve the publication (an APT or a verbatim one)
   and what each one serves after, and you type its id.
 
