@@ -903,6 +903,65 @@ mod tests {
         );
     }
 
+    /// The dry run says why the run stops for a replica, with the checks of the run (F57): a local repository or remote
+    /// of the name without the replica label, a distribution of the name without it, and a new distribution whose base
+    /// path overlaps another one. The replica of this source is updated.
+    #[tokio::test]
+    async fn the_dry_run_names_what_stops_the_run_for_a_replica() {
+        use wiremock::Mock;
+        use wiremock::matchers::{method, path, query_param};
+        let (up, down) = (wiremock::MockServer::start().await, wiremock::MockServer::start().await);
+        serve_status(&up, &["rpm"]).await;
+        serve_status(&down, &["rpm"]).await;
+        let page = |r: Value| json!({ "count": r.as_array().map_or(0, Vec::len), "next": null, "results": r });
+        let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+        let dist = |name: &str| {
+            json!({ "pulp_href": format!("/pulp/api/v3/distributions/rpm/rpm/{name}/"), "name": name, "base_path": name,
+                "base_url": format!("https://up/pulp/content/{name}/"), "publication": "/pulp/api/v3/publications/rpm/rpm/1/" })
+        };
+        let names = ["mine", "over", "remote", "repo", "taken"];
+        let dists = Value::Array(names.map(dist).to_vec());
+        Mock::given(method("GET")).and(path("/pulp/api/v3/distributions/rpm/rpm/")).respond_with(ok(page(dists))).mount(&up).await;
+        let ours = json!({ LABEL_REPLICA: "up" });
+        // (collection, name, labels): what the destination has of that name.
+        let local = [
+            ("repositories", "mine", ours.clone()),
+            ("remotes", "mine", ours.clone()),
+            ("distributions", "mine", ours),
+            ("remotes", "remote", json!({})),
+            ("repositories", "repo", json!({})),
+            ("distributions", "taken", json!({ "team": "x" })),
+        ];
+        for (coll, name, labels) in local {
+            let o = json!({ "pulp_href": format!("/pulp/api/v3/{coll}/rpm/rpm/{name}/"), "name": name, "base_path": name,
+                "pulp_labels": labels });
+            let m = Mock::given(method("GET")).and(path(format!("/pulp/api/v3/{coll}/rpm/rpm/"))).and(query_param("name", name));
+            m.respond_with(ok(page(json!([o])))).with_priority(1).mount(&down).await;
+        }
+        let below = json!([{ "pulp_href": "/pulp/api/v3/distributions/file/file/9/", "name": "local", "base_path": "over/x" }]);
+        let m = Mock::given(method("GET")).and(path("/pulp/api/v3/distributions/")).and(query_param("base_path__contains", "over/"));
+        m.respond_with(ok(page(below))).with_priority(1).mount(&down).await;
+        Mock::given(method("GET")).respond_with(ok(page(json!([])))).mount(&down).await;
+
+        let plan = plan(&client(&up, "up"), &client(&down, "down"), &[RepoType::Rpm], "", None).await.unwrap();
+        let rows: Vec<_> = plan.iter().map(|i| (i.name.as_str(), &i.action, i.note.as_str())).collect();
+        let foreign =
+            |kind: &str, name: &str| format!("conflict: a local {kind} named {name} exists and is not managed by this replication");
+        let taken = r#"conflict: distribution taken exists but lacks ownership labels {"pulp_tui_replica":"up"}: restore them or delete the distribution, then try again"#;
+        assert_eq!(
+            rows,
+            [
+                ("mine", &PlanAction::Update, "re-sync existing replica"),
+                ("over", &PlanAction::Skip, "conflict: base path over overlaps base path over/x of distribution local"),
+                ("remote", &PlanAction::Skip, foreign("remote", "remote").as_str()),
+                ("repo", &PlanAction::Skip, foreign("repository", "repo").as_str()),
+                ("taken", &PlanAction::Skip, taken),
+            ]
+        );
+        let sent = down.received_requests().await.unwrap();
+        assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "a dry run only reads: {sent:?}");
+    }
+
     #[tokio::test]
     async fn a_file_replica_publishes_under_the_upstream_manifest_name() {
         use wiremock::matchers::{method, path, query_param};
