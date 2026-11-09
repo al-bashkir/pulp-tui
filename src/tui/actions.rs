@@ -289,25 +289,12 @@ pub fn confirm_mirror(
         return go(app);
     }
     let complete = policy == "mirror_complete";
-    let git_remotes = RepoType::File.alt_remote().map_or("", |a| a.1);
     app.job("read the retention of the repositories", move |ctx| async move {
-        let (mut goes, mut files, mut gits) = (vec![], vec![], vec![]);
         let picked = match picked {
             Some((colls, name)) => Some(remote_href(&ctx.client, &colls, &name).await?),
             None => None,
         };
-        for href in repos {
-            let r: Value = ctx.client.get(&href, &[]).await?;
-            if latest_goes(&ctx, &r, 1).await?.is_some() {
-                goes.push(s(&r, "name"));
-            }
-            // pulp_file publishes the version of a mirror sync (pass-through, upstream manifest); pulp_deb does not.
-            // Only a File remote has that manifest (pulp_file FileFirstStage): a Git mirror sync fails after its version.
-            if RepoType::from_href(&href) == Some(RepoType::File) {
-                let from_git = picked.clone().unwrap_or_else(|| s(&r, "remote")).contains(git_remotes);
-                if from_git { &mut gits } else { &mut files }.push(s(&r, "name"));
-            }
-        }
+        let (goes, files, gits) = mirror_repos(&ctx, repos, picked).await?;
         ap(move |app| {
             let lines = mirror_lines(&goes, complete, &files, &gits);
             if goes.is_empty() {
@@ -317,6 +304,27 @@ pub fn confirm_mirror(
             }
         })
     });
+}
+
+/// The names of `repos` for `mirror_lines`: those whose current version a mirror sync makes Pulp delete (`goes`), and
+/// the File ones that sync from a File remote and from a Git remote (`picked`: the remote href of the form, else the
+/// default remote of each).
+async fn mirror_repos(ctx: &Ctx, repos: Vec<String>, picked: Option<String>) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
+    let git_remotes = RepoType::File.alt_remote().map_or("", |a| a.1);
+    let (mut goes, mut files, mut gits) = (vec![], vec![], vec![]);
+    for href in repos {
+        let r: Value = ctx.client.get(&href, &[]).await?;
+        if latest_goes(ctx, &r, 1).await?.is_some() {
+            goes.push(s(&r, "name"));
+        }
+        // pulp_file publishes the version of a mirror sync (pass-through, upstream manifest); pulp_deb does not.
+        // Only a File remote has that manifest (pulp_file FileFirstStage): a Git mirror sync fails after its version.
+        if RepoType::from_href(&href) == Some(RepoType::File) {
+            let from_git = picked.clone().unwrap_or_else(|| s(&r, "remote")).contains(git_remotes);
+            if from_git { &mut gits } else { &mut files }.push(s(&r, "name"));
+        }
+    }
+    Ok((goes, files, gits))
 }
 
 /// The mirror confirm: `goes` are the repositories whose current version the sync makes Pulp delete, `complete` is
@@ -1163,39 +1171,16 @@ fn repo_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
         let form = repo_form(t, caps.as_deref(), edit.then_some(&item), &remote);
         app.form(form, move |app, f| {
             let mut body = repo_body(f, edit)?;
-            let remote = body["remote"].as_str().map(str::to_string);
             // pulp_rpm merges the current labels into a request that also has `osv_config` (a removed label would stay),
             // and `pulp_labels` alone drops the OSV label: a label edit goes alone, then the OSV config is set again.
             let osv = (edit && body.get("pulp_labels").is_some() && f.fields.iter().any(|x| x.key == "osv_config"))
                 .then(|| body.as_object_mut().and_then(|b| b.remove("osv_config")));
             // An edit of the retention can make Pulp delete versions at once: those are named first.
             let retention = if edit { body.clone() } else { Value::Null };
-            let (href, remotes, name) = (href.clone(), remotes.clone(), name.clone());
+            let (saved, remotes) = (edit.then(|| href.clone()), remotes.clone());
             let label = format!("{} repository {}", if edit { "update" } else { "create" }, f.get("name"));
-            let target = href.clone();
-            let go = move |app: &mut App| {
-                submit(app, label, move |c| async move {
-                    if let Some(r) = remote {
-                        body["remote"] = remote_href(&c, &remotes, &r).await?.into();
-                    }
-                    if !edit {
-                        return Ok(c.post(&c.api(t.repositories()), &body).await?);
-                    }
-                    let osv = match osv {
-                        // Unchanged in the form: the server's config of now (the list row can be old).
-                        Some(None) => c.get::<Value>(&href, &[("fields", "osv_config".into())]).await?["osv_config"].clone(),
-                        Some(Some(v)) => v,
-                        None => Value::Null,
-                    };
-                    let m = c.patch(&href, &body).await?;
-                    if osv.is_null() {
-                        return Ok(m);
-                    }
-                    ops::settle(&c, m, &ops::no_progress).await?;
-                    Ok(c.patch(&href, &json!({ "osv_config": osv })).await?)
-                })
-            };
-            confirm_retain(app, t, target, name, retention, go);
+            let go = move |app: &mut App| submit(app, label, move |c| save_repo(c, t, saved, body, remotes, osv));
+            confirm_retain(app, t, href.clone(), name.clone(), retention, go);
             Ok(())
         });
     };
@@ -1208,6 +1193,40 @@ fn repo_edit(app: &mut App, t: RepoType, edit: bool, item: Value) {
         }),
         None => open(app, String::new()),
     }
+}
+
+/// Create a repository of type `t` with `body` (`href` None), or PATCH repository `href`; the remote name in `body`
+/// becomes its href first (`remotes`). `osv`: see `patch_repo`.
+async fn save_repo(
+    c: PulpClient,
+    t: RepoType,
+    href: Option<String>,
+    mut body: Value,
+    remotes: Vec<&'static str>,
+    osv: Option<Option<Value>>,
+) -> anyhow::Result<Mutation> {
+    if let Some(r) = body["remote"].as_str().map(str::to_string) {
+        body["remote"] = remote_href(&c, &remotes, &r).await?.into();
+    }
+    let Some(href) = href else { return Ok(c.post(&c.api(t.repositories()), &body).await?) };
+    patch_repo(&c, &href, &body, osv).await
+}
+
+/// PATCH repository `href` with `body`; after a label edit (`osv`, `repo_edit`) the OSV config again: the form's, or
+/// (`Some(None)`) the server's config.
+async fn patch_repo(c: &PulpClient, href: &str, body: &Value, osv: Option<Option<Value>>) -> anyhow::Result<Mutation> {
+    let osv = match osv {
+        // Unchanged in the form: the server's config of now (the list row can be old).
+        Some(None) => c.get::<Value>(href, &[("fields", "osv_config".into())]).await?["osv_config"].clone(),
+        Some(Some(v)) => v,
+        None => Value::Null,
+    };
+    let m = c.patch(href, body).await?;
+    if osv.is_null() {
+        return Ok(m);
+    }
+    ops::settle(c, m, &ops::no_progress).await?;
+    Ok(c.patch(href, &json!({ "osv_config": osv })).await?)
 }
 
 /// The retention in `key` of `b` (an edit body, or a repository): pulpcore cleans up only for a value above 0.
@@ -3526,29 +3545,40 @@ fn publication_create(app: &mut App, t: RepoType) {
         if checkpoint && number.is_some() {
             return Err("Checkpoint publishes the latest version: leave Version number empty".into());
         }
-        app.job(format!("publish {repo}"), move |ctx| async move {
-            let c = &ctx.client;
-            let r = repo_by_name(c, t, &repo).await?;
-            let v = version_or_latest(&r, number)?;
-            let mut body = ops::publication_body(c, t, &v, &options).await?;
-            if checkpoint {
-                body.as_object_mut().expect("an object").remove("repository_version");
-                body["repository"] = s(&r, "pulp_href").into();
-            }
-            let go = move |app: &mut App| {
-                app.job(format!("publish {repo}"), move |ctx| async move {
-                    let c = &ctx.client;
-                    let p = ops::create(c, &c.api(ops::publications_for(t, &options)), &body, "/publications/", &ctx.on_task()).await?;
-                    ap(move |app| {
-                        app.ok(format!("publication {} of {}", short(&p), short(&v)));
-                        app.reload();
-                    })
-                })
-            };
-            if checkpoint { confirm_new_checkpoint(&ctx, t, &r, go).await } else { ap(go) }
-        });
+        app.job(format!("publish {repo}"), move |ctx| new_publication(ctx, t, repo, number, options, checkpoint));
         Ok(())
     });
+}
+
+/// The New publication of version `number` (None: the latest) of repository `repo` with `options`; a `checkpoint` one
+/// of the latest version, after `confirm_new_checkpoint`.
+async fn new_publication(
+    ctx: Ctx,
+    t: RepoType,
+    repo: String,
+    number: Option<i64>,
+    options: Value,
+    checkpoint: bool,
+) -> anyhow::Result<Apply> {
+    let c = &ctx.client;
+    let r = repo_by_name(c, t, &repo).await?;
+    let v = version_or_latest(&r, number)?;
+    let mut body = ops::publication_body(c, t, &v, &options).await?;
+    if checkpoint {
+        body.as_object_mut().expect("an object").remove("repository_version");
+        body["repository"] = s(&r, "pulp_href").into();
+    }
+    let go = move |app: &mut App| {
+        app.job(format!("publish {repo}"), move |ctx| async move {
+            let c = &ctx.client;
+            let p = ops::create(c, &c.api(ops::publications_for(t, &options)), &body, "/publications/", &ctx.on_task()).await?;
+            ap(move |app| {
+                app.ok(format!("publication {} of {}", short(&p), short(&v)));
+                app.reload();
+            })
+        })
+    };
+    if checkpoint { confirm_new_checkpoint(&ctx, t, &r, go).await } else { ap(go) }
 }
 
 /// Delete publication `href` of `version` after the typed confirm, which names each distribution that serves
