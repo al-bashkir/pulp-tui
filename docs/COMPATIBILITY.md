@@ -874,6 +874,14 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
   breaks each later upload of that package into that release ("get() returned more than one
   PackageReleaseComponent", seen live) until orphan cleanup removes it. So pulp-tui looks the pair
   up first (`?package=&release_component=`) and adds the record with `modify/`.
+* **A record adds no release architecture.** A structured publication writes `binary-<arch>`
+  only for the `ReleaseArchitecture` records of the release (and `all`); a package of another
+  architecture is left out of the `Packages` index, and pulp_deb only logs a warning
+  (`tasks/publishing.py`, `add_packages`). `modify/` with a package also runs
+  `handle_duplicate_packages` (`models/repository.py`): it removes each package of the version
+  with the same `package`, `version`, `architecture` (and `architecture_variant`) but another
+  `sha256` or `metadata_sha256`, with its PRCs. The package release component confirm names
+  both (`record_notes`).
 * **`sha256` is `null` until download** for `on_demand` packages. Verify takes the digest
   from the served `Packages` index (what apt checks) and fails when the API differs.
 * **Structured copy.** `deb/copy/` with `structured: true` also copies the

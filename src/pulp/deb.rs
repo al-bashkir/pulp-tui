@@ -355,14 +355,14 @@ pub const PACKAGE_RELEASE_COMPONENTS: &str = "content/deb/package_release_compon
 pub const RECORDS: [&str; 4] =
     ["content/deb/releases/", "content/deb/release_components/", "content/deb/release_architectures/", PACKAGE_RELEASE_COMPONENTS];
 
-/// The href of the package `key` of `version`: `name`, `name_version` or `name_version_arch` (`DebPackage::key`), when
+/// The package (JSON) `key` of `version`: `name`, `name_version` or `name_version_arch` (`DebPackage::key`), when
 /// exactly one package of the version matches.
-pub async fn package_in(c: &PulpClient, version: &str, key: &str) -> Result<String> {
-    let mut q = vec![("repository_version", version.to_string()), ("fields", "pulp_href".into()), ("limit", "2".into())];
+pub async fn package_in(c: &PulpClient, version: &str, key: &str) -> Result<Value> {
+    let mut q = vec![("repository_version", version.to_string()), ("limit", "2".into())];
     q.extend(["package", "version", "architecture"].into_iter().zip(key.splitn(3, '_').map(str::to_string)));
     let p: Page<Value> = c.list(&c.api("content/deb/packages/"), &q).await?;
-    match (p.count, p.results.first().and_then(|r| r["pulp_href"].as_str())) {
-        (1, Some(h)) => Ok(h.to_string()),
+    match (p.count, p.results.into_iter().next().filter(|r| r["pulp_href"].is_string())) {
+        (1, Some(r)) => Ok(r),
         (n, _) => Err(PulpError::Config(format!(
             "{n} packages of version {} match {key:?}: give name_version_arch",
             ops::version_number(version)

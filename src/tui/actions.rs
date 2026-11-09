@@ -3368,7 +3368,8 @@ fn package_record_create(app: &mut App, version: String) {
 }
 
 /// Find `package` in `version`, then add its record with release component `rc` (`name`) to the latest version, after
-/// a confirm when the latest version does not have the package or the release component.
+/// a confirm when the latest version does not have the package or the release component, or pulp_deb does more
+/// (`record_notes`).
 fn package_record_job(app: &mut App, version: String, package: String, name: String, rc: String) {
     app.job(format!("find package {package}"), move |ctx| async move {
         let c = &ctx.client;
@@ -3376,20 +3377,62 @@ fn package_record_job(app: &mut App, version: String, package: String, name: Str
         if let Some(e) = snapshot_refusal(&r) {
             bail!(e);
         }
-        let p = deb::package_in(c, &version, &package).await?;
-        let latest = s(&r, "latest_version_href");
+        let found = deb::package_in(c, &version, &package).await?;
+        let (p, latest) = (s(&found, "pulp_href"), s(&r, "latest_version_href"));
         let units = [("packages/", &p, format!("package {package}")), ("release_components/", &rc, format!("release component {name}"))];
         let back = brought_back(c, &version, &latest, units).await?;
+        let notes = record_notes(c, &latest, &found, &rc).await?;
         ap(move |app| {
             let label = format!("create package release component {package} in {name}");
             let (n, repo) = (version_number(&latest), s(&r, "name"));
             let mut lines: Vec<String> =
                 back.iter().map(|w| format!("NOTE: {w} is not in the LATEST version {n} of {repo}, which gets the record.")).collect();
-            lines.push(format!("The new version has the {} again.", back.join(" and the ")));
+            if !back.is_empty() {
+                lines.push(format!("The new version has the {} again.", back.join(" and the ")));
+            }
+            lines.extend(notes);
             let go = move |app: &mut App| add_package_record(app, version, label, p, rc);
-            if back.is_empty() { go(app) } else { app.confirm("New package release component", lines, go) }
+            if lines.is_empty() { go(app) } else { app.confirm("New package release component", lines, go) }
         })
     });
+}
+
+/// What pulp_deb also does when the latest version `latest` gets the record of package `p` (JSON) in release component
+/// `rc`: `handle_duplicate_packages` removes another build of the same name, version and architecture (other digest)
+/// with its records; a structured publication leaves the package out of `binary-<arch>` when the release has no
+/// release architecture of it (`publishing.py` only logs that). As confirm lines.
+async fn record_notes(c: &PulpClient, latest: &str, p: &Value, rc: &str) -> anyhow::Result<Vec<String>> {
+    if latest.is_empty() {
+        return Ok(vec![]);
+    }
+    let (name, version, arch) = (s(p, "package"), s(p, "version"), s(p, "architecture"));
+    let q =
+        [("repository_version", latest.into()), ("package", name.clone()), ("version", version.clone()), ("architecture", arch.clone())];
+    let builds: Vec<Value> = c.list_all(&c.api("content/deb/packages/"), &q, 1000).await?;
+    let other =
+        |b: &&Value| b["architecture_variant"] == p["architecture_variant"] && ["sha256", "metadata_sha256"].iter().any(|k| b[k] != p[k]);
+    let note = |b: &Value| {
+        let file = s(b, "relative_path");
+        format!(
+            "NOTE: the latest version has another build of {name} {version} {arch} ({file}): pulp_deb removes it and its package release component records."
+        )
+    };
+    let mut notes: Vec<String> = builds.iter().filter(other).map(note).collect();
+    if arch != "all" {
+        let release = s(&c.get::<Value>(rc, &[("fields", "distribution".into())]).await?, "distribution");
+        let q = [
+            ("repository_version", latest.into()),
+            ("distribution", release.clone()),
+            ("architecture", arch.clone()),
+            ("limit", "1".into()),
+        ];
+        if c.list::<Value>(&c.api("content/deb/release_architectures/"), &q).await?.count == 0 {
+            notes.push(format!(
+                "NOTE: release {release} of the latest version has no architecture {arch}: a structured publication leaves the package out of its Packages index (create the release architecture first)."
+            ));
+        }
+    }
+    Ok(notes)
 }
 
 /// The `units` (Deb content path, href, name) of a record from `version` that the latest version `latest` lacks: the
@@ -5919,9 +5962,10 @@ mod tests {
         get(&server, &repo, r).await;
         let comps = json!([{ "pulp_href": rc, "distribution": "bookworm", "component": "main" }]);
         get(&server, &format!("{API}content/deb/release_components/"), page(comps)).await;
-        // `gone` is in the browsed version 1 only, `kept` also in the latest version 3.
+        // `gone` is in the browsed version 1 only, `kept` also in the latest version 3 (also the only build there).
         let (gone, kept) = (format!("{pkgs}1/"), format!("{pkgs}2/"));
-        for (k, v, found) in [("package", "gone", json!([{ "pulp_href": gone }])), ("package", "kept", json!([{ "pulp_href": kept }]))]
+        let pkg = |h: &str, name: &str| json!([{ "pulp_href": h, "package": name, "architecture": "all" }]);
+        for (k, v, found) in [("package", "gone", pkg(&gone, "gone")), ("package", "kept", pkg(&kept, "kept"))]
             .into_iter()
             .chain([("pulp_href__in", gone.as_str(), json!([])), ("pulp_href__in", kept.as_str(), json!([{ "pulp_href": kept }]))])
         {
@@ -5980,7 +6024,8 @@ mod tests {
             .mount(&server)
             .await;
         get(&server, &rcs, page(json!([{ "pulp_href": rc, "distribution": "bookworm", "component": "contrib" }]))).await;
-        get(&server, &format!("{API}content/deb/packages/"), page(json!([{ "pulp_href": pkg }]))).await;
+        let hello = json!({ "pulp_href": pkg, "package": "hello", "architecture": "all" });
+        get(&server, &format!("{API}content/deb/packages/"), page(json!([hello]))).await;
         get(&server, &prc, page(json!([{ "pulp_href": format!("{prc}1/") }]))).await;
         answer(&server, "POST", &format!("{repo}modify/"), 202, json!({ "task": format!("{API}tasks/1/") })).await;
         get(&server, &format!("{API}tasks/1/"), json!({ "pulp_href": format!("{API}tasks/1/"), "state": "completed" })).await;
@@ -5997,6 +6042,57 @@ mod tests {
         yes(&mut app);
         settle(&mut app, &mut rx).await;
         assert_eq!(posts_to(&server, &format!("{repo}modify/")).await, [json!({ "add_content_units": [pkg, rc, format!("{prc}1/")] })]);
+    }
+
+    /// The record of a package from an older version (audit F62): pulp_deb `handle_duplicate_packages` removes another
+    /// build of the same name, version and architecture that the latest version has, and a structured publication
+    /// leaves the package out of `binary-<arch>` when the release has no architecture of the package. The confirm names
+    /// both; nothing is sent before it.
+    #[tokio::test]
+    async fn a_package_release_component_names_the_build_it_replaces_and_a_missing_architecture() {
+        use crate::tui::app::{ListState, Modal, Screen};
+        use wiremock::matchers::{method, path, query_param};
+        let server = wiremock::MockServer::start().await;
+        let (repo, rcs, pkgs, prc) = (
+            format!("{API}repositories/deb/apt/r/"),
+            format!("{API}content/deb/release_components/"),
+            format!("{API}content/deb/packages/"),
+            format!("{API}content/deb/package_release_components/"),
+        );
+        let (v1, v3, rc, pkg) = (format!("{repo}versions/1/"), format!("{repo}versions/3/"), format!("{rcs}1/"), format!("{pkgs}1/"));
+        get(&server, &repo, json!({ "pulp_href": repo, "name": "r", "latest_version_href": v3, "pulp_labels": {} })).await;
+        get(&server, &rcs, page(json!([{ "pulp_href": rc, "distribution": "bookworm", "component": "main" }]))).await;
+        get(&server, &rc, json!({ "pulp_href": rc, "distribution": "bookworm", "component": "main" })).await;
+        get(&server, &format!("{API}content/deb/release_architectures/"), page(json!([]))).await;
+        let build = |href: &str, sha: &str, file: &str| json!({ "pulp_href": href, "package": "hello", "version": "1.0", "architecture": "amd64", "sha256": sha, "relative_path": file });
+        let found = |q: &[(&str, &str)], r: Value| {
+            let m = q.iter().fold(wiremock::Mock::given(method("GET")).and(path(&pkgs)), |m, (k, v)| m.and(query_param(*k, *v)));
+            m.respond_with(wiremock::ResponseTemplate::new(200).set_body_json(page(r)))
+        };
+        found(&[("repository_version", &v1)], json!([build(&pkg, "aa", "hello_1.0_amd64.deb")])).mount(&server).await;
+        found(&[("pulp_href__in", &pkg)], json!([])).mount(&server).await;
+        let other = build(&format!("{pkgs}2/"), "bb", "rebuilt/hello_1.0_amd64.deb");
+        found(&[("repository_version", &v3), ("version", "1.0")], json!([other])).mount(&server).await;
+        get(&server, &prc, page(json!([{ "pulp_href": format!("{prc}1/") }]))).await;
+        let (mut app, mut rx) = connected(&server).await;
+        let k = Kind::Content { version: v1, ctype: 11 };
+        (app.screen, app.list) = (Screen::List(k.clone()), ListState::new(k));
+        run(&mut app, Act::Create, Value::Null);
+        settle(&mut app, &mut rx).await; // the release components of the version
+        fill_and_submit(&mut app, &[("package", "hello"), ("release_component", "bookworm/main")]);
+        settle(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text)) };
+        assert_eq!(
+            lines[2..],
+            [
+                "NOTE: the latest version has another build of hello 1.0 amd64 (rebuilt/hello_1.0_amd64.deb): pulp_deb removes it \
+                 and its package release component records.",
+                "NOTE: release bookworm of the latest version has no architecture amd64: a structured publication leaves the \
+                 package out of its Packages index (create the release architecture first).",
+            ],
+            "{lines:?}"
+        );
+        assert!(server.received_requests().await.unwrap().iter().all(|r| r.method.as_str() == "GET"), "nothing is sent before the confirm");
     }
 
     /// A package release component needs a release component of the version; on a Content View snapshot repository it

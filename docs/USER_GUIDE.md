@@ -472,7 +472,11 @@ releases, components, indices and more). `/` searches package names or file path
   name_version_arch) in one of its release components; pulp-tui reuses an existing record of
   that pair and adds it with its package and release component. From an older version, a package
   or a release component that the latest version does not have comes back into the new version:
-  a confirm names it first. The screen then shows the new version. A structured publication serves the packages of a component in
+  a confirm names it first. The confirm also names another build of the package (same name,
+  version and architecture) in the latest version, which pulp_deb then removes with its records,
+  and a release without an architecture of the package: a structured publication then leaves the
+  package out (create the release architecture first). The screen then shows the new version. A
+  structured publication serves the packages of a component in
   `dists/<distribution>/<component>/`.
 * **x** and **a** send a large selection (above about 27,000 units) in batches, one task after
   the other; each batch makes a new version. The Task Center shows the task of each batch. When

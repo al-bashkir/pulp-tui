@@ -411,7 +411,8 @@ async fn the_tui_creates_release_records_that_a_publication_serves() {
 
 /// Create (c) of a package release component on the Content screen of an older version: the record goes into the
 /// latest version, which removed the package and its release component, so the confirm names both before any change
-/// (audit F33, F50). After yes, the new version has them again, with the record.
+/// (audit F33, F50). The latest version also lacks the release architecture amd64: the confirm says that a structured
+/// publication leaves the package out (audit F62). After yes, the new version has them again, with the record.
 #[tokio::test]
 async fn a_package_release_component_of_an_older_version_confirms_what_comes_back_through_the_tui() {
     if !live_enabled() {
@@ -435,7 +436,12 @@ async fn a_package_release_component_of_an_older_version_confirms_what_comes_bac
     };
     let gone = units(&v1).await;
     assert_eq!(gone.len(), 3, "{gone:?}");
-    ops::settle(&c, ops::remove_content(&c, &repo, gone.clone()).await.unwrap(), &no_progress).await.unwrap();
+    // Version 2 also lacks the release architecture of the package (audit F62), which the record does not bring back.
+    let q = [("repository_version", v1.clone()), ("fields", "pulp_href".into())];
+    let archs = c.list::<Value>(&c.api("content/deb/release_architectures/"), &q).await.unwrap().results;
+    let archs = archs.iter().map(|x| s(x, "pulp_href"));
+    let removed = gone.iter().cloned().chain(archs).collect();
+    ops::settle(&c, ops::remove_content(&c, &repo, removed).await.unwrap(), &no_progress).await.unwrap();
     let v2 = latest(&c, &repo).await;
     assert!(v2.ends_with("/versions/2/"), "{v2}");
 
@@ -451,6 +457,11 @@ async fn a_package_release_component_of_an_older_version_confirms_what_comes_bac
     assert_eq!(typed, None);
     let note = |what: &str| format!("NOTE: {what} is not in the LATEST version 2 of {name}, which gets the record.");
     assert_eq!(lines[..2], [note("package fixture-alpha"), note(&format!("release component {component}"))], "{lines:?}");
+    let arch = format!(
+        "NOTE: release {name} of the latest version has no architecture amd64: a structured publication leaves the package \
+         out of its Packages index (create the release architecture first)."
+    );
+    assert_eq!(lines.last(), Some(&arch), "{lines:?}");
     settle_tasks(&mut app, &mut rx).await;
     let v3 = latest(&c, &repo).await;
     assert!(v3.ends_with("/versions/3/"), "{v3}: {:?}", texts(&app));
