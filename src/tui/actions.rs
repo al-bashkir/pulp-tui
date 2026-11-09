@@ -4670,6 +4670,14 @@ mod tests {
         }
     }
 
+    /// pulpcore cleans up only for a retention above 0 (`retain_keep`): 0 and empty (null) confirm nothing.
+    #[test]
+    fn only_a_retention_above_0_cleans_up() {
+        let b = json!({ "retain_repo_versions": 1, "retain_checkpoints": 0, "empty": null });
+        let keeps = ["retain_repo_versions", "retain_checkpoints", "empty", "absent"].map(|k| retain_keep(&b, k));
+        assert_eq!(keeps, [Some(1), None, None, None]);
+    }
+
     /// pulpcore `protected_versions`, then `cleanup_old_versions` and `cleanup_old_checkpoints` (audit F53): Pulp keeps
     /// the versions that a distribution protects and the newest `keep` others; checkpoint publications lose the flag
     /// (and with it the protection of a checkpoint distribution) before the versions go.
