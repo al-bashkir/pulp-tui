@@ -376,21 +376,7 @@ pub async fn ensure_distribution(
 ) -> Result<String> {
     if let Some(d) = distribution_target(c, t, name, base_path, labels, db).await? {
         let adopt = owner_check(&d, labels, db)?; // passed in `distribution_target`; this gives the label to adopt
-        let repoint = d.publication.as_deref() != publication || d.repository.is_some() || d.repository_version.is_some();
-        if repoint || adopt.is_some() {
-            let mut body = json!({});
-            if repoint {
-                body = json!({ "publication": publication, "repository": null });
-                if d.repository_version.is_some() {
-                    body["repository_version"] = Value::Null;
-                }
-            }
-            if let Some((key, id)) = adopt {
-                // Pulp replaces the whole label map; `labels` are already present (checked above).
-                let mut all = d.pulp_labels.clone();
-                all.insert(key, id);
-                body["pulp_labels"] = json!(all);
-            }
+        if let Some(body) = repoint_body(&d, publication, adopt) {
             let m = c.patch(&d.pulp_href, &body).await?;
             settle(c, m, on).await?;
         }
@@ -408,6 +394,29 @@ pub async fn ensure_distribution(
         on,
     )
     .await
+}
+
+/// The PATCH of `ensure_distribution` for the existing distribution `d`: serve `publication` (only), and `adopt` (label
+/// key, database id) into its labels; None when nothing changes.
+fn repoint_body(d: &Distribution, publication: Option<&str>, adopt: Option<(String, String)>) -> Option<Value> {
+    let repoint = d.publication.as_deref() != publication || d.repository.is_some() || d.repository_version.is_some();
+    if !repoint && adopt.is_none() {
+        return None;
+    }
+    let mut body = json!({});
+    if repoint {
+        body = json!({ "publication": publication, "repository": null });
+        if d.repository_version.is_some() {
+            body["repository_version"] = Value::Null;
+        }
+    }
+    if let Some((key, id)) = adopt {
+        // Pulp replaces the whole label map; the ownership labels are already present (`owner_check`).
+        let mut all = d.pulp_labels.clone();
+        all.insert(key, id);
+        body["pulp_labels"] = json!(all);
+    }
+    Some(body)
 }
 
 /// What `ensure_distribution` does with distribution `name` at `base_path`, read from Pulp before any write: re-point
