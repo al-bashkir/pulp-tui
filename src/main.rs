@@ -71,7 +71,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            eprintln!("error: {}", pulp_tui::session_log::masked(format!("{e:#}")));
             ExitCode::FAILURE
         }
     }

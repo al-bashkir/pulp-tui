@@ -1628,3 +1628,21 @@ async fn deb_source_upload_refuses_another_dsc_of_a_kept_source_and_version_befo
         }
     }
 }
+
+/// Audit F64: the error that the CLI prints names a URL without its user info.
+#[tokio::test]
+async fn cli_errors_show_no_user_info_of_a_url() {
+    let server = MockServer::start().await;
+    let refused = ResponseTemplate::new(400).set_body_json(json!({ "detail": "proxy http://u:p@h/ refused" }));
+    Mock::given(method("GET")).respond_with(refused).mount(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, format!("[profiles.lab]\nurl = \"{}\"\nauth = \"none\"\n", server.uri())).unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_pulp-tui"))
+        .args(["--config", &config.display().to_string(), "--data-dir", &dir.path().display().to_string(), "check"])
+        .output()
+        .await
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("proxy http://•••@h/ refused") && !err.contains("u:p@"), "{err}");
+}

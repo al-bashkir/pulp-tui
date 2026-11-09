@@ -3,7 +3,7 @@
 //! Keeps the last `MAX_ROWS` rows (hidden poll rows are dropped first); each stored body is cut at
 //! `MAX_BODY` bytes. JSON keys in `SECRET_KEYS` (`password`, `token`, `secret`, …) and any key ending in
 //! `_<one of them>` are replaced with `•••` at any depth, and so is the user info of each URL in any string
-//! (`http://•••@host/`), also in the text of a notice. The Authorization header is
+//! (`http://•••@host/`), also in each line of a row (a notice, a body that is not JSON). The Authorization header is
 //! never recorded (`Request` has no header field) and upload bodies are replaced by their size. The log
 //! lives in memory only and is never written to disk.
 
@@ -53,6 +53,8 @@ impl Log {
     }
 
     pub fn push(&mut self, kind: &'static str, server: &str, summary: String, poll: bool, detail: Vec<String>) -> u64 {
+        // The one way into the Logs screen: no row shows the user info of a URL (audit F64: text bodies, errors).
+        let (summary, detail) = (masked(summary), detail.into_iter().map(masked).collect());
         if self.rows.len() >= MAX_ROWS {
             // Hidden polls go first: a long wait must not push the rows the user can see out of the log.
             let i = self.rows.iter().position(|e| e.poll).unwrap_or(0);
@@ -432,6 +434,26 @@ mod tests {
         let (summary, detail) = request_lines(&r);
         assert!(summary.contains("connection refused"));
         assert!(detail.iter().any(|l| l == "<upload, 42 bytes>"));
+    }
+
+    /// Audit F64: the Logs screen shows a text body and a request error without the user info of a URL.
+    #[test]
+    fn logs_show_text_bodies_and_errors_without_user_info() {
+        let r = Request {
+            server: "prod",
+            method: "POST",
+            url: "https://h/pulp/api/v3/x/",
+            status: Err("proxy http://u:p@px/ refused".into()),
+            elapsed: Duration::from_millis(5),
+            request: Body::Text(b"url=http://u:p@h/".to_vec()),
+            response: Body::Text(b"<html>proxy http://u:p@px/ refused</html>".to_vec()),
+        };
+        let (summary, detail) = request_lines(&r);
+        let mut l = Log::new();
+        let id = l.push("request", "prod", summary, false, detail);
+        let shown = format!("{:?} {:?}", l.rows(true), l.detail(id));
+        assert!(shown.contains("url=http://•••@h/") && shown.contains("proxy http://•••@px/ refused</html>"), "{shown}");
+        assert!(!shown.contains("u:p@"), "{shown}");
     }
 
     #[test]

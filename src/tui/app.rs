@@ -572,7 +572,7 @@ impl App {
             }
             Msg::JobProgress { id, text } => {
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
-                    j.progress = text;
+                    j.progress = crate::session_log::masked(text); // a progress line can hold an error (audit F64)
                 }
                 return; // no task changed: the task rows and a watch stay as they are
             }
@@ -1090,7 +1090,7 @@ impl App {
         }
         // Not named "load ...": list reloads cancel those.
         self.load_job("read choices", move |ctx| async move {
-            let result = super::pick::load_options(&ctx, &source, &role).await.map_err(|e| format!("{e:#}"));
+            let result = super::pick::load_options(&ctx, &source, &role).await.map_err(|e| crate::session_log::masked(format!("{e:#}")));
             super::actions::ap(move |app| app.apply_pick(form_id, field, &role, result))
         });
     }
@@ -1148,7 +1148,9 @@ impl App {
         });
     }
 
+    /// A text view. Each line loses the user info of its URLs (audit F64): results that jobs build hold error texts.
     pub fn text(&mut self, title: impl Into<String>, lines: Vec<String>) {
+        let lines = lines.into_iter().map(crate::session_log::masked).collect();
         self.show(Modal::Text { title: title.into(), lines, scroll: 0, watch: None });
     }
 
@@ -2882,6 +2884,39 @@ mod tests {
         app.handle_msg(Msg::TaskPolled { href: "/t/1/".into(), result: Err(failed) });
         let error = app.tasks.items[0].error.clone().unwrap_or_default();
         assert!(error.contains("proxy http://•••@h/ refused"), "{error}");
+    }
+
+    /// Audit F64: a picker load error, a text view (as a replication result makes it) and the job progress in the
+    /// footer show no user info of a URL.
+    #[tokio::test]
+    async fn picker_errors_text_views_and_job_progress_show_no_user_info_of_a_url() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let refused = ResponseTemplate::new(400).set_body_json(serde_json::json!({ "detail": "proxy http://u:p@h/ refused" }));
+        Mock::given(method("GET")).and(path("/pulp/api/v3/roles/")).respond_with(refused).mount(&server).await;
+        let mut app = on_rpm_repos(&server).await;
+        let mut rx = app.rx.take().unwrap();
+        let draw = |app: &App| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+            t.draw(|f| super::super::view::draw(f, app)).unwrap();
+            t.backend().to_string()
+        };
+        app.form(Form::new("Grant", vec![Field::pick("role", "Role", Source::Roles)]), |_, _| Ok(()));
+        app.handle_key(key(KeyCode::Enter));
+        settle(&mut app, &mut rx).await;
+        let s = draw(&app);
+        assert!(s.contains("Could not load choices") && s.contains("http://•••@h/") && !s.contains("u:p@"), "{s}");
+        app.modal = None;
+        app.text("Replication of up FAILED", vec!["sync of http://u:p@h/ failed".into()]);
+        let s = draw(&app);
+        assert!(s.contains("sync of http://•••@h/ failed") && !s.contains("u:p@"), "{s}");
+        app.modal = None;
+        app.spawn("replicate up".into(), false, std::future::pending());
+        let id = app.jobs.last().unwrap().id;
+        app.handle_msg(Msg::JobProgress { id, text: "retry http://u:p@h/".into() });
+        let s = draw(&app);
+        assert!(s.contains("replicate up retry http://•••@h/") && !s.contains("u:p@"), "{s}");
     }
 
     #[tokio::test]
