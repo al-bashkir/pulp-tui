@@ -564,3 +564,67 @@ async fn native_replication_through_the_tui() {
         cleanup_named(&up, t, name).await;
     }
 }
+
+/// Audit F47 (T04): Pulp accepts user info in an Upstream Pulp `base_url`. Through the TUI the list, Details, the
+/// Replicate confirmation, the FAILED result (a closed port), the Task Center row, the notices and the Logs show
+/// `http://•••@host/`, never the password.
+#[tokio::test]
+async fn upstream_base_url_user_info_never_shows_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let dst = client();
+    let caps = Capabilities::detect(&dst).await.unwrap();
+    if !caps.supports(Feature::NativeReplication) {
+        eprintln!("native replication unsupported by this server; skipping");
+        return;
+    }
+    let (name, masked) = (unique("t04-userinfo"), "http://•••@127.0.0.1:9/");
+    let mut body = json!({ "name": name, "base_url": "http://t04user:t04secret@127.0.0.1:9/", "api_root": "pulp/",
+        "q_select": format!("name__startswith=\"{name}\"") });
+    // Without a policy (pulpcore 3.63) a run may delete local objects: no replicate run there.
+    let policy = caps.supports(Feature::ReplicationPolicy);
+    if policy {
+        body["policy"] = "nodelete".into();
+    }
+    let href = ops::create(&dst, &dst.api("upstream-pulps/"), &body, "/upstream-pulps/", &no_progress).await.unwrap();
+    let (mut app, mut rx) = app().await;
+    let screen = |app: &App| {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
+        t.draw(|f| pulp_tui::tui::view::draw(f, app)).unwrap();
+        t.backend().to_string()
+    };
+    open_list(&mut app, &mut rx, Kind::UpstreamPulps, &name).await;
+    // Pulp's error of the failed task names the URL (pulpcore 3.123: "[PLP0014] External service '<url>' failed").
+    let mut error_names_url = false;
+    let mut seen = vec![screen(&app)];
+    assert!(seen[0].matches(masked).count() >= 2, "the base_url column and Details: {}", seen[0]);
+    if policy {
+        let item = row(&app, "name", &name).unwrap();
+        run(&mut app, Act::Replicate, item);
+        seen.push(screen(&app));
+        let (lines, _) = yes(&mut app);
+        assert!(lines.iter().any(|l| l.contains(masked)), "{lines:?}");
+        settle(&mut app, &mut rx).await;
+        seen.push(screen(&app));
+        let Some(Modal::Text { title, lines, .. }) = &app.modal else { panic!("no result: {:?}", texts(&app)) };
+        assert_eq!(title, &format!("Replication of {name} FAILED"), "{lines:?}");
+        error_names_url = lines.iter().any(|l| l.contains(masked));
+        seen.push(lines.join("\n"));
+        assert!(app.tasks.items[0].state == "failed", "{:?}", app.tasks.items[0]);
+        seen.push(format!("{:?}", app.tasks.items[0]));
+    } else {
+        eprintln!("no deletion policy on this server: no replicate run");
+    }
+    seen.extend(texts(&app));
+    let logs: Vec<String> = pulp_tui::session_log::rows(true)
+        .iter()
+        .map(|r| format!("{r} {:?}", pulp_tui::session_log::detail(r["id"].as_u64().unwrap())))
+        .collect();
+    assert!(logs.iter().any(|l| l.contains("upstream-pulps/") && l.contains(masked)), "the Logs body of the list");
+    assert!(!error_names_url || logs.iter().any(|l| l.contains("/tasks/") && l.contains(masked)), "the Logs body of a task poll");
+    seen.extend(logs);
+    let leaks: Vec<&str> = seen.iter().flat_map(|s| s.lines()).filter(|l| l.contains("t04secret") || l.contains("t04user")).collect();
+    assert!(leaks.is_empty(), "{leaks:#?}");
+    cleanup(&dst, &[&href]).await;
+}
