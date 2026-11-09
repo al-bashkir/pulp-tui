@@ -519,6 +519,9 @@ fn wrapped_rows(line: &Line, w: u16) -> usize {
 
 /// Keys of the form itself (the picker has its own hint). At most 90 characters: the box is 98 wide.
 fn form_hint(form: &Form) -> String {
+    if form.held() {
+        return "-- WAIT --  keys do nothing until you stop typing for a moment".into();
+    }
     if form.editing {
         let enter = if form.focus + 1 == form.fields.len() { "submit" } else { "next" };
         return format!("-- EDIT --  Enter: {enter}  Esc: done  Ctrl-S: submit");
@@ -762,6 +765,20 @@ mod tests {
         assert!(form_hint(&form).contains("Enter: next"));
         form.focus = 4;
         assert!(form_hint(&form).contains("Enter: submit"));
+    }
+
+    /// Polish of audit F48: while keys typed after Enter do nothing (the hold), the form footer says so.
+    #[test]
+    fn the_form_footer_shows_the_hold_until_a_pause() {
+        let mut form = Form::new("t", vec![Field::text("a", "A"), Field::new("b", "B", FieldKind::Bool)]);
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        form.handle_key(key(KeyCode::Char('i')));
+        form.handle_key(key(KeyCode::Enter)); // on to the checkbox: the hold starts
+        let s = screen(&form);
+        assert!(s.contains("-- WAIT --") && !s.contains("Space: toggle"), "{s}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let s = screen(&form);
+        assert!(!s.contains("-- WAIT --") && s.contains("Space: toggle"), "{s}");
     }
 
     #[tokio::test]

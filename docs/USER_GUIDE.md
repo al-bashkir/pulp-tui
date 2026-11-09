@@ -121,8 +121,9 @@ These rules apply to all screens. The screen sections do not repeat them.
   in a picker, also go to the next field; on the last field they stay. A next text field is
   edited at once. On a choice, checkbox or picker, the keys that you type after `Enter` without
   a pause of 0.3 s do nothing (also `Backspace`, arrows, `Esc` and `Ctrl-S`), so keys typed
-  ahead never change them and the form never sends a value that you did not see. After a pause
-  they work again.
+  ahead never change them and the form never sends a value that you did not see. The form footer
+  shows `-- WAIT --` in that time. Each key starts the pause again, also `Ctrl-S`: press it once
+  after the footer is back.
 * `Ctrl-S` submits from both modes, also from an open picker. `Esc` in move mode cancels.
 * A form with one text, secret or number field opens in edit mode.
 * Text editing (also in search): `← →`/`Ctrl-B Ctrl-F` one character, `Alt-B Alt-F`/`Ctrl-← Ctrl-→`

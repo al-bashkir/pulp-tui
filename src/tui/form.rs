@@ -589,6 +589,11 @@ impl Form {
         true
     }
 
+    /// Keys typed now do nothing (`hold`); the form footer says so.
+    pub fn held(&self) -> bool {
+        self.hold.is_some_and(|end| std::time::Instant::now() < end)
+    }
+
     pub fn handle_key(&mut self, k: KeyEvent) -> FormEvent {
         self.key_at(k, std::time::Instant::now())
     }
