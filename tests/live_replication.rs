@@ -614,6 +614,8 @@ async fn upstream_base_url_user_info_never_shows_through_the_tui() {
         eprintln!("native replication unsupported by this server; skipping");
         return;
     }
+    // The earlier tests of this binary fill the log; at its cap our task poll rows would be evicted first.
+    pulp_tui::session_log::clear();
     let (name, masked) = (unique("t04-userinfo"), "http://•••@127.0.0.1:9/");
     let mut body = json!({ "name": name, "base_url": "http://t04user:t04secret@127.0.0.1:9/", "api_root": "pulp/",
         "q_select": format!("name__startswith=\"{name}\"") });

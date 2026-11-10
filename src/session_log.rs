@@ -112,6 +112,11 @@ pub fn detail(id: u64) -> Option<Vec<String>> {
     lock().detail(id)
 }
 
+/// Drop every row; ids keep counting. Live tests share one log per process and its cap evicts poll rows first.
+pub fn clear() {
+    lock().rows.clear();
+}
+
 pub fn last_id() -> u64 {
     lock().last_id()
 }
