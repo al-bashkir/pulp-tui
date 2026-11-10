@@ -1,53 +1,75 @@
 # pulp-tui — functional coverage and async consistency audit
 
-Date: 2026-11-09 (audit 7). Revision: `a0aaca9` (`main`, `v0.5.0-181-ga0aaca9`, clean tree except this untracked file).
+Date: 2026-11-10 (audit 8). Revision: `v0.6.0` (`git describe`), `f980f36` (`main`, clean tree).
 Audit only: no source, test, doc or config change. This file is the only output.
 
-This is a re-audit of audit 6 (2026-11-09, also of `a0aaca9`). No commit was made after audit 6
-(`git diff a0aaca9` is empty), so none of its findings can be fixed; section 6.1 confirms that each one is still
-there. The work of this audit went into what audit 6 and the audits before it missed. New findings continue the
-numbering: F76–F97, G19–G20 and T06, so an ID never means two things. The findings of the audits before (F01–F65,
-E01–E03, G01–G18, T01–T04) stay as audit 6 recorded them: fixed, with G03–G18 open by the user's decision.
+This is a re-audit of audit 7 (2026-11-09, of `a0aaca9`). The three commits after it (this file, the 0.6.0 version
+number, one test helper) fix no finding, so F66–F97, G19, G20, T05 and T06 are all still open; section 6.1 gives the
+status of each one. The work of this audit went into what the seven audits before it missed, with other methods than
+theirs (below). New findings continue the numbering: F98–F132, G21, G22 and T07, so an ID never means two things. The
+findings of the older audits (F01–F65, E01–E03, G01–G18, T01–T04) stay as recorded: fixed, with G03–G18 open by the
+user's decision.
 
 ## 1. Executive summary
 
-The audit-6 findings F66–F75 and T05 are all still open (same revision). The full test suite passed again on fresh
-containers at `a0aaca9` (685 unit, 53 mock HTTP, 162 live and 3 `real` tests on pulpcore 3.123.1; 2796 s; section 8).
+**Earlier findings.** None is fixed (no code change). Two that were static are now reproduced on a server with
+domains: F89 [R36] and F90 [R37]. F67 has a second entry point, and F94 two more lines (section 6.1).
 
-Five reviewers with no earlier context searched one area each (repositories and remotes; versions, content,
-publications and distributions; the app shell and Task Center; pulpcore administration; Content Views and the store).
-Three other reviewers then tried to disprove each candidate against the code and the Pulp source in the container.
-22 findings survived. Three are P2, and all three were reproduced through the real binary in this audit:
+**Suite.** The full test suite passed on fresh containers at `f980f36`: 685 unit, 53 mock HTTP, 162 live and 3 `real`
+tests on pulpcore 3.123.1, every call exit 0, 2757 s (section 8).
 
-* **F76 (P2)**: **Reclaim** says "Pulp deletes the stored files of its synced content that no other repository
-  has". pulpcore (3.63.36, 3.95.3 and 3.123.1 have the same code) keeps back only shared *published metadata*; it
-  deletes the files of every other unit that the repository shares with other repositories, Content View snapshots
-  included. Runtime [R29]: after a typed Reclaim of `a7-src`, the three units of repository `a7-copy` had
-  `artifact: null`. They come back only on demand, and only while the upstream still serves them.
-* **F77 (P2)**: **ACS Edit** of an ACS with no paths (Pulp stores `[""]`) skips the "Remove ACS paths" check, and
-  pulpcore then deletes the `""` path row of *every* ACS on the server. Runtime [R30]: no dialog; the other ACS went
-  from `[""]` to `[]`; its next Refresh made an empty task group ("Refreshing 0 alternate content source paths")
-  that the Task Center shows as `gone`, "its tasks were purged". That ACS never indexes again.
-* **F78 (P2)**: **Delete of a Content View version** can delete version 0 of a snapshot repository. Every later
-  unfiltered RPM or Deb publish of that view then fails, and Resume cannot repair it. Runtime [R31]: v1 of `a7cv`
-  recorded `…/versions/0/` (first publish of an empty source); after v2 and the typed delete of v1, Publish v3 failed
-  with Pulp's 400 "Version 0 does not exist for repository 'pulp-tui-cv-a7cv-a7-os'".
+**What this audit did that the earlier ones did not.** It ran the TUI against three kinds of server that no earlier
+audit and no test uses: a server with domains, a server with the default `CONTENT_ORIGIN` (not set), and a 3.63.36
+server for the form paths (the suite on old images creates most objects through the API). It swept every form
+field against the serializers of the three supported images, compared the OpenAPI paths with the client by script,
+and reviewed selection identity and Connect in the shell. 43 candidates came out; the lead reproduced 18 at runtime,
+and three reviewers with no earlier context tried to disprove the others.
 
-19 findings are P3. Three of them were reproduced at runtime: **F79** Distribute in follow mode reports
-"[ok] … serves URL" for a repository with no publication, and the URL answers 404 [R32]; **F80** the palette entry
-"Tasks: dismiss finished" does not remove the stored references, so the 10 dismissed rows came back after a restart
-[R33]; **F81** the RPM Checksum type choice offers `sha224`, which Pulp refuses with 400 [R34]. The others are static
-findings, each checked against the plugin source: a false RPM `nested_by_digest` verify (F82), a File mirror sync
-that the confirm accepts and Pulp refuses (F83), an `import-repos` that refuses every RPM repository with an OSV
-config (F84), the Restore wording (F85), the false "Staff (bypasses RBAC)" texts (F86), self-lockout through a group
-(F87), and smaller gaps in export, guard, domain, upstream, pagination, Task Center, config and Content View paths
-(F88–F97).
+**Result: 35 new findings (11 P2, 24 P3), 2 new gaps. No P0, no P1.** 17 findings are runtime verified. The P2
+findings:
 
-Two new Pulp → client gaps: content labels (G19) and a self-service password change (G20).
+* **F98 [R48]** — After **Connect** from a sub-list, the list of the previous server stays while "connecting...". A
+  form opened in that window is sent to the new server: the role of "user a8-x1" went to another user with the same
+  number on the other server, and the result said "assign … to user a8-x1: done".
+* **F107 [R60]** — A **filtered RPM Content View publish** after the source replaced a modulemd: the preview said
+  "+0 added, -0 removed"; the version that became active in Library had none of the selected packages. Pulp removes
+  the packages of a removed modulemd between pulp-tui's remove request and its add request.
+* **F99 [R44], [R45]** — On a server with the default **`CONTENT_ORIGIN`** (not set; so in pulpcore 3.95.3 and 3.123.1, not in 3.63.36), `base_url` is
+  relative: every Verify is MISMATCH, every environment is DRIFT with the hint "repair the snapshot", the Rollback
+  check and fallback replication fail. **F105** (static): the same for object storage, where the content app answers 302.
+* **F100 [R46]** — **Remote Delete** says "Repository content and versions are not affected". Pulp deletes the
+  remote artifacts with the remote: on-demand content that was not downloaded yet answers 404 from then on.
+* **F101 [R52]** — **Native replication** with policy `nodelete` ("never delete local objects", confirm `y`) took
+  over a local repository and distribution that had the name of an upstream distribution: content replaced, labels
+  replaced, distribution re-pointed.
+* **F102 [R49]**, **F103 [R50]**, **F104 [R58]** — on a **3.63.36** server: every Deb repository Create from the
+  form fails (`autopublish` is sent with no capability check); every RPM repository Edit erases `repo_config` (a
+  pulp_rpm 3.27 quirk that the TUI does not know); Deb fallback replication from 3.11 into an older pulp_deb fails
+  after the sync, on every rerun.
+* **F106** (static) — an upload into a repository with a **package signing service** ends in "digest mismatch",
+  though Pulp signed and added the package.
+* **F109 [R62]** — for a user that is **not a superuser**, the Delete and Edit impacts say "No distribution uses
+  it" from lists that Pulp scopes to the user. A guard owner deleted a guard behind that text, and the distribution
+  that used it went from 403 to public.
 
-The task model is still sound: only `completed` is success, dependent steps wait for their tasks, no mutation is
-retried, and a `202` is never shown as done. The new async findings are about what a final state *says*: F77 calls an
-empty task group "purged", F79 says "serves" for a 404, F80 brings dismissed rows back.
+P3 findings reproduced at runtime: an empty role description is refused (F110); a config save removes what another
+process added to the file (F111); File Content search is 400 on the older images (F112); Verify of a guarded
+distribution says MISMATCH (F113); the Task Center filter hides nothing (F114); the header shows the edited URL while
+requests go to the old server (F115); the delete of an import task is a bare 500 (F116); Remove of a modulemd takes
+its packages with it and counts one unit (F117). 15 more P3 findings are from code reading (F108, F118–F132).
+
+**New gaps.** G21 [R43]: an uploaded Deb source package is in no `Sources` index of a structured publication,
+because the TUI cannot create a source package release component. G22: content create from a URL (`file_url`).
+
+**Rows that are verified now.** Domains (create, edit, migrate storage, delete), Copy URL (OSC 52), the Artifacts
+screen, the `z` dismiss, the Dashboard reload on a task end, and a host switch while a task runs were ❓ until
+audit 7. They are proven now ([R35]–[R42]). One ❓ is left: a sync from a ULN remote (needs an account).
+
+**Task model.** It is still sound: only `completed` is success, dependent steps wait for their tasks, no mutation is
+retried, a `202` is never shown as done, and a task that ends on another screen or across a host switch is shown
+with its final state. The new async findings are of three kinds: state of the previous server that survives a
+Connect (F98, F115); a check after a completed task that reports a wrong result (F99, F105, F106, F113); and two
+`modify/` tasks between which Pulp changes the version (F107).
 
 ### Coverage summary (from the matrix in section 10)
 
@@ -55,27 +77,39 @@ Cells: ✅ / ❌ / ❓ / — (not applicable). `—` is not in any coverage rati
 
 | Plugin / area | Rows | Pulp API | API client | Available in TUI | Works end-to-end | Async state consistent |
 |---|---:|---|---|---|---|---|
-| `pulp-tui` | 40 | 0 / 0 / 0 / 40 | 40 / 0 / 0 / 0 | 40 / 0 / 0 / 0 | 39 / 1 / 0 / 0 | 20 / 0 / 1 / 19 |
-| `pulp_deb` | 33 | 32 / 1 / 0 / 0 | 32 / 0 / 0 / 1 | 32 / 0 / 0 / 1 | 31 / 1 / 0 / 1 | 27 / 0 / 0 / 6 |
-| `pulp_file` | 47 | 47 / 0 / 0 / 0 | 47 / 0 / 0 / 0 | 47 / 0 / 0 / 0 | 44 / 2 / 1 / 0 | 36 / 1 / 0 / 10 |
-| `pulp_rpm` | 44 | 44 / 0 / 0 / 0 | 43 / 1 / 0 / 0 | 43 / 1 / 0 / 0 | 40 / 2 / 1 / 1 | 35 / 1 / 1 / 7 |
-| `pulpcore` | 72 | 69 / 2 / 0 / 1 | 54 / 16 / 0 / 2 | 54 / 16 / 0 / 2 | 50 / 1 / 3 / 18 | 39 / 0 / 2 / 31 |
-| **All** | 236 | 192 / 3 / 0 / 41 | 216 / 17 / 0 / 3 | 216 / 17 / 0 / 3 | 204 / 7 / 5 / 20 | 157 / 2 / 4 / 73 |
+| `pulp-tui` | 42 | 0 / 0 / 0 / 42 | 42 / 0 / 0 / 0 | 42 / 0 / 0 / 0 | 38 / 4 / 0 / 0 | 22 / 1 / 0 / 19 |
+| `pulp_deb` | 36 | 35 / 1 / 0 / 0 | 34 / 1 / 0 / 1 | 34 / 1 / 0 / 1 | 29 / 5 / 0 / 2 | 27 / 1 / 0 / 8 |
+| `pulp_file` | 48 | 47 / 1 / 0 / 0 | 47 / 1 / 0 / 0 | 48 / 0 / 0 / 0 | 43 / 5 / 0 / 0 | 36 / 1 / 0 / 11 |
+| `pulp_rpm` | 46 | 46 / 0 / 0 / 0 | 45 / 1 / 0 / 0 | 45 / 1 / 0 / 0 | 38 / 6 / 1 / 1 | 36 / 2 / 1 / 7 |
+| `pulpcore` | 75 | 72 / 2 / 0 / 1 | 56 / 17 / 0 / 2 | 56 / 17 / 0 / 2 | 52 / 4 / 0 / 19 | 41 / 0 / 0 / 34 |
+| **All** | 247 | 200 / 4 / 0 / 43 | 224 / 20 / 0 / 3 | 225 / 19 / 0 / 3 | 200 / 24 / 1 / 22 | 162 / 5 / 1 / 79 |
 
 Reading the numbers (counted from the rows of section 10 with a script):
 
-* **Rows:** 236 (audit 6: 234). New rows: G19 and G20 (both `pulpcore`).
-* **API client and TUI:** the 17 ❌ rows are the open gaps G03–G18 (decision) and the new G19, G20.
-* **Works end-to-end:** 204 of 216 applicable rows are proven through the TUI against real Pulp (audit 6: 210 of 216). The 7 ❌ rows are F66 (still open), F76 (Reclaim: File [R29], RPM and Deb static), F77 (ACS Edit: File [R30], RPM static) and F78 (Content View version delete [R31]). The 5 ❓ rows are unchanged: domains, ULN sync, Copy URL, the Artifacts screen, Task Center dismiss (now with F80 for its palette path).
-* **Async state consistent:** 157 proven, 2 inconsistent, 4 not proven (audit 6: 159 / 0 / 4). The 2 ❌ rows are the File and RPM ACS refresh rows (F77: an empty task group shown as `gone`, "its tasks were purged" [R30]).
-* P3 findings are named in their rows but do not set ❌ (the rule of the audits before).
+* **Rows:** 247 (audit 7: 236). The 11 new rows: G21, G22; one row for each case where a supported server version
+  or set-up behaves in another way (F102, F103, F104, F112, F106 for RPM and for Deb, F105, F109); F107.
+* **API client:** the 20 ❌ rows are the gaps G03–G18 (decision), G19, G20, the new G21 and G22, and the File search
+  filter that the older servers do not have (F112).
+* **Works end-to-end:** 200 of 225 applicable rows are proven through the TUI against real Pulp. 24 ❌ rows (audit 7:
+  7): the 7 of before (F66, F76 ×3, F77 ×2, F78) and 17 new ones: F99 (Verify ×3, drift), F100 (Remote delete ×3),
+  F101, F102, F103, F104, F105, F106 (×2), F107, F109, F112. 10 of the 17 have a runtime proof; 7 say "static" in
+  their row (F99 for RPM and Deb, F100 for RPM and Deb, F105, F106 ×2 — the last three with no runtime proof for
+  any type). 1 ❓ row (audit 7: 5): the ULN sync.
+* **Async state consistent:** 162 proven, 5 inconsistent, 1 not proven (audit 7: 157 / 2 / 4). The ❌ rows: the two
+  ACS refresh rows (F77), Connect (F98), and the two signing-upload rows (F106, static).
+* The rules for ❌ are at the top of section 10. The 24 ❌ do not mean that 24 features fail on the tested `latest`
+  server with its test settings: there, the suite and the earlier runs still pass. They are failures on another
+  supported version, on the default content origin, or behind a text that says the opposite of what Pulp does.
 
 ## 2. Scope and environment
 
 ### Repository and tools
 
-* pulp-tui `v0.5.0-181-ga0aaca9`, one Rust binary, about 43,000 lines in `src/` (unit tests in the same files).
-  Rust 1.99.1, Fedora 44, Linux 7.2.
+* pulp-tui `v0.6.0` (`f980f36`), one Rust binary, about 43,000 lines in `src/` (unit tests in the same files).
+  Fedora 44, Linux 7.3. Against `a0aaca9` (the revision of audits 6 and 7) the source differs only by
+  `session_log::clear()` (`src/session_log.rs:115-119`, a helper for one live test), the version number and the CI
+  timeout: `git diff a0aaca9..HEAD -- src tests Cargo.toml .github`. Later lines of `src/session_log.rs` moved down
+  by 5; every other line number of the earlier findings is still valid.
 * Tests: `cargo test` (unit + `tests/mock_http.rs`), live tests `tests/live_*.rs` through `tests/run-live.sh`.
 
 ### Supported plugins (from code and UX)
@@ -96,19 +130,23 @@ No unused generated client or scaffolding: the REST layer is hand-written. Two h
 
 | Source | pulpcore / pulp_file | pulp_rpm | pulp_deb | Notes |
 |---|---|---|---|---|
-| Tested in this audit (`quay.io/pulp/pulp:latest`, image of 2026-11-01, fresh containers) | 3.123.1 | 3.39.5 | 3.11.1 | certguard 3.123.1; `domain_enabled: false`; read from `status/` in this session |
-| Source read in this audit (`podman run --rm` of the `3.95.3` and `3.63.36` images) | 3.95.3 / 3.63.36 | 3.34.0 / 3.27.12 | 3.8.1 / 3.5.4 | used to scope F76, F77, F78, F81, F83, F84, G20 by version; no suite run on them in this audit |
-| Audit 6 (same revision `a0aaca9`) | 3.123.1 and 3.95.3 | | | every scenario and `real` passed on both (section 8 of audit 6) |
+| Suite of this audit (`quay.io/pulp/pulp:latest`, fresh containers pulp1, pulp2) | 3.123.1 | 3.39.5 | 3.11.1 | certguard 3.123.1; `domain_enabled: false`; read from `status/` in this session |
+| Runtime runs of this audit, server `dom` (own container of the `latest` image, `DOMAIN_ENABLED = True`) | 3.123.1 | 3.39.5 | 3.11.1 | used for the domain rows, F89, F90 and most new findings; restarted once without `CONTENT_ORIGIN` (F99) |
+| Runtime runs of this audit, server `old` (own container of the `3.63.36` image) | 3.63.36 | 3.27.12 | 3.5.4 | used for F102, F103, F104, F112 and F113: each claim about this version was run on it |
+| Source read in this audit (copied out of the three images to a scratch folder) | 3.123.1 / 3.95.3 / 3.63.36 | 3.39.5 / 3.34.0 / 3.27.12 | 3.11.1 / 3.8.1 / 3.5.4 | every Pulp line number in section 6.2 is from these copies; no suite and no runtime run on 3.95.3 in this audit |
+| Audits 5 and 6 (code equal to this revision but for the test helper) | 3.123.1, 3.95.3, 3.63.36 | | | every scenario and `real` passed on all three |
 
 ### Test hosts
 
 `http://127.0.0.1:8080` (pulp1) and `http://127.0.0.1:8081` (pulp2), local podman containers from
 `tests/env/pulp-env.sh`. No container ran before this audit; `down-all` ran at the start of the suite and at the end
 of the audit. User `admin` with the test-only password of the script. PostgreSQL 16 on `127.0.0.1:55432`. Fixture
-HTTP server on port 8000, and a second one on port 8011 (scratch folder) with three random files for F76 and F77, so
-that the Reclaim could not touch content that the suite shares. The runtime runs used their own config file and data
-directory in a scratch folder with one `pulp1` profile (secret `env:PULP_PASSWORD`). No secret appears in this
-report.
+HTTP server on port 8000. Two more containers were made for the runtime runs, with their own names, ports, volumes
+and settings files in the scratch folder, and removed at the end: `dom` (`127.0.0.1:8090`, `latest`, domains on) and
+`old` (`127.0.0.1:8091`, `3.63.36`). The runtime runs used their own config file and data directory in the scratch
+folder (profiles for pulp1, pulp2, `dom` in two domains, and `old`; secret `env:PULP_PASSWORD`). The suite ran on
+pulp1 and pulp2 at the same time; the only audit object on them was one user on pulp2 (made and deleted for F98).
+No secret appears in this report.
 
 ### Assumptions and limits
 
@@ -117,9 +155,13 @@ report.
   runtime proof, except where the row says "static".
 * Content Views, environments, fallback replication and repository definitions are pulp-tui concepts, not Pulp
   APIs: `pulp-tui` rows with `—` in the Pulp API column.
-* Not verified: domains (disabled on the server), ULN sync (needs an account), a TLS-terminating outer proxy (F92),
-  macOS/Windows, two TUI sessions on one shared database.
-* The runtime runs ran while the live suite ran on the same pulp1, with other object names.
+* Not verified: ULN sync (needs an account), a TLS-terminating outer proxy (F92), object storage (S3, Azure, GCS:
+  F105 is static), a package signing service (F106 is static), macOS/Windows, two TUI sessions on one shared
+  database. A user that is not a superuser was used for one run only (F109, [R62]); F121 is static.
+* Domains are verified in this audit for the first time (server `dom`). The domain rows of the matrix were ❓ in
+  audits 2 to 7.
+* A finding that names an older server version was run on that version (`old`, 3.63.36) or is marked static. No run
+  was made on 3.95.3: where a finding names 3.95.3, the evidence is the plugin source of that image.
 
 ## 3. Architecture and feature inventory
 
@@ -167,21 +209,31 @@ returns an `Apply` closure that changes `App` on the UI thread.
 | Tasks | `Tasks`, `ServerTasks(filters)`, `TaskGroups`, `Workers` | WatchTask, Inspect, CancelTask, DismissTasks, TrackTask, Filter, Delete, PurgeTasks | `task_action` | `ops::get_task`, `wait_task` |
 | Servers | `Profiles` | Connect, TestProfile, CRUD, StoreSecret, ExportCv, ImportCv, ExportRepos, ImportRepos | `profile_action` | `src/config.rs`, `src/repo_export.rs` |
 
-Registry check: `src/tui/kinds.rs` is unchanged since audit 5; every action in `Kind::actions` has a handler arm; no
-TODO, FIXME, `todo!` or `unimplemented!` in `src`. `Act::mutates` treats an action as mutating unless it is listed
-as read-only, so every new impact job is blocked in read-only mode too.
+Registry check (this session): `src/tui/kinds.rs` is unchanged since audit 5. A reviewer read each `(Kind, Act)` pair
+of `Kind::actions` (`kinds.rs:911-998`) against the dispatch in `actions::run` (`actions.rs:427-462`): every action
+has an arm that does real work, and no arm is unreachable except `MigrateDb` / `CopyDb` (offered on Connect, on
+purpose). `Act::mutates` treats an action as mutating unless it is listed as read-only, and the client itself refuses
+POST, PATCH, PUT and DELETE for a read-only profile (`client.rs:287-342`), so a form or confirm closure cannot send a
+mutation either. One write is outside that guard: the Library row of the shared database (F128).
 
-**OpenAPI cross-check (this session).** The live `docs/api.json` of pulp1 (3.123.1) has 598 operations for pulpcore,
-certguard, rpm, file and deb. Every operation maps to a matrix row, to a G gap, or to an `ObjectRoles` screen
-(`list_roles`/`add_role`/`remove_role`/`my_permissions` also on tasks, uploads and task schedules), with two new gaps:
-the `set_label`/`unset_label` operations of every content type (G19) and `PATCH login/` (G20). `DELETE login/`
-(logout) has no use with Basic auth. Pulp's newer `content/file/files/upload/` and `content/rpm/packages/upload/`
-endpoints are not used; the TUI posts to the content collection, which is equivalent.
+**OpenAPI cross-check (this session).** The live `docs/api.json` of pulp1 (3.123.1) has 1200 operations; 596 are for
+pulpcore, certguard, rpm, file and deb (a script over the paths; audit 7 counted 598 with another filter). The 101
+collection paths were compared with the path strings in `src/` by a script; the 111 per-object paths (without the
+role and label sub-paths) were compared by hand with the matrix rows. Every operation maps to a
+matrix row, to a G gap, or to an `ObjectRoles` screen (`list_roles` / `add_role` / `remove_role` / `my_permissions`
+also on tasks, uploads and task schedules). Collections that `src/` never names: the OpenPGP ones (G05),
+`distributions/core/artifacts/` (G06), `datarepair/7272/` and `livez/` (G13), `docs/api.yaml`, and Pulp's
+`content/file/files/upload/` and `content/rpm/packages/upload/` (the TUI posts to the content collection, which is
+equivalent). The check found one gap that the earlier audits missed: `POST content/deb/source_release_components/`
+(G21: the record Create of the TUI has four of the five release record types, `deb::RECORDS`, `src/pulp/deb.rs:355-356`).
+A reviewer added `file_url` on content create (G22). `DELETE login/` (logout) has no use with Basic auth. Deb content
+collections with POST that the TUI does not post to on purpose: `package_indices`, `source_indices`,
+`installer_file_indices`, `release_files` (index files of a synced repository; a verbatim publication serves them).
 
 ## 4. Missing Pulp → client features
 
 G03–G18 are unchanged since audit 3 and open by the user's decision (known gaps, built on demand only). G19 and G20
-are new.
+are from audit 7 and still open. G21 and G22 are new.
 
 | ID | Plugin | Pulp operation | Notes |
 |---|---|---|---|
@@ -203,6 +255,8 @@ are new.
 | G18 | pulpcore | `reclaim_space` of several repositories in one task | `ops::reclaim_space` takes one repository |
 | G19 | pulpcore / all content types | `{content}set_label/`, `{content}unset_label/` (content labels) | In the 3.123.1 OpenAPI for every RPM, File and Deb content type. The Content screens show no labels and cannot set them. Low demand; capability-gate it if built |
 | G20 | pulpcore | `PATCH login/` with `old_password` / `new_password` (`LoginUpdateSerializer`, `viewsets/user.py:454-461`; allowed to any authenticated user) | The client only reads `GET login/` (`src/pulp/caps.rs:116`). The Users screen needs the default admin-only policy, so a normal user cannot change their own password in the TUI. Not in pulpcore 3.95.3 (no `patch` on `LoginViewSet`); gate on `has_operation` |
+| G21 | pulp_deb | `POST content/deb/source_release_components/` (`source_package`, `release_component`; `SourcePackageReleaseComponentSerializer`, pulp_deb 3.11.1 `app/serializers/content_serializers.py:1394-1414`; in the 3.123.1 OpenAPI) | New, **runtime verified** [R43]. The TUI uploads a `.dsc` (`deb::upload_source`) but its record Create knows only `releases`, `release_components`, `release_architectures` and `package_release_components` (`deb::RECORDS`, `src/pulp/deb.rs:355-356`). A structured APT publication (the default mode) lists only source packages that have this record (`pulp_deb/app/tasks/publishing.py:310-350`); simple mode lists all (`:181-184`). Run: `.deb` uploaded into `stable` / `main`, then `fixture-src_1.0-1.dsc` ("new version 2"), Publish with Simple and Structured, Distribute: `dists/stable/main/source/Sources` is 200 with 0 bytes; `dists/default/all/source/Sources` lists `fixture-src`. The upload result and `docs/USER_GUIDE.md:222-229` do not say it. Smallest fix: add the fifth type to `deb::RECORDS` with a form like the package release component one |
+| G22 | pulpcore / all content types | Content create from a URL: `file_url` on `POST content/<type>/` (pulpcore `plugin/serializers/content.py:42`; 3.95.3 `:43`; 3.63.36 `:41`; in `file.FileContent`, `rpm.Package`, `deb.Package` of the OpenAPI), with `downloader_config` on 3.123.1 only (`:48`) | New (static). The upload forms take a local path only. Low demand; `pulp_labels` on create belongs to G19 |
 
 Pulp unavailable (not a pulp-tui defect): signing-service create (no API), task-schedule create/edit (GET only),
 Deb copy with dependency solving (pulp_deb raises `FeatureNotImplementedError`), Pulp export `dry_run` (accepted but
@@ -212,34 +266,48 @@ ignored by pulpcore 3.123.1), the repository list of an export before the import
 
 ## 5. Client → TUI exposure gaps
 
-The client layer has no orphan operation (two dead helpers, section 2). No new exposure gap.
+The client layer has no orphan operation (two dead helpers, section 2): no client method waits for a TUI path. The
+reverse case exists once: `ops::sees_everything` (`src/pulp/ops.rs:478-484`) tells whether the user sees all objects,
+but only the Content View left-out step uses it; the Delete impacts of the Pulp screens do not (F109). One screen
+state is reachable that no screen list offers: a parameterised sub-list of the previous server after a Connect (F98).
 
 ## 6. Broken or incomplete TUI workflows
 
-Evidence: **runtime** = PTY run of the real binary against pulp1 in this session (section 8); **static** = code
-reading, with the Pulp behavior checked in the plugin source of the container where named.
+Evidence: **runtime** = PTY run of the real binary against a real Pulp server (section 8: [R35]–[R62] are of this
+session; lower numbers are of the earlier audits at the same code); **static** = code reading, with the Pulp behavior
+checked in the plugin source of the image where named.
 
-### 6.1 Status of the audit-6 findings
+### 6.1 Status of the findings of the previous audit
 
-`git diff a0aaca9` is empty and `HEAD` is `a0aaca9`, so no fix exists. The code of each finding was read again.
+The previous audit (audit 7) left F66–F75 and T05 (from audit 6) and F76–F97, G19, G20 and T06 (its own) open. No
+commit after it changes the code of a finding: `git diff a0aaca9..HEAD -- src` has only `session_log::clear()`
+(section 2). So **no finding is fixed**. This audit did not only repeat that: it ran two findings that were static
+until now (F89, F90: both reproduced on a server with domains), and it found a second entry point for F67.
 
-| ID | Status | Evidence in this audit |
-|---|---|---|
-| F66 (P2) | not fixed | the Delete impact `actions_admin.rs:505-531` still checks only direct composite membership (`members.contains(&href)`); `guard_reach` is not called |
-| F67 | not fixed | `distribute` → `pinned_publication` before `ensure_distribution`, unchanged |
-| F68 | not fixed | `confirm_distribute` refuses a checkpoint distribution only for a pin, unchanged |
-| F69 | not fixed | `bind_target` `?` on `named_distribution`, unchanged |
-| F70 | not fixed | `resume_library_step`, unchanged |
-| F71 | not fixed | `verify_repo` compares only what is served, unchanged |
-| F72 | not fixed | the Publish preview, unchanged |
-| F73 | not fixed | `add_to_repo`, `copy_preview` without `latest_goes`, unchanged |
-| F74 | not fixed | `Tasks::poll_failed` / `stop` (`tasks.rs:125-142`) have no `is_final` check; `finish_task` (`store.rs:677-686`) has no `WHERE finished_at IS NULL` |
-| F75 | not fixed | `role_form` (`actions_admin.rs:344-369`) PATCHes at once |
-| T05 | not done | no new test |
-| Polish of audit 6 | not done | unchanged |
+| ID | Pri | Status | Evidence in this audit |
+|---|---|---|---|
+| F66 | P2 | not fixed | `actions_admin.rs:505-531` unchanged; the new F109 is another cause of the same false "No distribution uses it." |
+| F67 | P3 | not fixed, wider | `distribute` unchanged. New: the New / Edit distribution form has the same order (`save_distribution` `actions.rs:4002-4011` → `binding_fields` `:3986-3999` → `pinned_publication` `:3994` before the POST or PATCH; no `ops::overlapping_distribution` first). Fix both entry points together |
+| F68–F73 | P3 | not fixed | files unchanged |
+| F74 | P3 | not fixed | `tasks.rs:125-142`, `store.rs:677-686` unchanged |
+| F75 | P3 | not fixed | `role_form` unchanged; the new F110 is in the same function |
+| F76 | P2 | not fixed | `reclaim` text `actions.rs:2018` unchanged |
+| F77 | P2 | not fixed | `acs_paths`, `acs_edit` unchanged |
+| F78 | P2 | not fixed | `row_objects` `cv.rs:2055-2084` unchanged |
+| F79–F88 | P3 | not fixed | files unchanged |
+| F89 | P3 | not fixed, **now runtime verified** | [R36] on a server with domains: guard `a8-g` is the `default_content_guard` of domain `a8x`; Delete says "Delete content guard a8-g (core/header). No distribution uses it."; after the typed name the domain has `default_content_guard: null` |
+| F90 | P3 | not fixed, **now runtime verified** | [R37] the profile's domain is `a8x`; Domains → `a8x` → `d`: the impact has no line about the profile; after the typed name "task completed: delete domain a8x", then the Domains title says "error: not found [404]" over the old rows and every other screen says "Error: not found [404]" |
+| F91–F93 | P3 | not fixed | files unchanged |
+| F94 | P3 | not fixed, wider | also `path.is_file()` in two form submit closures (`actions.rs:1695`, `:1840`): a `stat` on the UI thread |
+| F95–F97 | P3 | not fixed | files unchanged |
+| G19, G20 | — | open | no client method |
+| T05, T06 | P3 | not done | no new test |
+| Polish of audits 6 and 7 | P3 | not done | unchanged; the Logs cut is now at `session_log.rs:233-234` |
 
-The audit-6 texts follow unchanged, so that this file stays the only reference (line numbers are still valid: the code
-did not change).
+The texts of the open findings follow unchanged, so that this file stays the only reference. Their line numbers are
+still valid.
+
+#### Open findings of audit 6
 
 #### F66 — P2 — Content guard Delete does not name distributions behind nested composites (runtime)
 
@@ -370,9 +438,9 @@ did not change).
 * The footer cuts long refusal texts at the screen width; the notification list (`N`) has them all (kept from
   audit 5).
 
-### 6.2 New findings
+#### Open findings of audit 7
 
-Root causes, so that a fix closes a class and not one case:
+Root causes of the audit-7 findings, so that a fix closes a class and not one case:
 
 * **RC1 — A confirm text states a Pulp rule that Pulp does not follow** (F76, F85, F86, F79): the text was written
   from the intent of the Pulp feature, not from its code. Each such text needs a test against the live server.
@@ -616,11 +684,441 @@ Root causes, so that a fix closes a class and not one case:
   and `UlnRemoteSerializer.validate_url` do not call the pulpcore check. The Edit forms show the URL as Pulp has it,
   as `docs/ARCHITECTURE.md:561-565` documents; the RPM remote `url` and the upstream `base_url` can hold a password.
 
-Candidate parts rejected after verification: the Edit form URL display (documented design, above); "export
+Candidate parts rejected by audit 7 after verification: the Edit form URL display (documented design, above); "export
 incremental stops silently" (the Export form explains it: kept as F88 with the smaller scope); the guard Edit and the
 domain default guard (no effect); "Restore does not name deleted versions" (it has a retention line: kept as F85);
 `save_binding_repo` as the cause of F97 (the name comes from the version row); "every TLS deployment breaks" (only an
 outer proxy: F92).
+
+### 6.2 New findings (audit 8)
+
+IDs continue the numbering: F98–F132, G21, G22 and T07. Paths are relative to the repository; Pulp paths are relative
+to the `site-packages` folder of the named image (`latest` = pulpcore 3.123.1, pulp_rpm 3.39.5, pulp_deb 3.11.1).
+`dom` is the audit's server with domains (3.123.1); `old` is the audit's 3.63.36 server (section 2).
+
+Root causes of this audit, so that a fix closes a class and not one case:
+
+* **RC4 — State of the previous server survives a Connect** (F98, F115; F93 and F95 of audit 7 are the same class):
+  a parameterised sub-list, an open form and the profile text are not tied to the connection that made them.
+* **RC5 — A served-content check accepts only "200 from an absolute URL"** (F99, F105, F113): a relative `base_url`,
+  a redirect to object storage and a content guard are all reported as MISMATCH or DRIFT, with the hint "repair".
+* **RC6 — A field or filter is sent without a capability check, or a server quirk of one version is not known**
+  (F102, F103, F104, F112, F129, F130): each one works on `latest`, where the suite runs its form tests, and fails
+  on an older supported image. The live tests create Deb and File repositories through the API, not the form.
+* **RC1 again — A confirm or help text states a Pulp rule that Pulp does not follow** (F100, F101, F117, F118).
+* **RC7 — An impact preview is built from a list that Pulp scopes to the user** (F109, F121).
+* **RC8 — Two `modify/` requests where Pulp reacts to the first one** (F107): Pulp's module rule changes the
+  version between the remove step and the add step, and the add list was computed before.
+
+#### F98 — P2 — After Connect from a sub-list, a form opened while "connecting..." writes to the new server with the object of the old server (runtime)
+
+* Where: `App::connect_now` (`src/tui/app.rs:783-844`) sets `conn = None` and then keeps the screen: `if let
+  Screen::List(k) = self.screen.clone() && !matches!(k, Kind::Profiles | Kind::Logs { .. }) { self.replace(k); }`
+  (`:803-807`). `k` keeps its parameters (`Kind::UserRoles { user }`, `GroupRoles { group }`, `GroupUsers { group }`,
+  `CvVersions { cv, .. }`, `Versions(Some)`, `Content { version }`). `App::unsupported` (`app.rs:1410-1412`) is `None`
+  without a connection, so `available_actions` (`:1414-1427`) still offers each action that needs no row. A form opens
+  with no I/O. The connect result (`app.rs:825-838`) opens the Dashboard (`:837`) but does not close the form, and
+  `open(Dashboard)` keeps `app.list`. The submit then runs with the client of the new server.
+* Endpoints: `POST {user_href}roles/`, `POST {group_href}roles/` (`assign_role`, `src/tui/actions_admin.rs:211-232`,
+  URL at `:230`), `POST {group_href}users/` (`member_action`, `:317-326`). User and group hrefs hold an integer key
+  (`/pulp/api/v3/users/2/`), and Pulp takes the target only from the URL (pulpcore `app/serializers/user.py:369`,
+  `:439`; `app/viewsets/user.py:195-199`; the same in 3.95.3 and 3.63.36).
+* Runtime [R48]: profile `old`: Users → `a8-x1` (`users/2/`) → `R` ("Roles of user a8-x1") → `:` "Connect: pulp2" →
+  Enter. The header says "server: pulp2 | connecting...", the list is still "Roles of user a8-x1". `c` within 0.2 s
+  opens "Assign role to user a8-x1". The connect ends, the form stays. Role `file.fileremote_viewer`, Object (none;
+  the picker lists objects of pulp2), `Ctrl-S` → "[ok] assign file.fileremote_viewer to user a8-x1: done". Pulp: on
+  pulp2, `users/2/` is `a8-carol` and now has the role; `a8-x1` on `old` has none.
+* More effects of the same code (static): a member is added to the group with the same number on the new server;
+  each form opened in that window is built with `caps = None`, so no version gate applies; `CvVersions` needs no
+  connection (`kinds.rs:503-508`) and its load has no scope check (`kinds.rs:1172-1178`), so with two profiles in one
+  local file the versions of the other profile's view stay on screen, and Delete marks a version deleted while its
+  Pulp objects stay on the old server (a 404 counts as gone, `cv.rs:565-575`); Resume can create a snapshot
+  repository on the new server (`cv.rs:909-945`).
+* Why P2: a role or a membership goes to another account on another server, and the result text names the account of
+  the old server. It needs one key in the connect window (some seconds: status, login and the OpenAPI download).
+* Smallest reproduction: [R48]. No test covers it: `a_failed_connect_drops_the_rows_of_the_previous_server`
+  (`app.rs:3073`) checks rows and marks only.
+
+#### F99 — P2 — With `CONTENT_ORIGIN` not set (the default of pulpcore 3.95.3 and 3.123.1), Verify, the drift check, the Rollback check and fallback replication fail for served content that is correct (runtime)
+
+* Where: `PulpClient::fetch_content` (`src/pulp/client.rs:346-349`): `url::Url::parse(url).map_err(|_|
+  PulpError::BadHref(url.into()))?` accepts only an absolute URL. The callers pass `base_url` as Pulp returns it:
+  `distribution_verify` (`src/tui/actions.rs:3686-3708`, "MISMATCH: {e}" at `:3704`), Rollback (`:3064-3068`), Content
+  View `verify_publication` (`src/cv.rs:1768-1774`), fallback replication (`src/replication.rs:320`; the plan also
+  uses the upstream `base_url` as the remote URL, `:126-164`), Copy URL (`actions.rs:3655`, `:3665-3670`).
+* Endpoint: `GET distributions/<type>/` field `base_url`, then the content app.
+* Pulp: `CONTENT_ORIGIN = None` is the default (`pulpcore/app/settings.py:288`; 3.95.3 `:289`), and
+  `BaseURLField.to_representation` then returns `/pulp/content/<base_path>/` (`app/serializers/fields.py:331-342`;
+  3.95.3 `:316-320`). pulpcore's own replication joins it with the server URL (`app/replica.py:121-122`). 3.63.36
+  needs an absolute value (`settings.py:276`), so it is not affected. The test environment always sets the value
+  (`tests/env/pulp-env.sh:66`), so no test sees a relative `base_url`.
+* Runtime [R44] (`dom` restarted without `CONTENT_ORIGIN`; `status/` says `content_origin: null`): Distributions →
+  `a8-big` → `V`: "URL: /pulp/content/default/a8-big/ … MISMATCH: unsafe href rejected:
+  /pulp/content/default/a8-big/PULP_MANIFEST". `y` copies "/pulp/content/default/a8-big/". The Dashboard line
+  "content:" is empty.
+* Runtime [R45]: Content View `a8cv` with File repository `a8-f`: `P` → "[ok] a8cv version 1 published and active in
+  Library" (the publish does not read served content). `D` → "Library: v1 DRIFT / a8-f: unsafe href rejected:
+  /pulp/content/default/library/a8cv/a8-f/PULP_MANIFEST / Library: check the content app, then repair the snapshot
+  version (Repositories, v, F): the served files are not those of the snapshot."
+* Effect: on such a server every Verify is MISMATCH, every promoted environment is DRIFT with a wrong repair hint,
+  Rollback says "re-pointed, but verification failed", each fallback replication item fails after it made its objects
+  (static), and Copy URL gives a path with no host. `Fix::Origin` ("distribution has no base_url: set CONTENT_ORIGIN",
+  `cv.rs:1768-1769`, `docs/USER_GUIDE.md:658`) waits for a null `base_url`, which no supported pulpcore returns.
+* Fix direction: join a `base_url` that starts with `/` with the profile URL in one place (`fetch_content` callers,
+  Copy URL, the fallback plan with the source profile URL).
+
+#### F100 — P2 — Remote Delete says "Repository content and versions are not affected"; Pulp deletes the remote artifacts, and on-demand content can no longer be downloaded (runtime)
+
+* Where: `remote_delete_impact` (`src/tui/actions.rs:1477-1492`), text at `:1481`; used by the Delete of one remote
+  (`remote_action`, `:2636-2644`) and of marked remotes (`marked_impact`, `:1563-1567`). It lists only the
+  repositories whose default remote it is; a remote used through the Sync form is not named.
+* Endpoint: `DELETE remotes/<plugin>/<type>/<id>/`.
+* Pulp: `RemoteArtifact.remote` is `on_delete=CASCADE` (`pulpcore/app/models/content.py:754`; 3.95.3 `:748`; 3.63.36
+  `:727`). The content app streams a unit without a stored file only from its remote artifacts and else answers 404
+  (`pulpcore/content/handler.py:1076-1096`).
+* Runtime [R46]: File remote `a8-od` (policy `on_demand`), repository synced (40 units, `artifact: null`),
+  published and distributed; `f1.bin` downloaded once. Remotes → `a8-od` → `d`: "Delete remote a8-od. Repository
+  content and versions are not affected. / 1 repository(ies) use it as default remote: a8-od / No alternate content
+  source uses it." → typed name → "task completed: delete remote a8-od". After: `PULP_MANIFEST` 200, `f1.bin` 200,
+  `f3.bin` **404**; the version still lists 40 units.
+* Effect: every unit of an `on_demand` or `streamed` remote that Pulp did not store yet (also files that a Reclaim
+  removed, F76) stays in all versions, publications and Content View snapshots, and each download is 404. Repair does
+  not bring it back; a new remote with the same URL and a new sync does.
+* Fix direction: read the remote's `policy`; for a policy other than `immediate` say that content not yet downloaded
+  cannot be served after the delete, and name the repositories.
+
+#### F101 — P2 — Native replication with policy `nodelete` takes over local objects that have the name of an upstream distribution; the form says "never delete local objects" and the confirm needs only `y` (runtime)
+
+* Where: the Upstream Pulp form note (`src/tui/actions_admin.rs:1060`): "nodelete: never delete local objects. …";
+  `replicate` (`:1138-1169`): the line "Pulp creates/updates repositories, remotes and distributions with the
+  upstream names." (`:1153`) and a plain `app.confirm` when `deletion_warning` (`:925-935`) gives `None`. No impact
+  is read.
+* Endpoint: `POST {upstream_pulp_href}replicate/`.
+* Pulp (3.123.1): `pulpcore/app/replica.py:86-91` `_is_managed` is false only for policy `labeled`. For `nodelete`
+  and `all`, a local remote, repository and distribution with the upstream distribution's name are updated
+  (`:113-246`): the repository is synced with a mirror policy, `pulp_labels` are replaced by `{"UpstreamPulp": id}`
+  (`:102-105`), and the distribution is set to the new `repository_version` (`tasks/replica.py:183-200`). On 3.123 a
+  distribution at the same base path with another name is renamed too (`replica.py:227-228`). 3.95.3 matches by name
+  (`replica.py:81`, `:125`, `:154`, `:188`); 3.63.36 has no policy and matches by name.
+* Runtime [R52] (`dom`; the upstream is its own domain `a8t`): local File repository `a8-take` (version 1 with
+  `local-only.txt`) and distribution `a8-take` (labels `owner=team-a`, follows the repository). Upstream Pulp
+  `a8-self`, policy `nodelete`, filter `name="a8-take"`. Replication → `R`: "Replicate from … into this server … /
+  Distribution filter: name="a8-take" / Deletion policy: nodelete / Pulp creates/updates repositories, remotes and
+  distributions with the upstream names." → `y`. After: repository `a8-take` version 2 (+40, −1: `local-only.txt` is
+  not in the latest version), its labels are `{"UpstreamPulp": …}`; the distribution lost `owner=team-a`, has
+  `repository: null` and `repository_version` = version 2; a remote `a8-take` exists.
+* Effect: a local repository that has the name of an upstream distribution loses its own content in the latest
+  version and its labels. With pulp-tui on both servers and the same view name, the downstream distribution
+  `pulp-tui-cv-<view>-<env>-<repo>` loses `pulp_tui_cv`, `pulp_tui_env` and `pulp_tui_db` and serves the replica
+  (then F71 applies). The stricter policy `labeled` does not touch unlabeled objects but asks for the typed name;
+  `nodelete` does touch them and asks for `y`.
+* Fix direction: before the confirm, list the local repositories, remotes and distributions that have no
+  `UpstreamPulp` label of this upstream (all of them when the filter cannot be evaluated locally: say "each local
+  object with the name of an upstream distribution"), say "content replaced by a mirror sync, labels replaced,
+  distribution re-pointed", and ask for the typed name. Correct the note at `:1060`.
+
+#### F102 — P2 — On pulp_deb 3.5.4 (image 3.63.36) every Deb repository Create from the form fails: `autopublish` is sent with no capability check (runtime)
+
+* Where: `Field::new("autopublish", "Autopublish", FieldKind::Bool)` (`src/tui/actions.rs:1106`) is in every
+  repository form; the type fields above it are behind `has(...)`. `repo_body` (`:1121-1160`) sends a Bool always
+  (`:1149`), so Create posts `"autopublish": false` (`:1211`).
+* Endpoint: `POST repositories/deb/apt/`.
+* Pulp: pulp_deb 3.5.4 has no `autopublish` (`pulp_deb/app/serializers/repository_serializers.py:78-84`); pulpcore
+  refuses an unknown field (`pulpcore/app/serializers/base.py:302-321`). pulp_deb 3.8.1 and 3.11.1 have the field.
+* Runtime [R49] (`old`): Deb Repositories → `c` → Name `a8-olddeb` → `Ctrl-S`: "[error] create repository a8-olddeb:
+  rejected [400]: autopublish: Unexpected field"; no repository. An Edit that changes the box gives the same 400.
+* Why no test saw it: `tests/live_deb.rs` creates repositories with `create(&c, t.repositories(), json!({"name": …}))`;
+  only `tests/live_repos.rs:712` (RPM) runs `Act::Create` on `Kind::Repos`.
+
+#### F103 — P2 — On pulp_rpm 3.27.12 (image 3.63.36) every RPM repository Edit that does not change "Repo config" erases `repo_config` (runtime)
+
+* Where: `repo_body` sends only changed fields on Edit (`src/tui/actions.rs:1124-1126`); PATCH at `:1224`.
+* Endpoint: `PATCH repositories/rpm/rpm/<id>/`.
+* Pulp: pulp_rpm 3.27.12 `pulp_rpm/app/serializers/repository.py:235-263` (`update`): `instance.repo_config =
+  gpgcheck_options if gpgcheck_options else validated_data.get("repo_config", {})`. A partial update without
+  `repo_config` stores `{}`. pulp_rpm 3.34.0 and 3.39.5 have no such override.
+* Runtime [R50] (`old`): repository `a8-oldrpm` with `repo_config {"gpgcheck": 1, "repo_gpgcheck": 1}`. RPM
+  Repositories → `e` → Description "audit 8" → `Ctrl-S`. The Logs screen shows the body `{"description": "audit 8"}`;
+  "task completed: update repository a8-oldrpm"; Pulp: `repo_config: {}`.
+* Effect: after any edit (description, remote, retention, labels) the next publication serves a `config.repo`
+  without the GPG check settings. Nothing tells the operator. Not in `docs/COMPATIBILITY.md`.
+* Fix direction: on a server with that shim (the repository schema has the deprecated `gpgcheck` field), add the
+  current `repo_config` to each RPM repository PATCH (also the settings PATCH of Content View snapshots,
+  `cv.rs:1024-1058`); record it in `docs/COMPATIBILITY.md`.
+
+#### F104 — P2 — Deb fallback replication from pulp_deb 3.11 into a 3.8 or 3.5 destination fails on every item after the sync (runtime)
+
+* Where: `ops::mode_fields` (`src/pulp/ops.rs:278-286`) lists `layout`, `publish_legacy_release_files` and
+  `excluded_package_metadata_fields`; `publication_mode` (`:292-297`) copies each one the upstream publication has
+  (`replication::deb_source`, `src/replication.rs:257-260`); `publication_body` (`ops.rs:346-348`) posts them
+  (`replication.rs:313-316`). No `has_field` check against the destination (`AGENTS.md` capability rule).
+* Endpoint: `POST publications/deb/apt/` on the destination.
+* Pulp: pulp_deb 3.11.1 `app/serializers/publication_serializers.py:82-91` has the three fields; 3.8.1 (`:59-65`)
+  and 3.5.4 (`:57-62`) do not; pulpcore answers 400 "Unexpected field".
+* Runtime [R58]: source profile `dom` (3.11.1), destination `old` (3.5.4). Replication → `F` → Types `deb`, name
+  `a8-deb`. Dry run: "CREATE Deb  a8-deb -> /a8-deb  new remote + repository + distribution". Run: "failed    Deb
+  a8-deb: rejected [400]: excluded_package_metadata_fields: Unexpected field; layout: Unexpected field;
+  publish_legacy_release_files: Unexpected field". Left on `old`: remote `a8-deb`, repository `a8-deb` at version 1
+  (synced), no publication, no distribution. A rerun fails the same way.
+* Fix direction: filter the mode by the destination schema in the TUI job after `replication::plan`
+  (`actions_admin.rs:1328`; `ctx.caps` is the destination), and let `find_publication` ignore fields that the
+  destination does not have.
+
+#### F105 — P2 — On object storage (S3, Azure, GCS) every served-content check reads Pulp's 302 as a mismatch (static)
+
+* Where: the only HTTP client has `.redirect(reqwest::redirect::Policy::none())` (`src/pulp/client.rs:144`), and
+  `fetch_content` (`:346-361`) returns the 302. Each probe accepts only 200: `src/pulp/rpm.rs:220-224` and `:250-251`,
+  `src/pulp/file.rs:22-25`, `src/pulp/deb.rs:79-82`, `:157-158`, `:165-166`.
+* Pulp: `pulpcore/content/handler.py:1239-1250` (3.95.3 `:1133-1141`, 3.63.36 `:1038-1049`): with S3, Azure or GCS
+  storage and `redirect_to_object_storage` (default true, `app/models/domain.py:48`, `settings.py:80`) the content app
+  answers `HTTPFound`, also for published metadata (`handler.py:886`, `:1254`).
+* Effect: Verify "MISMATCH: … returned HTTP 302", Rollback "verification failed", Content View DRIFT with the repair
+  hint, each fallback replication item `failed` after the replica is complete. The Domains form of pulp-tui offers
+  these storage classes and the redirect switch (`actions_admin.rs:811`). Object storage is not in "Unsupported or
+  limited" (`docs/COMPATIBILITY.md:993-1020`).
+* Not run: the test servers use file system storage. Two reviewers found it independently and a third one could not
+  disprove it.
+* Fix direction: `fetch_content` follows a small number of 3xx by hand, sends no `Authorization` to another origin
+  and masks the signed query in the session log.
+
+#### F106 — P2 — An upload into a repository with a package signing service ends in "digest mismatch", although Pulp completed it (static)
+
+* Where: `ops::uploaded` (`src/pulp/ops.rs:935-957`) calls `check_digest` (`:960-967`) with the sha256 of the local
+  file; callers `upload_fields` (`ops.rs:875`, used by `ops::upload` and `deb::upload`, `src/pulp/deb.rs:224`). In the
+  TUI, `upload_file` (`src/tui/actions.rs:1795-1818`) then skips the "[ok]" and the list reload. The repository form
+  offers the service (`actions.rs:1009-1015` RPM, `:1051-1056` Deb), and `docs/USER_GUIDE.md:313`, `:324` say that it
+  signs uploads.
+* Endpoints: `POST content/rpm/packages/`, `POST content/deb/packages/` with `repository`.
+* Pulp: pulp_rpm 3.39.5 `app/viewsets/package.py:116-152` dispatches `sign_and_create`; `app/tasks/signing.py:156-199`
+  makes the package from the signed file (a new artifact, `:178-181`). The same in 3.34.0 (`viewsets/package.py:114-143`)
+  and 3.27.12 (`:84-113`). pulp_deb 3.11.1: `app/viewsets/content.py:280-330`, `app/tasks/signing.py:212-245`.
+* Effect: the task completes and the signed package is in a new version; the TUI shows "[error] upload <path>: digest
+  mismatch for …" and the Task Center row says completed. A retry signs again and makes one more unit and version.
+* Not run: the test environment has no package signing service (`grep package_signing tests/` finds only the Deb form
+  test). Scenario: RPM repository → `e` → Package signing service and fingerprint → `u` → an unsigned `.rpm`.
+* Fix direction: when the repository has `package_signing_service`, report the server digest and say that Pulp
+  signed the package.
+
+#### F107 — P2 — A filtered RPM Content View publish drops selected packages when a modulemd of the source was replaced; the preview says "+0 added, -0 removed" (runtime)
+
+* Where: `CvService::snapshot` (`src/cv.rs:972-979`) computes the steps once: `let (remove, add) = self.changes(t,
+  derived, all).await?;` then `[batches(true, &remove), batches(false, &add)].concat()` (`:978`). `changes`
+  (`:1098-1118`) has `add = all - present` (`:1117`), with `present` read before any step. The steps are two requests
+  (`ops::remove_content`, `cv.rs:993`; `ops::add_content`, `:996`). `rpm_metadata` (`cv.rs:249-253`) selects every
+  modulemd of the source. Nothing compares the final snapshot with the selection (`:1010-1015` records only a count).
+* Endpoint: `POST {snapshot repository}modify/` two times.
+* Pulp: each new RPM version runs `resolve_module_packages` (`pulp_rpm/app/models/repository.py:469-471`;
+  `pulp_rpm/app/modulemd.py:59-83`): the packages of a removed modulemd that no module of that version lists are
+  removed too. The add side never adds packages (`:86-89`). The same in 3.34.0 (`repository.py:405-407`) and 3.27.12
+  (`:398-400`).
+* Runtime [R60] (`dom`): RPM repository `a8-rpm` (packages `fixture-alpha`, `fixture-beta`, `fixture-beta-debuginfo`,
+  one advisory, modulemd `a8mod:1:1` that lists alpha and beta). View `a8mod`, rule `exclude name=*-debuginfo`; `P` →
+  v1, snapshot: 2 packages, 1 modulemd. Then the source modulemd is replaced by `a8mod:1:2`, which lists beta; alpha
+  and beta are still in the source. `P`: preview "2 selected … published -> draft: +0 added, -0 removed" → `y` →
+  "Library:v2". Pulp: the new snapshot version has **no package** (`removed: rpm.modulemd 1, rpm.package 2`), one
+  modulemd that lists `fixture-beta`, one advisory. The next `P` previews "+2 added" and brings both back.
+* Effect: one published version, active in Library (and promoted further), without packages that the filter selects
+  and the preview counts; a module lists packages that the repository does not have. It needs a filtered RPM view and
+  a source that drops or replaces a modulemd while a package of it stays (mirror sync of a modular repository, or a
+  removed module). Unfiltered views (`rpm/copy/`), File and Deb are not affected.
+* Fix direction: `cv.rs:974-978`: send the modulemd removals in the same `modify/` as the adds, or run `changes`
+  again after the loop and add what is missing (do not put the add before the remove: advisories with the same id
+  conflict). Check the final snapshot keys against the selection before the version is recorded.
+
+#### F108 — P3 — An RPM Content View publish reuses a publication that has other publish settings (static)
+
+* Where: `CvService::publication` (`src/cv.rs:1065-1068`): `RepoType::Rpm | RepoType::File if !changed &&
+  vr.pending_task.is_none() => ops::find_publication(c, t, dv, &json!({}))`. With an empty mode, `find_publication`
+  (`src/pulp/ops.rs:326-334`) returns the newest publication of the version for RPM. `changed` is only "this run sent
+  a PATCH" (`copy_settings`, `cv.rs:1024-1058`). `ops::reusable_publication` (`ops.rs:318-323`), which Rollback and
+  Distribute use for a signing repository, is not used here. `docs/ARCHITECTURE.md:177-179` states the assumption.
+* Scenario: v1 is published without signing. Set Metadata signing service (or checksum, layout, repo config) on the
+  source. `P` → v2: the snapshot repository is PATCHed, then the publication task fails (or the client stops); v2 is
+  `failed`. `P` again (not Resume) → v3: equal content, equal settings now, so no PATCH; the old unsigned publication
+  is reused and v3 is "published and active in Library". The same after Delete of v2. Resume of v2 is safe. File
+  compares `manifest`; Deb never reuses.
+* The drift check then reports the missing `repomd.xml.asc`, so it is found when someone runs it.
+* Fix direction: compare the `mode_fields` of the publication with the snapshot repository, and do not reuse for a
+  repository that signs metadata.
+
+#### F109 — P2 — For a user that is not a superuser, the Delete and Edit impacts say "No distribution uses it" from a list that Pulp scopes to the user (runtime for the guard Delete; the other paths static)
+
+* Where: content guard Delete (`src/tui/actions_admin.rs:505-518`, "No distribution uses it." at `:517`); content
+  guard Edit (`confirm_guard_edit`, `:635-641`: saves with no confirm when the list is empty); `guard_use`
+  (`:656-662`) → `ops::guarded_distributions` (`src/pulp/ops.rs:187-197`); the "distributions" column
+  (`src/tui/kinds.rs:1083-1088`). Repository Delete (`src/tui/actions.rs:1456-1466`, "No distribution serves it." at
+  `:1463`). Publication Delete (`:3589-3595`): the WARNING line is missing. Version Delete (`:2859-2871`, `:2869`): a
+  false line only, because Pulp refuses a protected version itself. `ops::sees_everything` (`ops.rs:478-484`), made for
+  F59, is used only at `cv.rs:1394`.
+* Pulp: lists are scoped to what the user may view (`pulpcore/app/viewsets/base.py:359-380`; the generic
+  `distributions/` list, `app/viewsets/publication.py:574-584`; the same in 3.95.3 and 3.63.36). Delete needs only the
+  object permission, which the creator gets by the owner role. `Distribution.content_guard`, `.repository` and
+  `.publication` are `SET_NULL` (`app/models/publication.py:741-747`). `docs/USER_GUIDE.md:581-583` promises "The
+  impact lists the distributions that use the guard".
+* Runtime [R62] (`dom`): user `a8-u1` has only the role `core.headercontentguard_creator`. As `a8-u1`: Content Guards
+  → `c` → header guard `a8-ug` (the creator gets the owner role). The administrator puts `a8-ug` on File distribution
+  `a8-big`; without the header its `PULP_MANIFEST` answers 403. `a8-u1` sees no File distribution
+  (`distributions/file/file/` count 0). As `a8-u1`: `d` → "Delete content guard a8-ug (core/header). No distribution
+  uses it." → typed name → "[ok] delete content guard a8-ug: done". After: `a8-big` has `content_guard: null`, and
+  `PULP_MANIFEST` answers 200 without the header. The "distributions" column of the list was empty too.
+* The repository Delete, the publication Delete and the guard Edit were not run for such a user (same lists, same
+  scoping). Same class as F66 and F89: a false "No distribution uses it".
+* Fix direction: one helper next to `sees_everything`; when it is false, replace each "No distribution …" line with
+  "none that this Pulp user may view (not an administrator: others can exist)".
+
+#### P3 findings reproduced at runtime
+
+* **F110 — Role Create and Edit send `"description": ""`; Pulp answers 400.** `role_form`
+  (`actions_admin.rs:362`). pulpcore `RoleSerializer.description` is `allow_null` without `allow_blank`
+  (`app/serializers/user.py:218-220`; 3.95.3 `:219-220`; 3.63.36 `:200-201`). [R47]: Roles → `c` → name, default
+  permission, empty Description → "[error] create role a8-role: rejected [400]: description: This field may not be
+  blank." A role with a null description (made with another tool) cannot be edited until a description is typed.
+  The mock test `role_create_copies_the_permissions_but_not_the_name` asserts this body. Fix: send null for empty.
+* **F111 — A config save removes what another process added to the file since the TUI started.** `Config::save`
+  (`src/config.rs:497-529`) reads the file as `old` (`:503`) and removes each key that the in-memory config lacks
+  (`:427-438`); the callers build the new config from `app.cfg.clone()` (`app.rs:1246`, `actions.rs:630`, `:780`,
+  `:833`), and the file is loaded only at start. [R53]: `[profiles.outside]` appended to the file while the TUI ran;
+  `x` in the Screens pane ("Replication hidden") → the profile is gone from the file. `docs/USER_GUIDE.md:1058-1060`
+  says a save "changes only the keys whose values changed". Fix: apply the change to a fresh `Config::load`.
+* **F112 — File Content search (`/`) is HTTP 400 on pulp_file 3.95.3 and 3.63.36.** `Kind::source`
+  (`src/tui/kinds.rs:598`) sends `relative_path__icontains` with no capability check (`:1078-1080`). The old filter
+  sets have only exact `relative_path` and `sha256` (`pulp_file/app/viewsets.py:57-66` in 3.95.3, `:53-62` in
+  3.63.36). [R51] (`old`): File Repositories → `o` → `/` `a` Enter → "Error: rejected [400]: errors: Invalid Filter:
+  'relative_path__icontains'". 3.95.3: source only.
+* **F113 — Verify of a distribution with a content guard that the API user does not pass says MISMATCH.**
+  `fetch_content` sends only the API authorization; `file::verify` (`src/pulp/file.rs:22-25`) and the RPM and Deb
+  probes turn each non-200 into a mismatch; the Content View drift maps it to `Fix::Repair` (`cv.rs:1773-1774`, hint
+  `actions_cv.rs:740-743`). [R57] (`old`, header guard on a File distribution): `V` → "MISMATCH: served content
+  differs: PULP_MANIFEST returned HTTP 403". Fix: report 401 and 403 as "content guard refuses this client: not
+  compared".
+* **F114 — Task Center: `/` sets a filter that hides nothing.** `Kind::Tasks` is searchable (`kinds.rs:572-574`);
+  `reload` and the poll refresh set all rows (`app.rs:950-956`, `:591-595`, `task_items` `:605-607`); the title shows
+  the filter (`view.rs:156-158`). [R54]: `/` `zzzz` Enter → "[8 items, filter: zzzz]" with all 8 rows.
+* **F115 — After an Edit of the connected profile, the header shows the new URL while every request goes to the old
+  server.** `draw_header` (`src/tui/view.rs:48-54`) reads `app.cfg`; `put_profile` (`actions.rs:628-640`) does not
+  reconnect; `dst_origin` (`actions_admin.rs:965-967`) gives the edited origin to the replication confirm and to
+  `guard_self`. [R55]: connected to `dom` (port 8090); Edit → Server URL port 8091 → the header says "server: dom
+  (http://127.0.0.1:8091)"; File Repositories still lists the objects of port 8090. `docs/USER_GUIDE.md:17` says "The
+  header shows the active server". Fix: read the URL from `conn.client` while connected and mark "edited: reconnect".
+* **F116 — Delete of the task that ran a Pulp import gives a bare "server error [500]".** `server_task_delete`
+  (`actions.rs:4060-4073`). `Import.task` is `PROTECT` (`pulpcore/app/models/importer.py:26`), and
+  `TaskViewSet.destroy` (`app/viewsets/task.py:239-243`) does not catch it. [R56] (API on `dom`): `DELETE` of the
+  completed `pulp_import` task → HTTP 500 with an HTML body. The TUI side is static. Fix: turn the 500 of this
+  request into "an import record keeps this task".
+* **F117 — Remove (`x`) of an RPM modulemd also removes its packages; the confirm and the result count one unit.**
+  `remove_lines` (`actions.rs:3234-3238`), `content_removed` (`:127-133`); `remove_units` (`:106-112`) adds related
+  units only for Deb. Pulp: `resolve_module_packages` (F107). [R61]: Content → modulemds → `x` → "Create a new
+  version of a8-rpm without 1 unit(s). / The current and older versions are immutable and keep the content." → "[ok]
+  removed 1 unit(s): now showing version 5"; Pulp removed 1 modulemd and 1 package. An Add of a modulemd adds its
+  packages the same way. Fix: name the package count from the modulemd's `packages` field.
+
+#### P3 findings from code reading (each one passed a disprove review; none was run)
+
+* **F118 — The replication deletion warning says "gone upstream"; a narrower filter deletes replicas that still
+  exist upstream.** `deletion_warning` (`actions_admin.rs:925-935`); pulpcore builds the keep list from `q_select`
+  (`app/tasks/replica.py:113-155`) and deletes each (labeled) object not in it (`app/replica.py:284-339`).
+  `docs/COMPATIBILITY.md:752-754` has the same wording. The typed confirm does show the filter. Fix: "… that the
+  distribution filter no longer selects or that are gone upstream".
+* **F119 — A failed filesystem export leaves an export record that the list shows like a good one.** `Kind::Exports`
+  columns (`kinds.rs:815-819`) have no task state; pulpcore creates the record before the checks
+  (`app/tasks/export.py:320-337`). A second export into the same directory always fails
+  (`docs/USER_GUIDE.md:873`), so the row is common. Fix: a state column from the export's `task`.
+* **F120 — RPM fallback replication: the dry run says CREATE for an upstream distribution that serves nothing.**
+  `replication.rs:144-146` skips the publication read for a non-checkpoint RPM distribution, so a distribution that
+  follows a repository with no publication is a CREATE row (`:196-198`); the run makes the remote (`:306`) and the
+  repository (`:307`), then the sync fails with 404 (`:308`). File and Deb get SKIP (`:149-152`);
+  `docs/USER_GUIDE.md:822-823` promises that only for them.
+* **F121 — Object roles (`B`) fails for a user without `manage_roles`; a group owner cannot delete the group.**
+  `object_roles` (`actions_admin.rs:414-415`) reads `list_roles/` and `my_permissions/` together, and `list_roles/`
+  needs `manage_roles_*`; `docs/USER_GUIDE.md:104-106` promises "your permissions on it". The group Delete impact
+  reads `{group}roles/` (`:274`), which is administrator only (`pulpcore/app/viewsets/user.py:401-419`), while Pulp
+  allows the delete to the owner (`:107-110`). Fix: treat a 403 of these two reads as "not readable for this user".
+* **F122 — Plans check names per type, but Pulp names are unique across types.** Fallback replication
+  (`replication.rs:188-189`, `conflict` `:220-240`, `ops::distribution_target` `ops.rs:434`) and `import-repos`
+  (`repo_export.rs:283-285`) say CREATE or "create" when a repository, remote or distribution of another type has the
+  name; the run then gets 400 after it made the remote, or the remote, repository, version and publication
+  (`replication.rs:306`, `:369`, `:317`). Pulp side checked by API on `dom`: `{"name": ["This field must be
+  unique."]}` for a File repository with the name of a Deb repository. Fix: look the name up on the generic
+  `repositories/`, `remotes/` and `distributions/` lists in the plan.
+* **F123 — The ownership label of a fallback replica is the source profile name, not the server.**
+  `replication.rs:106`, `:305`, `owned` `:77-79`. A profile `up` that now names another server (an Edit, or the config
+  of a second operator) gives "SYNC re-sync existing replica" (`:193-195`), and the run PATCHes the replica's remote
+  URL (`:339-341`). Same class as F93. Fix: show "remote URL changes: old -> new" in the plan row, or label with
+  `Profile::server_key()`.
+* **F124 — `db copy` has two gaps.** (a) `--from PROFILE` does not check that both profiles are one server
+  (`src/main.rs:124-139`; `Store::copy_from` refuses only the same database, `store.rs:1675-1678`), so the views,
+  versions and bindings of server A can be written under server B. (b) A second copy loses the aliases of the first
+  database id: `copy_from` writes only `alias:<src.db_id()>` (`store.rs:1855-1859`) and not `src.aliases()`
+  (`:628-632`); `ops::label_owner` (`ops.rs:548-554`) then refuses the Pulp objects that still have the first id
+  ("owned by another pulp-tui database"), and `add_alias` has no caller in the product.
+* **F125 — Unpromote does not delete a distribution that a stopped promotion created but did not record.**
+  `bind_repo` creates the distribution (`cv.rs:1532`), checks the lock (`:1534`), then records it (`:1535-1546`);
+  `unpromote` reads only `binding_repos` rows (`:1567`, `:1575`); the preview too (`actions_cv.rs:933-957`). After a
+  stop in between, `u` says "is not in Dev any more" and the path still serves the version. A later Promote adopts it
+  by name.
+* **F126 — Server tasks: with the cursor on the first row, a reload moves it to the newest task; the Cancel confirm
+  shows only an href.** `set_items` (`app.rs:1034-1038`) keeps the row only for `selected > 0` or the Task Center;
+  `Kind::ServerTasks` is ordered `-pulp_created` (`kinds.rs:639-641`); `cancel_confirm` (`actions.rs:4092-4099`) is a
+  plain `y` with "Ask Pulp to cancel task {href}." Fix: follow the row on Server tasks and Task groups too; name and
+  state in the confirm.
+* **F127 — Content screen: Remove or Add picked from the action menu acts on the row selected at that moment, not on
+  the row of the menu.** `actions::run` drops the item (`actions.rs:455`); `content_action` (`:3194-3207`) reads
+  `app.list.current()`; `show_new_version` (`:137-146`) replaces the list (cursor on row 0, marks gone) when an
+  earlier Remove ends, also under an open menu; the confirm names no unit (`:3234-3238`).
+* **F128 — Opening Lifecycle Environments writes to the shared database for a read-only profile.** The list loader
+  calls `store.ensure_library(scope)` (`kinds.rs:1205-1207`; `store.rs:1120-1122`, `:1935-1950`); also
+  `actions_cv.rs:296`, `:863`. A database role without INSERT gets an error instead of the list.
+  `docs/USER_GUIDE.md:1208-1212` says such a profile cannot change environments.
+* **F129 — RPM "Package signing fingerprint" on pulp_rpm 3.34.0 and 3.27.12.** The help text
+  (`actions.rs:1015`, `docs/USER_GUIDE.md:314`) names `v4:<hex fingerprint>`, which those versions refuse
+  (`max_length=40`: `pulp_rpm/app/serializers/repository.py:90-99` in 3.34.0, `:74-83` in 3.27.12); clearing the
+  field sends null (`repo_body`, `actions.rs:1157`), which 3.34.0 refuses (no `allow_null`).
+* **F130 — Deb Verify probes `dists/default/` on pulp_deb 3.5.4 and 3.8.1, which do not publish it.** `deb::layout`
+  (`src/pulp/deb.rs:105-107`) adds the pair with no version check; only 3.11.1 publishes an empty structured release
+  (`pulp_deb/app/tasks/publishing.py:210`). A structured publication of a version without release components gives
+  "MISMATCH: dists/default/Release returned HTTP 404" on the old servers. `docs/COMPATIBILITY.md:934-935` says the
+  opposite of what Verify does.
+* **F131 — Profile Delete leaves the keyring secret; a new profile with the same name uses it.** `actions.rs:813-839`
+  only changes the config; `config.rs:355-369` has no keyring delete; the confirm (`:822-825`) and
+  `docs/USER_GUIDE.md:170-172` do not name the keyring. The old secret is then sent to the new URL (`config.rs:350`).
+  The entry `[database]:<name>` stays too.
+* **F132 — A Content View can be named `.` or `..`.** `validate_name` (`store.rs:2225-2230`) accepts them
+  (`validate_label` refuses them, `:2240`); the base path is then `library/../<repo>` (`cv.rs:270-272`). pulpcore
+  3.123.1 refuses it (`app/serializers/fields.py:19-28`), so the Library step fails on every publish; 3.95.3 and
+  3.63.36 accept it and serve a path that HTTP clients normalise away.
+
+#### Other P3 polish of this audit (static)
+
+* Each upload request has the total timeout `timeout_secs` (default 30 s, `client.rs:143`; chunk 8 MiB): below about
+  2.2 Mbit/s every chunk times out and the upload is deleted. `docs/USER_GUIDE.md:1073` names the setting with no
+  word about uploads.
+* `fs_export_source` (`actions_admin.rs:1633-1634`) reads only APT publications: a Deb version with only a verbatim
+  publication gets "has no publication". Use `ops::publications_where`.
+* `upstream_body` trims the secret `password` (`actions_admin.rs:1083`); Pulp keeps leading and trailing spaces.
+* `patch_repo` (`actions.rs:1215-1230`): a label edit of an RPM repository with an OSV config is two PATCHes; when
+  the second one is refused or does not run, the label edit is saved and the OSV config is gone, with no word about it.
+* A derived repository deleted outside pulp-tui gives a raw 404 on each Resume (`cv.rs:472`, `:904-909`); same kind
+  as F96.
+* `delete_view` checks `composite_refs` once (`cv.rs:2022`); a component add by another operator between the Pulp
+  deletes and `delete_cv` leaves a view with records and no Pulp objects (raw foreign-key error).
+* Filtered Deb snapshots never remove Release, ReleaseComponent and ReleaseArchitecture records (`cv.rs:1113`; on
+  purpose, `:1104-1105`); the user documents do not say it.
+* The Publish form note says "A preview of the exact content" (`actions_cv.rs:972`), but the run reads the source
+  versions again (`cv.rs:650-656`): a sync that ends while the confirm is open is published without a word.
+* The "Target repository" picker of Add to repository lists Content View snapshot repositories (`pick.rs:48`) that
+  `add_run` then refuses (`actions.rs:3296-3298`).
+* The Deb upload comment "Any file, served at `relative_path` of a publication" (`deb.rs:182`) is true only for a
+  verbatim publication: an APT publication serves no `.udeb` and no generic content. The upload result does not say
+  it. See G21 for source packages.
+* `replicate` builds its confirm from the list row (`actions_admin.rs:1145-1152`): a policy changed by another
+  operator after the list load is not seen.
+
+Candidate parts rejected by this audit after verification: "the RPM fallback replica does not get the upstream
+publish settings" (documented: `docs/ARCHITECTURE.md:359`, `docs/COMPATIBILITY.md:1008`); "an Edit of `q_select` asks
+nothing" (the delete runs at Replicate, which asks); the Distribute form and the plain Create forms for cross-type
+names (they pass Pulp's 400 through and leave nothing); "Deb same-as-source ignores a publication-level signing
+service" (documented, `docs/USER_GUIDE.md:702-703`); the tracing file writer on the UI thread (one small append per
+notice); "Production applies at once after a profile Edit" (documented, `docs/USER_GUIDE.md:169`).
 
 ## 7. Asynchronous state consistency findings
 
@@ -630,12 +1128,39 @@ outer proxy: F92).
   tasks errors. No POST, PATCH, PUT or DELETE is retried (`client.rs:425-433`), redirects are off.
 * Dependent steps wait for their tasks; Content View checkpoints store the task href before the wait. A failure moves
   the version to `failed` and keeps the served version ([R31]: v3 `failed`, Library still `v2`).
-* Every runtime step in this audit ended with a final Task Center row, and the visible list reloaded: `a7cv` showed
-  `Library:v1`, then `Library:v2`; the Versions list showed `deleted` and `failed` at once; the File list after the
-  Reclaim; the ACS list after the Edit.
-* Connect drops messages and jobs of the previous server; stale loads are dropped by generation.
+* Every runtime step of audits 7 and 8 ended with a final Task Center row, and the visible list reloaded (this
+  audit: domain create, edit, migrate and delete; upload; sync; publish; replicate; remote delete; Content View
+  publish).
+* A task that ends while the user is on another screen: [R42] the Dashboard changed "Tasks running 1" to 0 and the
+  File count from 0 to 40 with no key pressed, 41 s after the sync started.
+* A host switch while a task runs: [R41] the Task Center of the other servers did not show the task, and after the
+  switch back the row was `completed`. Connect drops messages and jobs of the previous server; stale loads are
+  dropped by generation. What a Connect does **not** drop is the screen and an open form (F98).
+* A restart: [R40] rows dismissed with `z` stay gone; [LT:task_center_reattaches_a_task_of_a_previous_session]
+  passed in this run.
+* Waits: each request has a timeout; `wait_task` and `wait_task_group` give up after 120 s of read errors
+  (`POLL_OUTAGE`, `src/pulp/ops.rs:21`); a task
+  that stays `waiting` is waited on without limit, as documented (Cancel ends it). A confirm or a form closes before
+  its closure runs, so a repeated key does not send a mutation twice.
 
-### Async findings of this audit
+### Async findings of this audit (audit 8)
+
+| ID | Expected state | Actual state | Screens | Task handling |
+|---|---|---|---|---|
+| F98 | after Connect, no screen, form or action of the previous server | the sub-list of the previous server stays while "connecting..."; a form opened then is submitted to the new server; "[ok] assign … to user a8-x1: done" names the old object [R48] | every parameterised sub-list (user and group roles, group members, Content View versions) | no task: the POST is synchronous; the client of the new connection is used |
+| F107 | the published version has what the preview counted | "Library:v2", preview "+0 added, -0 removed"; the snapshot has no package [R60] | Content Views, Versions, every environment that gets the version | both `modify/` tasks completed; Pulp changed the version between them; nothing compares the result with the selection |
+| F106 | "uploaded …, Pulp signed it", list reloaded | "[error] … digest mismatch"; Task Center row `completed`; no reload (static) | Repositories, Content, Task Center | the task and its created resources are right; the check after it is wrong |
+| F99 / F105 / F113 | OK, or "not compared: <reason>" | MISMATCH / DRIFT with a repair hint; fallback replication item `failed` after its tasks completed [R44], [R45], [R57] | Distributions, Content Views, Replication | tasks completed; the check after them fails |
+| F101 | the confirm names the local objects that change | repository, remote and distribution of the same name changed; the row says `completed`, "tasks 5/5" [R52] | Replication, Repositories, Distributions | the task group is tracked correctly |
+| F104 | dry run and run agree | dry run CREATE; run `failed` at the publication, with a synced repository left [R58] | Replication | sync task completed; the next POST is refused |
+| F114 | the filter hides rows, or `/` is not offered | title "filter: zzzz", all rows shown [R54] | Task Center | local list |
+| F115 | the header names the server that gets the requests | the edited URL [R55] | header, replication confirm | none |
+| F116 | a clear refusal | "server error [500]" (static for the TUI; [R56] for Pulp) | Server tasks | the DELETE is synchronous |
+| F119 | a failed export is told apart | the Exports list shows one more row like a good one (static) | Exports | the task is shown as failed in the Task Center |
+| F126 | Cancel acts on the task the operator looked at | on the first row a reload moves the cursor to a newer task; the confirm shows only an href (static) | Server tasks | — |
+| F127 | Remove acts on the row of the menu | the row selected when the menu entry runs, after the list replaced itself (static) | Content | the earlier Remove task ended and replaced the list |
+
+### Async findings of the earlier audits (still open)
 
 | ID | Expected state | Actual state | Screens | Task handling |
 |---|---|---|---|---|
@@ -658,26 +1183,61 @@ served for a grace period.
 
 | What | Command (summary) | Result |
 |---|---|---|
-| Reset + full suite (`latest`) | scratch script: `tests/env/pulp-env.sh down-all`, then each scenario in its own `CARGO_BUILD_JOBS=2 systemd-run --user --scope -p MemoryHigh=6G -p MemoryMax=10G -p CPUQuota=200% --quiet nice -n 19 tests/run-live.sh <scenario>` call | every call exit 0, 2796 s |
+| Reset + full suite (`latest`) | scratch script: `tests/env/pulp-env.sh down-all`, then each scenario in its own `CARGO_BUILD_JOBS=2 systemd-run --user --scope -p MemoryHigh=6G -p MemoryMax=10G -p CPUQuota=200% --quiet nice -n 19 tests/run-live.sh <scenario>` call; the exit code of each call was recorded | every call exit 0, 2757 s |
 | Unit + mock HTTP | part of each call: `cargo test --lib --test mock_http` | 685 passed; 53 passed (in each of the 11 calls) |
-| Live scenarios | repos / cv / rbac / failures / replication / shared_db / deb / export / content / admin | 44 / 27 / 2 / 3 / 12 / 10 / 16 / 8 / 11 / 29 passed (162) |
-| Real upstreams | `real` (Debian `main`, Rocky 9) | 3 passed, 630 s (call 651 s) |
-| Format, Markdown, advisories | `cargo fmt --check`; `dprint check` (tracked Markdown); `cargo audit` | exit 0; exit 0; exit 0 (RUSTSEC-2026-0459 ignored with a reason in `.cargo/audit.toml`; the same 4 allowed warnings) |
-| Status and schema | `GET status/`, `GET docs/api.json` of pulp1 | versions in section 2; 598 in-scope operations (section 3) |
-| Plugin source | `podman exec pulp1` reads (pulpcore `tasks/reclaim_space.py`, `serializers/acs.py`, `models/repository.py`, `access_policy.py`, `viewsets/user.py`, `serializers/user.py`, `models/exporter.py`, `models/domain.py`, `settings.py`; pulp_rpm `constants.py`, `viewsets/repository.py`, `tasks/publishing.py`, `serializers/repository.py`; pulp_deb `viewsets/repository.py`; pulp_file `viewsets.py`); `podman run --rm` of the 3.95.3 and 3.63.36 images for the same lines | used for F76–F92, G19, G20 |
-| Proxy behavior | `curl -H 'X-Forwarded-Proto: https' -H 'Host: pulp.example.com' …/tasks/?limit=1` | `next` = `http://pulp.example.com/…` (F92) |
-| Runtime TUI | `pulp-tui v0.5.0 (v0.5.0-181-ga0aaca9)` in tmux 200×50, own `--config` and `--data-dir`, profile `pulp1`, poll 500–3000 ms | R29–R34 below |
-| Test count | a script over `tests/live_*.rs` and `tests/common/mod.rs` | 99 of 162 live tests drive the TUI (165 with `real`) |
+| Live scenarios | repos / cv / rbac / failures / replication / shared_db / deb / export / content / admin | 44 / 27 / 2 / 3 / 12 / 10 / 16 / 8 / 11 / 29 passed (162), 0 failed |
+| Real upstreams | `real` (Debian `main`, Rocky 9) | 3 passed (call 681 s) |
+| Format, advisories | `cargo fmt --check`; `cargo audit` | exit 0; exit 0 (RUSTSEC-2026-0459 ignored with a reason in `.cargo/audit.toml`; the same 4 allowed warnings) |
+| Markdown | `dprint check` | exit 20: "Found 1 not formatted file", this report. Every other Markdown file passes. The report is tracked since `f5f6aca`, and the committed audit-7 text fails the same way (`dprint fmt --stdin` changes 792 lines of it): dprint wants padded table columns, which would double the size of this file (196 KB → 429 KB). The tables were left compact, as in the committed version. CI does not run dprint (`.github/workflows/` has no dprint step), `AGENTS.md` lists it. Decide: exclude `docs/audits/` in `dprint.json`, or format the file |
+| Status and schema | `GET status/` and `GET docs/api.json` of pulp1; `status/` of `dom` and `old` | versions in section 2; 1200 operations, 596 in scope (section 3) |
+| Plugin source | `podman create` + `podman cp` of `pulpcore`, `pulp_rpm`, `pulp_deb`, `pulp_file`, `pulp_certguard`, `rest_access_policy` out of the `latest`, `3.95.3` and `3.63.36` images into the scratch folder | every Pulp `file:line` of section 6.2 |
+| Runtime TUI | `pulp-tui v0.6.0` (debug build of the suite) in tmux 200×50 on its own socket, `set-clipboard on`, own `--config` and `--data-dir`, poll 500–3000 ms | R35–R62 below |
+| Test count | audit 7's script over `tests/live_*.rs` (the tests differ from audit 7 by one `session_log::clear()` call) | 99 of 162 live tests drive the TUI (165 with `real`) |
 
-Not run: clippy (audit 6 ran it at this revision; no code changed), `podman build -f Containerfile .`, mutation tests,
-the suite on 3.95.3 and 3.63.36 (audit 6 ran 3.95.3 at this revision; the version facts of the new findings were read
-from the old images' source).
+Not run: clippy (no code change since audit 6 ran it, but for a five-line test helper), `podman build -f
+Containerfile .`, mutation tests, the suite on 3.95.3 and 3.63.36 (audits 5 and 6 ran both at this code). The
+findings of this audit that name 3.63.36 were run on a 3.63.36 server; nothing was run on 3.95.3.
 
 ### Runtime runs
 
-R0–R28 are the runs of audits 3–6; the matrix still cites them where the code path did not change (the revision is
-the same as audit 6). R29–R34 are the runs of this audit (`a7-*` objects, view `a7cv`; the scratch fixture server on
-port 8011; pulpcore 3.123.1). They went with the containers at the final `down-all`.
+R0–R28 are the runs of audits 3–6 and R29–R34 those of audit 7; the matrix still cites them where the code path did
+not change. R35–R62 are the runs of this audit. Servers: `dom` = own container of the `latest` image with
+`DOMAIN_ENABLED = True` (port 8090; restarted once without `CONTENT_ORIGIN` for R44, R45 and once with a
+container-reachable origin for R58); `old` = own container of the `3.63.36` image (port 8091); pulp2 of the suite
+only as the Connect target of R48. Objects are named `a8-*`; they went with the two containers at the end.
+
+| Run | Steps | Result |
+|---|---|---|
+| R35 domains (`dom`) | Domains → `c` (name `a8x`, FileSystem, settings JSON) → `Ctrl-S`; `e` (description, "Hide guarded distributions") → `Ctrl-S`; `M` (new location) → `Ctrl-S` → typed `a8x` | "[ok] create domain a8x: done"; "task completed: update domain a8x"; `POST /pulp/a8x/api/v3/domains/migrate/` → "task completed: migrate the storage of domain a8x"; Pulp and the list agree after each step |
+| R36 F89 (`dom`) | API: header guard `a8-g` is the `default_content_guard` of domain `a8x`. Profile in domain `a8x`: Content Guards → `d` → typed name | "Delete content guard a8-g (core/header). No distribution uses it."; after: `default_content_guard: null` |
+| R37 F90 (`dom`) | same profile: Domains → `a8x` → `d` → typed `a8x` | no line about the profile's own domain; "task completed: delete domain a8x"; then "error: not found [404]" on every screen |
+| R38 Copy URL (`dom`) | Distributions (File) → `a8-f` → `y`; `tmux show-buffer` | "[ok] copied http://127.0.0.1:8090/pulp/content/default/a8-f/"; the buffer holds that URL |
+| R39 Artifacts (`dom`) | upload `one.txt` through the TUI; Artifacts; `/` + another sha256; `/` + its sha256; `i` | 1 artifact listed; 0 items; 1 item; Inspect shows the digests |
+| R40 dismiss (`dom`) | Tasks → `z`; restart; Tasks | "dismissed 3 finished task(s) from the list (Pulp keeps its records)"; 0 rows; 0 rows after the restart |
+| R41 host switch (`dom`) | profile in domain `a8s`: sync of `a8-slow` (40 files, `rate_limit` 1, 41 s); Servers → Connect `pulp1`; Connect `dom`; Connect back | Task Center of `pulp1` and `dom`: 0 items; after the switch back: `completed`, "sync a8-slow (additive)" |
+| R42 Dashboard (`dom`) | profile in domain `a8t`: sync started, then Dashboard, no key | "Tasks running 1", "File content 0" → "Tasks running 0", "File content 40", "[ok] task completed: sync a8-slow (additive)" |
+| R43 G21 (`dom`) | Deb repository `a8-deb`: `u` a `.deb` (Distribution `stable`, Component `main`), `u` `fixture-src_1.0-1.dsc`; `P` (Simple true, Structured default); `D` | "new version 2"; `dists/stable/main/source/Sources` 200, 0 bytes; `dists/default/all/source/Sources` lists `fixture-src` |
+| R44 F99 (`dom` without `CONTENT_ORIGIN`) | Distributions (File) → `a8-big` → `V`; `y`; Dashboard | "MISMATCH: unsafe href rejected: /pulp/content/default/a8-big/PULP_MANIFEST"; copied "/pulp/content/default/a8-big/"; "content:" empty |
+| R45 F99 (same server) | Content Views → `c` `a8cv` → `a` `a8-f` → `P` → `y`; `D` | "[ok] a8cv version 1 published and active in Library"; "Library: v1 DRIFT / a8-f: unsafe href rejected: … / … repair the snapshot version …" |
+| R46 F100 (`dom`) | domain `a8u`: File remote `a8-od` (`on_demand`), synced, autopublish, distribution; `f1.bin` fetched. Remotes → `d` → typed name | confirm "Repository content and versions are not affected."; after: `f1.bin` 200, `f3.bin` 404, the version has 40 units |
+| R47 F110 (`dom`) | Roles → `c` → name, empty Description → `Ctrl-S` | "[error] create role a8-role: rejected [400]: description: This field may not be blank." |
+| R48 F98 (`old` → pulp2) | Users → `a8-x1` (`users/2/`) → `R`; `:` "Connect: pulp2"; `c` after 0.2 s; role `file.fileremote_viewer`; `Ctrl-S` | form "Assign role to user a8-x1" stays over the Dashboard of pulp2; "[ok] assign file.fileremote_viewer to user a8-x1: done"; on pulp2 `users/2/` (`a8-carol`) has the role; `a8-x1` has none |
+| R49 F102 (`old`) | Deb Repositories → `c` → name → `Ctrl-S` | "[error] create repository a8-olddeb: rejected [400]: autopublish: Unexpected field" |
+| R50 F103 (`old`) | API: RPM repository with `repo_config {"gpgcheck":1,"repo_gpgcheck":1}`. `e` → Description → `Ctrl-S`; Logs | body `{"description": "audit 8"}`; "task completed"; Pulp `repo_config: {}` |
+| R51 F112 (`old`) | File Repositories → `o` → `/` `a` Enter | "Error: rejected [400]: errors: Invalid Filter: 'relative_path__icontains'" |
+| R52 F101 (`dom`) | local File repository and distribution `a8-take` (own file, label `owner=team-a`); Upstream Pulp `a8-self` (its own domain `a8t`, policy `nodelete`, filter `name="a8-take"`); Replication → `R` → `y` | repository version 2: +40, −1 (the local file is not in it), labels `{"UpstreamPulp": …}`; distribution: label gone, `repository: null`, `repository_version` set; remote `a8-take` made; Task Center `completed`, "tasks 5/5" |
+| R53 F111 (`dom`) | append `[profiles.outside]` to the config file; Screens pane → `x` | "[ok] Replication hidden"; the profile block is gone from the file |
+| R54 F114 (`dom`) | Tasks → `/` `zzzz` Enter | "[8 items, filter: zzzz]", 8 rows |
+| R55 F115 (`dom`) | Servers → `dom` → `e` → Server URL port 8091 → `Ctrl-S`; File Repositories | header "server: dom (http://127.0.0.1:8091)"; the list is the one of port 8090 |
+| R56 F116 (`dom`, API) | exporter, export, importer, import of `a8-f`; `DELETE` of the `pulp_import` task | HTTP 500, HTML "Server Error (500)" |
+| R57 F113 (`old`) | File distribution with a header content guard; Distributions → `V` | "MISMATCH: served content differs: PULP_MANIFEST returned HTTP 403" |
+| R58 F104 (`dom` → `old`) | connected to `old`: Replication → `F` → Source `dom`, Types `deb`, name `a8-deb` → `y` | dry run "CREATE Deb  a8-deb -> /a8-deb  new remote + repository + distribution"; "failed    Deb a8-deb: rejected [400]: excluded_package_metadata_fields: Unexpected field; layout: Unexpected field; publish_legacy_release_files: Unexpected field"; left: remote, repository at version 1 |
+| R59 (`dom`, API) | `modify/` that removes modulemd `a8mod:1:1` from `a8-rpm` | the new version: removed `rpm.modulemd 1, rpm.package 2` |
+| R60 F107 (`dom`) | view `a8mod` on `a8-rpm`, rule `exclude name=*-debuginfo`; `P` v1; modulemd replaced by `a8mod:1:2` (lists beta), packages still in the source; `P` v2; `P` v3 | v1 snapshot: 2 packages; v2 preview "+0 added, -0 removed", "Library:v2", snapshot: 0 packages, 1 modulemd, 1 advisory; v3 preview "+2 added", snapshot: 2 packages |
+| R61 F117 (`dom`) | `a8-rpm` → `o` → modulemds → `x` → `y` | "Create a new version of a8-rpm without 1 unit(s)."; "[ok] removed 1 unit(s): now showing version 5"; Pulp: removed `rpm.modulemd 1, rpm.package 1` |
+| R62 F109 (`dom`, profile of user `a8-u1` with only `core.headercontentguard_creator`) | as `a8-u1`: Content Guards → `c` → header guard `a8-ug`; API as administrator: `a8-ug` on File distribution `a8-big`; as `a8-u1`: `d` → typed name | "Delete content guard a8-ug (core/header). No distribution uses it."; "[ok] delete content guard a8-ug: done"; `a8-big`: `content_guard: null`, `PULP_MANIFEST` 403 before and 200 after, without the header |
+
+Runs of audit 7 (kept for the open findings):
 
 | Run | Steps | Result |
 |---|---|---|
@@ -690,26 +1250,80 @@ port 8011; pulpcore 3.123.1). They went with the containers at the final `down-a
 
 ### Verification of the candidates
 
-* 5 search reviewers proposed 24 candidates and 3 polish items; 3 disprove reviewers checked each against code and
-  Pulp source. 22 became F76–F97 (17 confirmed as proposed, 5 partly confirmed and rewritten to the confirmed part:
-  F85, F88, F89, F92, F97), 1 became G20, 1 was rejected as documented design (the Edit form URL display).
-* Checked again at runtime by this audit: F76, F77, F78, F79, F80, F81 (all reproduced).
-* Checked again in the code by this audit: F78 (`cv.rs:1131-1134`, `:1946-1954`), F85 (`restore_lines`), F77
-  (`acs_paths`, `acs_edit`), F80 (palette entry), F92 (`url_for`), and the audit-6 findings of section 6.1.
-* Taken from the verifiers' reading, with the lines quoted in this file: F82–F84, F86–F91, F93–F97, the polish items.
+* This audit: 6 search reviewers with no earlier context, each with another cut than audit 7 (a field-by-field
+  contract sweep of repositories, remotes and uploads against the serializers of the three images; impact previews
+  against Pulp's cascades and Verify per plugin; pulpcore administration with a non-admin lens; Content View
+  algorithms, crash points and the store; replication, definitions, CLI, config and the HTTP client; the app shell
+  with selection identity, Connect and the async checklist). They proposed 43 candidates. Two reviewers found F99 and
+  F105 independently.
+* The lead reproduced 18 of the candidates at runtime (R43–R61; F109 later, R62). 3 disprove reviewers with no earlier context
+  attacked every candidate that was not reproduced yet, and the polish items, and listed every action that F98
+  reaches. Most were confirmed, some with corrected line numbers. Six were cut back to the part that holds: F109 (the
+  version Delete part is a false line only), F115 (the Production part is documented), F118 (not the Edit), F120 (the
+  publish-settings part is documented), F122 (not the Distribute and Create forms), the F94 extension (not the log
+  writer). Two were rejected: the preview and the run read the source versions separately (an inherent limit, kept as
+  a polish line for its wording), and Deb "same as source" signing (documented).
+* Final: 35 findings F98–F132 (11 P2, 24 P3), 2 gaps (G21, G22), 11 polish items. Evidence: 17 findings and G21
+  runtime verified (F116 on the Pulp side only, by API; F109 for the guard Delete, run after its disprove review);
+  18 findings and G22 static, each with pulp-tui and Pulp lines that a second reader confirmed.
+* Line numbers: the lead read again the cited pulp-tui lines of F98–F103, F106–F108, F110–F112, F117, F118, F120,
+  F121, F124 (b), F126, F128–F130, F132 and G21. The pulp-tui lines of the other findings (F104, F105, F109,
+  F113–F116, F119, F122, F123, F124 (a), F125, F127, F131) and every Pulp line number are from a reviewer and were
+  confirmed by a disprove reviewer; they are not read a third time.
+* Audit 7: 5 search reviewers, 24 candidates, 22 findings F76–F97, G20; F76–F81 reproduced at runtime then.
 
 ### Blockers
 
-* Domains: `domain_enabled: false`; F89, F90 and the domain rows stay static / ❓.
 * ULN sync needs an Oracle ULN account.
-* OSC 52 clipboard (Copy URL) cannot be observed in tmux capture.
-* No TLS-terminating outer proxy in the test environment (F92).
+* No object storage (F105), no package signing service (F106), no TLS-terminating outer proxy (F92) in the test
+  environment.
+* A user that is not a superuser was set up for one run (F109, [R62]); F121 and the other paths of F109 are static.
 * F91 needs a 3.95 or 3.63 server with a running replication; F95–F97 need multi-profile or rename set-ups; not run.
+* Two requests of this audit were refused by the session's permission layer. (1) A second fixture HTTP server on
+  all interfaces: the slow-sync runs used content that the `dom` server served itself, so nothing was lost. (2) The
+  removal of 10 anonymous podman volumes that the containers of this session left (pulp1, pulp2, `dom`, `old` and
+  three containers made only to copy the plugin source): they are still there. All containers and all named volumes
+  are gone (`down-all` and the removal of the two audit containers). `tests/env/pulp-env.sh down` leaves such
+  anonymous volumes after every run (158 volumes of earlier days are on this machine); `podman volume prune` removes them.
+* Resolved in this audit (were blockers until audit 7): domains (a server with `DOMAIN_ENABLED`), the OSC 52
+  clipboard (tmux `set-clipboard on` and `show-buffer`), claims about 3.63.36 (a server of that image).
 
 ## 9. Prioritized remediation backlog
 
+No P0 and no P1. The rows of this audit come first, then the open rows of audits 7 and 6. Inside a priority the order
+is the suggested order of work.
+
 | Pri | ID | Action | Plugins / features | Likely fix location | Acceptance criteria | Suggested test |
 |---|---|---|---|---|---|---|
+| P2 | F98 (RC4) | On Connect, leave every parameterised sub-list (open the Dashboard or the root list at once) and close an open form, menu or confirm; offer no action on a kind that needs a connection while `conn` is `None`; check the scope of the view in the `CvVersions` load | all servers; users, groups, Content View versions | `connect_now` `app.rs:803-807`, connect result `:825-838`, `available_actions` `:1414-1427`, `kinds.rs:1172-1178` | from "Roles of user X", Connect then `c` opens no form; a form open before the connect result is closed; the new server gets no `POST users/<n>/roles/` | unit: `connect_now` on `Kind::UserRoles`, then `c`; mock: two servers, assert no POST on B; live: R48 |
+| P2 | F107 (RC8) | Make the filtered RPM snapshot equal to the selection: send the modulemd removals with the adds in one `modify/`, or run `changes` again after the steps and add what is missing; compare the final keys with the selection before the version is recorded | RPM Content Views with filters | `CvService::snapshot` `cv.rs:972-1015`, `changes` `:1098-1118` | R60: v2 has both packages; the preview and the snapshot agree | live: a fixture with a modulemd (`m:1:1` {a, b} replaced by `m:1:2` {b}), filtered view, two publishes, assert snapshot keys = selected keys; mock of the request order |
+| P2 | F99, F105, F113 (RC5) | One served-content fetch for all checks: join a `base_url` that starts with `/` with the profile URL (the source profile URL in the fallback plan); follow a few redirects by hand with no `Authorization` to another origin and a masked query in the log; report 401 / 403 as "content guard refuses this client: not compared", not as MISMATCH; Copy URL and the Dashboard use the joined URL | all types: Verify, Rollback check, Content View drift, fallback replication, Copy URL | `fetch_content` `client.rs:346-361`; `rpm.rs:220-251`, `file.rs:22-25`, `deb.rs:79-166`; `cv.rs:1768-1774`; `replication.rs:126-164`, `:320`; `actions.rs:3655-3670` | R44, R45: OK for a correct distribution without `CONTENT_ORIGIN`; a mock 302 is followed; a mock 403 gives "not compared" | mock HTTP: relative `base_url`; 302 to a second mock server (assert no auth header there); 403; live: one server of the test environment without `CONTENT_ORIGIN` |
+| P2 | F100 (RC1) | Read the remote's `policy`; for a policy other than `immediate` replace "not affected" by "content of this remote that Pulp has not downloaded yet cannot be served any more"; name every repository that has such content where it can be read cheaply, else say so | all remote types | `remote_delete_impact` `actions.rs:1477-1492`; `docs/USER_GUIDE.md:338-342` | the confirm of an `on_demand` remote has that line and no "not affected" | unit of the lines; live: R46 (404 after the delete, and the confirm said so) |
+| P2 | F101 (RC1) | Before the confirm say what Pulp does for each policy: "a local repository, remote or distribution with the name (3.123: or the base path) of an upstream distribution is taken over: content replaced by a mirror sync, labels replaced, distribution re-pointed"; list the local distributions without this upstream's label when the filter is empty or simple; typed name for every policy; correct the form note | native replication | `replicate` `actions_admin.rs:1138-1169`, note `:1060`, `deletion_warning` `:925-935`; `docs/USER_GUIDE.md:801-817`, `docs/COMPATIBILITY.md:707-755` | R52: the confirm names `a8-take` and asks for the typed name | unit of the confirm lines; live: local repository + distribution with the upstream name |
+| P2 | F102, F112, F129, F130 (RC6) | Gate by the server schema: `autopublish` in the repository form (`has("autopublish")`); the File path search (`relative_path__icontains` only when the filter exists, else exact `relative_path` or a note); the fingerprint help and `""` for a non-nullable field; `dists/default/` only for pulp_deb with the empty-release branch. Add a live test that creates a repository of **each** type through the form | Deb 3.5.4; File 3.95 / 3.63; RPM 3.34 / 3.27 | `actions.rs:1106`, `:1015`, `:1157`; `kinds.rs:598`; `deb.rs:105-107` | R49 creates the repository; R51 searches or says why not | unit: `repo_form(Deb, caps without autopublish)` has no such field; live on the 3.63.36 image: `Act::Create` for File and Deb repositories, File Content search |
+| P2 | F103 (RC6) | On pulp_rpm with the `repo_config` shim (schema has the deprecated `gpgcheck`), send the current `repo_config` in every RPM repository PATCH, also from `copy_settings`; record it in `docs/COMPATIBILITY.md` | RPM 3.27.12 | `repo_body` / `patch_repo` `actions.rs:1121-1230`; `cv.rs:1024-1058` | R50: `repo_config` unchanged after a description edit | live on 3.63.36: set `repo_config`, edit the description through the TUI, read it back |
+| P2 | F104 (RC6) | Filter the publication mode by the destination schema; `find_publication` ignores keys the destination lacks | Deb fallback replication across versions | `actions_admin.rs:1328`, `ops.rs:278-348`, `replication.rs:257-260`, `:313-316` | R58 ends with a served distribution | unit: destination caps with `simple, structured` only → the body has no `layout` |
+| P2 | F106 | When the repository has `package_signing_service`, do not compare with the local digest: report the server digest and "Pulp signed the package", and reload | RPM; Deb 3.11 | `ops::uploaded` / `check_digest` `ops.rs:935-967`, `upload_file` `actions.rs:1795-1818` | an upload into a signing repository ends "[ok]" and the list reloads | mock: repository with the service, content with another sha256; live when the environment gets a package signing service |
+| P2 | F109, F121 (RC7) | One helper next to `ops::sees_everything`: when the user does not see everything, replace each "No distribution uses / serves it" by "none that this Pulp user may view (others can exist)" and ask for the typed name; treat a 403 of `list_roles/` and `{group}roles/` as "not readable for this user" | guards, repositories, publications, versions; object roles; groups | `actions_admin.rs:505-518`, `:635-641`, `:414-415`, `:274`; `actions.rs:1456-1466`, `:2859-2871`, `:3589-3595`; `ops.rs:478-484` | a scoped user never reads "No distribution uses it"; `B` shows "my permissions" | mock: `access_policies/` 403 + empty lists; live in `live_rbac`: guard owner without distribution view |
+| P3 | F108 | Do not reuse an RPM publication whose mode fields differ from the snapshot repository, and never for a repository that signs metadata | RPM Content Views | `CvService::publication` `cv.rs:1065-1068`, `ops::reusable_publication` `ops.rs:318-323` | after a failed publish that set a signing service, the next publish POSTs a publication | mock next to `an_rpm_publication_is_reused_or_recorded_before_the_wait` |
+| P3 | F110 | Send null (or leave out) an empty role description | roles | `role_form` `actions_admin.rs:362` | R47 creates the role | mock (change the body assert); live Create with no description |
+| P3 | F111 | Apply each config change to a fresh `Config::load` of the file, not to the config of the TUI start | config | `config.rs:497-529`; `app.rs:1246`, `actions.rs:630`, `:780`, `:833` | R53: the outside profile stays | unit: outside add, then save |
+| P3 | F114 | Filter `task_items` with the same `keep`, or make Tasks not searchable | Task Center | `app.rs:605-607`, `kinds.rs:572-574` | R54 shows only matching rows | unit |
+| P3 | F115 (RC4) | Header and `dst_origin` read the URL of `conn.client`; mark an edited profile "reconnect" | shell, replication | `view.rs:48-54`, `actions_admin.rs:965-967` | R55: the header keeps port 8090 until Connect | unit of the header text |
+| P3 | F116 | Turn the 500 of a task Delete into "an import record keeps this task: delete the importer first" (or read `imports/` first) | server tasks | `server_task_delete` `actions.rs:4060-4073` | clear text | mock 500 |
+| P3 | F117 | For a modulemd in a Remove or Add, add "and its N packages" from the `packages` field; count them in the result | RPM content | `remove_lines` `actions.rs:3234-3250`, `content_removed` `:127-133`, `add_to_repo` | R61 names the package | unit of the lines |
+| P3 | F118 | Wording: "… that the distribution filter no longer selects or that are gone upstream"; same in the docs | native replication | `deletion_warning` `actions_admin.rs:925-935`, `docs/COMPATIBILITY.md:752-754` | text | unit |
+| P3 | F119 | A state column in Exports from the export's `task` | exporters | `kinds.rs:815-819` | a failed export row says failed | unit of the columns |
+| P3 | F120, F122 | Fallback plan: read the publication for RPM distributions too (SKIP "serves nothing"); look names up on the generic `repositories/`, `remotes/`, `distributions/` lists and report another type as a conflict; the same lookup in the `import-repos` plan | fallback replication, import-repos | `replication.rs:144-146`, `:188-240`; `repo_export.rs:283-289` | the dry run says SKIP / conflict; the run makes nothing | mock plan tests |
+| P3 | F123, F124 | Fallback: show "remote URL changes: old -> new" for an owned replica (or label with `server_key()`). `db copy`: refuse `--from` a profile of another server key (with an override flag); copy `src.aliases()` too | replication; CLI, store | `replication.rs:77-106`, `:190-196`; `main.rs:124-139`; `store.rs:1855-1859` | plan row names the URL change; A → B → C keeps alias A | unit: two-hop copy next to `store.rs:3274`; mock plan |
+| P3 | F125 | Unpromote and its preview also look up the derived distribution names of the attempted version and delete the owned ones | Content Views | `cv.rs:1567-1581`, `actions_cv.rs:933-957` | an unrecorded labeled distribution is named and deleted | mock |
+| P3 | F126, F127 | Server tasks and Task groups follow the selected row on reload; the Cancel confirm names task and state. Pass the menu item into `content_action`; name the first units in the Remove confirm | shell | `app.rs:1034-1038`, `actions.rs:4092-4099`; `actions.rs:455`, `:3194-3250` | the target is the row the operator saw | unit: `set_items` on `Kind::ServerTasks`; menu on row 2, `replace`, dispatch |
+| P3 | F128 | The Environments loaders only read (show a default Library row when none exists); only writes call `ensure_library` | shared database | `kinds.rs:1205-1207`, `actions_cv.rs:296`, `:863` | no INSERT from a read-only profile | unit with an empty store |
+| P3 | F131 | Add a keyring delete and call it (in `spawn_blocking`) after a profile Delete, for both users; at least a confirm line | config | `actions.rs:813-839`, `config.rs:355-369` | no entry left; the confirm names it | unit of the confirm lines |
+| P3 | F132 | Refuse `.` and `..` in `validate_name` | Content Views | `store.rs:2225-2230` | refused | unit |
+| P3 | G21 | Add `content/deb/source_release_components/` to the Deb record Create (form: source package, release component); say in the upload result of a `.dsc`, `.udeb` or generic file which publication serves it | Deb | `deb::RECORDS` `deb.rs:355-356`, the record forms `actions.rs:3329-3506` | R43: `dists/stable/main/source/Sources` lists the package after the record is made | live next to `the_tui_creates_release_records_that_a_publication_serves` |
+| P3 | T07 | Live tests through the TUI for F98–F104, F107, F110–F117 as listed above; a form Create test for every repository type; one scenario on a server without `CONTENT_ORIGIN`; run the form tests on the old images | various | `tests/live_*.rs`, `tests/env/pulp-env.sh` | each test fails before its fix | — |
+| P3 | polish (audit 8) | The 11 items of "Other P3 polish of this audit" in section 6.2; add `actions.rs:1695`, `:1840` to F94; fix F67 in `save_distribution` too | various | section 6.2 | — | unit |
 | P2 | F76 | Say what Pulp does: the files of every synced unit of the repository go, also of units that other repositories (Content View snapshots) share; name those repositories (or at least the snapshot repositories) in the impact; fix `COMPATIBILITY.md:367-369`, `USER_GUIDE.md:273-274` | all types | `reclaim` `actions.rs:1995-2040` | the confirm of a repository that shares units names the other repositories; no "no other repository" text | live: R29 (two File repositories, check that the confirm names `a7-copy`); unit of the lines |
 | P2 | F77 | Build `old` from the raw `paths` (keep `""`, shown as "(the remote URL itself)"), so the existing scan names every other ACS with `""` and asks first | RPM, File ACS | `acs_edit` `actions.rs:2711-2760`, `acs_paths` `:2652` | an edit of `[""]` → `["sub/"]` lists the other ACSs with no paths and sends nothing before the confirm | mock: item `{"paths": [""]}`, ACS list with another `[""]`; live: R30 |
 | P2 | F78 | Never delete `…/versions/0/` in `row_objects` (keep it with "base of every unfiltered copy", the rule of `drop_unused_versions`) | RPM, Deb Content Views | `cv.rs:2055-2084` | v1 that records `versions/0/` deletes only its publication; v3 publishes | mock (`delete_version_impact` keeps v0); live TUI: R31 |
@@ -748,29 +1362,38 @@ port 8011; pulpcore 3.123.1). They went with the containers at the final `down-a
 | P3 | F75 | Load the holders (as the Delete does) and ask for the role name when the permissions change | pulpcore roles | `role_form` `actions_admin.rs:344-369` | A permission edit of a held role names the holders; a description edit saves at once | unit |
 | P3 | T05 | Tests: live F53 on Deb and for Retain checkpoints; live checkpoint-publication confirm; live TUI test of F56 (a row with a publication); live TUI test for F59/F60 (now service level); tests for F66–F75 when fixed | various | `tests/live_repos.rs`, `tests/live_deb.rs`, `tests/live_cv.rs`, `tests/live_admin.rs` | Each test fails on the code before its fix | the tests named here |
 | P3 | polish | Repository name in the "now serves" line; `architecture_variant` wording ("may remove"); ImportRepos headline counts the skipped remote; clear `last_repo` on Connect; mask before the 64 KiB cut; keep the form after Esc in a confirm | various | section 6 | — | unit |
-| — | G03–G20 | Optional Pulp features; G19, G20 new | various | — | built on demand (user decision for G03–G18) | — |
+| — | G03–G20, G22 | Optional Pulp features (G21 is in the P3 rows above) | various | — | built on demand (user decision for G03–G18) | — |
 
 ## 10. Final comprehensive functionality matrix
 
-Evidence tags: **[Rn]** = runtime run of the real binary in a PTY (tmux) against pulp1 (section 8; R0–R6 of audit 3 at
-`3f59b9b`, R7–R11 of audit 4 at `f530b17`, R12–R19 of audit 5 at `5812b99`, R20–R28 of audit 6 and R29–R34 of this audit, both at `a0aaca9`);
-**[LT:x]** = live test that drives the TUI action (`run(&mut app, Act::…)`), passed in this audit's run at `a0aaca9`;
+Evidence tags: **[Rn]** = runtime run of the real binary in a PTY (tmux) against a real Pulp server (section 8; R0–R6
+of audit 3 at `3f59b9b`, R7–R11 of audit 4 at `f530b17`, R12–R19 of audit 5 at `5812b99`, R20–R34 of audits 6 and 7
+at `a0aaca9`, R35–R62 of this audit at `f980f36`: the code of the cited paths is the same in the last three);
+**[LT:x]** = live test that drives the TUI action (`run(&mut app, Act::…)`), passed in this audit's run at `f980f36`;
 **[LS:x]** = live test at service level (calls `ops`/`CvService`/`Store` directly; the TUI path is not exercised),
 passed in this run; **[U]** = unit or mock-HTTP test only; **[S]** = static analysis. *Works end-to-end* is ✅ only
 with [Rn] or [LT]. App-level rows (`pulp-tui`) are not Pulp APIs: their *Pulp API* cell is `—`.
-`*_x_through_the_tui` names a test that runs for File, RPM and Deb (or the types it names). P3 findings are named in
-their rows but do not set ❌.
+`*_x_through_the_tui` names a test that runs for File, RPM and Deb (or the types it names).
 
-Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every ratio, `❓` is not a success):
+Rules for ❌: a P2 finding sets ❌ in its row; where it has no runtime proof, the row says "static". A P3 finding is
+named in its row and does not set ❌, with one exception: a row that exists only for an older server version
+(F112) and whose operation fails there. Where an operation works on one supported server version or configuration
+and fails on another, the matrix has one row for each (the rule "one row for each subtype when the behavior
+differs"): the rows that name pulp_deb 3.5.4, pulp_rpm 3.27.12, pulp_file 3.95.3 / 3.63.36, a signing service,
+object storage and a user that is not a superuser. The Verify rows and the drift row are ❌ because they fail on a
+server with the default `CONTENT_ORIGIN` (F99); they work on every server that sets it, and all live tests do.
+
+Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every ratio, `❓` is not a success; counted from
+the rows with a script):
 
 | Plugin / area | Rows | Pulp API | API client | Available in TUI | Works end-to-end | Async state consistent |
 |---|---:|---|---|---|---|---|
-| `pulp-tui` | 40 | 0 / 0 / 0 / 40 | 40 / 0 / 0 / 0 | 40 / 0 / 0 / 0 | 39 / 1 / 0 / 0 | 20 / 0 / 1 / 19 |
-| `pulp_deb` | 33 | 32 / 1 / 0 / 0 | 32 / 0 / 0 / 1 | 32 / 0 / 0 / 1 | 31 / 1 / 0 / 1 | 27 / 0 / 0 / 6 |
-| `pulp_file` | 47 | 47 / 0 / 0 / 0 | 47 / 0 / 0 / 0 | 47 / 0 / 0 / 0 | 44 / 2 / 1 / 0 | 36 / 1 / 0 / 10 |
-| `pulp_rpm` | 44 | 44 / 0 / 0 / 0 | 43 / 1 / 0 / 0 | 43 / 1 / 0 / 0 | 40 / 2 / 1 / 1 | 35 / 1 / 1 / 7 |
-| `pulpcore` | 72 | 69 / 2 / 0 / 1 | 54 / 16 / 0 / 2 | 54 / 16 / 0 / 2 | 50 / 1 / 3 / 18 | 39 / 0 / 2 / 31 |
-| **All** | 236 | 192 / 3 / 0 / 41 | 216 / 17 / 0 / 3 | 216 / 17 / 0 / 3 | 204 / 7 / 5 / 20 | 157 / 2 / 4 / 73 |
+| `pulp-tui` | 42 | 0 / 0 / 0 / 42 | 42 / 0 / 0 / 0 | 42 / 0 / 0 / 0 | 38 / 4 / 0 / 0 | 22 / 1 / 0 / 19 |
+| `pulp_deb` | 36 | 35 / 1 / 0 / 0 | 34 / 1 / 0 / 1 | 34 / 1 / 0 / 1 | 29 / 5 / 0 / 2 | 27 / 1 / 0 / 8 |
+| `pulp_file` | 48 | 47 / 1 / 0 / 0 | 47 / 1 / 0 / 0 | 48 / 0 / 0 / 0 | 43 / 5 / 0 / 0 | 36 / 1 / 0 / 11 |
+| `pulp_rpm` | 46 | 46 / 0 / 0 / 0 | 45 / 1 / 0 / 0 | 45 / 1 / 0 / 0 | 38 / 6 / 1 / 1 | 36 / 2 / 1 / 7 |
+| `pulpcore` | 75 | 72 / 2 / 0 / 1 | 56 / 17 / 0 / 2 | 56 / 17 / 0 / 2 | 52 / 4 / 0 / 19 | 41 / 0 / 0 / 34 |
+| **All** | 247 | 200 / 4 / 0 / 43 | 224 / 20 / 0 / 3 | 225 / 19 / 0 / 3 | 200 / 24 / 1 / 22 | 162 / 5 / 1 / 79 |
 
 ### `pulp-tui` (application-level features built on the Pulp API)
 
@@ -781,9 +1404,9 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulp-tui` | Content View: break lock | — | ✅ | ✅ | ✅ | — | [LT:resume_watch_and_break_lock_through_the_tui] |
 | `pulp-tui` | Content View: compare versions | — | ✅ | ✅ | ✅ | — | [LT:content_view_workflows_through_the_tui] (Compare on Versions) |
 | `pulp-tui` | Content View: composite create, add/pin/remove components, publish | — | ✅ | ✅ | ✅ | ✅ | [LT:composite_content_view_through_the_tui] Library serves the composite's paths |
-| `pulp-tui` | Content View: create | — | ✅ | ✅ | ✅ | — | [R23]; store only |
+| `pulp-tui` | Content View: create | — | ✅ | ✅ | ✅ | — | [R23], [R45]; store only; F132 the names `.` and `..` are accepted (static) |
 | `pulp-tui` | Content View: delete view (impact, distributions, snapshots) | — | ✅ | ✅ | ✅ | ✅ | [R16]; [LT:content_view_workflows_through_the_tui] |
-| `pulp-tui` | Content View: drift check of all environments | — | ✅ | ✅ | ✅ | ✅ | [R4]; [LT] `CvDrift`; F60 fixed [LS:a_kept_library_distribution_bound_to_a_repository_is_reported_and_unbound]; F71 ownership loss not reported, wrong hint |
+| `pulp-tui` | Content View: drift check of all environments | — | ✅ | ✅ | ❌ | ✅ | **F99 (P2)**: [R45] on a server without `CONTENT_ORIGIN` (the default of pulpcore 3.95.3 and 3.123.1) a correct Library is "DRIFT … unsafe href rejected", with the hint "repair the snapshot version"; works where `base_url` is absolute: [R4]; [LT] `CvDrift`; F105 a 302 of object storage and F113 a 403 of a content guard are DRIFT too (static); F60 fixed [LS:a_kept_library_distribution_bound_to_a_repository_is_reported_and_unbound]; F71 ownership loss not reported, wrong hint |
 | `pulp-tui` | Content View: edit (description, pins, auto publish) | — | ✅ | ✅ | ✅ | — | [LT:environments_and_view_definition_through_the_tui, composite_content_view_through_the_tui] |
 | `pulp-tui` | Content View: edit filter rules | — | ✅ | ✅ | ✅ | — | [LT:content_view_workflows_through_the_tui] Filters then a second Publish |
 | `pulp-tui` | Content View: export / import definitions (E / I on Servers) | — | ✅ | ✅ | ✅ | ✅ | [LT:environment_relabel_and_definitions_export_import_through_the_tui] |
@@ -792,13 +1415,14 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulp-tui` | Content View: promote to environment — failure path | — | ✅ | ✅ | ✅ | ✅ | [LT:a_promotion_to_an_overlapping_base_path_is_named_and_creates_nothing_through_the_tui, a_partial_promotion_and_what_the_screens_show_through_the_tui]; [R15] |
 | `pulp-tui` | Content View: promote to environment — success path | — | ✅ | ✅ | ✅ | ✅ | [R15]; [LT:content_view_workflows_through_the_tui] |
 | `pulp-tui` | Content View: publish new version (Deb, signing choice) | — | ✅ | ✅ | ✅ | ✅ | [LT:deb_content_view_publish_signing_through_the_tui] signed / none / same as source |
-| `pulp-tui` | Content View: publish new version (RPM + File) | — | ✅ | ✅ | ✅ | ✅ | [R23] v1 `Library:v1`, v2 partial exactly for the previewed repositories (`Library:v1 (v2 partial)`); [R28] v3 `Library:v3`; F95 two local profiles of one server share the derived objects (static) |
+| `pulp-tui` | Content View: publish new version (RPM + File) | — | ✅ | ✅ | ✅ | ✅ | [R23] v1 `Library:v1`, v2 partial exactly for the previewed repositories (`Library:v1 (v2 partial)`); [R28] v3 `Library:v3`; [R45] File; F95 two local profiles of one server share the derived objects (static); F108 an RPM publish can reuse a publication with other publish settings (static) |
+| `pulp-tui` | Content View: publish new version, filtered RPM view after a modulemd of the source was replaced or removed | — | ✅ | ✅ | ❌ | ✅ | **F107 (P2)**: [R60] the preview says "+0 added, -0 removed"; the new Library version has none of the 2 selected packages (Pulp removes the packages of the removed modulemd between the remove step and the add step); the next publish adds them again |
 | `pulp-tui` | Content View: remove repository | — | ✅ | ✅ | ✅ | — | [R28]; [LT:environments_and_view_definition_through_the_tui] |
 | `pulp-tui` | Content View: resume interrupted publish | — | ✅ | ✅ | ✅ | ✅ | [LT:resume_watch_and_break_lock_through_the_tui]; F58 fixed (Resume confirm has the "In Library:" lines, [U]); F70 deleted version; F96 a gone source version gives a raw error on every Resume (static) |
 | `pulp-tui` | Content View: roll back environment | — | ✅ | ✅ | ✅ | ✅ | [LT:content_view_workflows_through_the_tui]; F97 after a source rename and re-add, the other derived distribution stays unrecorded (static) |
 | `pulp-tui` | Content View: sync source repositories (f) | — | ✅ | ✅ | ✅ | ✅ | [LT:content_view_workflows_through_the_tui] |
-| `pulp-tui` | Content View: unpromote | — | ✅ | ✅ | ✅ | ✅ | [LT:content_view_workflows_through_the_tui] |
-| `pulp-tui` | Content View database: migrate / copy (offered on Connect, save) | — | ✅ | ✅ | ✅ | — | [LT:database_migrate_and_copy_through_the_tui]; [LS:postgres_migration_9_restores_the_served_version_of_an_old_failed_row] |
+| `pulp-tui` | Content View: unpromote | — | ✅ | ✅ | ✅ | ✅ | [LT:content_view_workflows_through_the_tui]; F125 a distribution that a stopped promotion made but did not record stays (static) |
+| `pulp-tui` | Content View database: migrate / copy (offered on Connect, save) | — | ✅ | ✅ | ✅ | — | [LT:database_migrate_and_copy_through_the_tui]; [LS:postgres_migration_9_restores_the_served_version_of_an_old_failed_row]; F124 `db copy --from` has no same-server check, and a second copy loses the aliases of the first database id (static) |
 | `pulp-tui` | Content View version: delete | — | ✅ | ✅ | ❌ | ✅ | **F78 (P2)**: [R31] a version that records `…/versions/0/` of a snapshot repository deletes it; every later unfiltered RPM or Deb publish fails with 400; [R15]; [LT:content_view_workflows_through_the_tui, a_version_that_dev_serves_in_part_is_not_deleted_through_the_tui] |
 | `pulp-tui` | Content View version: list | — | ✅ | ✅ | ✅ | ✅ | [R15], [R23] states and environments |
 | `pulp-tui` | Content View version: watch pending task | — | ✅ | ✅ | ✅ | ✅ | [LT:resume_watch_and_break_lock_through_the_tui] (Watch W) |
@@ -806,14 +1430,15 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulp-tui` | Environment: delete | — | ✅ | ✅ | ✅ | — | [LT:environments_and_view_definition_through_the_tui] |
 | `pulp-tui` | Environment: relabel (moves distributions) | — | ✅ | ✅ | ✅ | ✅ | [LT:environment_relabel_and_definitions_export_import_through_the_tui]; refusal [LT:relabel_to_an_overlapping_label_is_refused_through_the_tui] |
 | `pulp-tui` | Environment: toggle protected | — | ✅ | ✅ | ✅ | — | [LT:environments_and_view_definition_through_the_tui] |
-| `pulp-tui` | Fallback replication: dry run and run (RPM, File, Deb) | — | ✅ | ✅ | ✅ | ✅ | [LT:fallback_replication_through_the_tui, deb_fallback_replication_through_the_tui]; F57 fixed [LS:the_fallback_plan_names_a_base_path_that_overlaps_a_local_distribution] |
+| `pulp-tui` | Fallback replication: Deb, source pulp_deb 3.11 into a destination with pulp_deb 3.8 or 3.5 | — | ✅ | ✅ | ❌ | ✅ | **F104 (P2)**: [R58] 3.11.1 → 3.5.4: dry run "CREATE"; run "failed … rejected [400]: … layout: Unexpected field …" after the remote, the repository and the sync; the same on each rerun; 3.8.1 by its source |
+| `pulp-tui` | Fallback replication: dry run and run (RPM, File, Deb; both servers of one version) | — | ✅ | ✅ | ✅ | ✅ | [LT:fallback_replication_through_the_tui, deb_fallback_replication_through_the_tui]; F57 fixed [LS:the_fallback_plan_names_a_base_path_that_overlaps_a_local_distribution]; static: F99 and F105 each item fails at its last check on a server without `CONTENT_ORIGIN` or with object storage; F120 RPM dry run CREATE for a distribution that serves nothing; F122 names of another type; F123 the label is the profile name |
 | `pulp-tui` | Form: keys typed ahead after Enter are held, with a footer marker | — | ✅ | ✅ | ✅ | — | [R27] `-- WAIT --`; [R19] |
 | `pulp-tui` | Logs screen (session requests, actions, notices) | — | ✅ | ✅ | ✅ | — | [LT:upstream_base_url_user_info_never_shows_through_the_tui] every Logs row and detail masked (F64 fixed); 64 KiB cut (polish) |
-| `pulp-tui` | Read-only profile blocks mutations | — | ✅ | ✅ | ✅ | — | [LT:server_profiles_create_edit_and_delete_through_the_tui] a mutation is refused at once |
+| `pulp-tui` | Read-only profile blocks mutations | — | ✅ | ✅ | ✅ | — | [LT:server_profiles_create_edit_and_delete_through_the_tui] a mutation is refused at once; F128 opening Environments still inserts the Library row into a shared database (static) |
 | `pulp-tui` | Repository definitions: export (X) | — | ✅ | ✅ | ✅ | — | [LT:repository_definitions_export_and_import] |
 | `pulp-tui` | Repository definitions: import (J, plan then create) | — | ✅ | ✅ | ✅ | ✅ | [LT:repository_definitions_export_and_import]; headline count (polish); F84 an RPM repository with an OSV config is refused with 400 (static) |
-| `pulp-tui` | Server profile: connect / switch host | — | ✅ | ✅ | ✅ | ❓ | [R0], [LT:server_profiles_create_edit_and_delete_through_the_tui]; dropping stale task messages on a switch [U] only; `last_repo` kept (polish) |
-| `pulp-tui` | Server profile: create / edit / delete | — | ✅ | ✅ | ✅ | — | [LT:server_profiles_create_edit_and_delete_through_the_tui] keeps the file comment; F94 the config is written on the UI thread (static) |
+| `pulp-tui` | Server profile: connect / switch host | — | ✅ | ✅ | ✅ | ❌ | **F98 (P2)**: [R48] a sub-list of the previous server ("Roles of user a8-x1") stays during "connecting..."; a form opened then posts to the new server: the role went to another user there, and the result named the old one. What holds: [R41] a switch while a task runs: the Task Center of the other server does not show it, and after the switch back the row is `completed`; [R0], [LT:server_profiles_create_edit_and_delete_through_the_tui]; `last_repo` kept (polish) |
+| `pulp-tui` | Server profile: create / edit / delete | — | ✅ | ✅ | ✅ | — | [LT:server_profiles_create_edit_and_delete_through_the_tui] keeps the file comment; F94 the config is written on the UI thread (static); F111 [R53] a save removes a profile that another process added to the file; F115 [R55] the header shows the edited URL while requests go to the old server; F131 Delete leaves the keyring secret (static) |
 | `pulp-tui` | Server profile: store secret in system keyring | — | ✅ | ✅ | ✅ | — | [LT:store_secret_in_the_keyring_through_the_tui] |
 | `pulp-tui` | Server profile: test connection | — | ✅ | ✅ | ✅ | — | [LT:server_profile_test_connection] |
 
@@ -826,24 +1451,27 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulp_deb` | Content: add to another repository (structured `deb/copy/`) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:content_add_and_remove_through_the_tui]; F73 no replacement line, no retention check |
 | `pulp_deb` | Content: browse 13 types, search packages | ✅ | ✅ | ✅ | ✅ | — | [LT:content_add_and_remove_through_the_tui, the_tui_creates_release_records_that_a_publication_serves] |
 | `pulp_deb` | Content: create release / component / architecture / package release component | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:the_tui_creates_release_records_that_a_publication_serves]; F62 fixed: [LT:a_package_release_component_of_an_older_version_confirms_what_comes_back_through_the_tui]; `architecture_variant` over-warning (polish) |
+| `pulp_deb` | Content: create source package release component (`content/deb/source_release_components/`) | ✅ | ❌ | ❌ | — | — | G21 (new): [R43] an uploaded source package is in no `Sources` index of a structured publication (0 bytes); the record Create has the four other types only |
 | `pulp_deb` | Content: remove units (with release records) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:content_add_and_remove_through_the_tui] the screen moves to the new version |
-| `pulp_deb` | Content: upload `.deb` (distribution, component, overwrite) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:uploads_of_each_type_through_the_tui] |
-| `pulp_deb` | Content: upload `.udeb` / source package / generic content | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:the_tui_uploads_a_udeb_a_source_package_and_generic_content_as_their_types] |
+| `pulp_deb` | Content: upload `.deb` (distribution, component, overwrite) | ✅ | ✅ | ✅ | ✅ | ✅ | [R43]; [LT:uploads_of_each_type_through_the_tui] |
+| `pulp_deb` | Content: upload `.deb` into a repository with a package signing service (pulp_deb 3.11) | ✅ | ✅ | ✅ | ❌ | ❌ | **F106 (P2)**, static: Pulp signs and completes; the TUI ends with "digest mismatch" and does not reload; no signing service of this kind in the test environment |
+| `pulp_deb` | Content: upload `.udeb` / source package / generic content | ✅ | ✅ | ✅ | ✅ | ✅ | [R43] `.dsc`; [LT:the_tui_uploads_a_udeb_a_source_package_and_generic_content_as_their_types]; an APT publication serves no `.udeb` and no generic content, and a source package only in simple mode (G21, polish) |
 | `pulp_deb` | Distribution: create / edit | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:deb_publications_and_distributions_through_the_tui] base path, binding, guard and checkpoint edits after the typed name |
 | `pulp_deb` | Distribution: delete (single, marked) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:deb_publications_and_distributions_through_the_tui] (single); marked [U] |
 | `pulp_deb` | Distribution: list and binding details | ✅ | ✅ | ✅ | ✅ | — | [LT:deb_publications_and_distributions_through_the_tui] |
 | `pulp_deb` | Distribution: re-point / rollback (keeps signing and verbatim mode) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:deb_publications_and_distributions_through_the_tui]; [LS:deb_rollback_keeps_a_simple_publication] |
-| `pulp_deb` | Distribution: verify served content | ✅ | ✅ | ✅ | ✅ | — | [LT:deb_publications_and_distributions_through_the_tui] "OK: " |
+| `pulp_deb` | Distribution: verify served content | ✅ | ✅ | ✅ | ❌ | — | **F99 (P2)**, static for Deb: the same `fetch_content` as [R44]: MISMATCH for every distribution on a server without `CONTENT_ORIGIN`; works where `base_url` is absolute: [LT:deb_publications_and_distributions_through_the_tui] "OK: "; F105 object storage, F113 content guard, F130 `dists/default/` on pulp_deb 3.5.4 / 3.8.1 (static) |
 | `pulp_deb` | Publication: create APT (structured / simple / signing) | ✅ | ✅ | ✅ | ✅ | ✅ | [R3]; [LT:deb_publications_and_distributions_through_the_tui] |
 | `pulp_deb` | Publication: create verbatim | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:deb_verbatim_publication_create_through_the_tui] |
 | `pulp_deb` | Publication: delete (APT, verbatim; served-after impact) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:deb_publications_and_distributions_through_the_tui] names the distribution and what it serves after |
 | `pulp_deb` | Publication: list APT + verbatim (merged, newest first) | ✅ | ✅ | ✅ | ✅ | — | [LT:deb_publications_and_distributions_through_the_tui] |
 | `pulp_deb` | Remote: create (distributions, components, architectures, udebs, sources, GPG key) | ✅ | ✅ | ✅ | ✅ | ✅ | [R3]; [LT:remotes_create_edit_and_delete_through_the_tui] |
-| `pulp_deb` | Remote: delete (impact) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:remotes_create_edit_and_delete_through_the_tui] names the repository; Pulp unsets its remote |
+| `pulp_deb` | Remote: delete (impact) | ✅ | ✅ | ✅ | ❌ | ✅ | **F100 (P2)**, static for Deb: the same text and pulpcore cascade as [R46]; [LT:remotes_create_edit_and_delete_through_the_tui] names the repository; Pulp unsets its remote |
 | `pulp_deb` | Remote: edit | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:remotes_create_edit_and_delete_through_the_tui] (a task) |
 | `pulp_deb` | Repository: copy content from another repository (`deb/copy/`, filters) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:copy_content_through_the_tui] name rule; F73 |
 | `pulp_deb` | Repository: copy with dependency solving | ❌ | — | — | — | — | Pulp unavailable: pulp_deb 3.11.1 raises `FeatureNotImplementedError` |
-| `pulp_deb` | Repository: create | ✅ | ✅ | ✅ | ✅ | ✅ | [R3] with the remote picker |
+| `pulp_deb` | Repository: create | ✅ | ✅ | ✅ | ✅ | ✅ | [R3] with the remote picker (pulp_deb 3.11.1) |
+| `pulp_deb` | Repository: create on pulp_deb 3.5.4 (image 3.63.36) | ✅ | ✅ | ✅ | ❌ | — | **F102 (P2)**: [R49] every Create from the form: "rejected [400]: autopublish: Unexpected field"; the live tests create Deb repositories through the API |
 | `pulp_deb` | Repository: delete (impact, typed confirm) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:deb_repository_delete_impact_names_the_distribution_of_a_verbatim_publication] |
 | `pulp_deb` | Repository: distribute (pin, optional signing service; re-point after the typed name) | ✅ | ✅ | ✅ | ✅ | ✅ | [R3]; F54 fixed [LT:deb_distribute_re_points_after_the_typed_name_through_the_tui]; F67 overlapping new path |
 | `pulp_deb` | Repository: edit (signing services, overrides, excluded fields) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:deb_repository_edit_of_the_signing_fields_through_the_tui]; Retain versions: F53 fixed (see the `pulp_file` row), no Deb live case (T05) |
@@ -862,20 +1490,21 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulp_file` | ACS: create / edit (path warning) / delete | ✅ | ✅ | ✅ | ❌ | ✅ | **F77 (P2)**: [R30] Edit of an ACS with no paths sends the PATCH with no check, and every other ACS with no paths loses its path row; ACS Delete "its 1 path(s)" (polish); [LT:acs_create_edit_and_delete_through_the_tui] |
 | `pulp_file` | ACS: refresh (task group) | ✅ | ✅ | ✅ | ✅ | ❌ | [LT:acs_refresh_through_the_tui_ends_with_its_task_group]; F77 [R30] the refresh of an ACS that lost its path row makes an empty group, shown `gone` "its tasks were purged" |
 | `pulp_file` | Content: add to another repository | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:content_add_and_remove_through_the_tui]; F73 a same-path unit is replaced with no dialog and no retention check |
-| `pulp_file` | Content: browse, search paths | ✅ | ✅ | ✅ | ✅ | — | [LT:content_add_and_remove_through_the_tui] |
-| `pulp_file` | Content: remove units | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:content_add_and_remove_through_the_tui]; a snapshot of another database refused [LT:snapshot_versions_publications_and_content_of_another_database_are_not_changed_through_the_tui] |
+| `pulp_file` | Content: browse, search paths | ✅ | ✅ | ✅ | ✅ | — | [LT:content_add_and_remove_through_the_tui] (pulp_file 3.123.1) |
+| `pulp_file` | Content: search paths (`/`) on pulp_file 3.95.3 and 3.63.36 | ❌ | ❌ | ✅ | ❌ | — | F112: [R51] on 3.63.36 "Error: rejected [400]: errors: Invalid Filter: 'relative_path__icontains'"; those versions filter only by exact `relative_path` and `sha256` (3.95.3 by its source); no capability check |
+| `pulp_file` | Content: remove units | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:content_add_and_remove_through_the_tui]; a snapshot of another database refused [LT:snapshot_versions_publications_and_content_of_another_database_are_not_changed_through_the_tui]; F127 (all types) Remove picked from the action menu acts on the row selected at that moment, and the confirm names no unit (static) |
 | `pulp_file` | Content: upload chunked (progress, digest check) | ✅ | ✅ | ✅ | ✅ | ✅ | [R1] 12 MB file; `latest` 1 → 2; no upload record left |
 | `pulp_file` | Content: upload single file | ✅ | ✅ | ✅ | ✅ | ✅ | [R1]; [LT:uploads_of_each_type_through_the_tui]; F73 overwrite has no retention check |
 | `pulp_file` | Content: upload without overwrite | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:file_upload_without_overwrite_through_the_tui] |
 | `pulp_file` | Distribution: checkpoint (verify, rollback refused) | ✅ | ✅ | ✅ | ✅ | — | [LT:checkpoint_distribution_verifies_and_refuses_rollback]; field from pulpcore 3.95 |
-| `pulp_file` | Distribution: copy content URL (OSC 52) | ✅ | ✅ | ✅ | ❓ | — | clipboard not observable in tmux; [U] |
+| `pulp_file` | Distribution: copy content URL (OSC 52) | ✅ | ✅ | ✅ | ✅ | — | [R38] `y` → "[ok] copied http://127.0.0.1:8090/pulp/content/default/a8-f/", and the tmux buffer (`set-clipboard on`) holds that URL, with the domain; F99 [R44] a relative path without host on a server without `CONTENT_ORIGIN` |
 | `pulp_file` | Distribution: create / edit | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:file_publications_and_distributions_through_the_tui] base path and binding edits after the typed name, old URL 404 |
 | `pulp_file` | Distribution: delete (single, marked) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:file_publications_and_distributions_through_the_tui]; marked [U] |
 | `pulp_file` | Distribution: edit of content guard or checkpoint (all types) | ✅ | ✅ | ✅ | ✅ | ✅ | [R9]; [LT:*_publications_and_distributions_through_the_tui] guard none → A → B → none with guard names, checkpoint on/off |
 | `pulp_file` | Distribution: list and binding details | ✅ | ✅ | ✅ | ✅ | — | [R1]; [LT:file_publications_and_distributions_through_the_tui] |
 | `pulp_file` | Distribution: re-point an existing distribution with Distribute (D) from Repositories, Versions or Publications (all types) | ✅ | ✅ | ✅ | ✅ | ✅ | F54 fixed: [R21] preview and typed name, Esc changes nothing; [LT:file_distribute_re_points_after_the_typed_name_through_the_tui, deb_distribute_re_points_after_the_typed_name_through_the_tui]; F68 [R25] follow onto a checkpoint distribution; repository id in "now serves" (polish) |
 | `pulp_file` | Distribution: re-point to a version (b) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:file_publications_and_distributions_through_the_tui] the job re-points and verifies |
-| `pulp_file` | Distribution: verify served content | ✅ | ✅ | ✅ | ✅ | — | [LT:checkpoint_distribution_verifies_and_refuses_rollback, file_publications_and_distributions_through_the_tui] |
+| `pulp_file` | Distribution: verify served content | ✅ | ✅ | ✅ | ❌ | — | **F99 (P2)**: [R44] without `CONTENT_ORIGIN`: "MISMATCH: unsafe href rejected: /pulp/content/default/a8-big/PULP_MANIFEST" for a correct distribution; works where `base_url` is absolute: [LT:checkpoint_distribution_verifies_and_refuses_rollback, file_publications_and_distributions_through_the_tui]; F113 [R57] a guarded distribution is "MISMATCH … HTTP 403"; F105 object storage (static) |
 | `pulp_file` | Publication: checkpoint publication that clears older checkpoints (impact, typed name; all types) | ✅ | ✅ | ✅ | ✅ | ✅ | [R22] the confirm names the checkpoint that loses the flag; after the typed name Pulp and the list agree; mock `a_checkpoint_publication_that_clears_older_checkpoints_needs_the_typed_name`; no live test (T05); pulpcore 3.123 (`retain_checkpoints`) |
 | `pulp_file` | Publication: create (manifest name, checkpoint) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:file_publications_and_distributions_through_the_tui] |
 | `pulp_file` | Publication: delete (served-after impact) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:file_publications_and_distributions_through_the_tui] |
@@ -884,7 +1513,7 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulp_file` | Remote (Git): delete | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:remotes_create_edit_and_delete_through_the_tui] (File Git) |
 | `pulp_file` | Remote (Git): edit `git_ref` | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:file_git_remote_syncs_a_repository_with_the_prefilled_form] |
 | `pulp_file` | Remote: create (timeouts, headers, TLS) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:remote_timeouts_keep_decimal_seconds_through_the_tui] |
-| `pulp_file` | Remote: delete (impact) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:remotes_create_edit_and_delete_through_the_tui] |
+| `pulp_file` | Remote: delete (impact) | ✅ | ✅ | ✅ | ❌ | ✅ | **F100 (P2)**: [R46] the confirm says "Repository content and versions are not affected"; after the delete of an `on_demand` remote the files that Pulp had not stored answer 404; [LT:remotes_create_edit_and_delete_through_the_tui] |
 | `pulp_file` | Remote: delete refused while an ACS uses it | ✅ | ✅ | ✅ | ✅ | — | [LT:remote_delete_refused_while_an_acs_uses_it] |
 | `pulp_file` | Remote: edit | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:remote_timeouts_keep_decimal_seconds_through_the_tui, remotes_create_edit_and_delete_through_the_tui] |
 | `pulp_file` | Repository: copy content (filters, `modify/`) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:copy_content_through_the_tui] path rule; F73 |
@@ -920,18 +1549,19 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulp_rpm` | Content: modulemd create | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:a_modulemd_made_through_the_tui_is_in_the_new_version] |
 | `pulp_rpm` | Content: modulemd defaults / obsoletes create | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_metadata_uploads_and_module_content_through_the_tui] |
 | `pulp_rpm` | Content: package upload (single, chunked, overwrite) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:uploads_of_each_type_through_the_tui]; chunked path verified on File [R1] |
-| `pulp_rpm` | Content: remove units | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:content_add_and_remove_through_the_tui] |
+| `pulp_rpm` | Content: package upload into a repository with a package signing service | ✅ | ✅ | ✅ | ❌ | ❌ | **F106 (P2)**, static: Pulp signs and completes (a new version); the TUI ends with "digest mismatch" and does not reload; a retry makes one more unit; no signing service of this kind in the test environment |
+| `pulp_rpm` | Content: remove units | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:content_add_and_remove_through_the_tui]; F117 [R61] Remove of a modulemd says "without 1 unit(s)" and Pulp also removes its packages |
 | `pulp_rpm` | Distribution: create / edit (`generate_repo_config`, hidden, guard) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_publications_and_distributions_through_the_tui] guard and checkpoint edits after the typed name |
 | `pulp_rpm` | Distribution: delete (single, marked) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_publications_and_distributions_through_the_tui]; marked [U] |
 | `pulp_rpm` | Distribution: list and binding details | ✅ | ✅ | ✅ | ✅ | — | [R2] `pinned` binding shown |
 | `pulp_rpm` | Distribution: re-point (signing repository makes a new publication) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_publications_and_distributions_through_the_tui]; signing case [LS:rpm_rollback_of_a_signing_repository_serves_signed_metadata] |
-| `pulp_rpm` | Distribution: verify served content | ✅ | ✅ | ✅ | ✅ | — | [R2] `… served with matching digest (5 packages)`; F82 a `nested_by_digest` publication gives a false MISMATCH (static) |
+| `pulp_rpm` | Distribution: verify served content | ✅ | ✅ | ✅ | ❌ | — | **F99 (P2)**, static for RPM: the same `fetch_content` as [R44]: MISMATCH for every distribution on a server without `CONTENT_ORIGIN`; works where `base_url` is absolute: [R2] `… served with matching digest (5 packages)`; F82 a `nested_by_digest` publication gives a false MISMATCH; F105 object storage; F113 content guard (static) |
 | `pulp_rpm` | Publication: create (checksum, compression, layout, repo config, checkpoint) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_publications_and_distributions_through_the_tui]; F81 `sha224` offered (static) |
 | `pulp_rpm` | Publication: delete (served-after impact) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_publications_and_distributions_through_the_tui] |
 | `pulp_rpm` | Publication: list | ✅ | ✅ | ✅ | ✅ | — | [LT:rpm_publications_and_distributions_through_the_tui] |
 | `pulp_rpm` | Remote (ULN): create / edit / delete | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:uln_remote_create_edit_and_delete_through_the_tui] |
 | `pulp_rpm` | Remote: create (SLES token, headers, timeouts) | ✅ | ✅ | ✅ | ✅ | ✅ | [R2]; [LT:remotes_create_edit_and_delete_through_the_tui] |
-| `pulp_rpm` | Remote: delete (impact, ACS refusal) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:remotes_create_edit_and_delete_through_the_tui] |
+| `pulp_rpm` | Remote: delete (impact, ACS refusal) | ✅ | ✅ | ✅ | ❌ | ✅ | **F100 (P2)**, static for RPM: the same text and pulpcore cascade as [R46]; [LT:remotes_create_edit_and_delete_through_the_tui] |
 | `pulp_rpm` | Remote: edit | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:remotes_create_edit_and_delete_through_the_tui] |
 | `pulp_rpm` | Repository: copy content, filtered (+ advisories, metadata, deps) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_filtered_copy_through_the_tui_takes_the_advisory_of_the_chosen_packages]; F73 |
 | `pulp_rpm` | Repository: advanced copy (several config entries, `dest_base_version`, `dependency_upgrade`) | ✅ | ❌ | ❌ | — | — | G03 (open by decision) |
@@ -940,7 +1570,8 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulp_rpm` | Repository: delete (single, marked) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:repository_delete_single_and_marked_through_the_tui] |
 | `pulp_rpm` | Repository: distribute (follow latest) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_serve_from_versions_through_the_tui]; F79 (static for RPM) |
 | `pulp_rpm` | Repository: distribute (pin latest) | ✅ | ✅ | ✅ | ✅ | ✅ | [R2] `repodata/repomd.xml` 200; re-point after the typed name (F54, `pulp_file` row); F67 with a signing service makes a new publication on each try |
-| `pulp_rpm` | Repository: edit (labels + OSV config, retain package versions) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_osv_config_survives_a_label_edit_through_the_tui, rpm_retain_package_versions_cleared_through_the_tui]; Retain versions: F53 fixed; F81 [R34] `sha224` offered, Pulp 400 |
+| `pulp_rpm` | Repository: edit (labels + OSV config, retain package versions) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_osv_config_survives_a_label_edit_through_the_tui, rpm_retain_package_versions_cleared_through_the_tui]; Retain versions: F53 fixed; F81 [R34] `sha224` offered, Pulp 400; F129 the fingerprint help and clear on pulp_rpm 3.34.0 / 3.27.12 (static) |
+| `pulp_rpm` | Repository: edit on pulp_rpm 3.27.12 (image 3.63.36) | ✅ | ✅ | ✅ | ❌ | ✅ | **F103 (P2)**: [R50] an Edit of the description sends `{"description": …}`; the task completes and Pulp stores `repo_config: {}` (was `gpgcheck` and `repo_gpgcheck` 1); nothing says so |
 | `pulp_rpm` | Repository: prune old packages (dry run, run; task group) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rpm_prune_dry_run_then_prune_through_the_tui] |
 | `pulp_rpm` | Repository: publish latest (publication options) | ✅ | ✅ | ✅ | ✅ | ✅ | [R2] |
 | `pulp_rpm` | Repository: reclaim space | ✅ | ✅ | ✅ | ❌ | ✅ | **F76 (P2)**, static for RPM: the same `reclaim` code and pulpcore task as [R29]; [LT:rpm_version_actions_through_the_tui] |
@@ -964,22 +1595,25 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulpcore` | Access policy: list, inspect | ✅ | ✅ | ✅ | ✅ | — | [LT:access_policy_reset_restores_the_default] |
 | `pulpcore` | Access policy: reset to plugin default | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:access_policy_reset_restores_the_default] |
 | `pulpcore` | Artifact distribution (`distributions/core/artifacts/`) | ✅ | ❌ | ❌ | — | — | G06 |
-| `pulpcore` | Artifact: list, find by sha256 | ✅ | ✅ | ✅ | ❓ | — | [LS:artifacts_screen_lists_and_finds_a_sha256] (screen load, no action) |
+| `pulpcore` | Artifact: list, find by sha256 | ✅ | ✅ | ✅ | ✅ | — | [R39] the screen lists the artifact of a TUI upload; `/` with another sha256 gives 0 items, with its sha256 1 item; Inspect shows it; [LS:artifacts_screen_lists_and_finds_a_sha256] |
 | `pulpcore` | Artifact: upload / delete | ✅ | ❌ | ❌ | — | — | G16; delete is deprecated and refused by the default policy |
 | `pulpcore` | Content guard: create `core/header` | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:content_guard_create_edit_and_delete_name_its_distribution] |
 | `pulpcore` | Content guard: create other types (rbac, envvar header, redirect, composite, x509, RHSM) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:content_guards_of_the_other_types_are_created_through_the_tui] (`core/envvar_header` from pulpcore 3.95) |
-| `pulpcore` | Content guard: delete (impact: distributions, composites) | ✅ | ✅ | ✅ | ❌ | ✅ | **F66 (P2)**: [R26] a guard inside two composite levels: "No distribution uses it", and the distribution behind the outer composite is public after the delete; direct use [LT:content_guard_create_edit_and_delete_name_its_distribution]; F89 a domain default guard is not named (static, domains only) |
+| `pulpcore` | Content guard: delete (impact: distributions, composites) | ✅ | ✅ | ✅ | ❌ | ✅ | **F66 (P2)**: [R26] a guard inside two composite levels: "No distribution uses it", and the distribution behind the outer composite is public after the delete; direct use [LT:content_guard_create_edit_and_delete_name_its_distribution]; F89 [R36] the default guard of a domain: "No distribution uses it", and the domain then has no default guard; F109 [R62] the same false line for a guard owner who is not a superuser |
 | `pulpcore` | Content guard: edit (impact through composites at any depth) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:content_guard_create_edit_and_delete_name_its_distribution] confirm, Esc, description-only edit at once; unit two composite levels |
 | `pulpcore` | Content guard: RBAC download access (add/remove role) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:rbac_guard_access_allows_and_removes_a_user] |
+| `pulpcore` | Content: create from a URL (`file_url`, `downloader_config`) | ✅ | ❌ | ❌ | — | — | G22 (new): no client method; `file_url` in all three images, `downloader_config` in 3.123.1 |
 | `pulpcore` | Content: server-wide search (`content/`, generic lists) | ✅ | ❌ | ❌ | — | — | G14 |
 | `pulpcore` | Content: set / unset labels (`{content}set_label/`) | ✅ | ❌ | ❌ | — | — | G19 (new): no client method; in the 3.123.1 OpenAPI for every RPM, File and Deb content type |
 | `pulpcore` | Current user and capabilities (status, login, OpenAPI) | ✅ | ✅ | ✅ | ✅ | — | [R0], [R12]; every [LT]; F92 behind an outer TLS proxy a multi-page `list_all` fails (static; Pulp side checked with curl) |
-| `pulpcore` | Dashboard: health, versions, counts | ✅ | ✅ | ✅ | ✅ | ❓ | [R12]; this audit's start screen; reload on task end [U] |
+| `pulpcore` | Dashboard: health, versions, counts | ✅ | ✅ | ✅ | ✅ | ✅ | [R42] with no key pressed, the end of a 41 s sync changed "Tasks running 1" to 0 and "File content 0" to 40; [R12]; F99 [R44] the "content:" line is empty without `CONTENT_ORIGIN` |
 | `pulpcore` | Data repair `datarepair/7272/`, `livez/` | ✅ | ❌ | ❌ | — | — | G13 |
+| `pulpcore` | Delete and Edit impacts for a user that is not a superuser (content guard Delete and Edit, repository Delete, publication Delete; all types) | ✅ | ✅ | ✅ | ❌ | — | **F109 (P2)**: [R62] a guard owner who may not view File distributions: "No distribution uses it."; after the typed name the distribution that used the guard is public (403 → 200); Pulp scopes the lists to what the user may view; repository and publication Delete and guard Edit static |
+| `pulpcore` | Distribution: served-content checks on object storage (S3, Azure, GCS; Verify, Rollback check, drift, fallback replication; all types) | ✅ | ✅ | ✅ | ❌ | — | **F105 (P2)**, static: the content app answers 302 and the client follows no redirect, so each check is MISMATCH or DRIFT; not run (no object storage in the test environment) |
 | `pulpcore` | Distribution: bind directly to a repository version (no publication pin) | ✅ | ❌ | ❌ | — | — | G15 |
-| `pulpcore` | Domain: create / edit / delete / migrate storage | ✅ | ✅ | ✅ | ❓ | ❓ | Pulp feature off on the test server (`domain_enabled: false`); gating [LS:domains_screen_follows_domain_enabled]; operations [U]; F90 deleting the profile's own domain has no warning (static) |
+| `pulpcore` | Domain: create / edit / delete / migrate storage | ✅ | ✅ | ✅ | ✅ | ✅ | first runtime proof, on a server with `DOMAIN_ENABLED`: [R35] Create "[ok] create domain a8x: done"; Edit (description, flag) and Migrate storage (typed name, `POST /pulp/a8x/api/v3/domains/migrate/`) each end "task completed", and Pulp and the list agree; [R37] Delete after the typed name; gating [LS:domains_screen_follows_domain_enabled]; F90 [R37] deleting the profile's own domain has no warning, then every screen is 404; uploads, sync, Task Center, Dashboard, Content Views and replication also ran inside domains ([R38]–[R42], [R45], [R52]) |
 | `pulpcore` | Domain: labels, default content guard, rename | ✅ | ❌ | ❌ | — | — | G08 |
-| `pulpcore` | Exporter (filesystem): create / edit / delete / export | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:filesystem_exporter_through_the_tui] |
+| `pulpcore` | Exporter (filesystem): create / edit / delete / export | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:filesystem_exporter_through_the_tui]; F119 a failed export leaves a record that the Exports list shows like a good one (static) |
 | `pulpcore` | Exporter (Pulp): create / edit / delete | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:pulp_exporter_and_importer_through_the_tui]; snapshots pickable [LT:a_content_view_snapshot_can_be_exported]; Create opens empty [R10] |
 | `pulpcore` | Exporter (Pulp): export (full, incremental, versions, start versions) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:pulp_exporter_and_importer_through_the_tui] (full); other modes [LS:pulp_export_and_import_of_a_file_repository] |
 | `pulpcore` | Exporter (Pulp): exports list / delete | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:pulp_exporter_and_importer_through_the_tui]; F88 the delete of the last export does not name its effect on incremental exports (static) |
@@ -995,24 +1629,24 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulpcore` | Importer: import into a Content View snapshot repository | ✅ | ✅ | ✅ | ✅ | — | [R10]; [LT:an_import_does_not_write_into_a_content_view_snapshot_unasked] (F28 limit) |
 | `pulpcore` | Importer: imports list | ✅ | ✅ | ✅ | ✅ | — | [LT:pulp_exporter_and_importer_through_the_tui] (Imports) |
 | `pulpcore` | Login: change own password (`PATCH login/`) | ✅ | ❌ | ❌ | — | — | G20 (new): the client only reads `GET login/`; pulpcore 3.123.1 (not 3.95.3) |
-| `pulpcore` | Object roles: list, my permissions, add, remove | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:object_roles_add_and_remove_a_viewer_on_a_repository] |
+| `pulpcore` | Object roles: list, my permissions, add, remove | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:object_roles_add_and_remove_a_viewer_on_a_repository] (as an administrator); F121 for a user without `manage_roles` the whole view is 403, also "my permissions" (static) |
 | `pulpcore` | OpenPGP keyrings, keys, OpenPGP distributions | ✅ | ❌ | ❌ | — | — | G05 |
 | `pulpcore` | Orphan cleanup (age; whole server) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:prune_orphans_through_the_tui] Pulp's count, typed profile name, result; G12 scope not offered |
 | `pulpcore` | Repository: `modify/` with a base version, or add and remove in one call | ✅ | ❌ | ❌ | — | — | G04 |
 | `pulpcore` | Repository: reclaim space of several repositories in one request | ✅ | ❌ | ❌ | — | — | G18 |
-| `pulpcore` | Role: create / edit / delete custom role | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:custom_role_create_edit_and_delete_through_the_tui] (Create with no row selected); F75 Edit changes every holder with no impact |
+| `pulpcore` | Role: create / edit / delete custom role | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:custom_role_create_edit_and_delete_through_the_tui] (Create with no row selected); F75 Edit changes every holder with no impact; F110 [R47] an empty Description is sent as `""` and Pulp answers 400 |
 | `pulpcore` | Role: list | ✅ | ✅ | ✅ | ✅ | — | [LT:custom_role_create_edit_and_delete_through_the_tui] |
 | `pulpcore` | Server repair (`repair/`) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:server_repair_checks_that_the_files_exist] |
 | `pulpcore` | Signing service: create | ❌ | — | — | — | — | Pulp unavailable: no API; list is used in pickers |
 | `pulpcore` | Task: cancel (single) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:track_and_cancel_server_tasks_through_the_tui] the Task Center row ends canceled |
-| `pulpcore` | Task: delete record | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:task_delete_and_purge]; typed task id [U] |
+| `pulpcore` | Task: delete record | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:task_delete_and_purge]; typed task id [U]; F116 the task of a Pulp import answers 500 ([R56], API), shown as a bare server error |
 | `pulpcore` | Task: filters beyond state/name/resource/start, `profile_artifacts` | ✅ | ❌ | ❌ | — | — | G11 |
 | `pulpcore` | Task: purge finished tasks | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:task_delete_and_purge]; a group of purged tasks ends `gone` [U] |
-| `pulpcore` | Task: server task list, filter, inspect | ✅ | ✅ | ✅ | ✅ | — | [LT:server_tasks_filter] |
+| `pulpcore` | Task: server task list, filter, inspect | ✅ | ✅ | ✅ | ✅ | — | [LT:server_tasks_filter]; F126 on the first row a reload moves the cursor to the newest task, and the Cancel confirm shows only an href (static) |
 | `pulpcore` | Task: track a server task (a) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:track_and_cancel_server_tasks_through_the_tui]; F61 fixed: Track of a stale row keeps the final state and label [U] |
-| `pulpcore` | Task Center: dismiss finished tasks | — | ✅ | ✅ | ❓ | — | local store [U]; the palette path F80 [R33]: the dismissed rows come back after a restart (the `z` path not run) |
+| `pulpcore` | Task Center: dismiss finished tasks | — | ✅ | ✅ | ✅ | — | [R40] `z`: "dismissed 3 finished task(s) from the list (Pulp keeps its records)", 0 rows, and 0 rows after a restart; the palette path F80 [R33]: the dismissed rows come back after a restart |
 | `pulpcore` | Task Center: re-attach after restart / Connect | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:task_center_reattaches_a_task_of_a_previous_session]; F93 references keyed by profile name: a profile Edit to another server stores them `gone` (static) |
-| `pulpcore` | Task Center: track submitted task until final, reload visible list | ✅ | ✅ | ✅ | ✅ | ✅ | [R20]–[R23], [R28] every task row ended final and the visible list reloaded; F74 a failed late poll can change a final row (race) |
+| `pulpcore` | Task Center: track submitted task until final, reload visible list | ✅ | ✅ | ✅ | ✅ | ✅ | [R20]–[R23], [R28] every task row ended final and the visible list reloaded; F74 a failed late poll can change a final row (race); [R42] a task that ends while the Dashboard is open; F114 [R54] `/` shows "filter: zzzz" and hides no row |
 | `pulpcore` | Task Center: task-group row (replication, import, ACS refresh, prune) | ✅ | ✅ | ✅ | ✅ | ✅ | [R13]; [LT:native_replication_through_the_tui, canceled_native_replication_is_not_complete] |
 | `pulpcore` | Task Center: watch task live (W) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:task_schedules_screen, resume_watch_and_break_lock_through_the_tui] |
 | `pulpcore` | Task group: cancel | ✅ | ✅ | ✅ | ✅ | ✅ | pulpcore ≥ 3.95; [LT:task_group_cancel] |
@@ -1022,13 +1656,13 @@ Totals of this matrix (✅ / ❌ / ❓ / — per column; `—` is outside every 
 | `pulpcore` | Task schedule: list, watch last task | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:task_schedules_screen] |
 | `pulpcore` | Upload (chunked): list, delete | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:an_unfinished_upload_is_listed_and_deleted] |
 | `pulpcore` | Upstream Pulp: create / edit / delete | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:upstream_pulp_create_edit_and_delete_through_the_tui] impact and typed name on delete; F91 on 3.95 and 3.63 a running replication is not named (static) |
-| `pulpcore` | Upstream Pulp: replicate now (task group) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:native_replication_through_the_tui] row ends completed, pulp1 serves; canceled run says CANCELED [LT:canceled_native_replication_is_not_complete]; failed run with masked user info [LT:upstream_base_url_user_info_never_shows_through_the_tui], [R13] |
+| `pulpcore` | Upstream Pulp: replicate now (task group) | ✅ | ✅ | ✅ | ❌ | ✅ | **F101 (P2)**: [R52] policy `nodelete`, confirm with `y`: a local repository and distribution with the name of the upstream distribution were taken over (latest version −1 local file, +40; labels replaced; distribution re-pointed), while the form says "nodelete: never delete local objects"; the Task Center row ended `completed`, "tasks 5/5"; F118 the deletion warning says "gone upstream" also for a narrower filter (static); [LT:native_replication_through_the_tui] row ends completed, pulp1 serves; canceled run says CANCELED [LT:canceled_native_replication_is_not_complete]; failed run with masked user info [LT:upstream_base_url_user_info_never_shows_through_the_tui], [R13] |
 | `pulpcore` | Upstream Pulp: replicate with per-request `q_select` | ✅ | ❌ | ❌ | — | — | G10 |
 | `pulpcore` | Upstream Pulp: replication history | ✅ | ✅ | ✅ | ✅ | — | [LT:native_replication_through_the_tui, canceled_native_replication_is_not_complete]; by reserved upstream, by name on 3.63 / 3.95 |
 | `pulpcore` | User: create / edit / set password / enable-disable | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:user_create_edit_password_disable_and_delete_through_the_tui] the passwords sign in; F86 "Staff (bypasses RBAC)" is false; F87 self-disable needs only `y` (static) |
 | `pulpcore` | User: delete (self guard, impact) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:user_create_edit_password_disable_and_delete_through_the_tui] |
 | `pulpcore` | User: list | ✅ | ✅ | ✅ | ✅ | — | [LT:user_create_edit_password_disable_and_delete_through_the_tui] |
-| `pulpcore` | User: roles add / remove (object, domain scope) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:group_create_roles_and_delete_through_the_tui] (a user's Roles screen; the user then sees the repository) |
+| `pulpcore` | User: roles add / remove (object, domain scope) | ✅ | ✅ | ✅ | ✅ | ✅ | [LT:group_create_roles_and_delete_through_the_tui] (a user's Roles screen; the user then sees the repository); F98 [R48] after a Connect from this screen, the form assigns the role to the user with the same number on the new server |
 | `pulpcore` | Versions: list per repository / all repositories | ✅ | ✅ | ✅ | ✅ | ✅ | [R20], [R21]; [LT:*_version_actions_through_the_tui] list reloads |
 | `pulpcore` | Vulnerability reports: list / delete as a screen | ✅ | ❌ | ❌ | — | — | G17 |
 | `pulpcore` | Worker: list, inspect | ✅ | ✅ | ✅ | ✅ | — | [LT:workers_screen] |
