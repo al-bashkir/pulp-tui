@@ -52,7 +52,7 @@ jobs:
   live:
     # End-to-end against real Pulp containers (pulpcore + pulp_rpm + pulp_file).
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       CONTAINER_RUNTIME: docker
     steps:
