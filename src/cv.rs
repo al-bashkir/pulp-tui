@@ -1130,7 +1130,7 @@ impl CvService {
         // request is sent and the log names the distribution (a binding row can serve a version no view version records).
         let pubs: Vec<Publication> = c.list_all(&c.api(t.publications()), &[("repository", derived.into())], 100_000).await?;
         let ds = ops::distributions(c, t).await?;
-        for v in versions.iter().filter(|v| v.number > 0 && v.pulp_href != latest && !used.contains(&v.pulp_href)) {
+        for v in versions.iter().filter(|v| !base_version(&v.pulp_href) && v.pulp_href != latest && !used.contains(&v.pulp_href)) {
             self.drop_version(&v.pulp_href, &pubs, &ds, log, on).await?;
         }
         Ok(())
@@ -2077,10 +2077,17 @@ fn row_objects(
                     None => "shared with another version".into(),
                 })
             })
-            .or(pulp);
+            .or(pulp)
+            .or_else(|| base_version(href).then(|| "base of every unfiltered copy".into()));
         objects.push((vr.repo().repo_name.clone(), href.clone(), keep));
     }
     objects
+}
+
+/// Whether `href` is version 0 of a snapshot repository, which pulp-tui never deletes: an unfiltered RPM or Deb copy
+/// starts on it (`dest_base_version: 0`), and Pulp refuses that copy once it is gone.
+fn base_version(href: &str) -> bool {
+    href.ends_with("/versions/0/")
 }
 
 /// Whether distribution `d` serves something: a publication, or (set outside pulp-tui) a repository or a repository version.
@@ -3198,6 +3205,34 @@ mod tests {
         let sent = server.received_requests().await.unwrap();
         let deletes: Vec<_> = sent.iter().filter(|r| r.method.as_str() == "DELETE").map(|r| r.url.path().to_string()).collect();
         assert_eq!(deletes, [p.clone(), dv.clone(), p, dv]);
+    }
+
+    /// F78: an unfiltered RPM or Deb copy starts on version 0, and a copy that changes nothing records it. Deleting
+    /// version 0 makes every later unfiltered publish of the repository fail (400 "Version 0 does not exist").
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_version_keeps_version_0_of_the_snapshot_repository() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, mut vr) = rpm_version(&svc).await;
+        let (p, v0) = ("/pulp/api/v3/publications/rpm/rpm/3/".to_string(), format!("{DERIVED}versions/0/"));
+        (vr.publication, vr.derived_version) = (Some(p.clone()), Some(v0.clone()));
+        svc.store.save_version_repo(&vr).await.unwrap();
+        svc.store.finish_version(vr.version_id, "published", None).await.unwrap();
+        serve_owner(&server, DERIVED, svc.store.db_id()).await;
+        serve_snapshot(&server, json!([]), json!([])).await; // no distribution serves them
+        Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(204)).mount(&server).await;
+        let why = "base of every unfiltered copy";
+        let impact = svc.delete_version_impact(vr.version_id).await.unwrap();
+        assert_eq!(impact, [(vr.repo().repo_name.clone(), p.clone(), None), (vr.repo().repo_name.clone(), v0.clone(), Some(why.into()))]);
+        let logs = Mutex::new(vec![]);
+        svc.delete_version(vr.version_id, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+        assert_eq!(logs.into_inner().unwrap(), [format!("keeping {v0}: {why}")]);
+        let sent = server.received_requests().await.unwrap();
+        let deletes: Vec<_> = sent.iter().filter(|r| r.method.as_str() == "DELETE").map(|r| r.url.path().to_string()).collect();
+        assert_eq!(deletes, [p], "only the publication goes");
+        assert_eq!(svc.store.version(vr.version_id).await.unwrap().state, "deleted");
     }
 
     #[tokio::test(flavor = "multi_thread")]

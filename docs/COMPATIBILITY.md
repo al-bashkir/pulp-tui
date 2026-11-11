@@ -909,7 +909,9 @@ Read in pulp_deb 3.11.1 (`pulp_deb/app/`) and its OpenAPI.
   not show) and index and Release file units (no `sha256`) are keyed by unit id; then the
   compare matches `content_summary.present`.
 * **Copy options.** `dependency_solving: true` fails with `FeatureNotImplementedError`, so
-  pulp-tui sends `false`. `dest_base_version: 0` starts from the empty version 0.
+  pulp-tui sends `false`. `dest_base_version: 0` starts from the empty version 0. When
+  version 0 is gone, the copy is refused (400 "Version 0 does not exist"; pulp_rpm the same),
+  so a Content View version delete never deletes it.
 * **Release signing order**: the publication's service, then the repository's release
   override (`signing_service_release_overrides`), then the repository's service.
 * **Override PATCH merges.** Only the distributions in the body change; `null` deletes one, `{}`

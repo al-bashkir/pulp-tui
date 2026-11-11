@@ -1508,6 +1508,56 @@ async fn a_version_that_dev_serves_in_part_is_not_deleted_through_the_tui() {
     cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
 }
 
+/// F78 (R31) through the TUI: v1 of an RPM source that was not synced yet records version 0 of its snapshot repository
+/// (the copy changed nothing). Delete (d) of v1 keeps version 0, so v3 can still copy onto it.
+#[tokio::test]
+async fn a_version_delete_keeps_version_0_and_the_next_publish_works_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvzero"));
+    let (mut app, mut rx) = app().await;
+    let svc = service(&app, &c);
+    let (st, scope) = (svc.store.clone(), svc.scope.clone());
+    let url = format!("{}/rpm/", upstream());
+    let remote = create(&c, RepoType::Rpm.remotes(), json!({ "name": id, "url": url, "policy": "immediate" }), "/remotes/").await;
+    let repo = create(&c, RepoType::Rpm.repositories(), json!({ "name": id, "remote": remote }), "/repositories/").await;
+    let cv = st.create_cv(&scope, &id, "").await.unwrap();
+    st.set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: "os".into(), repo_type: RepoType::Rpm, filters: vec![] })
+        .await
+        .unwrap();
+    let version = async |number: i64| st.versions(cv).await.unwrap().into_iter().find(|v| v.number == number).unwrap();
+
+    tui_publish(&mut app, &mut rx, &id, "").await;
+    let v0 = st.version_repos(version(1).await.id).await.unwrap().remove(0).derived_version.unwrap();
+    assert!(v0.ends_with("/versions/0/"), "{v0}");
+    ops::settle(&c, ops::sync(&c, RepoType::Rpm, &repo, None, "additive").await.unwrap(), &no_progress).await.unwrap();
+    tui_publish(&mut app, &mut rx, &id, "").await;
+    assert_eq!(cv_row(&mut app, &mut rx, &id).await["bound"], "Library:v2");
+
+    // Versions (v), Delete (d) of v1: the confirm says version 0 stays, and it does.
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvVersions, r);
+    settle(&mut app, &mut rx).await;
+    let v1_row = app.list.items.iter().find(|v| v["number"] == 1).cloned().unwrap();
+    run(&mut app, Act::Delete, v1_row);
+    settle(&mut app, &mut rx).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some("v1"));
+    assert!(lines.contains(&format!("  os: keep {v0} (base of every unfiltered copy)")), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    assert!(texts(&app).contains(&"version deleted".to_string()), "{:?}", texts(&app));
+    assert!(c.get::<RepoVersion>(&v0, &[]).await.is_ok(), "version 0 was deleted");
+    app.back();
+    settle(&mut app, &mut rx).await;
+
+    tui_publish(&mut app, &mut rx, &id, "").await;
+    assert_eq!(version(3).await.state, "published", "{:?}", texts(&app));
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
 /// Resume (R) of the newest component version whose auto publish never ran (the client stopped first): the composite
 /// that follows it publishes, and Library serves it. A second Resume has nothing left to do.
 #[tokio::test]

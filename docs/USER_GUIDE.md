@@ -764,7 +764,8 @@ A composite view joins other Content Views (its **components**). Example: `rocky
 * **d** deletes. Refused while an environment serves the version (also in part), while a promotion
   of it did not complete (`bound to Dev (failed)`, as the *environments* column says), or while a
   composite uses it. The confirm lists each publication and snapshot version that it deletes, and
-  each one that it keeps (still served by an environment) with the reason.
+  each one that it keeps (still served by an environment) with the reason. Version 0 of a
+  snapshot repository is always kept: each unfiltered RPM or Deb copy starts on it.
 * **i** details: source versions, snapshot versions, publications, unit counts, component
   versions.
 
