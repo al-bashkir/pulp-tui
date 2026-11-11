@@ -12,7 +12,7 @@ use pulp_tui::replication::{self, PlanAction};
 use pulp_tui::repo_export;
 use pulp_tui::store::Store;
 use pulp_tui::tui::actions::run;
-use pulp_tui::tui::app::{App, Modal, Msg};
+use pulp_tui::tui::app::{App, Modal, Msg, Screen};
 use pulp_tui::tui::kinds::{Act, Kind};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -664,4 +664,37 @@ async fn upstream_base_url_user_info_never_shows_through_the_tui() {
     let leaks: Vec<&str> = seen.iter().flat_map(|s| s.lines()).filter(|l| l.contains("t04secret") || l.contains("t04user")).collect();
     assert!(leaks.is_empty(), "{leaks:#?}");
     cleanup(&dst, &[&href]).await;
+}
+
+/// F98 (R48) through the TUI: Roles (R) of a user of pulp1, Assign role (c) open, then Connect to pulp2. The form
+/// closes and the sub-list goes: Pulp takes the target only from the URL, and users/<n>/ on pulp2 is another account
+/// (or none). While the client connects, Users offers no Create. pulp2 gets no role assignment for that href.
+#[tokio::test]
+async fn a_connect_leaves_the_forms_and_sub_lists_of_the_previous_server_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, up, name) = (client(), upstream_client(), unique("f98-user"));
+    let user = create(&c, "users/", json!({ "username": name }), "/users/").await;
+    let roles_on_pulp2 = async || up.get::<Value>(&format!("{user}roles/"), &[]).await.map(|v| v["count"].clone()).map_err(|e| e.status());
+    let before = roles_on_pulp2().await;
+    let (mut app, mut rx) = app().await;
+    add_upstream_profile(&mut app);
+    open_list(&mut app, &mut rx, Kind::Users, &name).await;
+    let u = row(&app, "username", &name).unwrap_or_else(|| panic!("no user {name}: {:?}", app.list.items));
+    run(&mut app, Act::Roles, u);
+    settle(&mut app, &mut rx).await;
+    run(&mut app, Act::Create, Value::Null);
+    assert!(matches!(app.modal, Some(Modal::Form { .. })), "Assign role: {:?}", texts(&app));
+
+    app.connect("pulp2");
+    assert!(app.modal.is_none(), "the form of pulp1 is closed");
+    assert_eq!(app.screen, Screen::Dashboard, "the roles of a user of pulp1 are no list of pulp2");
+    app.open(Screen::List(Kind::Users));
+    assert!(!app.available_actions(&Value::Null).contains(&Act::Create), "no Create before the connection");
+    settle(&mut app, &mut rx).await;
+    assert_eq!(app.conn.as_ref().map(|c| c.client.profile()), Some("pulp2"), "{:?}", texts(&app));
+    assert!(app.available_actions(&Value::Null).contains(&Act::Create), "connected: Create again");
+    assert_eq!(roles_on_pulp2().await, before, "pulp2 got no role assignment");
+    cleanup(&c, &[&user]).await;
 }

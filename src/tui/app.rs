@@ -799,11 +799,14 @@ impl App {
         if let Some((d, _)) = &db {
             self.cv_store = Err(format!("{}: opening", d.display_url())); // never the previous profile's store
         }
-        // The rows and marks belong to the previous server; Servers and Logs are local and keep theirs.
-        if let Screen::List(k) = self.screen.clone()
-            && !matches!(k, Kind::Profiles | Kind::Logs { .. })
-        {
-            self.replace(k);
+        // A form, menu or confirm acts on objects of the previous server.
+        self.modal = None;
+        // The rows and marks belong to the previous server, and a sub-list names one of its objects (users/2/ is
+        // another account on the next server); Servers and Logs are local and keep theirs.
+        match self.screen.clone() {
+            Screen::List(k) if k.names_an_object() => self.open(Screen::Dashboard),
+            Screen::List(k) if !matches!(k, Kind::Profiles | Kind::Logs { .. }) => self.replace(k),
+            _ => {}
         }
         let n = name.to_string();
         self.with_store(name, p.read_only, db, move |app, r| {
@@ -965,15 +968,10 @@ impl App {
                 let profile = self.profile.clone().unwrap_or_default();
                 let (cv, scope) = (self.cv_store.clone(), self.scope(&profile));
                 let cfg = self.cfg.clone();
-                let needs_conn = k.needs_connection();
                 let ctx = self.ctx();
-                if needs_conn && ctx.is_none() {
+                if let Some(e) = self.no_connection(&k) {
                     self.list.loading = false;
-                    self.list.error = Some(if self.connecting {
-                        "connecting...".into()
-                    } else {
-                        "not connected: select a server profile in Servers".into()
-                    });
+                    self.list.error = Some(e);
                     return;
                 }
                 if let Some(f) = ctx.as_ref().and_then(|c| k.unsupported(&c.caps)) {
@@ -1399,11 +1397,18 @@ impl App {
         let item = self.list.current().cloned().unwrap_or(Value::Null);
         if let Some(a) = self.available_actions(&item).into_iter().find(|a| a.key() == c) {
             super::actions::run(self, a, item);
-        } else if let Some(why) = self.unsupported()
+        } else if let Some(why) = self.unsupported().or_else(|| self.no_connection(&self.list.kind))
             && self.list.kind.actions().iter().any(|a| a.key() == c)
         {
             self.error(why);
         }
+    }
+
+    /// Why list `k` cannot be read and changes nothing: it needs a server and none is connected. Also while connecting:
+    /// a form opened then would go to the server that answers next, with no capability check.
+    fn no_connection(&self, k: &Kind) -> Option<String> {
+        (self.conn.is_none() && k.needs_connection())
+            .then(|| if self.connecting { "connecting..." } else { "not connected: select a server profile in Servers" }.into())
     }
 
     /// Why the server cannot serve the current screen (`Kind::unsupported`); None while not connected.
@@ -1412,7 +1417,7 @@ impl App {
     }
 
     pub fn available_actions(&self, item: &Value) -> Vec<Act> {
-        let ro = self.read_only();
+        let ro = self.read_only() || self.no_connection(&self.list.kind).is_some();
         let shared = self.shared();
         let unsupported = self.unsupported().is_some();
         self.list
@@ -1947,7 +1952,8 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.modal.take(), Some(Modal::Menu { .. })), "Enter: the action menu");
         app.handle_key(ch('c'));
-        assert!(matches!(app.modal.take(), Some(Modal::Form { .. })), "c: Create");
+        assert!(app.modal.is_none(), "c: no Create without a connection (F98)");
+        assert_eq!(app.notices.back().map(|n| n.text.as_str()), Some("not connected: select a server profile in Servers"));
         app.handle_key(ch('t'));
         assert_eq!(app.list.kind, Kind::FsExporters, "t: the other exporter type");
         app.push(Kind::PulpExporters);
@@ -3096,6 +3102,54 @@ mod tests {
         assert!(app.notices.iter().any(|n| n.level == Level::Error && n.text.starts_with("connection failed: ")));
         assert_eq!((app.list.items.len(), app.list.marked.len(), app.list.selected, app.list.loading), (0, 0, 0, false));
         assert_eq!(app.list.error.as_deref(), Some("not connected: select a server profile in Servers"));
+    }
+
+    /// F98: from "Roles of user a8-x1" on server A, Connect to B. Pulp takes the target of a role assignment only from
+    /// the URL, and users/2/ on B is another account. So the form of A closes, the sub-list goes, and while the client
+    /// connects no action opens a form. B gets no write.
+    #[tokio::test]
+    async fn a_connect_leaves_the_forms_and_sub_lists_of_the_previous_server() {
+        let (a, b) = (pulp().await, pulp().await);
+        let mut app = on_rpm_repos(&a).await;
+        app.cfg.profiles.insert("b".into(), Profile { url: b.uri(), auth: AuthMethod::None, ..Default::default() });
+        let mut rx = app.rx.take().unwrap();
+        app.push(Kind::UserRoles { user: "/pulp/api/v3/users/2/".into(), name: "a8-x1".into() });
+        app.handle_key(ch('c'));
+        assert!(matches!(app.modal, Some(Modal::Form { .. })), "Assign role");
+        app.connect("b");
+        assert!(app.modal.is_none(), "the form of A is closed");
+        assert_eq!(app.screen, Screen::Dashboard, "the roles of a user of A are no list of B");
+        app.open(Screen::List(Kind::Users));
+        app.handle_key(ch('c'));
+        assert!(app.modal.is_none(), "no form before the connection");
+        assert_eq!(app.notices.back().map(|n| (n.level, n.text.as_str())), Some((Level::Error, "connecting...")));
+        settle(&mut app, &mut rx).await;
+        assert_eq!(app.conn.as_ref().map(|c| c.client.profile()), Some("b"));
+        let writes = b.received_requests().await.unwrap().into_iter().filter(|r| r.method.as_str() != "GET").count();
+        assert_eq!(writes, 0);
+    }
+
+    /// F98: each sub-list of one object goes on Connect; a list of all objects stays, without its rows.
+    #[tokio::test]
+    async fn a_connect_leaves_every_sub_list_of_one_object() {
+        let (href, name) = (String::from("/pulp/api/v3/x/1/"), String::from("x"));
+        let subs = [
+            Kind::Versions(Some((href.clone(), name.clone()))),
+            Kind::Content { version: format!("{href}versions/1/"), ctype: 0 },
+            Kind::CvVersions { cv: 1, name: name.clone() },
+            Kind::Exports { exporter: href.clone(), name: name.clone() },
+            Kind::Imports { importer: href.clone(), name: name.clone() },
+            Kind::UserRoles { user: href.clone(), name: name.clone() },
+            Kind::GroupUsers { group: href.clone(), name: name.clone() },
+            Kind::GroupRoles { group: href.clone(), name: name.clone() },
+        ];
+        for (kind, stays) in subs.into_iter().map(|k| (k, false)).chain([(Kind::Versions(None), true), (Kind::Users, true)]) {
+            let mut app = app_on(kind.clone()).await;
+            let _dead = add_dead_profile(&mut app).await;
+            app.connect("dead");
+            let want = if stays { Screen::List(kind.clone()) } else { Screen::Dashboard };
+            assert_eq!(app.screen, want, "{kind:?}");
+        }
     }
 
     #[tokio::test]

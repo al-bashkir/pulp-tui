@@ -67,7 +67,9 @@ These rules apply to all screens. The screen sections do not repeat them.
 2. **Quit** or **Connect** stops waiting for client operations, so both ask first. Pulp tasks
    continue, and the Task Center attaches them again at the next start. When a task cannot be read
    for about two minutes, the operation ends with `could not read task …, it may still be running`.
-   This is not a failure.
+   This is not a failure. Connect also closes an open form, menu or confirmation, and leaves a list
+   of one object (roles of a user, versions of a view) for the Dashboard: that object belongs to
+   the previous server. Until the new server answers, its screens offer no action.
 3. **X on Tasks** asks Pulp to cancel a task or a task group. The Task Center then shows the state
    that Pulp reports, and reads the task again at once. When pulp-tui cannot read the state after
    the request, the cancel is still requested; a warning tells you that the state was not read.

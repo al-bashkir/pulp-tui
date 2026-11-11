@@ -508,6 +508,22 @@ impl Kind {
         )
     }
 
+    /// A sub-list of one object (its href, or the id of a view): the object exists only on the server and in the scope
+    /// that the list was opened on.
+    pub fn names_an_object(&self) -> bool {
+        matches!(
+            self,
+            Kind::Versions(Some(_))
+                | Kind::Content { .. }
+                | Kind::CvVersions { .. }
+                | Kind::Exports { .. }
+                | Kind::Imports { .. }
+                | Kind::UserRoles { .. }
+                | Kind::GroupUsers { .. }
+                | Kind::GroupRoles { .. }
+        )
+    }
+
     /// Precise message when the server lacks what this screen needs.
     pub fn unsupported(&self, caps: &Capabilities) -> Option<String> {
         let f = match self {
