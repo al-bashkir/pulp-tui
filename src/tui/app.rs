@@ -799,15 +799,7 @@ impl App {
         if let Some((d, _)) = &db {
             self.cv_store = Err(format!("{}: opening", d.display_url())); // never the previous profile's store
         }
-        // A form, menu or confirm acts on objects of the previous server.
-        self.modal = None;
-        // The rows and marks belong to the previous server, and a sub-list names one of its objects (users/2/ is
-        // another account on the next server); Servers and Logs are local and keep theirs.
-        match self.screen.clone() {
-            Screen::List(k) if k.names_an_object() => self.open(Screen::Dashboard),
-            Screen::List(k) if !matches!(k, Kind::Profiles | Kind::Logs { .. }) => self.replace(k),
-            _ => {}
-        }
+        self.leave_server_screens();
         let n = name.to_string();
         self.with_store(name, p.read_only, db, move |app, r| {
             if app.profile.as_deref() != Some(n.as_str()) {
@@ -825,20 +817,7 @@ impl App {
         let fut = async move {
             let client = PulpClient::new(&name, &p, &settings)?;
             let caps = Capabilities::detect(&client).await?;
-            let apply: Apply = Box::new(move |app: &mut App| {
-                if app.profile.as_deref() != Some(client.profile()) {
-                    return; // switched again meanwhile
-                }
-                app.connecting = false;
-                let user = caps.user.as_ref().map(|u| u.username.clone()).unwrap_or_else(|| "anonymous".into());
-                app.ok(format!("connected to {} as {user}", client.profile()));
-                if let Some(e) = &caps.openapi_error {
-                    app.notify(Level::Warn, format!("OpenAPI schema unavailable ({e}); capability checks are limited"));
-                }
-                app.conn = Some(Conn { client, caps: Arc::new(caps), scope });
-                app.reattach_tasks();
-                app.open(Screen::Dashboard);
-            });
+            let apply: Apply = Box::new(move |app: &mut App| app.connected(client, caps, scope));
             anyhow::Ok(apply)
         };
         let label = format!("connect {}", self.profile.as_deref().unwrap_or_default());
@@ -853,6 +832,35 @@ impl App {
                 app.reload(); // "connecting..." becomes "not connected"
             })
         });
+    }
+
+    /// Close the dialog and the screens of the previous server.
+    fn leave_server_screens(&mut self) {
+        // A form, menu or confirm acts on objects of the previous server.
+        self.modal = None;
+        // The rows and marks belong to the previous server, and a sub-list names one of its objects (users/2/ is
+        // another account on the next server); Servers and Logs are local and keep theirs.
+        match self.screen.clone() {
+            Screen::List(k) if k.names_an_object() => self.open(Screen::Dashboard),
+            Screen::List(k) if !matches!(k, Kind::Profiles | Kind::Logs { .. }) => self.replace(k),
+            _ => {}
+        }
+    }
+
+    /// The connect to `client`'s profile succeeded, unless the operator switched to another profile meanwhile.
+    fn connected(&mut self, client: PulpClient, caps: Capabilities, scope: String) {
+        if self.profile.as_deref() != Some(client.profile()) {
+            return; // switched again meanwhile
+        }
+        self.connecting = false;
+        let user = caps.user.as_ref().map(|u| u.username.clone()).unwrap_or_else(|| "anonymous".into());
+        self.ok(format!("connected to {} as {user}", client.profile()));
+        if let Some(e) = &caps.openapi_error {
+            self.notify(Level::Warn, format!("OpenAPI schema unavailable ({e}); capability checks are limited"));
+        }
+        self.conn = Some(Conn { client, caps: Arc::new(caps), scope });
+        self.reattach_tasks();
+        self.open(Screen::Dashboard);
     }
 
     fn reattach_tasks(&mut self) {
@@ -961,70 +969,73 @@ impl App {
                 // Cancel a still-running load of the same list; a newer generation wins.
                 self.abort_loads();
                 self.list.generation += 1;
-                self.list.loading = true;
-                self.list.error = None;
-                let generation = self.list.generation;
-                let (offset, filter) = (self.list.offset, self.list.filter.clone());
-                let profile = self.profile.clone().unwrap_or_default();
-                let (cv, scope) = (self.cv_store.clone(), self.scope(&profile));
-                let cfg = self.cfg.clone();
-                let ctx = self.ctx();
-                if let Some(e) = self.no_connection(&k) {
-                    self.list.loading = false;
-                    self.list.error = Some(e);
-                    return;
-                }
-                if let Some(f) = ctx.as_ref().and_then(|c| k.unsupported(&c.caps)) {
-                    self.list.loading = false;
-                    self.list.error = Some(f);
-                    return;
-                }
-                let scope = match scope {
-                    Ok(s) => s,
-                    Err(e) if matches!(k, Kind::ContentViews | Kind::CvVersions { .. } | Kind::Environments) => {
+                match self.list_source(&k) {
+                    Ok((ctx, scope)) => self.load_list(k, ctx, scope),
+                    Err(e) => {
                         self.list.loading = false;
                         self.list.error = Some(e);
-                        return;
                     }
-                    Err(_) => String::new(), // other screens never read the CV store
-                };
-                let fut = async move {
-                    let cv = cv.as_deref().map_err(String::as_str);
-                    let (items, count) = kinds::load(&k, ctx.as_ref(), cv, &scope, &profile, &cfg, offset, &filter).await?;
-                    let apply: Apply = Box::new(move |app: &mut App| {
-                        if app.list.generation != generation {
-                            return; // stale response
-                        }
-                        // Rows were deleted after paging: show the last page that still has rows.
-                        // Only on the list's own screen: the Dashboard keeps the list but reloads itself.
-                        if items.is_empty()
-                            && app.list.offset > 0
-                            && app.list.offset >= count
-                            && app.screen == Screen::List(app.list.kind.clone())
-                        {
-                            app.list.offset = count.saturating_sub(1) / PAGE * PAGE;
-                            app.reload();
-                            return;
-                        }
-                        app.list.loading = false;
-                        app.set_items(items, count);
-                    });
-                    anyhow::Ok(apply)
-                };
-                self.spawn("load list".into(), true, async move {
-                    let e = match fut.await {
-                        Ok(apply) => return Ok(apply),
-                        Err(e) => crate::session_log::masked(format!("{e:#}")),
-                    };
-                    ap(move |app| {
-                        if app.list.generation == generation {
-                            app.list.loading = false;
-                            app.list.error = Some(e);
-                        }
-                    })
-                });
+                }
             }
         }
+    }
+
+    /// What a load of list `k` reads with (the connection, the Content View scope), or why it cannot load now.
+    fn list_source(&self, k: &Kind) -> Result<(Option<Ctx>, String), String> {
+        if let Some(e) = self.no_connection(k) {
+            return Err(e);
+        }
+        let ctx = self.ctx();
+        if let Some(e) = ctx.as_ref().and_then(|c| k.unsupported(&c.caps)) {
+            return Err(e);
+        }
+        match self.scope(self.profile.as_deref().unwrap_or_default()) {
+            Ok(s) => Ok((ctx, s)),
+            Err(e) if matches!(k, Kind::ContentViews | Kind::CvVersions { .. } | Kind::Environments) => Err(e),
+            Err(_) => Ok((ctx, String::new())), // other screens never read the CV store
+        }
+    }
+
+    /// Load the current page of list `k` in the background; a newer load of the list wins.
+    fn load_list(&mut self, k: Kind, ctx: Option<Ctx>, scope: String) {
+        self.list.loading = true;
+        self.list.error = None;
+        let generation = self.list.generation;
+        let (offset, filter) = (self.list.offset, self.list.filter.clone());
+        let (profile, cv, cfg) = (self.profile.clone().unwrap_or_default(), self.cv_store.clone(), self.cfg.clone());
+        let fut = async move {
+            let cv = cv.as_deref().map_err(String::as_str);
+            let (items, count) = kinds::load(&k, ctx.as_ref(), cv, &scope, &profile, &cfg, offset, &filter).await?;
+            let apply: Apply = Box::new(move |app: &mut App| app.apply_rows(generation, items, count));
+            anyhow::Ok(apply)
+        };
+        self.spawn("load list".into(), true, async move {
+            let e = match fut.await {
+                Ok(apply) => return Ok(apply),
+                Err(e) => crate::session_log::masked(format!("{e:#}")),
+            };
+            ap(move |app| {
+                if app.list.generation == generation {
+                    app.list.loading = false;
+                    app.list.error = Some(e);
+                }
+            })
+        });
+    }
+
+    /// The rows of load `generation` of the list, unless a newer load started.
+    fn apply_rows(&mut self, generation: u64, items: Vec<Value>, count: u64) {
+        if self.list.generation != generation {
+            return; // stale response
+        }
+        // Rows were deleted after paging: show the last page that still has rows.
+        // Only on the list's own screen: the Dashboard keeps the list but reloads itself.
+        if items.is_empty() && self.list.offset > 0 && self.list.offset >= count && self.screen == Screen::List(self.list.kind.clone()) {
+            self.list.offset = count.saturating_sub(1) / PAGE * PAGE;
+            return self.reload();
+        }
+        self.list.loading = false;
+        self.set_items(items, count);
     }
 
     /// Replace the rows of the list. A cursor below the first row stays on the same item when rows move
