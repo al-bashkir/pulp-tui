@@ -1990,42 +1990,7 @@ fn reclaim(app: &mut App, repo: String) {
             .map_err(|_| "Keep versions: version numbers, e.g. 3,4".to_string())?;
         let repo = repo.clone();
         app.job("impact of reclaiming space", move |ctx| async move {
-            let c = &ctx.client;
-            let r: Value = c.get(&repo, &[]).await?;
-            if let Some(e) = snapshot_refusal(&r) {
-                bail!(e);
-            }
-            let name = s(&r, "name");
-            let versions: Vec<Value> = c.list_all(&format!("{repo}versions/"), &[("fields", "number".into())], 100_000).await?;
-            let numbers: Vec<u64> = versions.iter().filter_map(|v| v["number"].as_u64()).collect();
-            if let Some(n) = keep.iter().find(|n| !numbers.contains(n)) {
-                bail!("refused: {name} has no version {n}");
-            }
-            let remote = match r["remote"].as_str() {
-                Some(h) => {
-                    let v: Value = c.get(h, &[("fields", "name,policy".into())]).await?;
-                    // A File Git remote has no download policy.
-                    let policy = v["policy"].as_str().map(|p| format!(" (policy {p})")).unwrap_or_default();
-                    format!("Default remote: {}{policy}.", s(&v, "name"))
-                }
-                None => "No default remote: a file comes again from the remote of the sync that added it.".into(),
-            };
-            let kept = match keep.as_slice() {
-                [] => "No version keeps its files.".to_string(),
-                k => format!("Versions that keep their files: {}", k.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")),
-            };
-            let sharing = match r["latest_version_href"].as_str() {
-                Some(v) => Some(ops::sharing_repositories(c, &repo, v).await.map_err(|e| e.to_string())),
-                None => None,
-            };
-            let mut lines = vec![
-                format!("Reclaim disk space of {name}: Pulp deletes the stored files of its synced content."),
-                format!("The content stays in all {} versions: a client request downloads a file again from its remote", numbers.len()),
-                "(on demand), so the upstream must still serve it. Uploaded content (no remote) keeps its files.".into(),
-                remote,
-                kept,
-            ];
-            lines.extend(shared_lines(sharing, ops::sees_everything(c).await?));
+            let (name, lines) = reclaim_impact(&ctx.client, &repo, &keep).await?;
             let keep: Vec<String> = keep.iter().map(|n| version_of(&repo, *n as i64)).collect();
             ap(move |app| {
                 app.confirm_danger(format!("Reclaim space of {name}"), lines, &name.clone(), move |app| {
@@ -2041,7 +2006,56 @@ fn reclaim(app: &mut App, repo: String) {
     });
 }
 
-/// The reclaim task ended: the files its progress report deleted.
+/// The name of `repo` and the Reclaim confirm lines when versions `keep` keep their files, or why it is refused.
+async fn reclaim_impact(c: &PulpClient, repo: &str, keep: &[u64]) -> anyhow::Result<(String, Vec<String>)> {
+    let r: Value = c.get(repo, &[]).await?;
+    if let Some(e) = snapshot_refusal(&r) {
+        bail!(e);
+    }
+    let name = s(&r, "name");
+    let versions: Vec<Value> = c.list_all(&format!("{repo}versions/"), &[("fields", "number".into())], 100_000).await?;
+    let numbers: Vec<u64> = versions.iter().filter_map(|v| v["number"].as_u64()).collect();
+    if let Some(n) = keep.iter().find(|n| !numbers.contains(n)) {
+        bail!("refused: {name} has no version {n}");
+    }
+    let remote = remote_line(c, &r).await?;
+    let sharing = sharing_of(c, repo, &r).await;
+    let mut lines = vec![
+        format!("Reclaim disk space of {name}: Pulp deletes the stored files of its synced content."),
+        format!("The content stays in all {} versions: a client request downloads a file again from its remote", numbers.len()),
+        "(on demand), so the upstream must still serve it. Uploaded content (no remote) keeps its files.".into(),
+        remote,
+        kept_line(keep),
+    ];
+    lines.extend(shared_lines(sharing, ops::sees_everything(c).await?));
+    Ok((name, lines))
+}
+
+/// The Reclaim line of the versions that keep their files.
+fn kept_line(keep: &[u64]) -> String {
+    match keep {
+        [] => "No version keeps its files.".to_string(),
+        k => format!("Versions that keep their files: {}", k.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+/// What `ops::sharing_repositories` reads for the latest version of `repo` (its object `r`); `None`: it has none.
+async fn sharing_of(c: &PulpClient, repo: &str, r: &Value) -> Option<std::result::Result<ops::Sharing, String>> {
+    let latest = r["latest_version_href"].as_str()?;
+    Some(ops::sharing_repositories(c, repo, latest).await.map_err(|e| e.to_string()))
+}
+
+/// The Reclaim line of the default remote of repository `r` and its download policy.
+async fn remote_line(c: &PulpClient, r: &Value) -> anyhow::Result<String> {
+    let Some(h) = r["remote"].as_str() else {
+        return Ok("No default remote: a file comes again from the remote of the sync that added it.".into());
+    };
+    let v: Value = c.get(h, &[("fields", "name,policy".into())]).await?;
+    // A File Git remote has no download policy.
+    let policy = v["policy"].as_str().map(|p| format!(" (policy {p})")).unwrap_or_default();
+    Ok(format!("Default remote: {}{policy}.", s(&v, "name")))
+}
+
 /// The Reclaim lines about other repositories with the same units: pulpcore's `reclaim_space` keeps only the files
 /// of shared published metadata. `sharing`: what `ops::sharing_repositories` read (`None`: no latest version);
 /// `all`: whether Pulp shows the user every repository (`ops::sees_everything`).
@@ -2067,6 +2081,7 @@ fn shared_lines(sharing: Option<std::result::Result<ops::Sharing, String>>, all:
     lines
 }
 
+/// The reclaim task ended: the files its progress report deleted.
 fn reclaimed(app: &mut App, label: &str, t: &Task) {
     let done = t.progress_reports.iter().find(|r| r.code == "reclaim-space.artifact").and_then(|r| r.done).unwrap_or(0);
     app.ok(format!("{label}: deleted {done} file(s)"));
