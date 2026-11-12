@@ -103,9 +103,14 @@ async fn pulp_export_and_import_of_a_file_repository() {
     assert_eq!((imports.count, imports.results[0]["params"]["path"].as_str()), (2, Some(toc.as_str())));
     assert!(matches!(c.delete(&importer).await.unwrap(), pulp_tui::pulp::Mutation::Empty), "204, no task");
 
-    // Exports (o) lists them; Delete removes the record only.
-    let list: Page<Value> = c.list(&exports, &[("ordering", "pulp_created".into())]).await.unwrap();
-    assert_eq!((list.count, list.results[0]["pulp_href"].as_str()), (4, Some(export.as_str())));
+    // Exports (o) lists them; Delete removes the record only. Pulp has no `ordering` filter on exports: the rows come
+    // in no fixed order.
+    let list: Page<Value> = c.list(&exports, &[]).await.unwrap();
+    let mut listed: Vec<&str> = list.results.iter().filter_map(|e| e["pulp_href"].as_str()).collect();
+    listed.sort();
+    let mut made = [export.as_str(), inc.as_str(), older.as_str(), since.as_str()];
+    made.sort();
+    assert_eq!(listed, made);
     for e in [&export, &inc, &older, &since] {
         assert!(matches!(c.delete(e).await.unwrap(), pulp_tui::pulp::Mutation::Empty), "204, no task");
     }
