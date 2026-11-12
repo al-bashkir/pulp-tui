@@ -1464,6 +1464,47 @@ async fn file_verify_reads_the_manifest_of_the_publication() {
     assert_eq!(verify(json!({ "manifest": null })).await.unwrap(), "the publication has no manifest: served files not compared");
 }
 
+/// Audit F105: with object storage the content app answers 302 to a signed URL on another host. The check follows
+/// it with no API authorization, and the signature is not in the session log or an error text.
+#[tokio::test]
+async fn served_content_follows_a_redirect_to_object_storage() {
+    let (server, store) = (MockServer::start().await, MockServer::start().await);
+    let good = hex::encode(Sha256::digest(b"file bytes"));
+    let files = json!([{ "pulp_href": "/f/a/", "relative_path": "a.txt", "sha256": good }]);
+    Mock::given(method("GET"))
+        .and(path(format!("{API}content/file/files/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": files })))
+        .mount(&server)
+        .await;
+    let to = |url: String| ResponseTemplate::new(302).insert_header("location", url);
+    let redirect = |p: &str, url: String| Mock::given(method("GET")).and(path(p.to_string())).respond_with(to(url));
+    redirect("/pulp/content/d/PULP_MANIFEST", format!("{}/bucket/m?X-Amz-Signature=sekrit", store.uri())).mount(&server).await;
+    redirect("/pulp/content/d/dead", "http://127.0.0.1:1/bucket/x?X-Amz-Signature=sekrit".into()).mount(&server).await;
+    redirect("/pulp/content/d/loop", "/pulp/content/d/loop".into()).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/bucket/m"))
+        .and(query_param("X-Amz-Signature", "sekrit"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!("a.txt,{good},10\n")))
+        .mount(&store)
+        .await;
+    let c = client(&server, |_, _| {});
+    let base = format!("{}/pulp/content/d/", server.uri());
+
+    let ok = ops::verify_served(&c, RepoType::File, &base, "/v/", &json!({ "manifest": "PULP_MANIFEST" })).await.unwrap();
+    assert_eq!(ok, "PULP_MANIFEST matches 1 files");
+    let sent = store.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(!sent[0].headers.contains_key("authorization"), "API authorization went to object storage");
+    let text = logged("GET /bucket/m?••• 200");
+    assert!(!text.contains("sekrit"), "{text}");
+
+    let e = c.fetch_content(&format!("{base}dead"), 1024).await.unwrap_err();
+    assert!(matches!(e, PulpError::Network(_)) && !e.to_string().contains("sekrit"), "{e}");
+    assert!(!logged("GET /bucket/x?••• network error").contains("sekrit"));
+    // A redirect loop ends: what clients get then is the redirect.
+    assert_eq!(c.fetch_content(&format!("{base}loop"), 1024).await.unwrap().0, 302);
+}
+
 #[tokio::test]
 async fn rpm_verify_reads_the_layout_of_the_publication() {
     let server = MockServer::start().await;

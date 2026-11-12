@@ -3,7 +3,7 @@
 
 use crate::config::{AuthMethod, Profile, Settings, parse_secret_ref, resolve_secret};
 use crate::session_log::{self, Body};
-use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, LOCATION, RETRY_AFTER};
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -101,6 +101,9 @@ pub struct Page<T> {
     pub previous: Option<String>,
     pub results: Vec<T>,
 }
+
+/// Redirects that one `fetch_content` follows; after them the redirect is the answer.
+const CONTENT_REDIRECTS: usize = 5;
 
 #[derive(Clone)]
 pub struct PulpClient {
@@ -351,13 +354,30 @@ impl PulpClient {
         }
     }
 
-    /// Plain GET of served content (distribution base URLs, `content_url`). No API auth header is sent
-    /// to content URLs on other origins.
+    /// Plain GET of served content (distribution base URLs, `content_url`). It follows up to `CONTENT_REDIRECTS`
+    /// redirects as clients do: with object storage the content app answers 302 to a signed URL (audit F105).
     pub async fn fetch_content(&self, url: &str, max_bytes: u64) -> Result<(u16, Vec<u8>)> {
         let url = &self.content_url(url);
-        let u = url::Url::parse(url).map_err(|_| PulpError::BadHref(url.into()))?;
+        let mut u = url::Url::parse(url).map_err(|_| PulpError::BadHref(url.into()))?;
+        let mut hops = 0;
+        loop {
+            let (status, headers, body) = self.fetch_once(&u, max_bytes).await?;
+            let redirect = hops < CONTENT_REDIRECTS && matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308);
+            match headers.get(LOCATION).filter(|_| redirect).and_then(|l| u.join(l.to_str().ok()?).ok()) {
+                Some(next) => (u, hops) = (next, hops + 1),
+                None => return Ok((status.as_u16(), body)),
+            }
+        }
+    }
+
+    /// One GET of `fetch_content`. No API auth header is sent to another origin, and the log shows no query: it is
+    /// the signature of an object storage URL.
+    async fn fetch_once(&self, u: &url::Url, max_bytes: u64) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
+        let mut plain = u.clone();
+        plain.set_query(None);
+        let shown = display_url(&plain, &[]) + if u.query().is_some() { "?•••" } else { "" };
         if !matches!(u.scheme(), "http" | "https") {
-            return Err(PulpError::BadHref(url.into()));
+            return Err(PulpError::BadHref(shown));
         }
         let mut rb = self.inner.http.get(u.clone());
         if let Some(a) = &self.inner.auth
@@ -367,8 +387,7 @@ impl PulpClient {
         }
         // Served files are not stored in the log, only their size.
         let served = |b: &[u8]| Body::Text(format!("<content, {} bytes>", b.len()).into_bytes());
-        let (status, _, body) = self.exchange(rb, max_bytes, "GET", &display_url(&u, &[]), Body::None, served).await?;
-        Ok((status.as_u16(), body))
+        self.exchange(rb, max_bytes, "GET", &shown, Body::None, served).await
     }
 
     /// Send `rb`, read at most `max` bytes of the answer and record the exchange in the session log
@@ -381,7 +400,7 @@ impl PulpClient {
         url: &str,
         request: Body,
         shown: fn(&[u8]) -> Body,
-    ) -> Result<(StatusCode, Option<Duration>, Vec<u8>)> {
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
         let started = Instant::now();
         let log = |status: std::result::Result<u16, String>, response: Body| {
             let server = &self.inner.profile;
@@ -407,16 +426,11 @@ impl PulpClient {
         // Written before the body read, so a body that is too large or fails to read still reaches the file log.
         let path = url::Url::parse(url).map(|u| u.path().to_string()).unwrap_or_default();
         tracing::debug!(%method, path, status = status.as_u16(), "pulp api");
-        let retry_after = resp
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|s| Duration::from_secs(s.min(30)));
+        let headers = resp.headers().clone();
         match read_limited(resp, max).await {
             Ok(bytes) => {
                 log(Ok(status.as_u16()), shown(&bytes));
-                Ok((status, retry_after, bytes))
+                Ok((status, headers, bytes))
             }
             Err(e) => {
                 log(Err(e.to_string()), Body::None);
@@ -466,9 +480,14 @@ impl PulpClient {
             rb = rb.json(b);
             logged = serde_json::to_value(b).map_or(Body::None, Body::Json);
         }
-        let (status, retry_after, bytes) =
+        let (status, headers, bytes) =
             self.exchange(rb, self.inner.max_bytes, method.as_str(), &shown, logged, json_or_text).await.map_err(|e| (e, None))?;
         if !status.is_success() {
+            let retry_after = headers
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|s| Duration::from_secs(s.min(30)));
             return Err((PulpError::Api { status: status.as_u16(), message: error_text(&bytes) }, retry_after));
         }
         if bytes.is_empty() {
@@ -516,7 +535,11 @@ pub fn jitter(base: u64, pct: u64) -> u64 {
     if span == 0 { base } else { base - span + nanos % (2 * span + 1) }
 }
 
-fn map_reqwest(e: reqwest::Error) -> PulpError {
+fn map_reqwest(mut e: reqwest::Error) -> PulpError {
+    // The query of an object storage URL is its signature (`fetch_content`).
+    if let Some(u) = e.url_mut() {
+        u.set_query(None);
+    }
     if e.is_timeout() {
         PulpError::Timeout
     } else {
