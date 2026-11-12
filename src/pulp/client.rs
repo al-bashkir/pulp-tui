@@ -341,9 +341,20 @@ impl PulpClient {
         Ok(())
     }
 
-    /// Plain GET of served content (distribution base URLs). No API auth header is sent
+    /// The absolute URL of served content at `url`. Without CONTENT_ORIGIN (the default of pulpcore 3.95 and later)
+    /// Pulp gives a distribution's `base_url` as a path on its own server (`/pulp/content/<base_path>/`), which
+    /// pulpcore's replica joins with the server URL too (`app/replica.py`).
+    pub fn content_url(&self, url: &str) -> String {
+        match url.starts_with('/') {
+            true => self.inner.base.join(url).map(String::from).unwrap_or_else(|_| url.into()),
+            false => url.into(),
+        }
+    }
+
+    /// Plain GET of served content (distribution base URLs, `content_url`). No API auth header is sent
     /// to content URLs on other origins.
     pub async fn fetch_content(&self, url: &str, max_bytes: u64) -> Result<(u16, Vec<u8>)> {
+        let url = &self.content_url(url);
         let u = url::Url::parse(url).map_err(|_| PulpError::BadHref(url.into()))?;
         if !matches!(u.scheme(), "http" | "https") {
             return Err(PulpError::BadHref(url.into()));
@@ -624,6 +635,25 @@ mod tests {
             ..Default::default()
         };
         PulpClient::new("t", &p, &Settings::default()).unwrap()
+    }
+
+    /// F99: without CONTENT_ORIGIN, pulpcore gives `base_url` as a path and status `content_origin: null`; the content
+    /// app is on the server of the profile. An absolute URL (CONTENT_ORIGIN set, or object storage) stays.
+    #[test]
+    fn content_is_on_the_profile_server_without_a_content_origin() {
+        let c = client(Some("edge"));
+        assert_eq!(c.content_url("/pulp/content/edge/docs/"), "https://pulp.example.com/pulp/content/edge/docs/");
+        assert_eq!(c.content_url("https://cdn.example.com/docs/"), "https://cdn.example.com/docs/");
+        assert_eq!(c.content_url(""), "");
+        let caps = |origin: serde_json::Value| crate::pulp::Capabilities {
+            status: serde_json::from_value(serde_json::json!({ "versions": [],
+                "content_settings": { "content_origin": origin, "content_path_prefix": "/pulp/content/" } }))
+            .ok(),
+            ..Default::default()
+        };
+        assert_eq!(caps(serde_json::Value::Null).content_base(&c).as_deref(), Some("https://pulp.example.com/pulp/content/"));
+        let set = caps(serde_json::json!("https://cdn.example.com/"));
+        assert_eq!(set.content_base(&c).as_deref(), Some("https://cdn.example.com/pulp/content/"));
     }
 
     #[test]

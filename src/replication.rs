@@ -130,6 +130,8 @@ pub async fn plan(
                 out.push(it);
                 continue;
             };
+            // The destination downloads from here: a path is on the server of the source profile.
+            let base = src.content_url(&base);
             if dst_content_base.is_some_and(|b| base.starts_with(b)) {
                 it.note = "upstream content is served by the destination itself (loop)".into();
                 out.push(it);
@@ -317,8 +319,9 @@ async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror:
     let dist = ops::ensure_distribution(c, t, &it.name, &it.base_path, Some(&publication), &labels, None, on).await?;
     let d: Distribution = c.get(&dist, &[]).await?;
     let p: Value = c.get(&publication, &[]).await?;
-    let check = ops::verify_served(c, t, d.base_url.as_deref().unwrap_or_default(), &version, &p).await?;
-    Ok(format!("{} served at {} ({check})", short_version(&version), d.base_url.unwrap_or_default()))
+    let base = c.content_url(d.base_url.as_deref().unwrap_or_default());
+    let check = ops::verify_served(c, t, &base, &version, &p).await?;
+    Ok(format!("{} served at {base} ({check})", short_version(&version)))
 }
 
 /// Checked again at run time: an object with the name of `it` may have been created since the dry run.
@@ -741,6 +744,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_file_replica_syncs_from_the_manifest_the_upstream_serves() {
+        // F99: without CONTENT_ORIGIN the upstream `base_url` is a path on the server of the source profile.
+        for relative in [false, true] {
+            a_file_replica_syncs_from_the_served_manifest(relative).await;
+        }
+    }
+
+    async fn a_file_replica_syncs_from_the_served_manifest(relative: bool) {
         use wiremock::matchers::{method, path, query_param};
         let (up, down) = (wiremock::MockServer::start().await, wiremock::MockServer::start().await);
         serve_status(&up, &["file"]).await;
@@ -748,10 +758,14 @@ mod tests {
         let page = |r: Value| json!({ "count": r.as_array().map_or(0, Vec::len), "next": null, "results": r });
         let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
         let repo = "/pulp/api/v3/repositories/file/file/1/";
+        let (base, served) = match relative {
+            false => ("https://up/pulp/content/files/".to_string(), "https://up/pulp/content/files/CUSTOM".to_string()),
+            true => ("/pulp/content/files/".into(), format!("{}/pulp/content/files/CUSTOM", up.uri())),
+        };
         wiremock::Mock::given(method("GET"))
             .and(path("/pulp/api/v3/distributions/file/file/"))
             .respond_with(ok(page(json!([{ "pulp_href": "/pulp/api/v3/distributions/file/file/1/", "name": "files",
-                "base_path": "files", "base_url": "https://up/pulp/content/files/", "repository": repo }]))))
+                "base_path": "files", "base_url": base, "repository": repo }]))))
             .mount(&up)
             .await;
         // The upstream repository was published with a custom manifest name.
@@ -764,7 +778,7 @@ mod tests {
             .await;
         wiremock::Mock::given(method("GET")).respond_with(ok(page(json!([])))).mount(&down).await;
         let plan = plan(&client(&up, "up"), &client(&down, "down"), &[RepoType::File], "", None).await.unwrap();
-        assert_eq!((plan[0].remote_url.as_str(), &plan[0].action), ("https://up/pulp/content/files/CUSTOM", &PlanAction::Create));
+        assert_eq!((plan[0].remote_url.as_str(), &plan[0].action), (served.as_str(), &PlanAction::Create));
         assert_eq!(plan[0].manifest.as_deref(), Some("CUSTOM"), "the replica publishes under that name too");
     }
 

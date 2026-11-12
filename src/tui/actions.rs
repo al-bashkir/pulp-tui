@@ -758,7 +758,7 @@ fn profile_action(app: &mut App, act: Act, item: Value) {
                     "user: {}",
                     caps.user.as_ref().map(|u| format!("{} (staff: {:?})", u.username, u.is_staff)).unwrap_or("anonymous / unknown".into())
                 ));
-                lines.push(format!("content served at: {}", caps.content_base().unwrap_or_default()));
+                lines.push(format!("content served at: {}", caps.content_base(&c).unwrap_or_default()));
                 lines.push(String::new());
                 lines.extend(caps.summary_lines());
                 ap(move |app| app.text(format!("Test {name}"), lines))
@@ -3711,6 +3711,7 @@ fn copy_url(app: &mut App, name: &str, url: String) {
     if url.is_empty() {
         return app.error(format!("distribution {name} has no base_url: nothing copied"));
     }
+    let url = app.conn.as_ref().map_or(url.clone(), |c| c.client.content_url(&url));
     copy_to_clipboard(&url);
     app.ok(format!("copied {url}"));
 }
@@ -3736,7 +3737,7 @@ fn distribution_verify(app: &mut App, t: RepoType, href: String, name: String) {
         let Some((version, publication, how)) = served_now(c, &ctx.caps, t, &d).await? else {
             bail!("distribution serves nothing (no binding, or no publication of its repository or version)");
         };
-        let url = ops::served_url(&s(&d, "base_url"), d["checkpoint"] == true, &publication);
+        let url = ops::served_url(&c.content_url(&s(&d, "base_url")), d["checkpoint"] == true, &publication);
         let res = ops::verify_served(c, t, &url, &version, &publication).await;
         let lines = vec![
             format!("{name}: {how}"),
@@ -4298,7 +4299,7 @@ fn dashboard_lines(app: &App, stat: &mut dyn FnMut(Stat) -> String) -> Vec<Strin
     let (c, caps) = (&conn.client, &conn.caps);
     let mut lines = vec![];
     if let Some(st) = &caps.status {
-        lines.push(format!("Server        {}   content: {}", c.profile(), caps.content_base().unwrap_or_default()));
+        lines.push(format!("Server        {}   content: {}", c.profile(), caps.content_base(c).unwrap_or_default()));
         lines.push(format!(
             "User          {}",
             caps.user
@@ -8787,12 +8788,21 @@ mod tests {
 
     #[tokio::test]
     async fn verify_compares_the_manifest_that_the_distribution_serves() {
+        // F99: without CONTENT_ORIGIN (the default of pulpcore 3.95 and later) `base_url` is a path on the server.
+        for relative in [false, true] {
+            verify_compares_the_manifest(relative).await;
+        }
+    }
+
+    async fn verify_compares_the_manifest(relative: bool) {
         use crate::tui::app::Modal;
         use wiremock::matchers::{method, path};
         let server = wiremock::MockServer::start().await;
         let (repo, dist) = (format!("{API}repositories/file/file/r/"), format!("{API}distributions/file/file/d/"));
-        let base = format!("{}/pulp/content/docs/", server.uri());
-        get(&server, &dist, json!({ "pulp_href": dist, "name": "docs", "base_url": base, "repository": repo })).await;
+        let url = format!("{}/pulp/content/docs/", server.uri());
+        let base = if relative { "/pulp/content/docs/".to_string() } else { url.clone() };
+        let item = json!({ "pulp_href": dist, "name": "docs", "base_url": base, "repository": repo });
+        get(&server, &dist, item.clone()).await;
         // The repository was published with its custom manifest name.
         let p = json!({ "pulp_href": "/p/1/", "repository_version": format!("{repo}versions/1/"), "pulp_created": "2026-01-01T00:00:00Z", "manifest": "CUSTOM" });
         get(&server, &format!("{API}publications/file/file/"), page(json!([p]))).await;
@@ -8813,7 +8823,10 @@ mod tests {
         let Some(Modal::Text { title, lines, .. }) = &app.modal else { panic!("no result: {:?}", app.notices.back().map(|n| &n.text)) };
         assert_eq!(title, "Verify docs");
         assert_eq!(lines.first().map(String::as_str), Some("docs: follows repository r: newest publication 1"), "{lines:?}");
+        assert_eq!(lines[2], format!("URL: {url}"));
         assert_eq!(lines.last().map(String::as_str), Some("OK: CUSTOM matches 1 files"), "{lines:?}");
+        distribution_action(&mut app, RepoType::File, Act::CopyUrl, item);
+        assert_eq!(app.notices.back().unwrap().text, format!("copied {url}"));
     }
 
     #[tokio::test]

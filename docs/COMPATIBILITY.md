@@ -752,7 +752,14 @@ Read in pulpcore 3.123.1 (`app/viewsets/domain.py`, `app/models/domain.py`,
 * **Upstream `base_url`** is the upstream's content origin: in the test containers
   `http://host.containers.internal:8081`, which pulp1 reaches and the host does not resolve
   (seen live). So the fallback reads the upstream through its API only; the replica
-  remote gets that URL as it is.
+  remote gets that URL as it is. A relative `base_url` (no `CONTENT_ORIGIN` upstream) is
+  joined with the source profile URL, so the destination must reach the source there.
+* **Relative `base_url`.** Without `CONTENT_ORIGIN` (the default of pulpcore 3.95.3 and
+  3.123.1, `settings.py:288`; 3.63.36 requires it) a distribution's `base_url` is
+  `/pulp/content/<base_path>/` and status gives `content_origin: null`. pulp-tui joins it with
+  the profile URL (`PulpClient::content_url`), as pulpcore's own replica does
+  (`app/replica.py:121-122`): Verify, the Rollback check, the drift check, the replica check,
+  Copy URL and the Dashboard `content:` line.
 * **`api_root`** of an Upstream Pulp is relative and needs a trailing slash (`pulp/`).
 * **Deletion policy.** In 3.123.1, `remove_missing` deletes for every policy but `nodelete`:
   `labeled` deletes the objects labeled with this Upstream Pulp that are gone upstream, `all`

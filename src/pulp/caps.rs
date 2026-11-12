@@ -246,10 +246,12 @@ impl Capabilities {
         if self.supports(f) { Ok(()) } else { Err(PulpError::Unsupported(f.describe().into())) }
     }
 
-    /// `content_origin + content_path_prefix` from status (where distributions are served).
-    pub fn content_base(&self) -> Option<String> {
+    /// `content_origin + content_path_prefix` from status (where distributions are served). Without CONTENT_ORIGIN
+    /// (`null`) the content app is on the server of `c` (`PulpClient::content_url`).
+    pub fn content_base(&self, c: &PulpClient) -> Option<String> {
         let cs = self.status.as_ref()?.content_settings.as_ref()?;
-        Some(format!("{}{}", cs["content_origin"].as_str()?.trim_end_matches('/'), cs["content_path_prefix"].as_str()?))
+        let origin = cs["content_origin"].as_str().unwrap_or_default().trim_end_matches('/');
+        Some(c.content_url(&format!("{origin}{}", cs["content_path_prefix"].as_str()?)))
     }
 
     pub fn summary_lines(&self) -> Vec<String> {

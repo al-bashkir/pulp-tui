@@ -389,6 +389,16 @@ probed packages download.
 * Rocky 9 AppStream (10,743 packages): cost of one page (500 and 5000 rows) and of the full
   listing. `live_real::rocky9_appstream_page_cost`
 
+### A server without CONTENT_ORIGIN
+
+`tests/run-live.sh origin` starts pulp3 (port 8082) without `CONTENT_ORIGIN`, the default of
+pulpcore 3.95 and later: a `base_url` is `/pulp/content/<base_path>/`.
+
+* The Dashboard names where content is served; Verify of a File distribution says OK at the
+  URL joined with the profile URL; Copy URL copies that URL; the drift check of a published
+  Content View finds Library OK.
+  `live_origin::served_content_is_found_on_a_server_without_a_content_origin_through_the_tui`
+
 ### By hand
 
 * In the TUI (tmux, real servers): dashboard, repository create/search/upload, remote

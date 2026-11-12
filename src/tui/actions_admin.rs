@@ -1324,7 +1324,7 @@ pub fn fallback(app: &mut App) {
         let (filter, mirror, settings) = (f.get("filter").to_string(), f.bool("mirror"), app.cfg.settings.clone());
         app.job(format!("plan replication from {src_name}"), move |ctx| async move {
             let src = PulpClient::new(&src_name, &src_profile, &settings)?;
-            let base = ctx.caps.content_base();
+            let base = ctx.caps.content_base(&ctx.client);
             let plan = replication::plan(&src, &ctx.client, &types, &filter, base.as_deref()).await?;
             let mut lines: Vec<String> = vec![
                 format!("Dry run: {src_name} -> {} ({})", ctx.client.profile(), if mirror { "mirror" } else { "additive" }),

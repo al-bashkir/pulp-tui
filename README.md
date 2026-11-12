@@ -95,6 +95,7 @@ cargo test                     # unit + mock HTTP tests (live tests skip themsel
 tests/run-live.sh              # starts Pulp in Podman/Docker, runs all live scenarios
 tests/run-live.sh repos cv     # selected scenarios (repos cv rbac failures replication shared_db deb export)
 tests/run-live.sh real         # real Debian main and Rocky 9 repositories (needs internet; not in "all")
+tests/run-live.sh origin       # a Pulp without CONTENT_ORIGIN (starts pulp3 on port 8082; not in "all")
 tests/env/pulp-env.sh up-all     # start pulp1, pulp2, PostgreSQL and the fixture http server
 tests/env/pulp-env.sh down-all   # remove all of them (containers and volumes)
 ```
