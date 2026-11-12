@@ -3110,6 +3110,7 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
                     ap(move |app| {
                         match check {
                             Ok(m) => app.ok(format!("{dist} now serves {}: {m}", short(&version))),
+                            Err(e @ PulpError::NotCompared(_)) => app.ok(format!("{dist} now serves {}: {e}", short(&version))),
                             Err(e) => app.notify(Level::Warn, format!("{dist} re-pointed, but verification failed: {e}")),
                         }
                         app.reload();
@@ -3746,6 +3747,7 @@ fn distribution_verify(app: &mut App, t: RepoType, href: String, name: String) {
             String::new(),
             match res {
                 Ok(m) => format!("OK: {m}"),
+                Err(PulpError::NotCompared(why)) => format!("NOT COMPARED: {why}"),
                 Err(e) => format!("MISMATCH: {e}"),
             },
         ];

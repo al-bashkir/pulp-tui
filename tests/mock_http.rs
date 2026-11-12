@@ -1461,7 +1461,37 @@ async fn file_verify_reads_the_manifest_of_the_publication() {
     assert_eq!(e("PULP_MANIFEST").await.unwrap_err().to_string(), "served content differs: PULP_MANIFEST returned HTTP 404");
     let old = e("OLD").await.unwrap_err().to_string();
     assert_eq!(old, "served content differs: OLD does not match the version (1 served, 1 expected)");
-    assert_eq!(verify(json!({ "manifest": null })).await.unwrap(), "the publication has no manifest: served files not compared");
+    let none = verify(json!({ "manifest": null })).await.unwrap_err();
+    assert!(matches!(none, PulpError::NotCompared(_)), "{none:?}");
+    assert_eq!(none.to_string(), "not compared: the publication has no manifest");
+}
+
+/// Audit F113: a content guard that refuses the API user is a check not made, not a mismatch. A refusal of object
+/// storage after the redirect is what every client gets: a mismatch.
+#[tokio::test]
+async fn a_content_guard_refusal_is_not_compared() {
+    let (server, store) = (MockServer::start().await, MockServer::start().await);
+    for (p, status) in [("/pulp/content/g/PULP_MANIFEST", 403), ("/pulp/content/h/PULP_MANIFEST", 401), ("/bucket/m", 403)] {
+        Mock::given(method("GET")).and(path(p)).respond_with(ResponseTemplate::new(status)).mount(&server).await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/pulp/content/s/PULP_MANIFEST"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", format!("{}/bucket/m", store.uri())))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET")).and(path("/bucket/m")).respond_with(ResponseTemplate::new(403)).mount(&store).await;
+    let c = client(&server, |_, _| {});
+    let verify = |d: &str| {
+        let (c, base) = (&c, format!("{}/pulp/content/{d}/", server.uri()));
+        async move { ops::verify_served(c, RepoType::File, &base, "/v/", &json!({ "manifest": "PULP_MANIFEST" })).await.unwrap_err() }
+    };
+    for (d, status) in [("g", 403), ("h", 401)] {
+        let e = verify(d).await;
+        assert!(matches!(e, PulpError::NotCompared(_)), "{e:?}");
+        assert_eq!(e.to_string(), format!("not compared: a content guard refuses this client (HTTP {status})"));
+    }
+    let e = verify("s").await;
+    assert!(matches!(e, PulpError::Mismatch(_)), "{e:?}");
 }
 
 /// Audit F105: with object storage the content app answers 302 to a signed URL on another host. The check follows

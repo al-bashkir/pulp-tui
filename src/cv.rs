@@ -337,7 +337,7 @@ pub enum Fix {
     Origin,
     /// `retain_repo_versions` on a snapshot repository: Pulp would prune snapshots.
     Retention,
-    /// Not drift: a check that could not run (a File publication without a manifest). Nothing to fix.
+    /// Not drift: a check that could not run (`PulpError::NotCompared`). Nothing to fix.
     Unchecked,
 }
 
@@ -1770,13 +1770,9 @@ impl CvService {
             return issues;
         };
         let dv = vr.derived_version.as_deref().unwrap_or_default();
-        match ops::verify_served(c, br.repo_type, base, dv, &p).await {
-            Err(e) => issues.push(Drift::new(format!("{}: {e}", br.repo_name), Fix::Repair)),
-            // `file::verify` compares the manifest only: without one it reads nothing.
-            Ok(note) if br.repo_type == RepoType::File && p["manifest"].as_str().is_none() => {
-                issues.push(Drift::new(format!("{}: {note}", br.repo_name), Fix::Unchecked))
-            }
-            Ok(_) => {}
+        if let Err(e) = ops::verify_served(c, br.repo_type, base, dv, &p).await {
+            let fix = if matches!(e, PulpError::NotCompared(_)) { Fix::Unchecked } else { Fix::Repair };
+            issues.push(Drift::new(format!("{}: {e}", br.repo_name), fix));
         }
         issues
     }
@@ -3847,7 +3843,7 @@ mod tests {
             Mock::given(method("GET")).and(path(at)).respond_with(ResponseTemplate::new(200).set_body_json(body)).mount(&server).await;
         }
         let (lines, failed) = svc.relabel_env(lib, "library", &|_| {}, &ops::no_progress).await.unwrap();
-        let note = "    docs: the publication has no manifest: served files not compared";
+        let note = "    docs: not compared: the publication has no manifest";
         assert_eq!((lines.iter().map(String::as_str).collect::<Vec<_>>(), failed), (vec!["no served path changes", "web: OK", note], 0));
     }
 

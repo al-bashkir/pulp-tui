@@ -600,8 +600,8 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
                     let status = match (drift.is_empty(), drift.iter().all(|d| d.fix == Fix::Unchecked)) {
                         (true, _) => "OK - served metadata match; RPM/Deb: also the smallest package",
                         (false, true) => {
-                            "OK - served metadata match; RPM/Deb: also the smallest package; File: no manifest compared for the \
-                             repositories below"
+                            "OK - served metadata match; RPM/Deb: also the smallest package; not compared: the repositories \
+                             below"
                         }
                         (false, false) => "DRIFT",
                     };
@@ -917,9 +917,7 @@ fn promotion_result(app: &mut App, name: &str, env: &str, number: i64, res: anyh
         (Err(e), _) => app.error(format!("{e:#} (partial states are recorded; promote again to retry or roll back)")),
         // `Fix::Unchecked` is not drift, as in the drift check.
         (Ok(()), Ok(d)) if d.iter().all(|d| d.fix == Fix::Unchecked) => {
-            let unchecked: Vec<String> = d.into_iter().map(|d| d.text).collect();
-            let note =
-                if unchecked.is_empty() { String::new() } else { format!("; File: no manifest compared ({})", unchecked.join("; ")) };
+            let note: String = d.into_iter().map(|d| format!("; {}", d.text)).collect();
             app.ok(format!("{name} v{number} active in {env}; served metadata verified{note}"))
         }
         (Ok(()), d) => {
@@ -2873,8 +2871,7 @@ mod tests {
         let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirmation: {:?}", last_notice(&app)) };
         on_yes.unwrap()(&mut app);
         drain(&mut app, &mut rx).await;
-        let ok = "web v1 active in Library; served metadata verified; File: no manifest compared (docs: the publication has no \
-                  manifest: served files not compared)";
+        let ok = "web v1 active in Library; served metadata verified; docs: not compared: the publication has no manifest";
         let notices: Vec<(Level, &str)> = app.notices.iter().map(|n| (n.level, n.text.as_str())).collect();
         assert!(notices.contains(&(Level::Ok, ok)), "{notices:?}");
         assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v.id));
@@ -3057,9 +3054,9 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "Library: v1 OK - served metadata match; RPM/Deb: also the smallest package; File: no manifest compared for the \
-                 repositories below",
-                "    docs: the publication has no manifest: served files not compared"
+                "Library: v1 OK - served metadata match; RPM/Deb: also the smallest package; not compared: the repositories \
+                 below",
+                "    docs: not compared: the publication has no manifest"
             ]
         );
     }

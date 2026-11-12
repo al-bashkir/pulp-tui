@@ -320,7 +320,10 @@ async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror:
     let d: Distribution = c.get(&dist, &[]).await?;
     let p: Value = c.get(&publication, &[]).await?;
     let base = c.content_url(d.base_url.as_deref().unwrap_or_default());
-    let check = ops::verify_served(c, t, &base, &version, &p).await?;
+    let check = match ops::verify_served(c, t, &base, &version, &p).await {
+        Err(e @ PulpError::NotCompared(_)) => e.to_string(),
+        r => r?,
+    };
     Ok(format!("{} served at {base} ({check})", short_version(&version)))
 }
 

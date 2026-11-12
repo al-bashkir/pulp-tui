@@ -34,6 +34,10 @@ pub enum PulpError {
     /// A served-content check (`ops::verify_served`) found what clients get is not the version.
     #[error("served content differs: {0}")]
     Mismatch(String),
+    /// A served-content check that read nothing to compare: a content guard refuses this client, or a File
+    /// publication has no manifest.
+    #[error("not compared: {0}")]
+    NotCompared(String),
     #[error("task {state}: {message}")]
     TaskFailed { href: String, state: String, message: String },
     #[error("could not read task {href}, it may still be running (see Tasks): {message}")]
@@ -356,12 +360,16 @@ impl PulpClient {
 
     /// Plain GET of served content (distribution base URLs, `content_url`). It follows up to `CONTENT_REDIRECTS`
     /// redirects as clients do: with object storage the content app answers 302 to a signed URL (audit F105).
+    /// A 401 or 403 of the content app itself is `NotCompared`: its content guard refuses this client (audit F113).
     pub async fn fetch_content(&self, url: &str, max_bytes: u64) -> Result<(u16, Vec<u8>)> {
         let url = &self.content_url(url);
         let mut u = url::Url::parse(url).map_err(|_| PulpError::BadHref(url.into()))?;
         let mut hops = 0;
         loop {
             let (status, headers, body) = self.fetch_once(&u, max_bytes).await?;
+            if hops == 0 && matches!(status.as_u16(), 401 | 403) {
+                return Err(PulpError::NotCompared(format!("a content guard refuses this client (HTTP {})", status.as_u16())));
+            }
             let redirect = hops < CONTENT_REDIRECTS && matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308);
             match headers.get(LOCATION).filter(|_| redirect).and_then(|l| u.join(l.to_str().ok()?).ok()) {
                 Some(next) => (u, hops) = (next, hops + 1),

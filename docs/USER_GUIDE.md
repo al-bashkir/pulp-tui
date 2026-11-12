@@ -533,7 +533,10 @@ LATEST** (a repository) or **CHECKPOINTS** (a checkpoint distribution of a repos
   checkpoint distribution serves the newest checkpoint publication of its repository only at
   `<base path>/<timestamp>/` (for example `20260102T030405Z`); Verify reads it there. Deb: it
   fetches `Release`, a `Packages` index and the smallest `.deb`, and compares the digest. A
-  difference reads `MISMATCH: served content differs: …`.
+  difference reads `MISMATCH: served content differs: …`. Verify follows a redirect to object
+  storage (S3, Azure, GCS), with no API credentials to that host. `NOT COMPARED: …` means that
+  nothing was read to compare: a content guard refuses the API user (HTTP 401 or 403), or a File
+  publication has no manifest.
 * **b** re-points to a version, with a preview. It first reads that version: a number that the
   repository does not have is refused, and the message gives the latest number. On Deb, it keeps the signing service of the
   publication that it serves now, or a verbatim publication stays verbatim. On RPM, it makes a new signed publication when the repository
@@ -648,8 +651,9 @@ retry, or roll back to the served version to clear the failed attempt.
 * **D** verifies all environments (drift check). `OK` means: each distribution serves the
   publication of the snapshot, and the served metadata (`repomd.xml`, `Release`, the File
   manifest) match it; for RPM and Deb also the smallest package with its digest. Other files are
-  not downloaded. A File publication without a manifest has nothing to compare: the `OK` line
-  says `no manifest compared` and names the repository. While a workflow holds the lock of the
+  not downloaded. A File publication without a manifest, or a distribution whose content guard
+  refuses the API user, has nothing to compare: the `OK` line says `not compared` and names the
+  repository with the reason. While a workflow holds the lock of the
   view (for example a promotion that runs), an environment with drift gets one line that names
   that workflow: verify again when it ends. Otherwise it names one action per kind of drift:
   * a distribution that serves another publication (also one of a repository that the version

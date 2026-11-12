@@ -18,7 +18,7 @@ pub fn key(f: &FileContent) -> String {
 /// version's files. `base` ends with `/`.
 pub async fn verify(c: &PulpClient, base: &str, version: &str, manifest: Option<&str>) -> Result<String> {
     let fail = |m: String| Err(PulpError::Mismatch(m));
-    let Some(probe) = manifest else { return Ok("the publication has no manifest: served files not compared".into()) };
+    let Some(probe) = manifest else { return Err(PulpError::NotCompared("the publication has no manifest".into())) };
     let (status, body) = c.fetch_content(&format!("{base}{probe}"), 64 << 20).await?;
     if status != 200 {
         return fail(format!("{probe} returned HTTP {status}"));

@@ -361,6 +361,37 @@ async fn checkpoint_distribution_verifies_and_refuses_rollback() {
     cleanup(&c, &[&dist, &repo]).await;
 }
 
+/// Audit F113: Verify of a distribution behind a header content guard, which the API user does not pass, says that
+/// the served files were not compared, not MISMATCH.
+#[tokio::test]
+async fn verify_of_a_guarded_distribution_is_not_compared() {
+    if !live_enabled() {
+        return;
+    }
+    let (mut app, mut rx) = app().await;
+    let (c, t) = (client(), RepoType::File);
+    let name = unique("it-guarded");
+    let repo = create(&c, t.repositories(), json!({ "name": name }), "/repositories/").await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.txt");
+    std::fs::write(&path, format!("{name}\n")).unwrap();
+    ops::upload(&c, t, &path, Some("a.txt"), Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
+    let publication = create(&c, t.publications(), json!({ "repository": repo }), "/publications/").await;
+    let guard = json!({ "name": name, "header_name": "x-it-key", "header_value": "open" });
+    let guard = create(&c, "contentguards/core/header/", guard, "/contentguards/").await;
+    let dist = json!({ "name": name, "base_path": name, "publication": publication, "content_guard": guard });
+    let dist = create(&c, t.distributions(), dist, "/distributions/").await;
+
+    app.list.kind = Kind::Distributions(t);
+    run(&mut app, Act::Verify, c.get(&dist, &[]).await.unwrap());
+    settle(&mut app, &mut rx).await;
+    let Some(Modal::Text { lines, .. }) = app.modal.take() else { panic!("no verify result: {:?}", texts(&app)) };
+    let want = "NOT COMPARED: a content guard refuses this client (HTTP 403)";
+    assert_eq!(lines.last().map(String::as_str), Some(want), "{lines:?}");
+
+    cleanup(&c, &[&dist, &guard, &repo]).await;
+}
+
 /// pulpcore `AlternateContentSource.remote` is PROTECT: the Remotes delete refuses a remote that an ACS uses
 /// before any request, and the remote stays.
 #[tokio::test]
