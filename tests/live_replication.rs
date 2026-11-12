@@ -215,6 +215,18 @@ async fn fallback_replication() {
     assert_eq!(served(&dst, &replica("PULP_MANIFEST")).await.0, 404, "the publication of the first run is not reused");
     assert_eq!(store.last_replications(dst.profile(), up.profile()).await.unwrap().len(), 2);
 
+    // F113: a content guard on the replica that this client does not pass; the run is complete and says what it
+    // could not compare.
+    let guard = json!({ "name": docs, "header_name": "x-it-key", "header_value": "open" });
+    let guard = create(&dst, "contentguards/core/header/", guard, "/contentguards/").await;
+    let d: Value = ops::find_by_name(&dst, &dst.api(RepoType::File.distributions()), &docs).await.unwrap().unwrap();
+    let m = dst.patch(d["pulp_href"].as_str().unwrap(), &json!({ "content_guard": guard })).await.unwrap();
+    ops::settle(&dst, m, &no_progress).await.unwrap();
+    let plan = replication::plan(&up, &dst, &[RepoType::File], &prefix, None).await.unwrap();
+    let res = replication::run(&dst, &store, up.profile(), &plan, false, &|_| {}, &no_progress).await.unwrap();
+    let not_compared = "not compared: a content guard refuses this client (HTTP 403)";
+    assert!(res.iter().all(|l| l.starts_with("completed") && l.contains(not_compared)), "{res:?}");
+
     // Loop guard: distributions served by the destination itself are skipped.
     let plan = replication::plan(&dst, &dst, &[RepoType::Rpm], &prefix, Some("http://127.0.0.1:8080/pulp/content/")).await.unwrap();
     assert!(plan.iter().all(|p| p.action == PlanAction::Skip && p.note.contains("loop")), "{plan:?}");
