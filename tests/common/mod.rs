@@ -100,16 +100,20 @@ pub async fn served(c: &PulpClient, url: &str) -> (u16, Vec<u8>) {
 /// An app connected to the test Pulp as profile `pulp1`, with its jobs done: tests drive the same forms,
 /// confirmations and jobs that an operator uses.
 pub async fn app() -> (App, UnboundedReceiver<Msg>) {
-    let url = std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+    app_at("pulp1", &std::env::var("PULP_TUI_TEST_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into())).await
+}
+
+/// `app`, connected as profile `name` to the test Pulp at `url`.
+pub async fn app_at(name: &str, url: &str) -> (App, UnboundedReceiver<Msg>) {
     let dir = tempfile::tempdir().unwrap().keep();
     std::fs::write(dir.join("pw"), std::env::var("PULP_TUI_TEST_PASSWORD").unwrap_or_else(|_| "password".into())).unwrap();
     let secret = Some(format!("file:{}", dir.join("pw").display()));
     let mut cfg = Config::default();
-    cfg.profiles.insert("pulp1".into(), Profile { url, username: Some("admin".into()), secret, ..Default::default() });
+    cfg.profiles.insert(name.into(), Profile { url: url.into(), username: Some("admin".into()), secret, ..Default::default() });
     let local = Arc::new(Store::open_in_memory().await.unwrap());
     let mut app = App::new(cfg, "/dev/null".into(), local, Err(NO_PROFILE.into()));
     let mut rx = app.rx.take().unwrap();
-    app.connect("pulp1");
+    app.connect(name);
     settle(&mut app, &mut rx).await;
     assert!(app.conn.is_some(), "not connected: {:?}", texts(&app));
     (app, rx)

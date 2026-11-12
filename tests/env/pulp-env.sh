@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Reproducible Pulp test environment (pulpcore + pulp_rpm + pulp_file all-in-one image).
 #
-#   tests/env/pulp-env.sh up   [pulp1|pulp2]   start (reuses a running container)
-#   tests/env/pulp-env.sh down [pulp1|pulp2]   stop and remove container + volumes
+#   tests/env/pulp-env.sh up   [pulp1|pulp2|pulp3]   start (reuses a running container)
+#   tests/env/pulp-env.sh down [pulp1|pulp2|pulp3]   stop and remove container + volumes
 #   tests/env/pulp-env.sh status
 #   tests/env/pulp-env.sh pg-up | pg-down   PostgreSQL for the shared-database tests
 #   tests/env/pulp-env.sh deb-signing-up [pulp1|pulp2]   Deb Release signing service (test GPG key)
 #   tests/env/pulp-env.sh rpm-signing-up [pulp1|pulp2]   RPM metadata signing service (same key)
-#   tests/env/pulp-env.sh up-all | down-all   pulp1, pulp2, PostgreSQL and the fixture http server
+#   tests/env/pulp-env.sh up-all | down-all   pulp1, pulp2, PostgreSQL and the fixture http server (down-all: pulp3 too)
 #
 # pulp1 (port 8080) is the main/downstream server. pulp2 (port 8081) is only
-# needed by the replication tests (upstream). Both use admin/password.
+# needed by the replication tests (upstream). pulp3 (port 8082) has no CONTENT_ORIGIN, the
+# default of pulpcore 3.95 and later, for the `origin` scenario only. All use admin/password.
 # PostgreSQL (pg-up) listens on 127.0.0.1:55432, user and database pulp_tui,
 # password $PG_PASSWORD (default pulp_tui_test, a test-only value).
 set -euo pipefail
@@ -23,7 +24,7 @@ PG_IMAGE=${PG_IMAGE:-docker.io/library/postgres:16}
 PG_PASSWORD=${PG_PASSWORD:-pulp_tui_test}
 PG_NAME=pulp-tui-pg
 
-port_of() { case "$1" in pulp1) echo 8080 ;; pulp2) echo 8081 ;; *) echo "unknown instance $1" >&2; exit 2 ;; esac; }
+port_of() { case "$1" in pulp1) echo 8080 ;; pulp2) echo 8081 ;; pulp3) echo 8082 ;; *) echo "unknown instance $1" >&2; exit 2 ;; esac; }
 
 # `exec` in a Pulp container. In the latest image (CentOS Stream 10, rpm 4.19), the createrepo_c wheel loads its own
 # older librpm, which cannot parse the system `%add_sysuser` macro: each pulpcore-manager run prints that one harmless
@@ -34,11 +35,13 @@ pulp_exec() {
 }
 
 # The content origin must be reachable from the host (tests fetch served content)
-# and, for the upstream, from the other container (replication downloads).
+# and, for the upstream, from the other container (replication downloads). pulp3 has none:
+# its base_url is a path on the server.
 origin_of() {
   case "$1" in
     pulp1) echo "http://127.0.0.1:$(port_of pulp1)" ;;
     pulp2) echo "http://host.containers.internal:$(port_of pulp2)" ;;
+    *) echo "" ;;
   esac
 }
 
@@ -61,9 +64,12 @@ up() {
   fi
   $RUNTIME rm -f "$name" >/dev/null 2>&1 || true
   mkdir -p "$ENV_DIR/$name"
+  local origin content_origin=""
+  origin=$(origin_of "$name")
+  if [ -n "$origin" ]; then content_origin="CONTENT_ORIGIN = \"$origin\""; fi
   # Test-only key; recent images no longer generate one.
   cat >"$ENV_DIR/$name/settings.py" <<EOF
-CONTENT_ORIGIN = "$(origin_of "$name")"
+$content_origin
 SECRET_KEY = "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 TOKEN_AUTH_DISABLED = True
 # Exporters write here and importers read here (the pulp user owns the storage volume).
@@ -229,7 +235,7 @@ case "$cmd" in
   deb-signing-up) deb_signing_up "${1:-pulp1}" ;;
   rpm-signing-up) rpm_signing_up "${1:-pulp1}" ;;
   up-all) up pulp1; up pulp2; pg_up; http_up ;;
-  down-all) down pulp1; down pulp2; pg_down; http_down ;;
+  down-all) down pulp1; down pulp2; down pulp3; pg_down; http_down ;;
   status) $RUNTIME ps -a --filter name=pulp --format '{{.Names}} {{.Status}} {{.Ports}}' ;;
-  *) echo "usage: $0 up|down|status [pulp1|pulp2] | pg-up|pg-down | http-up|http-down | deb-signing-up|rpm-signing-up [pulp1|pulp2] | up-all|down-all" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|status [pulp1|pulp2|pulp3] | pg-up|pg-down | http-up|http-down | deb-signing-up|rpm-signing-up [pulp1|pulp2] | up-all|down-all" >&2; exit 2 ;;
 esac

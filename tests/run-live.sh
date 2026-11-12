@@ -7,6 +7,7 @@
 #   tests/run-live.sh            all scenarios
 #   tests/run-live.sh repos cv   selected scenarios (repos cv rbac failures replication shared_db deb export content admin)
 #   tests/run-live.sh real       real Debian main and Rocky 9 upstreams (needs internet; not in "all")
+#   tests/run-live.sh origin     a server without CONTENT_ORIGIN (starts pulp3; not in "all")
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -24,7 +25,7 @@ cargo test --lib --test mock_http
 
 scenarios=${*:-repos cv rbac failures replication shared_db deb export content admin}
 for s in $scenarios; do
-  case $s in cv | replication) $ENV up pulp2 ;; esac
+  case $s in cv | replication) $ENV up pulp2 ;; origin) $ENV up pulp3 ;; esac
   [ "$s" = shared_db ] && $ENV pg-up
   [ "$s" = deb ] && $ENV deb-signing-up pulp1
   [ "$s" = repos ] && $ENV rpm-signing-up pulp1
