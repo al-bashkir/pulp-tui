@@ -298,33 +298,47 @@ pub async fn run(
 }
 
 async fn replicate_one(c: &PulpClient, src_profile: &str, it: &PlanItem, mirror: bool, on: OnTask<'_>) -> Result<String> {
-    let t = it.t;
-    let policy = match (t, mirror) {
-        (_, false) => "additive",
-        (RepoType::Rpm, true) => "mirror_content_only",
-        (_, true) => "mirror",
-    };
     let labels = json!({ LABEL_REPLICA: src_profile });
     let remote = replica_remote(c, src_profile, it, &labels, on).await?;
     let repo = replica_repo(c, src_profile, it, &remote, &labels, on).await?;
-    ops::settle(c, ops::sync(c, t, &repo, Some(&remote), policy).await?, on).await?;
+    ops::settle(c, ops::sync(c, it.t, &repo, Some(&remote), sync_policy(it.t, mirror)).await?, on).await?;
     let r: Repository = c.get(&repo, &[]).await?;
     let version = r.latest_version_href.ok_or_else(|| anyhow!("no repository version after sync"))?;
-    // Not `ensure_publication`: a signing replica would get a new publication on every run. A reused unsigned RPM one
-    // fails `verify_served` below (repomd.xml.asc); Deb verify does not check signatures.
-    let publication = match ops::find_publication(c, t, &version, &it.mode).await? {
+    serve_replica(c, it, &version, &labels, on).await
+}
+
+/// The sync policy of a replica: additive, or mirror (`mirror_content_only` for RPM).
+fn sync_policy(t: RepoType, mirror: bool) -> &'static str {
+    match (t, mirror) {
+        (_, false) => "additive",
+        (RepoType::Rpm, true) => "mirror_content_only",
+        (_, true) => "mirror",
+    }
+}
+
+/// The publication of `version` in the mode of `it`: an existing one, else a new one. Not `ensure_publication`: a
+/// signing replica would get a new publication on every run. A reused unsigned RPM one fails `verify_served` in
+/// `serve_replica` (repomd.xml.asc); Deb verify does not check signatures.
+async fn replica_publication(c: &PulpClient, it: &PlanItem, version: &str, on: OnTask<'_>) -> Result<String> {
+    Ok(match ops::find_publication(c, it.t, version, &it.mode).await? {
         Some(p) => p,
-        None => ops::create_publication(c, t, &version, &it.mode, on).await?,
-    };
-    let dist = ops::ensure_distribution(c, t, &it.name, &it.base_path, Some(&publication), &labels, None, on).await?;
+        None => ops::create_publication(c, it.t, version, &it.mode, on).await?,
+    })
+}
+
+/// Publish `version` of the replica of `it`, distribute it at the base path of `it` and check what it serves.
+async fn serve_replica(c: &PulpClient, it: &PlanItem, version: &str, labels: &Value, on: OnTask<'_>) -> Result<String> {
+    let t = it.t;
+    let publication = replica_publication(c, it, version, on).await?;
+    let dist = ops::ensure_distribution(c, t, &it.name, &it.base_path, Some(&publication), labels, None, on).await?;
     let d: Distribution = c.get(&dist, &[]).await?;
     let p: Value = c.get(&publication, &[]).await?;
     let base = c.content_url(d.base_url.as_deref().unwrap_or_default());
-    let check = match ops::verify_served(c, t, &base, &version, &p).await {
+    let check = match ops::verify_served(c, t, &base, version, &p).await {
         Err(e @ PulpError::NotCompared(_)) => e.to_string(),
         r => r?,
     };
-    Ok(format!("{} served at {base} ({check})", short_version(&version)))
+    Ok(format!("{} served at {base} ({check})", short_version(version)))
 }
 
 /// Checked again at run time: an object with the name of `it` may have been created since the dry run.

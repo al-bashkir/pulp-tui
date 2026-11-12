@@ -3066,17 +3066,10 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
         cv_distribution_refusal(&d, "promote or roll back the view")?;
         // The new publication keeps the mode of the served one: clients keep their paths and signatures.
         let served = served_now(c, &ctx.caps, t, &d).await?;
-        let (current, mode) = match &served {
-            Some((v, p, how)) => (format!("{} ({how})", short(v)), pinned_mode(t, Some(p), &version, None)),
-            None => ("nothing".into(), pinned_mode(t, None, &version, None)),
-        };
+        let mode = pinned_mode(t, served.as_ref().map(|(_, p, _)| p), &version, None);
+        let current = served.as_ref().map_or("nothing".into(), |(v, _, how)| format!("{} ({how})", short(v)));
         ops::refuse_checkpoint(&dist, d["checkpoint"] == true).map_err(|e| anyhow!("{e}; it now serves {current}"))?;
-        let signs = t == RepoType::Rpm && rpm::signs_metadata(c, &version).await?;
-        let publication = match ops::reusable_publication(c, t, &version, &mode).await? {
-            Some(p) => format!("existing {}", short(&p)),
-            None if signs => "new, signed with the repository's metadata signing service".into(),
-            None => "new".into(),
-        };
+        let publication = rollback_publication(c, t, &version, &mode).await?;
         let mut lines = vec![
             format!("Distribution {dist} ({})", s(&d, "base_url")),
             format!("  now serves:  {current}"),
@@ -3087,36 +3080,53 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
             "Repository metadata switches immediately. Pulp may keep serving files of the previous".into(),
             "publication for DISTRIBUTED_PUBLICATION_RETENTION_PERIOD (default 3 days).".into(),
         ];
-        if let Some((v, ..)) = served.filter(|(v, ..)| !v.is_empty() && repo_of_version(v) != repo_of_version(&version)) {
-            let name = async |h: &str| c.get::<Value>(&repo_of_version(h), &[("fields", "name".into())]).await.map(|r| s(&r, "name"));
-            let (new, now) = (name(&version).await?, name(&v).await?);
-            let n = version_number(&version);
-            lines.insert(3, format!("  WARNING: version {n} of repository {new}, but the distribution serves repository {now} now"));
+        if let Some(warning) = other_repository(c, served.map(|(v, ..)| v), &version).await? {
+            lines.insert(3, warning);
         }
         let typed = dist.clone();
+        ap(move |app| app.confirm_prod(format!("Roll back {dist}"), lines, &typed, move |app| rollback_run(app, t, d, dist, version, mode)))
+    });
+}
+
+/// The publication line of a rollback preview: the publication of `version` in `mode` that it reuses, or a new one.
+async fn rollback_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> anyhow::Result<String> {
+    let signs = t == RepoType::Rpm && rpm::signs_metadata(c, version).await?;
+    Ok(match ops::reusable_publication(c, t, version, mode).await? {
+        Some(p) => format!("existing {}", short(&p)),
+        None if signs => "new, signed with the repository's metadata signing service".into(),
+        None => "new".into(),
+    })
+}
+
+/// A warning line when `version` is of another repository than the version that is `served` now.
+async fn other_repository(c: &PulpClient, served: Option<String>, version: &str) -> anyhow::Result<Option<String>> {
+    let Some(v) = served.filter(|v| !v.is_empty() && repo_of_version(v) != repo_of_version(version)) else { return Ok(None) };
+    let name = async |h: &str| c.get::<Value>(&repo_of_version(h), &[("fields", "name".into())]).await.map(|r| s(&r, "name"));
+    let (new, now) = (name(version).await?, name(&v).await?);
+    let n = version_number(version);
+    Ok(Some(format!("  WARNING: version {n} of repository {new}, but the distribution serves repository {now} now")))
+}
+
+/// Re-point distribution `d` (named `dist`) to `version` with a publication in `mode`, then check what it serves.
+fn rollback_run(app: &mut App, t: RepoType, d: Value, dist: String, version: String, mode: Value) {
+    app.job(format!("rollback {dist}"), move |ctx| async move {
+        let c = &ctx.client;
+        let on = ctx.on_task();
+        // Checkpoint may have been set since the preview: refuse before the publication is made.
+        let now: Value = c.get(&s(&d, "pulp_href"), &[]).await?;
+        ops::refuse_checkpoint(&dist, now["checkpoint"] == true)?;
+        let p = ops::ensure_publication(c, t, &version, &mode, &on).await?;
+        let base = s(&d, "base_path");
+        ops::ensure_distribution(c, t, &dist, &base, Some(&p), &json!({}), None, &on).await?;
+        let pv: Value = c.get(&p, &[]).await?;
+        let check = ops::verify_served(c, t, &s(&d, "base_url"), &version, &pv).await;
         ap(move |app| {
-            app.confirm_prod(format!("Roll back {dist}"), lines, &typed, move |app| {
-                app.job(format!("rollback {dist}"), move |ctx| async move {
-                    let c = &ctx.client;
-                    let on = ctx.on_task();
-                    // Checkpoint may have been set since the preview: refuse before the publication is made.
-                    let now: Value = c.get(&s(&d, "pulp_href"), &[]).await?;
-                    ops::refuse_checkpoint(&dist, now["checkpoint"] == true)?;
-                    let p = ops::ensure_publication(c, t, &version, &mode, &on).await?;
-                    let base = s(&d, "base_path");
-                    ops::ensure_distribution(c, t, &dist, &base, Some(&p), &json!({}), None, &on).await?;
-                    let pv: Value = c.get(&p, &[]).await?;
-                    let check = ops::verify_served(c, t, &s(&d, "base_url"), &version, &pv).await;
-                    ap(move |app| {
-                        match check {
-                            Ok(m) => app.ok(format!("{dist} now serves {}: {m}", short(&version))),
-                            Err(e @ PulpError::NotCompared(_)) => app.ok(format!("{dist} now serves {}: {e}", short(&version))),
-                            Err(e) => app.notify(Level::Warn, format!("{dist} re-pointed, but verification failed: {e}")),
-                        }
-                        app.reload();
-                    })
-                });
-            })
+            match check {
+                Ok(m) => app.ok(format!("{dist} now serves {}: {m}", short(&version))),
+                Err(e @ PulpError::NotCompared(_)) => app.ok(format!("{dist} now serves {}: {e}", short(&version))),
+                Err(e) => app.notify(Level::Warn, format!("{dist} re-pointed, but verification failed: {e}")),
+            }
+            app.reload();
         })
     });
 }

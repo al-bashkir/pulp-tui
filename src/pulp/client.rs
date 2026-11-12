@@ -370,8 +370,7 @@ impl PulpClient {
             if hops == 0 && matches!(status.as_u16(), 401 | 403) {
                 return Err(PulpError::NotCompared(format!("a content guard refuses this client (HTTP {})", status.as_u16())));
             }
-            let redirect = hops < CONTENT_REDIRECTS && matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308);
-            match headers.get(LOCATION).filter(|_| redirect).and_then(|l| u.join(l.to_str().ok()?).ok()) {
+            match redirect_target(&u, status, &headers).filter(|_| hops < CONTENT_REDIRECTS) {
                 Some(next) => (u, hops) = (next, hops + 1),
                 None => return Ok((status.as_u16(), body)),
             }
@@ -515,6 +514,14 @@ fn display_url(url: &url::Url, query: &[(&str, String)]) -> String {
         u.query_pairs_mut().extend_pairs(query);
     }
     u.to_string()
+}
+
+/// Where the answer `status` with `headers` to a GET of `u` redirects to; `None` when it is not a redirect.
+fn redirect_target(u: &url::Url, status: StatusCode, headers: &HeaderMap) -> Option<url::Url> {
+    if !matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    u.join(headers.get(LOCATION)?.to_str().ok()?).ok()
 }
 
 /// A response body for the log: JSON when it parses, else the raw text.
