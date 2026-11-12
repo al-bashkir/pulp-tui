@@ -1531,8 +1531,10 @@ async fn served_content_follows_a_redirect_to_object_storage() {
     let e = c.fetch_content(&format!("{base}dead"), 1024).await.unwrap_err();
     assert!(matches!(e, PulpError::Network(_)) && !e.to_string().contains("sekrit"), "{e}");
     assert!(!logged("GET /bucket/x?••• network error").contains("sekrit"));
-    // A redirect loop ends: what clients get then is the redirect.
+    // A redirect loop ends after 5 redirects: what clients get then is the redirect.
     assert_eq!(c.fetch_content(&format!("{base}loop"), 1024).await.unwrap().0, 302);
+    let asked = server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/pulp/content/d/loop").count();
+    assert_eq!(asked, 6, "the first GET and 5 redirects");
 }
 
 #[tokio::test]
