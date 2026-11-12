@@ -1320,17 +1320,52 @@ async fn version_actions_through_the_tui(t: RepoType, path: &str) {
     let (lines, typed) = yes(&mut app);
     assert_eq!(typed.as_deref(), Some(name.as_str()));
     assert!(lines[1].starts_with("The content stays in all 3 versions: "), "{lines:?}");
-    assert_eq!(lines[3..], [format!("Default remote: {name} (policy immediate)."), "No version keeps its files.".into()]);
+    assert_eq!(lines[3..5], [format!("Default remote: {name} (policy immediate)."), "No version keeps its files.".into()]);
+    // Other tests sync the same fixtures, so which repositories have the same units changes from run to run.
+    assert!(lines[7].starts_with("Read ") && lines[7].contains(" units of its latest version; "), "{lines:?}");
     settle(&mut app, &mut rx).await;
     let done = texts(&app).into_iter().find_map(|n| n.strip_prefix(&format!("reclaim space of {name}: deleted ")).map(String::from));
     let deleted: usize = done.unwrap_or_else(|| panic!("no result: {:?}", texts(&app))).trim_end_matches(" file(s)").parse().unwrap();
     let (after, still) = stored(&c, t, &v3).await;
     assert_eq!(still, units, "the content stays in the version");
-    // Units that another repository of the server also has keep their file (other tests sync the fixtures too).
     assert_eq!(before - after, deleted, "{before} with a file before, {after} after");
     let task: Task = c.get(&app.tasks.items[0].href, &[]).await.unwrap();
     assert!(task.name.ends_with("reclaim_space") && task.state == "completed", "{task:?}");
     cleanup(&c, &[&repo, &remote]).await;
+}
+
+/// F76 (R29) through the TUI: `copy` has the units of the synced `src`. The Reclaim (R) confirm of `src` names `copy`,
+/// and after the reclaim the units of `copy` have no file either: pulpcore keeps only shared published metadata.
+#[tokio::test]
+async fn reclaim_space_names_a_repository_with_the_same_units_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, t, id) = (client(), RepoType::File, unique("f76"));
+    let (src, copy_name) = (format!("{id}-src"), format!("{id}-copy"));
+    let (repo, remote) = synced_repo(&c, t, &src, "file/PULP_MANIFEST", "mirror").await;
+    let copy = create(&c, t.repositories(), json!({ "name": copy_name }), "/repositories/").await;
+    let units = ops::content_in(&c, &latest(&c, &repo).await).await.unwrap();
+    ops::settle(&c, ops::add_content(&c, &copy, units).await.unwrap(), &no_progress).await.unwrap();
+    let files = async || -> Vec<Value> {
+        c.list_all(&c.api("content/file/files/"), &[("repository_version", latest(&c, &copy).await)], 1000).await.unwrap()
+    };
+    assert!(files().await.iter().all(|f| f["artifact"].is_string()), "synced immediate: each unit has its file");
+
+    let (mut app, mut rx) = app().await;
+    open_list(&mut app, &mut rx, Kind::Repos(t, false), &src).await;
+    let r = row(&app, "name", &src).unwrap();
+    run(&mut app, Act::Reclaim, r);
+    fill(&mut app, &[("keep", "")]);
+    settle(&mut app, &mut rx).await; // the impact is read before the confirmation
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some(src.as_str()));
+    assert_eq!(lines[0], format!("Reclaim disk space of {src}: Pulp deletes the stored files of its synced content."));
+    assert!(lines.contains(&format!("  {copy_name}")), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    let left = files().await;
+    assert!(!left.is_empty() && left.iter().all(|f| f["artifact"].is_null()), "{left:?}");
+    cleanup(&c, &[&repo, &copy, &remote]).await;
 }
 
 #[tokio::test]

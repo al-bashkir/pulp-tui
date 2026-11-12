@@ -2014,13 +2014,18 @@ fn reclaim(app: &mut App, repo: String) {
                 [] => "No version keeps its files.".to_string(),
                 k => format!("Versions that keep their files: {}", k.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")),
             };
-            let lines = vec![
-                format!("Reclaim disk space of {name}: Pulp deletes the stored files of its synced content that no other repository has."),
+            let sharing = match r["latest_version_href"].as_str() {
+                Some(v) => Some(ops::sharing_repositories(c, &repo, v).await.map_err(|e| e.to_string())),
+                None => None,
+            };
+            let mut lines = vec![
+                format!("Reclaim disk space of {name}: Pulp deletes the stored files of its synced content."),
                 format!("The content stays in all {} versions: a client request downloads a file again from its remote", numbers.len()),
                 "(on demand), so the upstream must still serve it. Uploaded content (no remote) keeps its files.".into(),
                 remote,
                 kept,
             ];
+            lines.extend(shared_lines(sharing, ops::sees_everything(c).await?));
             let keep: Vec<String> = keep.iter().map(|n| version_of(&repo, *n as i64)).collect();
             ap(move |app| {
                 app.confirm_danger(format!("Reclaim space of {name}"), lines, &name.clone(), move |app| {
@@ -2037,6 +2042,31 @@ fn reclaim(app: &mut App, repo: String) {
 }
 
 /// The reclaim task ended: the files its progress report deleted.
+/// The Reclaim lines about other repositories with the same units: pulpcore's `reclaim_space` keeps only the files
+/// of shared published metadata. `sharing`: what `ops::sharing_repositories` read (`None`: no latest version);
+/// `all`: whether Pulp shows the user every repository (`ops::sees_everything`).
+fn shared_lines(sharing: Option<std::result::Result<ops::Sharing, String>>, all: bool) -> Vec<String> {
+    let mut lines = vec![
+        "Other repositories with the same units (Content View snapshots, copies, syncs of the same upstream)".to_string(),
+        "lose those files too, unless a version kept here has the unit.".into(),
+    ];
+    match sharing {
+        None | Some(Ok(ops::Sharing { read: 0, .. })) => {}
+        Some(Err(e)) => lines.push(format!("Which other repositories have its units was not read: {e}")),
+        Some(Ok(s)) if s.names.is_empty() => {
+            lines.push(format!("Read {} of the {} units of its latest version; no other repository has any of them.", s.read, s.total))
+        }
+        Some(Ok(s)) => {
+            lines.push(format!("Read {} of the {} units of its latest version; other repositories with some of them:", s.read, s.total));
+            lines.extend(s.names.iter().map(|n| format!("  {n}")));
+        }
+    }
+    if !all {
+        lines.push("Pulp shows this user only the repositories that it may view: others can have units too.".into());
+    }
+    lines
+}
+
 fn reclaimed(app: &mut App, label: &str, t: &Task) {
     let done = t.progress_reports.iter().find(|r| r.code == "reclaim-space.artifact").and_then(|r| r.done).unwrap_or(0);
     app.ok(format!("{label}: deleted {done} file(s)"));
@@ -10108,6 +10138,90 @@ mod tests {
         settle(&mut app, &mut rx).await;
         let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text)) };
         assert_eq!(lines[3], "Default remote: up-git.");
+    }
+
+    /// F76: what the Reclaim confirm says when nothing was read, nothing is shared, or the read failed.
+    #[test]
+    fn reclaim_says_what_it_read_about_other_repositories() {
+        let read = |read, total| Some(Ok(ops::Sharing { names: vec![], read, total }));
+        for (sharing, last) in [
+            (None, "lose those files too, unless a version kept here has the unit."),
+            (read(0, 0), "lose those files too, unless a version kept here has the unit."),
+            (read(3, 3), "Read 3 of the 3 units of its latest version; no other repository has any of them."),
+            (Some(Err("permission denied [403]".into())), "Which other repositories have its units was not read: permission denied [403]"),
+        ] {
+            let lines = shared_lines(sharing, true);
+            assert_eq!(lines.last().map(String::as_str), Some(last), "{lines:?}");
+        }
+    }
+
+    /// F76: pulpcore's reclaim also deletes the files of units that other repositories have (`reclaim_space` keeps only
+    /// shared published metadata). The confirm says so, and names the other repositories that have some units of the
+    /// latest version, with how many units it read. For a user who does not see every repository it says so.
+    #[tokio::test]
+    async fn reclaim_space_names_the_other_repositories_that_have_its_units() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let repo = format!("{API}repositories/file/file/r/");
+        let (copy, snapshot, latest) =
+            (format!("{API}repositories/file/file/c/"), format!("{API}repositories/file/file/s/"), format!("{repo}versions/2/"));
+        let item = json!({ "pulp_href": repo, "name": "src", "latest_version_href": latest });
+        get(&server, &repo, item.clone()).await;
+        get(&server, &format!("{repo}versions/"), page(json!([{ "number": 2 }, { "number": 1 }, { "number": 0 }]))).await;
+        let ok = |body: Value| ResponseTemplate::new(200).set_body_json(body);
+        // 500 units in the latest version: the first page is read.
+        let units: Vec<Value> = (1..=2).map(|i| json!({ "pulp_href": format!("{API}content/file/files/{i}/") })).collect();
+        let first = json!({ "count": 500, "next": format!("{API}content/?offset=2"), "results": units });
+        Mock::given(method("GET"))
+            .and(path(format!("{API}content/")))
+            .and(query_param("repository_version", latest.as_str()))
+            .respond_with(ok(first))
+            .mount(&server)
+            .await;
+        let both = format!("{API}content/file/files/1/,{API}content/file/files/2/");
+        let versions = json!([{ "repository": repo }, { "repository": copy }, { "repository": snapshot }, { "repository": copy }]);
+        Mock::given(method("GET"))
+            .and(path(format!("{API}repository_versions/")))
+            .and(query_param("content__in", both.as_str()))
+            .respond_with(ok(page(versions)))
+            .mount(&server)
+            .await;
+        let names = json!([{ "name": "src-copy" }, { "name": "pulp-tui-cv-web-src" }]);
+        Mock::given(method("GET"))
+            .and(path(format!("{API}repositories/")))
+            .and(query_param("pulp_href__in", format!("{copy},{snapshot}")))
+            .respond_with(ok(page(names)))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = connected(&server).await;
+        app.list.kind = Kind::Repos(RepoType::File, false);
+        let confirm = async |app: &mut App, rx: &mut tokio::sync::mpsc::UnboundedReceiver<super::super::app::Msg>| {
+            run(app, Act::Reclaim, item.clone());
+            fill_and_submit(app, &[]);
+            settle(app, rx).await;
+            let Some(Modal::Confirm { lines, .. }) = app.modal.take() else {
+                panic!("no confirm: {:?}", app.notices.back().map(|n| &n.text))
+            };
+            lines
+        };
+        let shared = [
+            "Other repositories with the same units (Content View snapshots, copies, syncs of the same upstream)",
+            "lose those files too, unless a version kept here has the unit.",
+            "Read 2 of the 500 units of its latest version; other repositories with some of them:",
+            "  pulp-tui-cv-web-src",
+            "  src-copy",
+        ];
+        // access_policies/ answers 404: not an administrator.
+        let lines = confirm(&mut app, &mut rx).await;
+        assert_eq!(lines[0], "Reclaim disk space of src: Pulp deletes the stored files of its synced content.");
+        assert_eq!(
+            lines[5..],
+            [&shared[..], &["Pulp shows this user only the repositories that it may view: others can have units too."]].concat()
+        );
+        get(&server, &format!("{API}access_policies/"), page(json!([]))).await; // an administrator
+        assert_eq!(confirm(&mut app, &mut rx).await[5..], shared);
     }
 
     /// pulpcore 3.123 repairs every artifact of the domain for a version without content: such a version is refused.

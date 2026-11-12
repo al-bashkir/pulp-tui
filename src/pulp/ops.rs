@@ -598,6 +598,45 @@ pub async fn reclaim_space(c: &PulpClient, repo: &str, keep: &[String]) -> Resul
     c.post(&c.api(RECLAIM_SPACE), &body).await
 }
 
+/// Units of a version that `sharing_repositories` reads (one page), and hrefs in one `__in` query (URL length).
+const SHARE_SAMPLE: usize = 200;
+const HREFS_PER_QUERY: usize = 40;
+
+/// The other repositories that have some units of a repository version.
+pub struct Sharing {
+    /// Their names, sorted.
+    pub names: Vec<String>,
+    /// Units read (at most `SHARE_SAMPLE`).
+    pub read: usize,
+    /// Units in the version.
+    pub total: u64,
+}
+
+/// The repositories other than `repo` that have some of the first `SHARE_SAMPLE` units of its `version`
+/// (`repository_versions/?content__in=`: the versions with any of them, in pulpcore 3.63 to 3.123).
+/// shortcut: a repository that has only units after the sample is not named; read every unit if operators need it.
+pub async fn sharing_repositories(c: &PulpClient, repo: &str, version: &str) -> Result<Sharing> {
+    let q = [("repository_version", version.to_string()), ("fields", "pulp_href".into()), ("limit", SHARE_SAMPLE.to_string())];
+    let page = c.list::<Value>(&c.api("content/"), &q).await?;
+    let units: Vec<&str> = page.results.iter().filter_map(|u| u["pulp_href"].as_str()).collect();
+    let mut others = BTreeSet::new();
+    for chunk in units.chunks(HREFS_PER_QUERY) {
+        let q = [("content__in", chunk.join(",")), ("fields", "repository".into())];
+        for v in c.list_all::<Value>(&c.api("repository_versions/"), &q, 100_000).await? {
+            others.extend(v["repository"].as_str().filter(|r| *r != repo).map(String::from));
+        }
+    }
+    let others: Vec<String> = others.into_iter().collect();
+    let mut names = vec![];
+    for chunk in others.chunks(HREFS_PER_QUERY) {
+        let q = [("pulp_href__in", chunk.join(",")), ("fields", "name".into())];
+        let found = c.list_all::<Value>(&c.api("repositories/"), &q, 100_000).await?;
+        names.extend(found.iter().filter_map(|r| r["name"].as_str().map(String::from)));
+    }
+    names.sort();
+    Ok(Sharing { names, read: units.len(), total: page.count })
+}
+
 /// Bytes of hrefs in one copy or modify body. Pulp refuses a body above Django's
 /// `DATA_UPLOAD_MAX_MEMORY_SIZE` (default 2,621,440) with HTTP 400; this leaves room for the rest.
 const BATCH_BYTES: usize = 2_000_000;

@@ -272,11 +272,13 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   is sent. A Deb copy is structured: it also copies the Release,
   component and architecture records, and does not solve dependencies. A large selection goes in
   batches, as for **x** and **a** on Content.
-* **R** reclaims disk space. Pulp deletes the stored files of synced content that no other
-  repository has. The content stays in every version. Pulp downloads a file again from the remote
-  when a client asks, so the upstream must still serve it. Uploaded content keeps its files. A
-  form asks which versions keep their files (`3,4`; empty = none). The confirm shows the default
-  remote and its download policy. Type the repository name to start.
+* **R** reclaims disk space. Pulp deletes the stored files of synced content, also of units that
+  other repositories have (Content View snapshots, copies, syncs of the same upstream): those
+  repositories lose the files too. The content stays in every version. Pulp downloads a file again
+  from the remote when a client asks, so the upstream must still serve it. Uploaded content keeps
+  its files. A form asks which versions keep their files (`3,4`; empty = none). The confirm shows
+  the default remote and its download policy, and names the other repositories that have some of
+  the first 200 units of the latest version. Type the repository name to start.
 * **O** (RPM) prunes old packages of the marked repositories (else of the selected one). A package
   goes when the repository has a newer version of it (same name and architecture) and it came into
   the repository more than **Keep days** ago (default 14; 0 keeps only the newest). pulp-tui runs

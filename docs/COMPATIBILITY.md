@@ -366,8 +366,13 @@ What Pulp does, then what pulp-tui does. Versions are those in which the source 
   `verify_checksums: false` unless the operator asks for it (reading every file is slow).
 * **Reclaim space** (`repositories/reclaim_space/`: `repo_hrefs`, optional
   `repo_versions_keeplist`; progress report `reclaim-space.artifact`). It deletes the stored
-  file of each unit that no other repository has, that has a remote artifact (not an
-  upload; no `force` in the API) and whose type allows it. The units stay. On pulp1 (5
+  file of each unit of the repository that no kept version has, that has a remote artifact
+  (not an upload; no `force` in the API) and whose type allows it, also when other
+  repositories have the unit: `tasks/reclaim_space.py:41-43`
+  `exclude(pk__in=c_keep_qs, pulp_type=PublishedMetadata…)` keeps only shared published
+  metadata (the same lines in 3.63.36, 3.95.3 and 3.123.1). The other repositories then serve
+  the unit on demand too. The confirm names them from `repository_versions/?content__in=` for
+  the first 200 units of the latest version. The units stay. On pulp1 (5
   packages synced `immediate`): 5 files deleted, `artifact: null`, the distribution still
   served a package with the right digest, which then had its file again.
 * **Orphan cleanup** (`orphans/cleanup/`, task `orphan_cleanup`, progress reports
