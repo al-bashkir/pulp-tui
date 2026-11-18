@@ -89,6 +89,10 @@ pub fn parse_rule(s: &str, t: RepoType) -> Result<FilterRule, String> {
     };
     let mut r = FilterRule { action, name: None, arch: None, evr: None, version: None, path: None };
     for w in words {
+        // A value must be what the TUI shows: ratatui drops control characters, and a NUL ends a version early.
+        if w.contains(char::is_control) {
+            return Err(format!("control character in {w:?}"));
+        }
         if let Some(v) = w.strip_prefix("name=") {
             r.name = Some(v.into());
         } else if let Some(v) = w.strip_prefix("arch=") {
@@ -266,7 +270,8 @@ pub fn dpkg_verrevcmp(a: &str, b: &str) -> Ordering {
     };
     let non_digit = |c: u8| c != 0 && !c.is_ascii_digit();
     let (mut i, mut j) = (0, 0);
-    while i < a.len() || j < b.len() {
+    // The sentinel that the inner loops stop on: with the lengths, an inner NUL made the loop endless.
+    while at(a, i) != 0 || at(b, j) != 0 {
         while non_digit(at(a, i)) || non_digit(at(b, j)) {
             let (ac, bc) = (order(at(a, i)), order(at(b, j)));
             if ac != bc {
@@ -505,6 +510,31 @@ mod tests {
             assert_eq!(dpkg_verrevcmp(a, b), want, "{a} vs {b}");
             assert_eq!(dpkg_verrevcmp(b, a), want.reverse(), "{b} vs {a}");
         }
+    }
+
+    /// Audit: a NUL ends the string, as in C. The loop once never ended on it (a publish could not be stopped).
+    #[test]
+    fn dpkg_verrevcmp_ends_on_a_nul() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let cmp = [("1.0\0", "1.0"), ("1.00", "1.0\0x"), ("\0", ""), ("1.0\0", "1.1"), ("1.1", "1\0.2")];
+            tx.send(cmp.map(|(a, b)| dpkg_verrevcmp(a, b))).unwrap()
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), [Equal, Equal, Equal, Less, Greater]);
+    }
+
+    #[test]
+    fn rule_values_with_control_characters_are_refused() {
+        let err = |rule: &str, t| parse_rule(rule, t).unwrap_err();
+        assert_eq!(err("include version=1.0\0", RepoType::Deb), r#"control character in "version=1.0\0""#);
+        assert_eq!(err("include name=a\u{1b}[2K", RepoType::Rpm), r#"control character in "name=a\u{1b}[2K""#);
+        assert_eq!(err("include evr>=1.0\u{9b}", RepoType::Rpm), r#"control character in "evr>=1.0\u{9b}""#);
+        assert_eq!(err("exclude path=a\u{7f}", RepoType::File), r#"control character in "path=a\u{7f}""#);
+        // Whitespace still only separates the words.
+        assert_eq!(
+            parse_rule("include\tname=a\tarch=b", RepoType::Rpm).unwrap(),
+            parse_rule("include name=a arch=b", RepoType::Rpm).unwrap()
+        );
     }
 
     #[test]

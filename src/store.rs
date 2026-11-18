@@ -2924,6 +2924,22 @@ mod tests {
         assert!(s.content_views("k").await.unwrap().is_empty());
     }
 
+    /// Audit: an imported rule is refused unless it is a rule that the TUI form takes. A NUL in a Deb version made
+    /// the publish loop forever.
+    #[tokio::test]
+    async fn import_refuses_a_rule_that_the_form_refuses() {
+        let s = Store::open_in_memory().await.unwrap();
+        let bad = [(serde_json::json!({ "action": "include", "version": ["=", "1.0\u{0}"] }), r#"control character in "version=1.0\0""#)];
+        for (rule, want) in bad {
+            let ex: Export = serde_json::from_value(serde_json::json!({ "format": 2, "environments": [], "content_views": [
+                { "name": "web", "repos": [{ "repo_href": "/r/1/", "repo_name": "apt", "repo_type": "deb", "filters": [rule] }] }
+            ] }))
+            .unwrap();
+            assert_eq!(s.import("k", &ex).await.unwrap_err().to_string(), format!("web apt: {want}"));
+            assert!(s.content_views("k").await.unwrap().is_empty(), "{want}: nothing written");
+        }
+    }
+
     #[tokio::test]
     async fn db_id_is_stable_and_aliases_work() {
         let dir = tempfile::tempdir().unwrap();
