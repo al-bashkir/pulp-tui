@@ -325,18 +325,19 @@ fn sync_policy(t: RepoType, mirror: bool) -> &'static str {
 
 /// The publication of `version` in the mode of `it`: an existing one, else a new one. Not `ensure_publication`: a
 /// signing replica would get a new publication on every run. A reused unsigned RPM one fails `verify_served` in
-/// `serve_replica` (repomd.xml.asc); Deb verify does not check signatures.
-async fn replica_publication(c: &PulpClient, it: &PlanItem, version: &str, on: OnTask<'_>) -> Result<String> {
-    Ok(match ops::find_publication(c, it.t, version, &it.mode).await? {
-        Some(p) => p,
-        None => ops::create_publication(c, it.t, version, &it.mode, on).await?,
+/// `serve_replica` (repomd.xml.asc); Deb verify does not check signatures. Only one that is as pulp-tui makes it is
+/// reused (`ops::own_publication`; replicas are not recorded): the notes say why one was not.
+async fn replica_publication(c: &PulpClient, it: &PlanItem, version: &str, on: OnTask<'_>) -> Result<(String, Vec<String>)> {
+    Ok(match ops::own_publication(c, it.t, version, &it.mode, &[]).await? {
+        (Some(p), notes) => (p, notes),
+        (None, notes) => (ops::create_publication(c, it.t, version, &it.mode, on).await?, notes),
     })
 }
 
 /// Publish `version` of the replica of `it`, distribute it at the base path of `it` and check what it serves.
 async fn serve_replica(c: &PulpClient, it: &PlanItem, version: &str, labels: &Value, on: OnTask<'_>) -> Result<String> {
     let t = it.t;
-    let publication = replica_publication(c, it, version, on).await?;
+    let (publication, skipped) = replica_publication(c, it, version, on).await?;
     let dist = ops::ensure_distribution(c, t, &it.name, &it.base_path, Some(&publication), labels, None, on).await?;
     let d: Distribution = c.get(&dist, &[]).await?;
     let p: Value = c.get(&publication, &[]).await?;
@@ -345,7 +346,8 @@ async fn serve_replica(c: &PulpClient, it: &PlanItem, version: &str, labels: &Va
         Err(e @ PulpError::NotCompared(_)) => e.to_string(),
         r => r?,
     };
-    Ok(format!("{} served at {base} ({check})", short_version(version)))
+    let notes: String = skipped.iter().map(|why| format!("; {why}")).collect();
+    Ok(format!("{} served at {base} ({check}){notes}", short_version(version)))
 }
 
 /// The replica `kind` (remote, repository) of `it` in `collection`, with its href, when there is one. Checked again at
@@ -463,6 +465,58 @@ mod tests {
         assert_eq!(e.to_string(), "a local remote named os exists and is not managed by this replication");
         let sent = server.received_requests().await.unwrap();
         assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed: {sent:?}");
+    }
+
+    /// A rerun with no upstream change syncs no new version, so it may find a publication of that version that another
+    /// Pulp user made (a publication creator role and view permission on the repository are enough), with other
+    /// settings (`gpgcheck` off). It is not reused: a new publication is made, and the result says why. One that only
+    /// this Pulp user (`op`) holds a role on and that has the settings of a new one is reused.
+    #[tokio::test]
+    async fn a_replica_publication_that_another_user_made_is_not_reused() {
+        use wiremock::matchers::{method, path};
+        let (repo, pubs) = ("/pulp/api/v3/repositories/rpm/rpm/1/", "/pulp/api/v3/publications/rpm/rpm/");
+        let (version, found, made) = (format!("{repo}versions/2/"), format!("{pubs}2/"), format!("{pubs}9/"));
+        let settings = |config: Value| json!({ "checksum_type": "sha256", "compression_type": null, "layout": "nested_alphabetically", "repo_config": config });
+        let (own, planted) = (settings(json!({})), settings(json!({ "gpgcheck": 0 })));
+        let role = "user eve has role rpm.rpmpublication_owner on it";
+        let field = r#"its field differs from a new one (repo_config is {"gpgcheck":0}, not {})"#;
+        // (holders of its owner role, its settings, why it is not reused)
+        for (holders, has, skipped) in [(vec!["eve"], &own, Some(role)), (vec!["op"], &planted, Some(field)), (vec!["op"], &own, None)] {
+            let server = wiremock::MockServer::start().await;
+            let c = client(&server, "dst");
+            let get = |p: &str| wiremock::Mock::given(method("GET")).and(path(p.to_string()));
+            let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+            get("/pulp/api/v3/login/").respond_with(ok(json!({ "username": "op" }))).mount(&server).await;
+            let roles = json!({ "roles": [{ "role": "rpm.rpmpublication_owner", "users": holders, "groups": [] }] });
+            get(&format!("{found}list_roles/")).respond_with(ok(roles)).mount(&server).await;
+            get(repo).respond_with(ok(json!({ "pulp_href": repo, "repo_config": {}, "checksum_type": null }))).mount(&server).await;
+            let mut candidate = json!({ "pulp_href": found, "repository_version": version });
+            candidate.as_object_mut().unwrap().extend(has.as_object().unwrap().clone());
+            get(pubs).respond_with(ok(json!({ "count": 1, "next": null, "results": [candidate] }))).mount(&server).await;
+            let task = wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": "/pulp/api/v3/tasks/1/" }));
+            wiremock::Mock::given(method("POST")).and(path(pubs)).respond_with(task).mount(&server).await;
+            let done = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "completed", "created_resources": [made] });
+            get("/pulp/api/v3/tasks/1/").respond_with(ok(done)).mount(&server).await;
+            let it = PlanItem {
+                t: RepoType::Rpm,
+                name: "os".into(),
+                base_path: "os".into(),
+                remote_url: "https://up/os/".into(),
+                manifest: None,
+                distributions: None,
+                mode: json!({}),
+                action: PlanAction::Update,
+                note: String::new(),
+            };
+            let (p, notes) = replica_publication(&c, &it, &version, &ops::no_progress).await.unwrap();
+            let posts = server.received_requests().await.unwrap().iter().filter(|r| r.method.as_str() == "POST").count();
+            let Some(why) = skipped else {
+                assert_eq!((p.as_str(), posts, notes.len()), (found.as_str(), 0, 0), "{holders:?} {has}: reused");
+                continue;
+            };
+            assert_eq!((p.as_str(), posts), (made.as_str(), 1), "{holders:?} {has}: a new one");
+            assert_eq!(notes, [format!("publication {found} is not reused: {why}")]);
+        }
     }
 
     /// Another Pulp user made the remote or the repository of the replica with the replica label (before the first

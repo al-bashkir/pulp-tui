@@ -664,6 +664,18 @@ Read in pulpcore 3.123.1 (`RolesMixin` in `app/viewsets/base.py`, `NestedRoleSer
   same defaults; there the serializer default of `package_signing_fingerprint` is `""` (3.95.3)
   and Deb has no `package_signing_fingerprint_release_overrides`. pulp-tui treats null, `""`,
   `[]` and `{}` as the same and compares only the fields that an object has.
+* **Publications** (read in 3.123.1). Creating one needs the model-level `add_<type>publication`
+  permission (the `*_publication_creator` role) and view permission on the repository only
+  (`has_repo_or_repo_ver_param_model_or_domain_or_obj_perms:<plugin>.view_<type>repository`, RPM,
+  File, Deb APT and verbatim); the creator gets the `*_publication_owner` role. Lists are newest
+  first (`ordering = ("-pulp_created",)`). An RPM publish request takes `checksum_type`,
+  `repo_config`, `compression_type` and `layout` from the repository when it leaves them out
+  (`RpmPublicationViewSet.create`); a Deb one does not take the signing service (the field stays
+  null). A new publication of a bare repository shows: RPM `checksum_type` `sha256`,
+  `compression_type` null, `layout` `nested_alphabetically`, `repo_config` `{}`; File `manifest`
+  `PULP_MANIFEST`; Deb `simple` false, `structured` true, `signing_service` null,
+  `publish_legacy_release_files` false, `excluded_package_metadata_fields` `[]`, `layout`
+  `nested_alphabetically` (`publish_upstream_release_fields` is write-only).
 
 ### Domains
 

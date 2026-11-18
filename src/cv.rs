@@ -1192,19 +1192,30 @@ impl CvService {
         Ok(changed)
     }
 
+    /// The publication of snapshot `dv` of `vr` that `publication` reuses, if any. Only one that this database records or
+    /// that is as pulp-tui makes it (`ops::own_publication`; another is logged): anyone who may view the snapshot
+    /// repository and has a publication creator role can publish its version with other settings.
+    async fn reused_publication(&self, vr: &CvVersionRepo, dv: &str, changed: bool, log: Log<'_>) -> Result<Option<String>> {
+        let t = vr.repo().repo_type;
+        // A publication keeps the settings the repository had when it was made: after the PATCH, a reused one (same
+        // version: the content did not change) would serve the old ones. A pending task is one already sent. Deb: never
+        // reused: a publication signed with the repository's keys stores `signing_service: null`, so one of another
+        // signing choice cannot be told apart.
+        if changed || vr.pending_task.is_some() || t == RepoType::Deb {
+            return Ok(None);
+        }
+        let recorded = self.store.recorded_hrefs(&self.scope).await?;
+        let (p, skipped) = ops::own_publication(&self.client, t, dv, &json!({}), &recorded).await?;
+        skipped.into_iter().for_each(|why| log(format!("{}: {why}", vr.repo().repo_name)));
+        Ok(p)
+    }
+
     /// The publication of snapshot `dv` of `vr` (`changed`: the publish settings can differ from those of a publication
-    /// made before): a reused one, or a new one, checkpointed like the copy, so Watch task shows it and Resume re-attaches.
+    /// made before): a reused one (`reused_publication`), or a new one, checkpointed like the copy, so Watch task shows
+    /// it and Resume re-attaches.
     async fn publication(&self, vr: &mut CvVersionRepo, dv: &str, changed: bool, log: Log<'_>, on: OnTask<'_>) -> Result<String> {
         let (c, t) = (&self.client, vr.repo().repo_type);
-        let reuse = match t {
-            // A publication keeps the settings the repository had when it was made: after the PATCH, a reused one
-            // (same version: the content did not change) would serve the old ones. A pending task is one already sent.
-            RepoType::Rpm | RepoType::File if !changed && vr.pending_task.is_none() => ops::find_publication(c, t, dv, &json!({})).await?,
-            // Deb: never reused: a publication signed with the repository's keys stores `signing_service: null`, so
-            // one of another signing choice cannot be told apart.
-            RepoType::Rpm | RepoType::File | RepoType::Deb => None,
-        };
-        if let Some(p) = reuse {
+        if let Some(p) = self.reused_publication(vr, dv, changed, log).await? {
             return Ok(p);
         }
         let src = vr.repo().repo_href.clone();
@@ -3299,6 +3310,9 @@ mod tests {
             Mock::given(method("GET")).and(path("/pulp/api/v3/tasks/7/")).respond_with(ok(done)).mount(&server).await;
             serve_labels(&server, &vr.repo().repo_href, json!({})).await;
             let found: Vec<Value> = existing.iter().map(|p| json!({ "pulp_href": p })).collect();
+            if let Some(p) = existing {
+                serve_made_by_me(&server, p).await; // made by this Pulp user (`ops::own_publication`)
+            }
             let page = json!({ "count": found.len(), "next": null, "results": found });
             Mock::given(method("GET")).and(path(pubs)).respond_with(ResponseTemplate::new(200).set_body_json(page)).mount(&server).await;
             let svc = publishing(svc, cv, vr.version_id).await;
@@ -3319,6 +3333,67 @@ mod tests {
                 let want = (Some("/pulp/api/v3/tasks/1/"), None);
                 assert_eq!((saved.pending_task.as_deref(), saved.publication), want, "Watch task opens it, Resume re-attaches");
             }
+        }
+    }
+
+    /// A publication of the snapshot version that this database does not record is reused only when it is as pulp-tui
+    /// makes it: no one but this Pulp user (`op`) holds a role on it, and its publish settings are those that a new one
+    /// gets now (from the snapshot repository). Anyone who may view the repository and has a publication creator role
+    /// can publish the version with other settings (`gpgcheck` off). Such a candidate is skipped and logged, and a new
+    /// publication is made. A recorded one is reused as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_an_own_or_recorded_publication_of_the_snapshot_is_reused() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (pubs, found, made) =
+            ("/pulp/api/v3/publications/rpm/rpm/", "/pulp/api/v3/publications/rpm/rpm/2/", "/pulp/api/v3/publications/rpm/rpm/9/");
+        let settings = |gpgcheck: u8| json!({ "checksum_type": "sha256", "compression_type": null, "layout": "nested_alphabetically", "repo_config": { "gpgcheck": gpgcheck } });
+        let (own, planted) = (settings(1), settings(0));
+        let role = "user eve has role rpm.rpmpublication_owner on it";
+        let field = r#"its field differs from a new one (repo_config is {"gpgcheck":0}, not {"gpgcheck":1})"#;
+        // (holders of its owner role, its settings, recorded by another version, why it is not reused)
+        for (holders, has, recorded, skipped) in [
+            (vec!["eve"], &own, false, Some(role)),
+            (vec!["op"], &planted, false, Some(field)),
+            (vec![], &planted, false, Some(field)),
+            (vec!["op"], &own, false, None),
+            (vec!["eve"], &planted, true, None),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            serve_json(&server, "/pulp/api/v3/login/", json!({ "pulp_href": "/u/1/", "username": "op" })).await;
+            let roles = json!({ "roles": [{ "role": "rpm.rpmpublication_owner", "users": holders, "groups": [] }] });
+            serve_json(&server, &format!("{found}list_roles/"), roles).await;
+            let (cv, mut vr) = rpm_version(&svc).await;
+            let dv = format!("{DERIVED}versions/1/");
+            // The snapshot repository has the publish settings of its source (`copy_settings`).
+            let derived = json!({ "pulp_href": DERIVED, "checksum_type": null, "compression_type": null, "layout": null,
+                "repo_config": { "gpgcheck": 1 } });
+            serve_json(&server, DERIVED, derived).await;
+            let mut candidate = json!({ "pulp_href": found, "repository_version": dv });
+            candidate.as_object_mut().unwrap().extend(has.as_object().unwrap().clone());
+            serve_json(&server, pubs, json!({ "count": 1, "next": null, "results": [candidate] })).await;
+            let task = ResponseTemplate::new(202).set_body_json(json!({ "task": "/pulp/api/v3/tasks/1/" }));
+            Mock::given(method("POST")).and(path(pubs)).respond_with(task).mount(&server).await;
+            let done = json!({ "pulp_href": "/pulp/api/v3/tasks/1/", "state": "completed", "created_resources": [made] });
+            serve_json(&server, "/pulp/api/v3/tasks/1/", done).await;
+            if recorded {
+                let repo = vr.repo().clone();
+                let v0 = svc.store.begin_version(cv, "", &[repo]).await.unwrap();
+                let mut row = svc.store.version_repos(v0.id).await.unwrap().remove(0);
+                (row.derived_repo, row.derived_version, row.publication) = (Some(DERIVED.into()), Some(dv.clone()), Some(found.into()));
+                svc.store.save_version_repo(&row).await.unwrap();
+            }
+            let logs = Mutex::new(vec![]);
+            let p = svc.publication(&mut vr, &dv, false, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+            let posts = server.received_requests().await.unwrap().iter().filter(|r| r.method.as_str() == "POST").count();
+            let logs = logs.into_inner().unwrap();
+            let Some(why) = skipped else {
+                assert_eq!((p.as_str(), posts), (found, 0), "{holders:?} {has}: reused");
+                continue;
+            };
+            assert_eq!((p.as_str(), posts), (made, 1), "{holders:?} {has}: a new one");
+            assert!(logs.contains(&format!("os: publication {found} is not reused: {why}")), "{logs:?}");
         }
     }
 

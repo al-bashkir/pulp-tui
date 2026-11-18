@@ -1342,7 +1342,9 @@ Only Pulp RBAC stops this:
    `rpm.rpmpublication_creator`, `rpm.rpmdistribution_creator`, `file.file…_creator`). Pulp gives
    the creator the owner role of each new object only. When such a user makes a snapshot
    repository, Content View distribution or replica with the pulp-tui name and labels first,
-   pulp-tui refuses it (see Database ID).
+   pulp-tui refuses it (see Database ID). A publication of a snapshot or replica version that
+   such a user made (view permission on the repository is enough) is not reused: pulp-tui makes
+   its own and logs `publication ... is not reused: ...`.
 3. **Do not give** `rpm.admin` or a global `*_owner` role to other users.
 
 Assign roles on **Users** or **Groups**: **R**, then **c** with the role and an empty object. A

@@ -171,6 +171,16 @@ Katello: they live in the store of the profile and are built from Pulp objects.
   decides; `ops::distribution_target` calls it, so the preview refuses too. Metadata and
   release signing services are not compared: a publish sets them on a snapshot repository, and
   operators set them on a replica repository.
+* Publications are found by version, not by name, and any user who may view a repository and
+  has a publication creator role can publish its version (`rpm.add_rpmpublication` and
+  `view_rpmrepository`; the same for File and Deb). So a publish (snapshot) and a replica rerun
+  reuse a publication of the version only when the store records it (a version row) or it is as
+  pulp-tui makes it (`ops::own_publication`, the same decision, `ops::foreign_reason`): no other
+  role holder, and its publish settings (`mode_fields`, all guarded) equal those of a new one:
+  the publish body, else for RPM the repository's (Pulp copies them), else Pulp's default. Here
+  Pulp's default does not pass by itself: a publication with the default `repo_config` drops the
+  repository's `gpgcheck`. A candidate that fails is skipped, not refused: pulp-tui makes its
+  own and logs why (a replica's result line names it).
 * Known limit: a recorded href skips these checks, so a peer of a shared store who also has a
   Pulp creator role is not covered: it can make an object and write its href into a row.
 * The store is shared: a peer with SQL access can write any href into a row. So before a version
@@ -211,7 +221,9 @@ a signing service href). Then for each repository (`publish_repo`):
    on Resume of a recorded version (a publication keeps the old settings). Deb always
    creates one (a signed and an unsigned one cannot be told apart). RPM keeps the reuse
    also with a metadata signing service: each change of the service is a PATCH in step 4,
-   so a new publication follows it, and Pulp lists the newest publication first.
+   so a new publication follows it, and Pulp lists the newest publication first. Only a
+   publication that the store records, or that is as pulp-tui makes it, is reused
+   (`ops::own_publication`, see Ownership); another is skipped and logged.
 
 Then the version is stored `published` and the Library step runs.
 
@@ -441,8 +453,9 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
     the replica repository has no signing service. It reads only the API: the upstream
     `base_url` is for the destination server and may not resolve on the client.
   * It never deletes and does not copy content guards, labels or metadata.
-  * It reuses a publication of the synced version (`ops::find_publication`), also for an
-    RPM repository with a metadata signing service (a new one on every run would pile up).
+  * It reuses a publication of the synced version (`ops::own_publication`: only one as pulp-tui
+    makes it), also for an RPM repository with a metadata signing service (a new one on every
+    run would pile up).
     If the reused one is unsigned, the verify after it fails on `repomd.xml.asc`.
 * Guards: source and destination differ; a distribution served from the destination's
   content origin is a loop and is skipped.
