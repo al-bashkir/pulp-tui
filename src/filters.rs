@@ -150,6 +150,10 @@ fn refused_criterion(r: &FilterRule, t: RepoType) -> Option<&'static str> {
 /// shows. `parse_rule` of the text alone is not enough: `name=[ name=x` reads as `name=x`.
 pub fn check_rule(r: &FilterRule, t: RepoType) -> Result<(), String> {
     let s = r.to_string();
+    // The action and the keys have no `;`, so one is in a value.
+    if s.contains(';') {
+        return Err(format!("rule {s:?} has ';' in a value: ';' separates rules"));
+    }
     if parse_rule(&s, t)? != *r {
         return Err(format!("rule {s:?} changes when it is read back (a space in a value?)"));
     }
@@ -624,5 +628,14 @@ mod tests {
         assert!(evr_matches(&p, "=", "1.2"));
         assert!(evr_matches(&p, "<", "1.2-4"));
         assert!(evr_matches(&p, ">", "0:1.1"));
+    }
+
+    /// Review of the run-1 fixes: a stored or imported rule with `;` in a value showed as two rules
+    /// (`include name=a;b`), and the form reads `;` as the end of a rule. Such a rule is refused.
+    #[test]
+    fn check_rule_refuses_a_semicolon_in_a_value() {
+        let r = parse_rule("include name=a;b", RepoType::Rpm).unwrap();
+        assert_eq!(check_rule(&r, RepoType::Rpm), Err(r#"rule "include name=a;b" has ';' in a value: ';' separates rules"#.into()));
+        assert_eq!(check_rule(&parse_rule("include name=a", RepoType::Rpm).unwrap(), RepoType::Rpm), Ok(()));
     }
 }
