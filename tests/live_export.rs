@@ -447,10 +447,13 @@ async fn filesystem_exporter_through_the_tui() {
     assert_eq!((r["path"].as_str(), r["method"].as_str()), (Some(dir.as_str()), Some("write")));
     let exporter = r["pulp_href"].as_str().unwrap().to_string();
 
-    // Export (E) "publication", version empty: a publication of the latest version that pulp-tui may reuse (this user
-    // made it with the repository's settings), named in the result.
+    // Export (E) "publication", version empty: the newest publication of the latest version that this user made, as it
+    // is; the confirm names it before anything is written.
     run(&mut app, Act::Export, r.clone());
     fill(&mut app, &[("repo", &repo), ("what", "publication")]);
+    settle(&mut app, &mut rx).await;
+    let (lines, _) = yes(&mut app);
+    assert!(lines.iter().any(|l| l.starts_with(&format!("  publication: {} of ", short(&publication)))), "{lines:?}");
     settle(&mut app, &mut rx).await;
     shown(&app, &format!("export {name}: publication {} written to {dir}", short(&publication)));
     let made = exports_of(&c, &exporter).await;

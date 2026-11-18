@@ -247,7 +247,7 @@ fn pinned_mode(t: RepoType, served: Option<&Value>, version: &str, signing: Opti
 }
 
 /// "k=v, ..." of the set fields of a publication mode.
-fn mode_line(mode: &Value) -> String {
+pub(super) fn mode_line(mode: &Value) -> String {
     let set = mode.as_object().into_iter().flatten().filter(|(_, v)| !v.is_null());
     let line = set.map(|(k, v)| format!("{k}={}", v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect::<Vec<_>>();
     if line.is_empty() { "repository default settings".into() } else { line.join(", ") }

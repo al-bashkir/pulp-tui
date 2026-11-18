@@ -181,10 +181,12 @@ Katello: they live in the store of the profile and are built from Pulp objects.
   `excluded_package_metadata_fields`; `ops::from_repository`), else Pulp's default. Here
   Pulp's default does not pass by itself: a publication with the default `repo_config` drops the
   repository's `gpgcheck`. A candidate that fails is skipped, not refused: pulp-tui makes its
-  own and logs why (a replica's result line names it). The TUI's pinned Distribute, rollback,
-  distribution edit and publication export (`ops::ensure_publication` /
-  `reusable_publication`) ask the same, with no store record (operator repositories): their
-  preview and result name a skipped one.
+  own and logs why (a replica's result line names it). The TUI's pinned Distribute, rollback and
+  distribution edit (`ops::ensure_publication` / `reusable_publication`) ask the same, with no
+  store record (operator repositories): their preview and result name a skipped one. The
+  filesystem export asks only the role half (`ops::role_refusal`): it writes the newest
+  publication of the version that is the operator's own, as it is (any mode or signing), names
+  it and any skipped one in its confirm, and never makes one.
 * Known limits: a recorded href skips these checks, so a peer of a shared store who also has a
   Pulp creator role is not covered: it can make an object and write its href into a row. An
   RPM publication's `checksum_type` is compared only when the publish body or the repository

@@ -619,8 +619,9 @@ async fn foreign_reason(c: &PulpClient, obj: &Value, body: &Value, recorded: boo
 }
 
 /// Why the object roles of the object at `href` do not show that pulp-tui made it (`refuse_foreign`), and what to do: a
-/// role of another principal (`foreign_roles`), or roles that this user may not read.
-async fn role_refusal(c: &PulpClient, href: &str) -> Result<Option<(String, &'static str)>> {
+/// role of another principal (`foreign_roles`), or roles that this user may not read. The filesystem export asks only
+/// this: it writes the operator's own publication as it is.
+pub async fn role_refusal(c: &PulpClient, href: &str) -> Result<Option<(String, &'static str)>> {
     let roles: Value = match c.get(&format!("{href}list_roles/"), &[]).await {
         Ok(v) => v,
         Err(e) if matches!(e.status(), Some(403 | 404)) => {

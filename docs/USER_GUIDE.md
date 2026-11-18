@@ -917,12 +917,14 @@ Filesystem exporters write the plain files of one publication or version:
 
 * **c** / **e**: name, directory, method (`write`, `hardlink` or `symlink`).
 * **E**: a repository, a version (empty = latest), and a publication of that version or the
-  version. The publication is one that pulp-tui may reuse (made by your Pulp user, with the
-  repository's publish settings, as for **D**); else pulp-tui makes one first, and the result
-  says why it did not use a publication that another user made. **Start version number**
-  (optional, same repository): Pulp writes
-  only the files that this version does not have (a publication: and all its metadata files),
-  for example the changes since the version of the previous export.
+  version. The publication is the newest one of the version that only your Pulp user has a role
+  on (Deb verbatim ones too), as it is: its mode and signing service stay. A confirm names it and
+  its settings before anything is written, and names a newer publication that another user made
+  (a publication creator with view permission on the repository can make one), which is
+  skipped. **E** never makes a publication: without one of yours it refuses (`... has no
+  publication made by you: publish it first`). **Start version number** (optional, same
+  repository): Pulp writes only the files that this version does not have (a publication: and
+  all its metadata files), for example the changes since the version of the previous export.
 * The directory must not exist. Change it before the next export.
 
 ### Importers
