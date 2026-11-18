@@ -2051,7 +2051,7 @@ fn check_import_view(v: &ExportView) -> Result<()> {
     validate_name(&v.name).with_context(|| format!("content view {:?}", v.name))?;
     for r in &v.repos {
         for f in &r.filters {
-            crate::filters::check_rule(f, r.repo_type).map_err(|e| anyhow!("{} {}: {e}", v.name, r.repo_name))?;
+            crate::filters::check_new_rule(f, r.repo_type).map_err(|e| anyhow!("{} {}: {e}", v.name, r.repo_name))?;
         }
     }
     Ok(())
@@ -2537,6 +2537,10 @@ mod tests {
         sqlx::query("UPDATE cv_repos SET filters = $1").bind(r#"[{"action":"include","name":"[ name=x"}]"#).execute(&s.pool).await.unwrap();
         let e = format!("{:#}", s.cv_repos(cv).await.unwrap_err());
         assert_eq!(e, r#"invalid filter rules of apt: rule "include name=[ name=x" changes when it is read back (a space in a value?)"#);
+        // Second review of the run-1 fixes: a rule with ';' in a value that an older import stored still loads. It is
+        // refused where rules come in (import; the form splits on ';'), not on every read of the view.
+        sqlx::query("UPDATE cv_repos SET filters = $1").bind(r#"[{"action":"include","name":"a;b"}]"#).execute(&s.pool).await.unwrap();
+        assert_eq!(s.cv_repos(cv).await.unwrap()[0].filters[0].name.as_deref(), Some("a;b"));
     }
 
     #[tokio::test]
@@ -2960,6 +2964,10 @@ mod tests {
             (
                 serde_json::json!({ "action": "exclude", "version": [">", "=1.0"] }),
                 r#"rule "exclude version>=1.0" changes when it is read back (a space in a value?)"#,
+            ),
+            (
+                serde_json::json!({ "action": "include", "name": "a;b" }),
+                r#"rule "include name=a;b" has ';' in a value: ';' separates rules"#,
             ),
         ];
         for (rule, want) in bad {

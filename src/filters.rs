@@ -150,14 +150,22 @@ fn refused_criterion(r: &FilterRule, t: RepoType) -> Option<&'static str> {
 /// shows. `parse_rule` of the text alone is not enough: `name=[ name=x` reads as `name=x`.
 pub fn check_rule(r: &FilterRule, t: RepoType) -> Result<(), String> {
     let s = r.to_string();
-    // The action and the keys have no `;`, so one is in a value.
-    if s.contains(';') {
-        return Err(format!("rule {s:?} has ';' in a value: ';' separates rules"));
-    }
     if parse_rule(&s, t)? != *r {
         return Err(format!("rule {s:?} changes when it is read back (a space in a value?)"));
     }
     Ok(())
+}
+
+/// `check_rule` of a rule that comes in from outside (an import), which is also refused with `;` in a value: the form
+/// reads `;` as the end of a rule, and the screens show it as two rules. A stored rule gets only `check_rule`: an
+/// older import may have taken one, and refusing it on every read would make its view unreadable.
+pub fn check_new_rule(r: &FilterRule, t: RepoType) -> Result<(), String> {
+    let s = r.to_string();
+    // The action and the keys have no `;`, so one is in a value.
+    if s.contains(';') {
+        return Err(format!("rule {s:?} has ';' in a value: ';' separates rules"));
+    }
+    check_rule(r, t)
 }
 
 /// Split the `<op><value>` of an `evr` or `version` criterion; `w` is the whole word.
@@ -630,12 +638,16 @@ mod tests {
         assert!(evr_matches(&p, ">", "0:1.1"));
     }
 
-    /// Review of the run-1 fixes: a stored or imported rule with `;` in a value showed as two rules
-    /// (`include name=a;b`), and the form reads `;` as the end of a rule. Such a rule is refused.
+    /// Review of the run-1 fixes: a rule with `;` in a value (`include path=a;b`) shows as two rules, and the form reads
+    /// `;` as the end of a rule. It is refused where rules come in: the form and an import (`check_new_rule`). A stored
+    /// one still loads (`check_rule`): an older import took it, and its view must stay readable.
     #[test]
-    fn check_rule_refuses_a_semicolon_in_a_value() {
-        let r = parse_rule("include name=a;b", RepoType::Rpm).unwrap();
-        assert_eq!(check_rule(&r, RepoType::Rpm), Err(r#"rule "include name=a;b" has ';' in a value: ';' separates rules"#.into()));
-        assert_eq!(check_rule(&parse_rule("include name=a", RepoType::Rpm).unwrap(), RepoType::Rpm), Ok(()));
+    fn a_semicolon_in_a_value_is_refused_where_rules_come_in() {
+        let t = RepoType::File;
+        let r = parse_rule("include path=a;b", t).unwrap();
+        assert_eq!(check_new_rule(&r, t), Err(r#"rule "include path=a;b" has ';' in a value: ';' separates rules"#.into()));
+        assert_eq!(check_rule(&r, t), Ok(()));
+        assert_eq!(check_new_rule(&parse_rule("include path=a", t).unwrap(), t), Ok(()));
+        assert_eq!(parse_rules("include path=a;b", t), Err(r#"rule must start with include/exclude, got Some("b")"#.into()), "the form");
     }
 }
