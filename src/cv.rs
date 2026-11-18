@@ -3202,12 +3202,47 @@ mod tests {
             assert_none(&server, "POST").await;
             let Some(want) = want else {
                 assert_eq!(res.unwrap(), DERIVED, "{holder}");
+                let saved = svc.store.version_repos(v.id).await.unwrap().remove(0).derived_repo;
+                assert_eq!(saved.as_deref(), Some(DERIVED), "recorded");
+                let sent = server.received_requests().await.unwrap();
+                let patches: Vec<Value> = sent.iter().filter(|r| r.method.as_str() == "PATCH").map(|r| r.body_json().unwrap()).collect();
+                let adopted = json!({ "pulp_labels": { LABEL_CV: "web", LABEL_DB: svc.store.db_id() } });
+                assert_eq!(patches, if copied { vec![] } else { vec![adopted] }, "the database id is set when it is missing");
                 continue;
             };
             assert_eq!(res.unwrap_err().to_string(), want);
             assert_eq!(vr.derived_repo, None, "nothing recorded");
             assert_none(&server, "PATCH").await;
         }
+    }
+
+    /// No repository of the derived name: a new one with the view's labels and this database's id, recorded. A resume
+    /// uses the recorded one again once it is still ours.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_snapshot_repository_is_created_with_the_labels_and_recorded() {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        serve_json(&server, "/pulp/api/v3/repositories/rpm/rpm/", json!({ "count": 0, "next": null, "results": [] })).await;
+        let created = wiremock::ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": DERIVED }));
+        wiremock::Mock::given(method("POST")).and(path("/pulp/api/v3/repositories/rpm/rpm/")).respond_with(created).mount(&server).await;
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let src = CvRepo { repo_href: "/r/1/".into(), repo_name: "os".into(), repo_type: RepoType::Rpm, filters: vec![] };
+        let v = svc.store.begin_version(cv, "", &[src]).await.unwrap();
+        let mut vr = svc.store.version_repos(v.id).await.unwrap().remove(0);
+        assert_eq!(svc.derived_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap(), DERIVED);
+        let labels = json!({ LABEL_CV: "web", LABEL_DB: svc.store.db_id() });
+        let body = json!({ "name": "pulp-tui-cv-web-os", "description": "Content View web snapshot of os (managed by pulp-tui)",
+            "pulp_labels": labels });
+        let posts = || async {
+            let sent = server.received_requests().await.unwrap();
+            sent.iter().filter(|r| r.method.as_str() == "POST").map(|r| r.body_json().unwrap()).collect::<Vec<Value>>()
+        };
+        assert_eq!(posts().await, std::slice::from_ref(&body));
+        assert_eq!(svc.store.version_repos(v.id).await.unwrap()[0].derived_repo.as_deref(), Some(DERIVED));
+        serve_json(&server, DERIVED, json!({ "pulp_labels": labels })).await;
+        assert_eq!(svc.derived_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap(), DERIVED);
+        assert_eq!(posts().await, [body], "resumed: nothing new");
     }
 
     #[tokio::test(flavor = "multi_thread")]
