@@ -527,7 +527,8 @@ LATEST** (a repository) or **CHECKPOINTS** (a checkpoint distribution of a repos
 *binding* column shows `pinned`, `latest` or `checkpoint`. **i** full JSON.
 
 * **y** copies the content URL (OSC 52 terminal clipboard). In tmux, set
-  `set -g allow-passthrough on` or `set -s set-clipboard on`.
+  `set -g allow-passthrough on` or `set -s set-clipboard on`. A URL with a control character
+  (which the screen does not show) is not copied.
 * **V** verifies what the distribution serves. One that follows a repository serves its newest
   publication, which is not the latest version when that version has no publication. A
   checkpoint distribution serves the newest checkpoint publication of its repository only at

