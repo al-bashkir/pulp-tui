@@ -423,7 +423,7 @@ async fn pulp_exporter_and_importer_through_the_tui() {
     cleanup(&c, &[&dst, &other, &repo, &remote]).await;
 }
 
-/// The Filesystem Exporters screen through the TUI: Create (method write), Export (E) of the newest publication, Edit
+/// The Filesystem Exporters screen through the TUI: Create (method write), Export (E) of an own publication, Edit
 /// of the directory (a task; Pulp needs a new one for each export), Export of the repository version, Delete.
 #[tokio::test]
 async fn filesystem_exporter_through_the_tui() {
@@ -447,11 +447,12 @@ async fn filesystem_exporter_through_the_tui() {
     assert_eq!((r["path"].as_str(), r["method"].as_str()), (Some(dir.as_str()), Some("write")));
     let exporter = r["pulp_href"].as_str().unwrap().to_string();
 
-    // Export (E) "publication", version empty: the newest publication of the latest version.
+    // Export (E) "publication", version empty: a publication of the latest version that pulp-tui may reuse (this user
+    // made it with the repository's settings), named in the result.
     run(&mut app, Act::Export, r.clone());
     fill(&mut app, &[("repo", &repo), ("what", "publication")]);
     settle(&mut app, &mut rx).await;
-    shown(&app, &format!("export {name}: publication written to {dir}"));
+    shown(&app, &format!("export {name}: publication {} written to {dir}", short(&publication)));
     let made = exports_of(&c, &exporter).await;
     assert_eq!(made.iter().map(|e| e["exported_resources"].clone()).collect::<Vec<_>>(), [json!([publication])]);
 

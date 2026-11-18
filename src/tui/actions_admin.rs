@@ -1586,7 +1586,7 @@ fn chosen_versions(text: &str, exporter: &str, repos: &[ExportRepo]) -> Result<V
     repos.iter().map(|r| pairs.get(&r.name).and_then(Value::as_str).map_or(Ok(None), |n| version(r, n))).collect()
 }
 
-/// Export the files of one publication (the newest of the version) or of one repository version.
+/// Export the files of one publication of the version (`fs_export_source`) or of one repository version.
 fn fs_export(app: &mut App, href: String, name: String, path: String) {
     let what = vec!["publication".to_string(), "repository version".to_string()];
     let mut fields = vec![
@@ -1597,7 +1597,8 @@ fn fs_export(app: &mut App, href: String, name: String, path: String) {
         let help = "only the files that this version of the repository lacks (a publication: and its metadata); empty = all";
         fields.push(Field::new("start", "Start version number", FieldKind::Number).help(help));
     }
-    fields.push(Field::new("what", "Export", FieldKind::Choice(what)).help("publication: the newest publication of the version"));
+    let help = "publication: one of the version with the repository settings that pulp-tui made; else a new one is made";
+    fields.push(Field::new("what", "Export", FieldKind::Choice(what)).help(help));
     let form = Form::new(format!("Export {name}"), fields)
         .note(format!("Pulp makes {path} on the Pulp server and writes the files into it."))
         .note("It must not exist yet: for the next export, edit the exporter's directory first.");
@@ -1608,32 +1609,39 @@ fn fs_export(app: &mut App, href: String, name: String, path: String) {
         let start = f.number("start").map(|n| format!("{repo}versions/{n}/"));
         let (href, name, path) = (href.clone(), name.clone(), path.clone());
         app.job(format!("export {name}"), move |ctx| async move {
-            let c = &ctx.client;
-            let mut body = fs_export_source(c, t, &repo, number, publication).await?;
+            let (mut body, skipped) = fs_export_source(&ctx, t, &repo, number, publication).await?;
             if let Some(s) = start {
                 body["start_repository_version"] = s.into();
             }
-            ops::create(c, &format!("{href}exports/"), &body, "/exports/", &ctx.on_task()).await?;
-            let what = if publication { "publication" } else { "repository version" };
-            ap(move |app| app.ok(format!("export {name}: {what} written to {path}")))
+            ops::create(&ctx.client, &format!("{href}exports/"), &body, "/exports/", &ctx.on_task()).await?;
+            let what = body["publication"].as_str().map_or("repository version".into(), |p| format!("publication {}", short(p)));
+            let skipped: String = skipped.iter().map(|n| format!("; {n}")).collect();
+            ap(move |app| app.ok(format!("export {name}: {what} written to {path}{skipped}")))
         });
         Ok(())
     });
 }
 
-/// What a filesystem export of `repo` writes: version `number` (None = latest), or its newest publication.
-async fn fs_export_source(c: &PulpClient, t: RepoType, repo: &str, number: Option<i64>, publication: bool) -> anyhow::Result<Value> {
+/// What a filesystem export of `repo` writes: version `number` (None = latest), or a publication of it with the
+/// repository settings (`ops::ensure_publication`: one that pulp-tui may reuse, else a new one), with why a found one
+/// was not reused. Anyone who may view the repository and has a publication creator role can publish its versions.
+async fn fs_export_source(
+    ctx: &Ctx,
+    t: RepoType,
+    repo: &str,
+    number: Option<i64>,
+    publication: bool,
+) -> anyhow::Result<(Value, Vec<String>)> {
+    let c = &ctx.client;
     let v = match number {
         Some(n) => format!("{repo}versions/{n}/"),
         None => s(&c.get::<Value>(repo, &[]).await?, "latest_version_href"),
     };
     if !publication {
-        return Ok(json!({ "repository_version": v }));
+        return Ok((json!({ "repository_version": v }), vec![]));
     }
-    let q = [("repository_version", v.clone()), ("ordering", "-pulp_created".into()), ("limit", "1".into())];
-    let newest = c.list::<Value>(&c.api(t.publications()), &q).await?.results.first().map(|p| s(p, "pulp_href"));
-    let p = newest.ok_or_else(|| anyhow::anyhow!("{} has no publication: publish it, or export the repository version", short(&v)))?;
-    Ok(json!({ "publication": p }))
+    let (p, skipped) = ops::ensure_publication(c, t, &v, &json!({}), &ctx.on_task()).await?;
+    Ok((json!({ "publication": p }), skipped))
 }
 
 /// An export record: Pulp deletes the record only, never the files.
@@ -3013,6 +3021,10 @@ mod tests {
         );
     }
 
+    /// A publication export writes a publication of the version that is as pulp-tui makes it (`ops::ensure_publication`):
+    /// one that only this Pulp user (`op`) holds a role on is reused; one that another user made (a publication creator
+    /// with view permission on the repository can make one) is not, and neither is a missing one: a new one is made, and
+    /// the result says why.
     #[tokio::test]
     async fn a_filesystem_export_sends_the_publication_or_the_repository_version() {
         use crate::tui::kinds::Act;
@@ -3022,11 +3034,19 @@ mod tests {
         let (task, v3) = ("/pulp/api/v3/tasks/5/", format!("{REPO}versions/3/"));
         let server = MockServer::start().await;
         serve(&server, "GET", REPO, 200, json!({ "pulp_href": REPO, "latest_version_href": v3 })).await;
-        let newest = json!({ "count": 2, "results": [{ "pulp_href": format!("{PUBS}9/") }] });
+        let newest = json!({ "count": 1, "results": [{ "pulp_href": format!("{PUBS}9/") }] });
         let by_version = |v: &str| Mock::given(method("GET")).and(path(PUBS)).and(query_param("repository_version", v));
         by_version(&v3).respond_with(ResponseTemplate::new(200).set_body_json(newest)).mount(&server).await;
+        let foreign = json!({ "count": 1, "results": [{ "pulp_href": format!("{PUBS}8/") }] });
+        by_version(&format!("{REPO}versions/4/")).respond_with(ResponseTemplate::new(200).set_body_json(foreign)).mount(&server).await;
         let none = ResponseTemplate::new(200).set_body_json(json!({ "count": 0, "results": [] }));
         by_version(&format!("{REPO}versions/2/")).respond_with(none).mount(&server).await;
+        serve(&server, "GET", "/pulp/api/v3/login/", 200, json!({ "username": "op" })).await;
+        for (p, holder) in [("9/", "op"), ("8/", "eve")] {
+            let roles = json!({ "roles": [{ "role": "file.filepublication_owner", "users": [holder], "groups": [] }] });
+            serve(&server, "GET", &format!("{PUBS}{p}list_roles/"), 200, roles).await;
+        }
+        serve(&server, "POST", PUBS, 201, json!({ "pulp_href": format!("{PUBS}10/") })).await;
         serve(&server, "POST", &format!("{FS}exports/"), 202, json!({ "task": task })).await;
         let done = json!({ "pulp_href": task, "state": "completed", "created_resources": [format!("{FS}exports/1/")] });
         serve(&server, "GET", task, 200, done).await;
@@ -3042,15 +3062,27 @@ mod tests {
             settle(&mut app, &mut rx).await;
             notices(&app).pop().unwrap()
         };
-        assert_eq!(export("publication", "").await, (Level::Ok, "export web: publication written to /var/lib/pulp/exports/web".into()));
-        let (level, text) = export("publication", "2").await;
-        assert!(level == Level::Error && text.contains("1@v2 has no publication"), "{text}");
+        let written =
+            |p: &str, notes: &str| (Level::Ok, format!("export web: publication {p} written to /var/lib/pulp/exports/web{notes}"));
+        assert_eq!(export("publication", "").await, written("9", ""));
+        let why = format!("; publication {PUBS}8/ is not reused: user eve has role file.filepublication_owner on it");
+        assert_eq!(export("publication", "4").await, written("10", &why));
+        assert_eq!(export("publication", "2").await, written("10", ""), "a version without a publication gets one");
         assert_eq!(export("repository version", "2").await.0, Level::Ok);
-        let posts: Vec<Value> = sent(&server).await.into_iter().map(|(_, _, b)| b).collect();
+        let posts: Vec<(String, Value)> = sent(&server).await.into_iter().map(|(_, p, b)| (p, b)).collect();
+        let export_of = |b: Value| (format!("{FS}exports/"), b);
+        let publish = |v: u32| (PUBS.to_string(), json!({ "repository_version": format!("{REPO}versions/{v}/") }));
         assert_eq!(
             posts,
-            [json!({ "publication": format!("{PUBS}9/") }), json!({ "repository_version": format!("{REPO}versions/2/") })],
-            "the newest publication of the latest version; nothing for a version without one"
+            [
+                export_of(json!({ "publication": format!("{PUBS}9/") })),
+                publish(4),
+                export_of(json!({ "publication": format!("{PUBS}10/") })),
+                publish(2),
+                export_of(json!({ "publication": format!("{PUBS}10/") })),
+                export_of(json!({ "repository_version": format!("{REPO}versions/2/") })),
+            ],
+            "the own publication of the latest version; a new one instead of another user's or none"
         );
 
         // A start version: Pulp writes only the files that it lacks (and the metadata of a publication).

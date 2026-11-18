@@ -916,8 +916,11 @@ Pulp exporters:
 Filesystem exporters write the plain files of one publication or version:
 
 * **c** / **e**: name, directory, method (`write`, `hardlink` or `symlink`).
-* **E**: a repository, a version (empty = latest), and the publication (the newest of that
-  version) or the version. **Start version number** (optional, same repository): Pulp writes
+* **E**: a repository, a version (empty = latest), and a publication of that version or the
+  version. The publication is one that pulp-tui may reuse (made by your Pulp user, with the
+  repository's publish settings, as for **D**); else pulp-tui makes one first, and the result
+  says why it did not use a publication that another user made. **Start version number**
+  (optional, same repository): Pulp writes
   only the files that this version does not have (a publication: and all its metadata files),
   for example the changes since the version of the previous export.
 * The directory must not exist. Change it before the next export.
