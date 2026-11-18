@@ -205,9 +205,9 @@ write any href into it:
 * `publish_repo` refuses a row whose source version is not `<source repository>versions/<n>/`,
   whose signing is not `''`, `none` or under `signing-services/`, or whose snapshot version is
   not of its snapshot repository (`CvService::stray_row`), before any request.
-* The Resume confirmation names the source version, the repository and the Deb signing of each
-  row that is not published yet (`CvService::resume_sources`, with the same refusals);
-  `resume` refuses when these differ from the rows that the confirmation read.
+* Resume always asks. Its confirmation names the source version, the repository and the Deb
+  signing of each row that is not published yet (`CvService::resume_sources`, with the same
+  refusals); `resume` refuses when these differ from the rows that the confirmation read.
 
 ### Checkpoints and Resume
 

@@ -771,11 +771,12 @@ A composite view joins other Content Views (its **components**). Example: `rocky
   `interrupted` Library step, it runs the Library step and auto publish again. For the newest
   published version, it runs the auto publish of each composite that does not have it yet. Auto
   publish does not run while Library is protected: when only that is left, **R** refuses and names
-  the composites to publish yourself. When its Library step changes Library distributions (as
-  **P** does), **R** asks first and names each change under `In Library:`. This confirmation (and
-  the one of a protected Library) also names what each repository that is not published yet
-  copies from: its source version, the Pulp name of the repository as the **P** preview gives it,
-  and the Deb signing. When these change after the confirmation, **R** stops: press **R** again.
+  the composites to publish yourself. **R** always asks first (with a protected Library, you type
+  `Library`). The confirmation names what each repository that is not published yet copies from:
+  its source version, the Pulp name of the repository as the **P** preview gives it, and the Deb
+  signing. When its Library step changes Library distributions (as **P** does), it also names each
+  change under `In Library:`. When the sources change after the confirmation, **R** stops: press
+  **R** again.
   **R** refuses a version whose row names a source version of another repository, a signing that
   is not a signing service, or a snapshot version of another repository (a change in the shared
   database): delete the version and publish again.

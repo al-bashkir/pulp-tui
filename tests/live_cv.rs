@@ -1321,6 +1321,11 @@ async fn resume_watch_and_break_lock_through_the_tui() {
     st.try_lock(cv, "bob@ws2", "dead-token", "publish", unix_now()).await.unwrap().unwrap();
     run(&mut app, Act::Resume, v1_row.clone());
     settle(&mut app, &mut rx).await;
+    // Resume always asks, and names what the version copies from.
+    let (lines, typed) = yes(&mut app);
+    let source = format!("  docs (Pulp repository {id}-docs) (File): from {}", latest(&c, &repo).await);
+    assert_eq!((typed, &lines[1]), (None, &source), "{lines:?}");
+    settle(&mut app, &mut rx).await;
     let refused = format!("Content View {id} is locked by bob@ws2 (publish) since ");
     assert!(texts(&app).iter().any(|t| t.contains(&refused)), "{:?}", texts(&app));
     assert_eq!(st.version(v1.id).await.unwrap().state, "failed");
@@ -1343,6 +1348,8 @@ async fn resume_watch_and_break_lock_through_the_tui() {
     run(&mut app, Act::CvVersions, r);
     settle(&mut app, &mut rx).await;
     run(&mut app, Act::Resume, v1_row.clone());
+    settle(&mut app, &mut rx).await;
+    yes(&mut app);
     settle(&mut app, &mut rx).await;
     shown(&app, &format!("{id} v1 published"));
     assert_eq!(st.version(v1.id).await.unwrap().state, "published");
@@ -1726,6 +1733,8 @@ async fn resume_publishes_a_lagging_composite_through_the_tui() {
     settle(&mut app, &mut rx).await;
     let v2_row = app.list.items.iter().find(|v| v["number"] == 2).cloned().unwrap();
     run(&mut app, Act::Resume, v2_row.clone());
+    settle(&mut app, &mut rx).await;
+    yes(&mut app);
     settle(&mut app, &mut rx).await;
     shown(&app, &format!("{extras_name} v2 published; auto publish: {id} v2 published"));
     let c2 = st.versions(comp).await.unwrap().remove(0);

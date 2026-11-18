@@ -1098,7 +1098,8 @@ fn resume_check(app: &mut App, cv: i64, name: String, vid: i64, number: String) 
         let protected = refuse_auto_only(&svc, cv, &v).await?;
         let rows = svc.store.version_repos(vid).await?;
         require_deb_copy(&ctx.caps, &rows)?;
-        let (lines, title) = resume_lines(&svc, &name, &v, protected, &rows).await?;
+        let lines = resume_lines(&svc, &name, &v, &rows).await?;
+        let title = Some(format!("Resume {name} v{number}"));
         ap(move |app| guard_library(app, protected, lines, title, move |app| resume(app, cv, name, vid, number, rows)))
     });
 }
@@ -1127,21 +1128,13 @@ async fn refuse_auto_only(svc: &CvService, cv: i64, v: &CvVersion) -> anyhow::Re
     );
 }
 
-/// The Resume confirmation of `v` of view `name` (with `rows`) and its title. It names what the version copies from
-/// (`CvService::resume_sources`) and what the Library step changes; with no Library change an open Library (not
-/// `protected`) resumes at once (title `None`).
-async fn resume_lines(
-    svc: &CvService,
-    name: &str,
-    v: &CvVersion,
-    protected: bool,
-    rows: &[CvVersionRepo],
-) -> anyhow::Result<(Vec<String>, Option<String>)> {
+/// The Resume confirmation of `v` of view `name` (with `rows`): what the version copies from
+/// (`CvService::resume_sources`) and what the Library step changes. Resume always asks: the run acts only on the
+/// sources that the operator saw (the store is shared).
+async fn resume_lines(svc: &CvService, name: &str, v: &CvVersion, rows: &[CvVersionRepo]) -> anyhow::Result<Vec<String>> {
     let first = format!("Resume {name} v{}: it becomes active in Library unless a newer version is published.", v.number);
-    let library = resume_library_lines(svc, name, v).await?;
-    let title = (!library.is_empty()).then(|| format!("Resume {name} v{}", v.number));
-    let sources = if protected || title.is_some() { svc.resume_sources(rows).await? } else { vec![] };
-    Ok((std::iter::once(first).chain(sources).chain(library).collect(), title))
+    let sources = svc.resume_sources(rows).await?;
+    Ok(std::iter::once(first).chain(sources).chain(resume_library_lines(svc, name, v).await?).collect())
 }
 
 /// Delete (d) of version `vid` (`number`, list row `item`) of view `cv` (`name`): what it removes (`delete_lines`), the
@@ -1929,6 +1922,8 @@ mod tests {
         let item = json!({ "id": v1.id, "number": 1, "state": "failed" });
         version_action(&mut app, "lab", web, "web".into(), Act::Resume, item);
         drain(&mut app, &mut rx).await;
+        yes(&mut app);
+        drain(&mut app, &mut rx).await;
         assert_eq!(last_notice(&app), (Level::Warn, "web v1 published; Library not changed: v2 is newer (use Rollback to serve v1)"));
         assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v2.id));
         assert!(st.versions(c).await.unwrap().is_empty(), "composites follow v2: nothing new to auto publish");
@@ -2286,7 +2281,7 @@ mod tests {
         assert!(newer.number > v.number);
         resume(&mut app, "published");
         drain(&mut app, &mut rx).await;
-        assert!(app.modal.is_none(), "Library keeps v{}: no Library line, no confirmation", newer.number);
+        assert_eq!(confirm_lines(&mut app), &want[..1], "Library keeps v{}: no Library line", newer.number);
     }
 
     /// Compare (m) needs exactly one other marked version; with it, the comparison opens.
@@ -2320,6 +2315,32 @@ mod tests {
             drain(&mut app, &mut rx).await;
             assert_eq!(open_form(&mut app).0.title, "v1 -> environment");
         }
+    }
+
+    /// Security audit run-1 (publish, Resume): Resume always asks first, also with no Library change, and the
+    /// confirmation names what the version copies from. Nothing runs before the answer.
+    #[tokio::test]
+    async fn resume_always_asks_and_names_the_sources() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        serve_distributions(&server, &[], None).await; // the Library target of os: nothing refuses it
+        let os = cv_repo("os", "rpm", "1");
+        serve(&server, "GET", os.repo_href.clone(), 200, json!({ "pulp_href": os.repo_href, "name": "os" })).await;
+        let v = st.begin_version(web, "", std::slice::from_ref(&os)).await.unwrap();
+        let sv = format!("{}versions/3/", os.repo_href);
+        let row = CvVersionRepo { source_version: Some(sv.clone()), ..st.version_repos(v.id).await.unwrap().remove(0) };
+        st.save_version_repo(&row).await.unwrap();
+        st.finish_version(v.id, "failed", None).await.unwrap();
+        version_action(&mut app, "lab", web, "web".into(), Act::Resume, json!({ "id": v.id, "number": v.number, "state": "failed" }));
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Confirm { title, lines, typed: None, .. }) = app.modal.take() else {
+            panic!("no confirmation: {:?}", app.notices.back().map(|n| &n.text))
+        };
+        let first = "Resume web v1: it becomes active in Library unless a newer version is published.".to_string();
+        assert_eq!((title.as_str(), lines), ("Resume web v1", vec![first, format!("  os (RPM): from {sv}")]));
+        assert_eq!(st.version(v.id).await.unwrap().state, "failed", "nothing before the confirmation");
     }
 
     /// Security audit run-1 (publish, Resume): the Resume confirmation names what the version copies from, with the name
@@ -2369,13 +2390,17 @@ mod tests {
         let (mut app, mut rx, st) = composite_app().await;
         app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
         serve_distributions(&server, &[], None).await; // the Library target of os (Resume preview): nothing refuses it
+        let os = cv_repo("os", "rpm", "1");
+        serve(&server, "GET", os.repo_href.clone(), 200, json!({ "pulp_href": os.repo_href, "name": "os" })).await;
         let web = st.create_cv("lab", "web", "").await.unwrap();
-        st.begin_version(web, "", &[cv_repo("os", "rpm", "1")]).await.unwrap();
+        st.begin_version(web, "", &[os]).await.unwrap();
         app.push(Kind::CvVersions { cv: web, name: "web".into() });
         drain(&mut app, &mut rx).await;
         let item = app.list.items[0].clone();
         assert_eq!(item["state"], "interrupted");
         version_action(&mut app, "lab", web, "web".into(), Act::Resume, item);
+        drain(&mut app, &mut rx).await;
+        yes(&mut app);
         drain(&mut app, &mut rx).await;
         assert_eq!(last_notice(&app).0, Level::Error);
         assert_eq!(app.list.items[0]["state"], "failed");
@@ -2582,6 +2607,8 @@ mod tests {
         assert_eq!(last_notice(&app), (Level::Info, "version is already published"), "composites follow the newest version");
         resume(&mut app, &v2);
         drain(&mut app, &mut rx).await;
+        yes(&mut app);
+        drain(&mut app, &mut rx).await;
         assert_eq!(last_notice(&app), (Level::Ok, "extras v2 published; auto publish: rocky9 v2 published"));
         let used = st.version_components(st.versions(c).await.unwrap()[0].id).await.unwrap();
         assert!(used.iter().any(|u| u.version_id == v2.id), "{used:?}");
@@ -2629,6 +2656,8 @@ mod tests {
         app.push(Kind::CvVersions { cv: web, name: "web".into() });
         let item = json!({ "id": v.id, "number": 1, "state": "published" });
         version_action(&mut app, "lab", web, "web".into(), Act::Resume, item.clone());
+        drain(&mut app, &mut rx).await;
+        yes(&mut app);
         drain(&mut app, &mut rx).await;
         assert_eq!(last_notice(&app), (Level::Ok, "web v1 published; auto publish: rocky9 v1 published"));
         assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v.id));
@@ -3101,6 +3130,17 @@ mod tests {
         match app.modal.take() {
             Some(Modal::Confirm { lines, .. }) => lines,
             _ => panic!("no confirmation"),
+        }
+    }
+
+    /// Answer the open confirmation with yes; its lines.
+    fn yes(app: &mut App) -> Vec<String> {
+        match app.modal.take() {
+            Some(Modal::Confirm { lines, on_yes, .. }) => {
+                on_yes.unwrap()(app);
+                lines
+            }
+            _ => panic!("no confirmation: {:?}", app.notices.back().map(|n| &n.text)),
         }
     }
 
