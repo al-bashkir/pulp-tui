@@ -697,6 +697,10 @@ exclude path=isos/*            # File repositories
 * `evr` and `version` take `= < <= > >=` with RPM or Debian version comparison. `epoch:` is
   optional. Without a release (RPM) or revision (Deb), the rule compares only epoch and version.
 * The value must start with a letter or digit, so a typo such as `evr=>5.14` is refused.
+* A value with a control character is refused. `import-cv` takes only rules that this form takes.
+  A stored rule that the form refuses (for example one edited in the database) stops the publish
+  and the preview with an error, for example
+  `invalid filter rules of baseos: rule "include name=[ name=x" changes when it is read back (a space in a value?)`.
 
 #### Deb repositories in Content Views
 

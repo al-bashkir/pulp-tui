@@ -204,6 +204,9 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
 * **Deb**: binary packages by name glob, architecture glob, dpkg version. Source packages
   and upstream indices are dropped; the publication makes new indices.
 * **File**: relative path glob.
+* A rule from an import or the database must be the rule that `parse_rule` gives from its text
+  (`filters::check_rule`); the store checks it on import and on each read, so a publish and its
+  preview refuse it. A glob that does not compile makes the `Selector` select nothing.
 
 ### Library step
 

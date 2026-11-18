@@ -2038,7 +2038,7 @@ fn check_import_view(v: &ExportView) -> Result<()> {
     validate_name(&v.name).with_context(|| format!("content view {:?}", v.name))?;
     for r in &v.repos {
         for f in &r.filters {
-            crate::filters::parse_rule(&f.to_string(), r.repo_type).map_err(|e| anyhow!("{} {}: {e}", v.name, r.repo_name))?;
+            crate::filters::check_rule(f, r.repo_type).map_err(|e| anyhow!("{} {}: {e}", v.name, r.repo_name))?;
         }
     }
     Ok(())
@@ -2189,10 +2189,14 @@ async fn insert_version_repo(c: &mut AnyConnection, vr: &CvVersionRepo) -> Resul
 }
 
 fn cv_repo_row(r: &AnyRow) -> Result<CvRepo> {
-    let repo_name: String = r.try_get(1)?;
+    let (repo_name, t): (String, _) = (r.try_get(1)?, repo_type(r.try_get(2)?)?);
     // Never read as "no filters": a publish would then copy everything.
-    let filters = serde_json::from_str(r.try_get(3)?).with_context(|| format!("invalid filter rules of {repo_name}"))?;
-    Ok(CvRepo { repo_href: r.try_get(0)?, repo_name, repo_type: repo_type(r.try_get(2)?)?, filters })
+    let filters: Vec<FilterRule> = serde_json::from_str(r.try_get(3)?).with_context(|| format!("invalid filter rules of {repo_name}"))?;
+    // A rule that the form refuses (written by hand) refuses the publish and its preview: both read the rules here.
+    for f in &filters {
+        crate::filters::check_rule(f, t).map_err(|e| anyhow!("invalid filter rules of {repo_name}: {e}"))?;
+    }
+    Ok(CvRepo { repo_href: r.try_get(0)?, repo_name, repo_type: t, filters })
 }
 
 fn version_row(r: &AnyRow) -> Result<CvVersion> {
@@ -2516,6 +2520,10 @@ mod tests {
         sqlx::query("UPDATE cv_repos SET filters = $1").bind(r#"[{"action":"keep-newest"}]"#).execute(&s.pool).await.unwrap();
         let e = format!("{:#}", s.cv_repos(cv).await.unwrap_err());
         assert!(e.starts_with("invalid filter rules of apt: "), "{e}");
+        // Audit: a rule that the TUI form refuses (written by hand) refuses the publish and the preview too.
+        sqlx::query("UPDATE cv_repos SET filters = $1").bind(r#"[{"action":"include","name":"[ name=x"}]"#).execute(&s.pool).await.unwrap();
+        let e = format!("{:#}", s.cv_repos(cv).await.unwrap_err());
+        assert_eq!(e, r#"invalid filter rules of apt: rule "include name=[ name=x" changes when it is read back (a space in a value?)"#);
     }
 
     #[tokio::test]
@@ -2925,11 +2933,22 @@ mod tests {
     }
 
     /// Audit: an imported rule is refused unless it is a rule that the TUI form takes. A NUL in a Deb version made
-    /// the publish loop forever.
+    /// the publish loop forever; the text of `[ name=openssl` reads as `name=openssl`, but the stored glob `[` did
+    /// not compile and selected every package.
     #[tokio::test]
     async fn import_refuses_a_rule_that_the_form_refuses() {
         let s = Store::open_in_memory().await.unwrap();
-        let bad = [(serde_json::json!({ "action": "include", "version": ["=", "1.0\u{0}"] }), r#"control character in "version=1.0\0""#)];
+        let bad = [
+            (serde_json::json!({ "action": "include", "version": ["=", "1.0\u{0}"] }), r#"control character in "version=1.0\0""#),
+            (
+                serde_json::json!({ "action": "include", "name": "[ name=openssl" }),
+                r#"rule "include name=[ name=openssl" changes when it is read back (a space in a value?)"#,
+            ),
+            (
+                serde_json::json!({ "action": "exclude", "version": [">", "=1.0"] }),
+                r#"rule "exclude version>=1.0" changes when it is read back (a space in a value?)"#,
+            ),
+        ];
         for (rule, want) in bad {
             let ex: Export = serde_json::from_value(serde_json::json!({ "format": 2, "environments": [], "content_views": [
                 { "name": "web", "repos": [{ "repo_href": "/r/1/", "repo_name": "apt", "repo_type": "deb", "filters": [rule] }] }

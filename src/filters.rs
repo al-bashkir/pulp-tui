@@ -152,6 +152,16 @@ pub fn parse_rule(s: &str, t: RepoType) -> Result<FilterRule, String> {
     Ok(r)
 }
 
+/// Refuse a rule that the TUI form would not give from its text: an imported or stored rule must select what it
+/// shows. `parse_rule` of the text alone is not enough: `name=[ name=x` reads as `name=x`.
+pub fn check_rule(r: &FilterRule, t: RepoType) -> Result<(), String> {
+    let s = r.to_string();
+    if parse_rule(&s, t)? != *r {
+        return Err(format!("rule {s:?} changes when it is read back (a space in a value?)"));
+    }
+    Ok(())
+}
+
 /// Split the `<op><value>` of an `evr` or `version` criterion; `w` is the whole word.
 fn parse_cmp(w: &str, rest: &str, what: &str) -> Result<(String, String), String> {
     let op =
@@ -176,16 +186,16 @@ pub struct Selector {
     has_include: bool,
 }
 
-fn glob(p: &Option<String>) -> Option<GlobMatcher> {
-    p.as_ref().and_then(|g| Glob::new(g).ok()).map(|g| g.compile_matcher())
+fn glob(p: &Option<String>) -> Result<Option<GlobMatcher>, globset::Error> {
+    p.as_ref().map(|g| Glob::new(g).map(|g| g.compile_matcher())).transpose()
 }
 
 impl Selector {
     pub fn new(rules: &[FilterRule]) -> Self {
-        Self {
-            has_include: rules.iter().any(|r| r.action == Action::Include),
-            rules: rules.iter().map(|r| (r.clone(), glob(&r.name), glob(&r.arch), glob(&r.path))).collect(),
-        }
+        let compiled: Result<Vec<Compiled>, globset::Error> =
+            rules.iter().map(|r| Ok((r.clone(), glob(&r.name)?, glob(&r.arch)?, glob(&r.path)?))).collect();
+        // A pattern that does not compile selects nothing (an include with no rules), never "any".
+        Self { has_include: compiled.is_err() || rules.iter().any(|r| r.action == Action::Include), rules: compiled.unwrap_or_default() }
     }
 
     fn select(&self, matches: impl Fn(&FilterRule, &Option<GlobMatcher>, &Option<GlobMatcher>, &Option<GlobMatcher>) -> bool) -> bool {
@@ -487,6 +497,18 @@ mod tests {
         assert!(s.file(&f("docs/readme.txt")));
         assert!(!s.file(&f("isos/a.iso")));
         assert!(Selector::new(&[]).file(&f("x")));
+    }
+
+    /// Audit: a glob that does not compile once matched every unit, so `include name=[` selected everything.
+    #[test]
+    fn a_pattern_that_does_not_compile_selects_nothing() {
+        let name = |action, n: &str| FilterRule { action, name: Some(n.into()), arch: None, evr: None, version: None, path: None };
+        for action in [Action::Include, Action::Exclude] {
+            let s = Selector::new(&[name(action, "["), name(Action::Include, "*")]);
+            assert!(!s.package(&pkg("bash", "5.2-1", "x86_64")), "{action:?}");
+        }
+        let path = FilterRule { name: None, path: Some("[".into()), ..name(Action::Exclude, "") };
+        assert!(!Selector::new(&[path]).file(&FileContent { pulp_href: "/f/".into(), relative_path: "a".into(), sha256: None }));
     }
 
     #[test]
