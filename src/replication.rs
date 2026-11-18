@@ -1217,7 +1217,8 @@ mod tests {
             .mount(&server)
             .await;
         wiremock::Mock::given(method("GET")).and(path(repo)).respond_with(ok(r)).mount(&server).await;
-        serve_made_by_me(&server, &[remote, repo]).await;
+        // The old publication too: only its manifest name keeps it from being reused.
+        serve_made_by_me(&server, &[remote, repo, "/pulp/api/v3/publications/file/file/1/"]).await;
         wiremock::Mock::given(method("PATCH")).and(path(repo)).respond_with(ok(json!({}))).mount(&server).await;
         // After the PATCH, the repository names the upstream manifest.
         wiremock::Mock::given(method("GET"))

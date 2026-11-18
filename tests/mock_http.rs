@@ -1535,6 +1535,29 @@ async fn file_publication_takes_the_manifest_of_the_repository() {
     }
 }
 
+/// A File publication of the version is found only when it has the manifest name that a new one would get (the
+/// repository's, or the one asked for); with no publication at all the repository is not read.
+#[tokio::test]
+async fn a_file_publication_is_found_only_with_the_manifest_name_of_a_new_one() {
+    let repo = format!("{API}repositories/file/file/1/");
+    let (version, coll) = (format!("{repo}versions/2/"), format!("{API}publications/file/file/"));
+    let p = |n: u32, m: &str| json!({ "pulp_href": format!("{coll}{n}/"), "repository_version": version, "manifest": m });
+    for (found, mode, repo_reads, want) in [
+        (vec![p(2, "PULP_MANIFEST"), p(1, "CUSTOM")], json!({}), 1, Some(format!("{coll}1/"))),
+        (vec![p(2, "PULP_MANIFEST"), p(1, "CUSTOM")], json!({ "manifest": "PULP_MANIFEST" }), 0, Some(format!("{coll}2/"))),
+        (vec![], json!({}), 0, None),
+    ] {
+        let server = MockServer::start().await;
+        let page = json!({ "count": found.len(), "next": null, "results": found });
+        Mock::given(method("GET")).and(path(&coll)).respond_with(ResponseTemplate::new(200).set_body_json(page)).mount(&server).await;
+        let get = Mock::given(method("GET")).and(path(&repo));
+        get.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "manifest": "CUSTOM" }))).expect(repo_reads).mount(&server).await;
+        let c = client(&server, |_, _| {});
+        assert_eq!(ops::find_publication(&c, RepoType::File, &version, &mode).await.unwrap(), want, "{mode}");
+        server.verify().await;
+    }
+}
+
 #[tokio::test]
 async fn file_verify_reads_the_manifest_of_the_publication() {
     let server = MockServer::start().await;

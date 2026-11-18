@@ -3365,6 +3365,7 @@ mod tests {
             let roles = json!({ "roles": [{ "role": "rpm.rpmpublication_owner", "users": holders, "groups": [] }] });
             serve_json(&server, &format!("{found}list_roles/"), roles).await;
             let (cv, mut vr) = rpm_version(&svc).await;
+            svc.store.save_version_repo(&vr).await.unwrap(); // the store records the snapshot repository, not the candidate
             let dv = format!("{DERIVED}versions/1/");
             // The snapshot repository has the publish settings of its source (`copy_settings`).
             let derived = json!({ "pulp_href": DERIVED, "checksum_type": null, "compression_type": null, "layout": null,
@@ -3395,6 +3396,27 @@ mod tests {
             assert_eq!((p.as_str(), posts), (made, 1), "{holders:?} {has}: a new one");
             assert!(logs.contains(&format!("os: publication {found} is not reused: {why}")), "{logs:?}");
         }
+    }
+
+    /// A publish task that an earlier run sent is re-attached: no publication of the version is reused instead, also one
+    /// that this Pulp user made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_publish_task_is_reattached_not_replaced_by_a_reused_publication() {
+        let (pubs, made) = ("/pulp/api/v3/publications/rpm/rpm/", "/pulp/api/v3/publications/rpm/rpm/9/");
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        serve_made_by_me(&server, &format!("{pubs}2/")).await;
+        let own = json!({ "pulp_href": format!("{pubs}2/"), "repository_version": format!("{DERIVED}versions/1/") });
+        serve_json(&server, pubs, json!({ "count": 1, "next": null, "results": [own] })).await;
+        serve_json(&server, DERIVED, json!({ "pulp_href": DERIVED })).await;
+        let done = json!({ "pulp_href": "/pulp/api/v3/tasks/5/", "state": "completed", "created_resources": [made] });
+        serve_json(&server, "/pulp/api/v3/tasks/5/", done).await;
+        let (_, mut vr) = rpm_version(&svc).await;
+        vr.pending_task = Some("/pulp/api/v3/tasks/5/".into());
+        let p = svc.publication(&mut vr, &format!("{DERIVED}versions/1/"), false, &|_| {}, &ops::no_progress).await.unwrap();
+        assert_eq!(p, made);
+        let sent = server.received_requests().await.unwrap();
+        assert!(sent.iter().all(|r| r.url.path() != pubs), "no publication looked up or made: {sent:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
