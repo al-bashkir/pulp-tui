@@ -1543,13 +1543,9 @@ impl CvService {
     /// its maker may have, so `ops::distribution_target` refuses it at another path. The preview (`bind_target`) and the
     /// run (`bind_repo`) ask this.
     pub async fn served_path(&self, cv: &str, env: &Environment, repo: &CvRepo) -> Result<(Option<Distribution>, String)> {
-        let named = self.named_distribution(cv, env, repo).await?;
-        let recorded = match &named {
-            Some(d) => self.store.recorded_hrefs(&self.scope).await?.contains(&d.pulp_href),
-            None => false,
-        };
+        let (named, recorded) = (self.named_distribution(cv, env, repo).await?, self.store.recorded_hrefs(&self.scope).await?);
         let path = match &named {
-            Some(d) if recorded => d.base_path.clone(),
+            Some(d) if recorded.contains(&d.pulp_href) => d.base_path.clone(),
             _ => base_path(cv, &env.label, &repo.repo_name),
         };
         Ok((named, path))
