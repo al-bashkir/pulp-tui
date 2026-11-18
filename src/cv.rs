@@ -892,64 +892,74 @@ impl CvService {
         Ok(())
     }
 
-    /// The derived repository of `vr`: the recorded one, if this view still owns it; else the one of its name that this
-    /// view owns (labels, and `ops::refuse_foreign`; labeled for this database when unlabeled), or a new one. Recorded
-    /// before it is returned.
+    /// The derived repository of `vr`: the recorded one, if this view still owns it; else `find_or_create_derived`.
+    /// Recorded before it is returned.
     async fn derived_repo(&self, cv: &str, vr: &mut CvVersionRepo, log: Log<'_>, on: OnTask<'_>) -> Result<String> {
-        let c = &self.client;
-        let repo = vr.repo().clone();
-        let t = repo.repo_type;
-        let name = derived_repo_name(cv, &repo.repo_name);
+        let name = derived_repo_name(cv, &vr.repo().repo_name);
         let aliases = self.store.aliases().await?;
-        // Resuming: another database may have adopted the repository since the checkpoint.
-        if let Some(r) = &vr.derived_repo
-            && let Some(why) = self.not_ours(r, &json!({ LABEL_CV: slug(cv) }), &aliases).await?
-        {
-            bail!("repository {name} is {why}");
+        if let Some(r) = &vr.derived_repo {
+            // Resuming: another database may have adopted the repository since the checkpoint.
+            let why = self.not_ours(r, &json!({ LABEL_CV: slug(cv) }), &aliases).await?;
+            return why.map_or_else(|| Ok(r.clone()), |why| Err(anyhow!("repository {name} is {why}")));
         }
-        if vr.derived_repo.is_none() {
-            let href = match ops::find_by_name::<Repository>(c, &c.api(t.repositories()), &name).await? {
-                // Never write into a repository this view does not own (name collision).
-                Some(r) if r.pulp_labels.get(LABEL_CV).map(String::as_str) == Some(slug(cv).as_str()) => {
-                    let id = self.store.db_id();
-                    let adopt = ops::label_owner(&r.pulp_labels, LABEL_DB, id, &aliases)
-                        .map_err(|o| anyhow!("repository {name} is owned by another pulp-tui database ({o})"))?;
-                    let recorded = self.store.recorded_hrefs(&self.scope).await?.contains(&r.pulp_href);
-                    ops::refuse_foreign(c, &format!("repository {name}"), &r.pulp_href, recorded).await?;
-                    if adopt {
-                        let mut labels = r.pulp_labels.clone();
-                        labels.insert(LABEL_DB.into(), id.into());
-                        self.alive()?;
-                        let m = c.patch(&r.pulp_href, &json!({ "pulp_labels": labels })).await?;
-                        ops::settle(c, m, on).await?;
-                    }
-                    r.pulp_href
-                }
-                // The `-` join of view and repository names can collide (`a-b` + `c`, `a` + `b-c`); the format stays.
-                Some(r) => match r.pulp_labels.get(LABEL_CV) {
-                    Some(other) => bail!(
-                        "repository {name} belongs to content view {other} (label {LABEL_CV}={other}): view {cv} with repository {} \
-                         derives the same name; refusing to modify it",
-                        repo.repo_name
-                    ),
-                    None => bail!("repository {name} exists but is not labeled {LABEL_CV}={}; refusing to modify it", slug(cv)),
-                },
-                None => {
-                    log(format!("creating derived repository {name}"));
-                    let body = json!({
-                        "name": name,
-                        "description": format!("Content View {cv} snapshot of {} (managed by pulp-tui)", repo.repo_name),
-                        "pulp_labels": { LABEL_CV: slug(cv), LABEL_DB: self.store.db_id() },
-                    });
-                    self.alive()?;
-                    ops::create(c, &c.api(t.repositories()), &body, "/repositories/", on).await?
-                }
-            };
-            vr.derived_repo = Some(href);
+        let href = self.find_or_create_derived(cv, vr.repo(), &name, &aliases, log, on).await?;
+        vr.derived_repo = Some(href.clone());
+        self.alive()?;
+        self.store.save_version_repo(vr).await?;
+        Ok(href)
+    }
+
+    /// The repository `name` derived from `repo` of view `cv`: the one of that name when this view owns it (its label;
+    /// `take_derived`), else a new one. Never one that another view labeled: the `-` join of view and repository names
+    /// can collide (`a-b` + `c`, `a` + `b-c`), and the format stays.
+    async fn find_or_create_derived(
+        &self,
+        cv: &str,
+        repo: &CvRepo,
+        name: &str,
+        aliases: &[String],
+        log: Log<'_>,
+        on: OnTask<'_>,
+    ) -> Result<String> {
+        let c = &self.client;
+        let coll = c.api(repo.repo_type.repositories());
+        let Some(r) = ops::find_by_name::<Repository>(c, &coll, name).await? else {
+            log(format!("creating derived repository {name}"));
+            let body = json!({
+                "name": name,
+                "description": format!("Content View {cv} snapshot of {} (managed by pulp-tui)", repo.repo_name),
+                "pulp_labels": { LABEL_CV: slug(cv), LABEL_DB: self.store.db_id() },
+            });
             self.alive()?;
-            self.store.save_version_repo(vr).await?;
+            return Ok(ops::create(c, &coll, &body, "/repositories/", on).await?);
+        };
+        match r.pulp_labels.get(LABEL_CV) {
+            Some(v) if *v == slug(cv) => self.take_derived(name, r, aliases, on).await,
+            Some(other) => bail!(
+                "repository {name} belongs to content view {other} (label {LABEL_CV}={other}): view {cv} with repository {} \
+                 derives the same name; refusing to modify it",
+                repo.repo_name
+            ),
+            None => bail!("repository {name} exists but is not labeled {LABEL_CV}={}; refusing to modify it", slug(cv)),
         }
-        Ok(vr.derived_repo.clone().unwrap_or_default())
+    }
+
+    /// Repository `r` of the derived name `name`, with this view's label: refused when another database owns it or
+    /// pulp-tui cannot show that it made it (`ops::refuse_foreign`); labeled for this database when it has no database
+    /// label (or that of an alias).
+    async fn take_derived(&self, name: &str, r: Repository, aliases: &[String], on: OnTask<'_>) -> Result<String> {
+        let (c, id) = (&self.client, self.store.db_id());
+        let adopt = ops::label_owner(&r.pulp_labels, LABEL_DB, id, aliases)
+            .map_err(|o| anyhow!("repository {name} is owned by another pulp-tui database ({o})"))?;
+        let recorded = self.store.recorded_hrefs(&self.scope).await?.contains(&r.pulp_href);
+        ops::refuse_foreign(c, &format!("repository {name}"), &r.pulp_href, recorded).await?;
+        if adopt {
+            let mut labels = r.pulp_labels.clone();
+            labels.insert(LABEL_DB.into(), id.into());
+            self.alive()?;
+            ops::settle(c, c.patch(&r.pulp_href, &json!({ "pulp_labels": labels })).await?, on).await?;
+        }
+        Ok(r.pulp_href)
     }
 
     /// Copy the selection of `vr` into `derived` and record the snapshot version: the copy checkpoint.
@@ -1459,6 +1469,11 @@ impl CvService {
         Ok(Some(d))
     }
 
+    /// This database's aliases and the hrefs that it records: what `ops::distribution_target` needs besides its id.
+    async fn known(&self) -> Result<(Vec<String>, Vec<String>)> {
+        Ok((self.store.aliases().await?, self.store.recorded_hrefs(&self.scope).await?))
+    }
+
     /// What a promotion does for `repo` of view `cv` in `env` (`bind_repo`), read from Pulp before any write: the
     /// distribution of the derived name that it re-points (`None`: it makes one), and why it fails for `repo` (`None`:
     /// it does not). The checks are those of the run: `named_distribution` (in `served_path`), then
@@ -1466,8 +1481,7 @@ impl CvService {
     pub async fn bind_target(&self, cv: &str, env: &Environment, repo: &CvRepo) -> Result<(Option<Distribution>, Option<String>)> {
         let named = self.named_distribution(cv, env, repo).await?;
         let path = named.as_ref().map_or_else(|| base_path(cv, &env.label, &repo.repo_name), |d| d.base_path.clone());
-        let (name, aliases) = (distribution_name(cv, &env.name, &repo.repo_name), self.store.aliases().await?);
-        let recorded = self.store.recorded_hrefs(&self.scope).await?;
+        let (name, (aliases, recorded)) = (distribution_name(cv, &env.name, &repo.repo_name), self.known().await?);
         let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice(), recorded.as_slice()));
         let refusal = match ops::distribution_target(&self.client, repo.repo_type, &name, &path, &dist_labels(cv, &env.name), db).await {
             Ok(_) => None,
@@ -1528,7 +1542,7 @@ impl CvService {
         let name = distribution_name(cv, &env.name, &repo.repo_name);
         let bp = self.served_path(cv, env, repo).await?;
         let labels = dist_labels(cv, &env.name);
-        let (aliases, recorded) = (self.store.aliases().await?, self.store.recorded_hrefs(&self.scope).await?);
+        let (aliases, recorded) = self.known().await?;
         self.alive()?;
         let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice(), recorded.as_slice()));
         let href = ops::ensure_distribution(&self.client, repo.repo_type, &name, &bp, Some(publication), &labels, db, on).await?;
