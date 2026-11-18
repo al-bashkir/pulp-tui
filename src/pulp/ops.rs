@@ -1163,7 +1163,9 @@ mod tests {
         r["headers"] = json!([]);
         assert_eq!(planted(&r, &body).len(), 2, "an empty list is unset");
         // A replica repository names its remote: the body's value is wanted, not Pulp's default.
-        let repo = json!({ "remote": "/r/1/", "retain_repo_versions": null, "repo_config": {}, "package_signing_fingerprint": "" });
+        let repo = json!({ "remote": "/r/1/", "retain_repo_versions": null, "repo_config": {}, "package_signing_fingerprint": "",
+            "retain_package_versions": 0 });
+        assert_eq!(planted(&json!({ "retain_package_versions": 1 }), &json!({})), ["retain_package_versions is 1, not 0"]);
         assert!(planted(&repo, &json!({ "remote": "/r/1/" })).is_empty());
         assert_eq!(planted(&repo, &json!({})), [r#"remote is "/r/1/", not null"#]);
         assert_eq!(planted(&repo, &json!({ "remote": "/r/2/" })), [r#"remote is "/r/1/", not "/r/2/""#]);
