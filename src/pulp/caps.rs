@@ -103,30 +103,35 @@ pub fn parse_version(v: &str) -> (u64, u64, u64) {
     (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
 }
 
+/// The user that the server authenticates `c` as: `login/`, or on older servers without it the Basic-auth user found in
+/// `users/`. `None` when that is not readable (no permission to read users, or no users API).
+pub async fn current_user(c: &PulpClient) -> Result<Option<CurrentUser>> {
+    let user_of = |v: &Value| CurrentUser {
+        href: v["pulp_href"].as_str().unwrap_or_default().into(),
+        username: v["username"].as_str().unwrap_or_default().into(),
+        is_staff: v["is_staff"].as_bool(),
+    };
+    match c.get::<Value>(&c.api("login/"), &[]).await {
+        Ok(v) => Ok(Some(user_of(&v))),
+        // Older pulpcore has no login endpoint: look up the Basic-auth user by name.
+        Err(e) if e.status() == Some(404) => {
+            let Some(name) = c.username() else { return Ok(None) };
+            match c.list::<Value>(&c.api("users/"), &[("username", name.into())]).await {
+                Ok(page) => Ok(page.results.iter().find(|v| v["username"] == name).map(user_of)),
+                Err(e) if matches!(e.status(), Some(403 | 404)) => Ok(None), // no permission to read users, or no users API
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl Capabilities {
     pub async fn detect(c: &PulpClient) -> Result<Self> {
         let mut caps = Capabilities::default();
         caps.set_status(c.get(&c.api("status/"), &[]).await?);
-        let user_of = |v: &Value| CurrentUser {
-            href: v["pulp_href"].as_str().unwrap_or_default().into(),
-            username: v["username"].as_str().unwrap_or_default().into(),
-            is_staff: v["is_staff"].as_bool(),
-        };
         // Anonymous status works without credentials; login/ proves them.
-        match c.get::<Value>(&c.api("login/"), &[]).await {
-            Ok(v) => caps.user = Some(user_of(&v)),
-            // Older pulpcore has no login endpoint: look up the Basic-auth user by name.
-            Err(e) if e.status() == Some(404) => {
-                if let Some(name) = c.username() {
-                    match c.list::<Value>(&c.api("users/"), &[("username", name.into())]).await {
-                        Ok(page) => caps.user = page.results.iter().find(|v| v["username"] == name).map(user_of),
-                        Err(e) if matches!(e.status(), Some(403 | 404)) => {} // no permission to read users, or no users API
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-            Err(e) => return Err(e),
-        }
+        caps.user = current_user(c).await?;
         if let Some(u) = caps.user.as_mut().filter(|u| u.is_staff.is_none()) {
             // Staff flag is only visible to users allowed to read their own user object.
             if let Ok(v) = c.get::<Value>(&u.href, &[("fields", "is_staff".into())]).await {
