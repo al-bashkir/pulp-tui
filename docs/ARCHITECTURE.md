@@ -224,7 +224,10 @@ write any href into it:
   its href when that differs from the recorded name (`cv::pulp_named`).
 * `publish_repo` refuses a row whose source version is not `<source repository>versions/<n>/`,
   whose signing is not `''`, `none` or under `signing-services/`, or whose snapshot version is
-  not of its snapshot repository (`CvService::stray_row`), before any request.
+  not of its snapshot repository (`CvService::stray_row`), before any request. The recorded task
+  (`pending_task`) is a row href too: what it made must be a version of the snapshot repository
+  (the copy step), or a publication of the snapshot version (the publication step), else the row
+  is refused before that version or publication is recorded.
 * Resume always asks. Its confirmation names the source version, the repository and the Deb
   signing of each row that is not published yet (`CvService::resume_sources`, with the same
   refusals); `resume` refuses when these differ from the rows that the confirmation read.

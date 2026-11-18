@@ -906,7 +906,7 @@ impl CvService {
     fn stray_row(&self, vr: &CvVersionRepo) -> Option<String> {
         let (src, s) = (&vr.repo().repo_href, vr.signing.as_str());
         let service = (!["", "none"].contains(&s)).then_some(s);
-        if let Some(why) = not_hrefs([Some(src.as_str()), vr.source_version.as_deref(), service]) {
+        if let Some(why) = not_hrefs([Some(src.as_str()), vr.source_version.as_deref(), service, vr.pending_task.as_deref()]) {
             return Some(why);
         }
         if let Some(sv) = vr.source_version.as_deref().filter(|sv| !version_of(sv, src)) {
@@ -986,7 +986,13 @@ impl CvService {
         let dv = vr.derived_version.clone().unwrap_or_default();
         log(format!("{}: publishing {dv}", vr.repo().repo_name));
         self.alive()?;
-        vr.publication = Some(self.publication(vr, &dv, changed, log, on).await?);
+        let recorded = vr.pending_task.is_some(); // `publication` re-attaches to it
+        let p = self.publication(vr, &dv, changed, log, on).await?;
+        // A recorded task is a row href (the store is shared): what it made must be a publication of this snapshot.
+        if recorded && self.client.get::<Value>(&p, &[]).await?["repository_version"].as_str() != Some(dv.as_str()) {
+            bail!("{p} is not a publication of {dv}; delete this version and publish again");
+        }
+        vr.publication = Some(p);
         self.alive()?;
         self.store.save_version_repo(vr).await?;
         Ok(())
@@ -1118,6 +1124,10 @@ impl CvService {
                 r.latest_version_href.ok_or_else(|| anyhow!("derived repository has no version"))?
             }
         };
+        // A recorded task is a row href (the store is shared): what it made must be a version of this snapshot.
+        if !version_of(&version, derived) {
+            bail!("{version} is not a version of the snapshot repository {derived}; delete this version and publish again");
+        }
         let rv: RepoVersion = c.get(&version, &[]).await?;
         vr.content_count = Some(rv.content_summary.present_count() as i64);
         vr.derived_version = Some(version.clone());
@@ -2794,6 +2804,7 @@ mod tests {
         let done = json!({ "pulp_href": "/pulp/api/v3/tasks/2/", "state": "completed", "created_resources": [p] });
         let done = ResponseTemplate::new(200).set_body_json(done);
         Mock::given(method("GET")).and(path("/pulp/api/v3/tasks/2/")).respond_with(done).mount(&server).await;
+        serve_json(&server, &p, json!({ "pulp_href": p, "repository_version": format!("{DERIVED}versions/1/") })).await;
         svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap();
         let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
         assert_eq!((saved.publication.as_deref(), saved.pending_task), (Some(p.as_str()), None));
@@ -3335,6 +3346,7 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(done))
             .mount(&server)
             .await;
+        serve_json(&server, p, json!({ "pulp_href": p, "repository_version": format!("{DEB_DERIVED}versions/1/") })).await;
         svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap();
         let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
         assert_eq!((saved.publication.as_deref(), saved.pending_task), (Some(p), None));
@@ -3795,6 +3807,45 @@ mod tests {
             svc.delete_version(vr.version_id, None, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
             assert_none(&server, "DELETE").await;
             assert_eq!(logs.into_inner().unwrap(), [format!("keeping {r}versions/1/: {r} is not a Pulp href")]);
+        }
+    }
+
+    /// Second review of the run-1 fix: `pending_task` is a row href too. A peer writes a task that made a version or a
+    /// publication of another repository, or an href that is not one. Resume refuses the row before it records that
+    /// version (the cleanup would also keep it as the latest) or that publication.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_refuses_a_recorded_task_that_made_objects_of_another_repository() {
+        let (task, foreign) = ("/pulp/api/v3/tasks/9/", "/pulp/api/v3/repositories/rpm/rpm/99/versions/4/");
+        let fp = "/pulp/api/v3/publications/rpm/rpm/77/";
+        // (the snapshot version is recorded: the task is the publication step, what the task made, the refusal)
+        for (resumed, made, why) in [
+            (false, foreign, format!("{foreign} is not a version of the snapshot repository {DERIVED}")),
+            (true, fp, format!("{fp} is not a publication of {DERIVED}versions/1/")),
+            (false, "", format!("{task}# is not a Pulp href")),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let (_, mut vr) = rpm_version(&svc).await;
+            vr.pending_task = Some(if made.is_empty() { format!("{task}#") } else { task.into() });
+            if resumed {
+                vr.derived_version = Some(format!("{DERIVED}versions/1/"));
+            }
+            svc.store.save_version_repo(&vr).await.unwrap();
+            serve_owner(&server, DERIVED, svc.store.db_id()).await;
+            serve_json(&server, "/pulp/api/v3/repositories/rpm/rpm/1/", json!({ "name": "os" })).await;
+            serve_json(&server, task, json!({ "pulp_href": task, "state": "completed", "name": "copy", "created_resources": [made] }))
+                .await;
+            serve_json(&server, foreign, json!({ "pulp_href": foreign, "number": 4 })).await;
+            serve_json(&server, fp, json!({ "pulp_href": fp, "repository_version": foreign })).await;
+            wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+                .respond_with(wiremock::ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+            let e = svc.publish_repo("web", &mut vr, &|_| {}, &ops::no_progress).await.unwrap_err();
+            assert_eq!(format!("{e:#}"), format!("{why}; delete this version and publish again"));
+            assert_none(&server, "DELETE").await;
+            let saved = svc.store.version_repos(vr.version_id).await.unwrap().remove(0);
+            assert_eq!((saved.derived_version.is_some(), saved.publication), (resumed, None), "nothing recorded");
         }
     }
 
