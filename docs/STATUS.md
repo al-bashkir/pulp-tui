@@ -213,6 +213,11 @@ Through the TUI:
   attempt. A version that Dev serves in part is not deleted.
   `live_cv::a_partial_promotion_and_what_the_screens_show_through_the_tui`,
   `live_cv::a_version_that_dev_serves_in_part_is_not_deleted_through_the_tui`
+* A peer of the shared store writes other hrefs into a version row with SQL: Delete keeps
+  them and deletes only what the confirmation showed; Publish and Resume refuse a source
+  that changed after the confirmation.
+  `live_cv::a_version_delete_keeps_what_a_peer_wrote_into_its_row_through_the_tui`,
+  `live_cv::publish_and_resume_refuse_a_source_that_a_peer_changed_through_the_tui`
 
 ### Replication
 
@@ -342,6 +347,13 @@ Through the TUI:
 * A user who cannot see a distribution gets 404 for it: a left-out Content View row of that
   distribution stays, with its protection; only an administrator's 404 forgets the row.
   `live_rbac::a_404_of_a_hidden_distribution_keeps_a_content_view_row_for_a_user`
+* A user with only the creator role makes the Content View distribution first, with the
+  pulp-tui labels: the preview and the promotion refuse it at its own path, for its owner
+  role, and (after the role is handed over) for a planted content guard; it is not changed.
+  `live_rbac::a_promotion_refuses_a_distribution_that_another_user_made_with_the_labels`
+* A publication that another user made of a snapshot version is not reused: the next
+  publish makes its own, and Library serves it.
+  `live_rbac::a_publish_does_not_reuse_a_publication_that_another_user_made_of_the_snapshot`
 * Server-side cancel of waiting and running tasks, 409 for completed tasks.
   `live_failures::cancel_waiting_and_running_tasks`
 * TLS errors are reported and never downgraded.
@@ -413,24 +425,29 @@ pulpcore 3.95 and later: a `base_url` is `/pulp/content/<base_path>/`.
 
 ## Test results (last run)
 
-Run of 2026-11-09 at 6d64485 on fresh containers (`tests/env/pulp-env.sh down-all`, then
-`tests/run-live.sh <scenario>` for each scenario and for `real`). The counts below are for
-`quay.io/pulp/pulp:latest` (pulpcore 3.123.1; the whole run took 2814 s). The images 3.95.3
-and 3.63.36 ran the same number of tests and passed (see COMPATIBILITY.md).
+Run of 2026-11-19 at 9dee460 on fresh containers (`tests/env/pulp-env.sh down-all`, then
+`tests/run-live.sh <scenario>` for each scenario, `origin` and `real`). The counts below are
+for `quay.io/pulp/pulp:latest` (pulpcore 3.123.1; the whole run took 2947 s). The images
+3.95.3 and 3.63.36 ran the same tests and passed, except `origin` on 3.63.36: without
+`CONTENT_ORIGIN` that server gives `base_url` without the leading `/` (`pulp/content/...`),
+and the test expects `/pulp/content/...`. After 87956c3 (filesystem export), `export` and
+`admin` passed again on fresh containers of all three images.
 
-| Check                                         | Result           |
-| --------------------------------------------- | ---------------- |
-| `cargo test --lib`                            | 685 passed       |
-| `cargo test --test mock_http`                 | 53 passed        |
-| live `repos` / `cv` / `rbac` / `failures`     | 44 / 27 / 2 / 3  |
-| live `replication` / `shared_db` / `deb`      | 12 / 10 / 16     |
-| live `export` / `content` / `admin`           | 8 / 11 / 29      |
-| live total, all scenarios except `real`       | 162 passed       |
-| live `real`                                   | 3 passed (644 s) |
-| `cargo fmt --check`, `dprint check`           | clean            |
-| `cargo clippy -D warnings`, both feature sets | clean            |
+| Check                                         | Result                                           |
+| --------------------------------------------- | ------------------------------------------------ |
+| `cargo test --lib`                            | 724 passed                                       |
+| `cargo test --test mock_http`                 | 61 passed                                        |
+| live `repos` / `cv` / `rbac` / `failures`     | 45 / 30 / 4 / 3                                  |
+| live `replication` / `shared_db` / `deb`      | 13 / 10 / 16                                     |
+| live `export` / `content` / `admin`           | 8 / 11 / 30                                      |
+| live total, the 10 default scenarios          | 170 passed                                       |
+| live `origin`                                 | 1 passed                                         |
+| live `real`                                   | 3 passed (551 s)                                 |
+| `cargo fmt --check`                           | clean                                            |
+| `dprint check`                                | clean, except the audit report in `docs/audits/` |
+| `cargo clippy -D warnings`, both feature sets | clean                                            |
 
-Not run again on 2026-11-09 (the results below are older):
+Not run again on 2026-11-19 (the results below are older):
 
 * `podman build -f Containerfile .` (2026-10-27): built (31.0 MB image, no keyring, with
   the PostgreSQL driver; `pulp-tui --version` runs).
