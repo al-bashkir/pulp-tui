@@ -670,32 +670,29 @@ impl CvService {
             bail!("the repositories of {} changed after the preview; publish again to see the new preview", cv.name);
         }
         check_repo_clash(&[(cv.name.clone(), repos.clone())])?;
-        // Snapshot all source versions first so the view is consistent in time.
-        let mut sources = vec![];
-        for r in &repos {
+        let rows = self.source_rows(&cv, &repos, signing).await?;
+        self.alive()?;
+        let v = self.store.begin_snapshot_version(cv_id, notes, &rows).await?;
+        self.audit("cv.publish.start", &format!("{} version {}", cv.name, v.number)).await;
+        log(format!("{} v{}: publishing {} repositories", cv.name, v.number, repos.len()));
+        self.resume(v.id, Some(&rows), log, on).await
+    }
+
+    /// The first rows of a new version of view `cv`: the latest version of each source repository in `repos`, read
+    /// first so the view is consistent in time, and the Deb `signing` choice. Refuses a snapshot repository as source.
+    async fn source_rows(&self, cv: &ContentView, repos: &[CvRepo], signing: &str) -> Result<Vec<CvVersionRepo>> {
+        let mut rows = vec![];
+        for r in repos {
             let repo: Repository =
                 self.client.get(&r.repo_href, &[]).await.with_context(|| format!("source repository {}", r.repo_name))?;
             if let Some(owner) = repo.pulp_labels.get(LABEL_CV) {
                 bail!("{} is a snapshot repository of content view {owner}; remove it from {} and add its source", r.repo_name, cv.name);
             }
             let sv = repo.latest_version_href.ok_or_else(|| anyhow!("{} has no versions", r.repo_name))?;
-            sources.push(sv);
+            // `signing` is a checkpoint: a resumed publish signs as asked.
+            rows.push(CvVersionRepo { repo: Some(r.clone()), source_version: Some(sv), signing: signing.into(), ..Default::default() });
         }
-        let rows: Vec<CvVersionRepo> = repos
-            .iter()
-            .zip(sources)
-            .map(|(r, sv)| CvVersionRepo {
-                repo: Some(r.clone()),
-                source_version: Some(sv),
-                signing: signing.into(), // a checkpoint: a resumed publish signs as asked
-                ..Default::default()
-            })
-            .collect();
-        self.alive()?;
-        let v = self.store.begin_snapshot_version(cv_id, notes, &rows).await?;
-        self.audit("cv.publish.start", &format!("{} version {}", cv.name, v.number)).await;
-        log(format!("{} v{}: publishing {} repositories", cv.name, v.number, repos.len()));
-        self.resume(v.id, Some(&rows), log, on).await
+        Ok(rows)
     }
 
     /// Each component of a composite with the version it publishes from (its pin, else its newest
@@ -816,51 +813,59 @@ impl CvService {
         let v = self.store.version(version_id).await?;
         let cv = self.store.content_view(v.cv_id).await?;
         if v.state == "published" {
-            if !self.library_interrupted(&v).await? {
-                return Ok((v, None));
-            }
-            log(format!("{} v{}: the Library step stopped; running it again", cv.name, v.number));
-            let note = self.library_step(&v, log, on).await;
-            return Ok((self.store.version(v.id).await?, note));
+            return self.resume_library(v, &cv.name, log, on).await;
         }
-        if v.state == "deleted" {
-            bail!("version {} was deleted", v.number);
-        }
-        if v.state == "deleting" {
-            bail!("version {} is being deleted; delete it again to finish", v.number);
+        if let Some(why) = deleted(&v) {
+            bail!(why);
         }
         self.alive()?;
         self.store.start_publishing(v.id, self.token()).await?;
-        let res = async {
-            let rows = self.store.version_repos(v.id).await?;
-            // The store is shared: a row can change after the confirmation.
-            if seen.is_some_and(|s| sources(s) != sources(&rows)) {
-                bail!("the sources of version {} changed after they were shown; resume it again to see them", v.number);
-            }
-            for mut vr in rows {
-                self.publish_repo(&cv.name, &mut vr, log, on).await.with_context(|| format!("repository {}", vr.repo().repo_name))?;
-            }
-            anyhow::Ok(())
+        match self.publish_rows(&v, &cv.name, seen, log, on).await {
+            Ok(()) => self.published(&v, &cv.name, log, on).await,
+            Err(e) => self.publish_failed(&v, &cv.name, e).await,
         }
-        .await;
-        match res {
-            Ok(()) => {
-                self.alive()?;
-                self.store.finish_version(v.id, "published", None).await?;
-                self.audit("cv.publish.done", &format!("{} version {}", cv.name, v.number)).await;
-                log(format!("{} v{} published", cv.name, v.number));
-                let note = self.library_step(&v, log, on).await;
-                Ok((self.store.version(v.id).await?, note))
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                // Runs even when the lock is lost (it records why the workflow stopped), but only over this
-                // workflow's own `publishing` state (by lock token).
-                self.store.fail_publishing_version(v.id, &msg, self.token()).await?;
-                self.audit("cv.publish.failed", &format!("{} version {}: {msg}", cv.name, v.number)).await;
-                Err(e)
-            }
+    }
+
+    /// Record why the publish of `v` of view `cv` stopped (`e`), and return it. Runs even when the lock is lost, but
+    /// only over this workflow's own `publishing` state (by lock token).
+    async fn publish_failed(&self, v: &CvVersion, cv: &str, e: anyhow::Error) -> Result<(CvVersion, Option<String>)> {
+        let msg = format!("{e:#}");
+        self.store.fail_publishing_version(v.id, &msg, self.token()).await?;
+        self.audit("cv.publish.failed", &format!("{cv} version {}: {msg}", v.number)).await;
+        Err(e)
+    }
+
+    /// Record `v` of view `cv` published, then run its Library step. Returns what `resume` returns.
+    async fn published(&self, v: &CvVersion, cv: &str, log: Log<'_>, on: OnTask<'_>) -> Result<(CvVersion, Option<String>)> {
+        self.alive()?;
+        self.store.finish_version(v.id, "published", None).await?;
+        self.audit("cv.publish.done", &format!("{cv} version {}", v.number)).await;
+        log(format!("{cv} v{} published", v.number));
+        let note = self.library_step(v, log, on).await;
+        Ok((self.store.version(v.id).await?, note))
+    }
+
+    /// `resume` of published `v` of view `cv`: only a Library step that stopped runs again.
+    async fn resume_library(&self, v: CvVersion, cv: &str, log: Log<'_>, on: OnTask<'_>) -> Result<(CvVersion, Option<String>)> {
+        if !self.library_interrupted(&v).await? {
+            return Ok((v, None));
         }
+        log(format!("{cv} v{}: the Library step stopped; running it again", v.number));
+        let note = self.library_step(&v, log, on).await;
+        Ok((self.store.version(v.id).await?, note))
+    }
+
+    /// `publish_repo` for each row of version `v` of view `cv`; refused when their sources are not `seen` (the store is
+    /// shared: a row can change after the confirmation).
+    async fn publish_rows(&self, v: &CvVersion, cv: &str, seen: Option<&[CvVersionRepo]>, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
+        let rows = self.store.version_repos(v.id).await?;
+        if seen.is_some_and(|s| sources(s) != sources(&rows)) {
+            bail!("the sources of version {} changed after they were shown; resume it again to see them", v.number);
+        }
+        for mut vr in rows {
+            self.publish_repo(cv, &mut vr, log, on).await.with_context(|| format!("repository {}", vr.repo().repo_name))?;
+        }
+        Ok(())
     }
 
     /// The lines of a Resume confirmation for the rows `vrs` of a version: for each own row that is not published yet,
@@ -961,10 +966,15 @@ impl CvService {
             self.snapshot(vr, &derived, log, on).await?;
         }
         let changed = self.copy_settings(vr, &derived, log, on).await?;
+        self.publish_snapshot(vr, changed || resumed, log, on).await
+    }
+
+    /// Publish the recorded snapshot version of `vr` (`publication`, with `changed`) and record the publication.
+    async fn publish_snapshot(&self, vr: &mut CvVersionRepo, changed: bool, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
         let dv = vr.derived_version.clone().unwrap_or_default();
         log(format!("{}: publishing {dv}", vr.repo().repo_name));
         self.alive()?;
-        vr.publication = Some(self.publication(vr, &dv, changed || resumed, log, on).await?);
+        vr.publication = Some(self.publication(vr, &dv, changed, log, on).await?);
         self.alive()?;
         self.store.save_version_repo(vr).await?;
         Ok(())
@@ -1627,20 +1637,31 @@ impl CvService {
         Ok(cv.into())
     }
 
+    /// Refused unless `publication` of row `vr` of view `cv` is a snapshot of the view (`unbound`, `row_view`).
+    async fn refuse_unbound(&self, cv: &str, vr: &CvVersionRepo, publication: &str, aliases: &[String]) -> Result<()> {
+        match self.unbound(&self.row_view(cv, vr).await?, vr, aliases).await? {
+            Some(why) => bail!("not serving {publication}: {why}"),
+            None => Ok(()),
+        }
+    }
+
     async fn bind_repo(&self, cv: &str, env: &Environment, vr: &CvVersionRepo, on: OnTask<'_>) -> Result<()> {
         let repo = vr.repo();
         let publication = vr.publication.as_deref().ok_or_else(|| anyhow!("version has no publication"))?;
         let (aliases, recorded) = self.known().await?;
-        if let Some(why) = self.unbound(&self.row_view(cv, vr).await?, vr, &aliases).await? {
-            bail!("not serving {publication}: {why}");
-        }
+        self.refuse_unbound(cv, vr, publication, &aliases).await?;
         let name = distribution_name(cv, &env.name, &repo.repo_name);
         let bp = self.served_path(cv, env, repo).await?;
         let labels = dist_labels(cv, &env.name);
         self.alive()?;
         let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice(), recorded.as_slice()));
         let href = ops::ensure_distribution(&self.client, repo.repo_type, &name, &bp, Some(publication), &labels, db, on).await?;
-        let cv_id = vr_cv(&self.store, vr.version_id).await?;
+        self.record_binding(env, vr, href, bp).await
+    }
+
+    /// Record that distribution `href` at base path `bp` serves the publication of row `vr` in `env`.
+    async fn record_binding(&self, env: &Environment, vr: &CvVersionRepo, href: String, bp: String) -> Result<()> {
+        let (repo, cv_id) = (vr.repo(), vr_cv(&self.store, vr.version_id).await?);
         self.alive()?;
         self.store
             .save_binding_repo(&BindingRepo {
@@ -1651,10 +1672,9 @@ impl CvService {
                 repo_type: repo.repo_type,
                 distribution: href,
                 base_path: bp,
-                publication: Some(publication.into()),
+                publication: vr.publication.clone(),
             })
-            .await?;
-        Ok(())
+            .await
     }
 
     // ---- unpromote ---------------------------------------------------------------------
@@ -1935,43 +1955,58 @@ impl CvService {
         };
         let old_name = if against.is_some() { "published" } else { "empty" };
         if cv.composite {
-            let parts = self.resolve_components(&cv).await?;
-            let old_used = match against {
-                Some(v) => self.store.version_components(v).await?,
-                None => vec![],
-            };
-            let used: Vec<UsedVersion> = parts
-                .iter()
-                .map(|(c, v, _)| UsedVersion { cv_id: c.cv_id, name: c.name.clone(), version_id: v.id, number: v.number })
-                .collect();
-            let rows: Vec<CvVersionRepo> = parts.into_iter().flat_map(|(_, _, r)| r).collect();
-            let mut out = component_lines(&old_used, &used);
-            out.extend(self.compare_rows(&old, &rows, old_name, "draft").await?);
-            return Ok((out, vec![]));
+            return self.preview_composite(&cv, &old, against, old_name).await.map(|lines| (lines, vec![]));
         }
         let repos = self.store.cv_repos(cv_id).await?;
+        self.preview_repos(&repos, &old, old_name).await.map(|lines| (lines, repos))
+    }
+
+    /// `preview_repo` of each of `repos`.
+    async fn preview_repos(&self, repos: &[CvRepo], old: &[CvVersionRepo], old_name: &str) -> Result<Vec<String>> {
         let mut out = vec![];
-        for r in &repos {
-            let repo: Repository = self.client.get(&r.repo_href, &[]).await?;
-            let shown = pulp_named(&r.repo_name, &repo.name);
-            let Some(sv) = repo.latest_version_href else {
-                out.push(format!("== {shown} has no versions"));
-                continue;
-            };
-            let sel = self.select(r, &sv, true).await?;
-            let prev = old.iter().find(|o| o.repo().repo_href == r.repo_href).and_then(|o| o.derived_version.clone());
-            let prev_keys = ops::content_keys(&self.client, r.repo_type, prev.as_deref()).await?;
-            let d = ops::diff(&prev_keys, &sel.keys);
-            out.push(format!(
-                "== {shown} ({}) from {sv}: {} selected, filters: {}",
-                r.repo_type.label(),
-                sel.keys.len(),
-                crate::filters::format_rules(&r.filters)
-            ));
-            out.extend(d.lines(old_name, "draft"));
-            out.push(String::new());
+        for r in repos {
+            out.extend(self.preview_repo(r, old, old_name).await?);
         }
-        Ok((out, repos))
+        Ok(out)
+    }
+
+    /// `preview` of composite `cv`: the component changes, then the content difference against the rows `old` of version
+    /// `against` (named `old_name`).
+    async fn preview_composite(
+        &self,
+        cv: &ContentView,
+        old: &[CvVersionRepo],
+        against: Option<i64>,
+        old_name: &str,
+    ) -> Result<Vec<String>> {
+        let parts = self.resolve_components(cv).await?;
+        let old_used = match against {
+            Some(v) => self.store.version_components(v).await?,
+            None => vec![],
+        };
+        let used: Vec<UsedVersion> = parts
+            .iter()
+            .map(|(c, v, _)| UsedVersion { cv_id: c.cv_id, name: c.name.clone(), version_id: v.id, number: v.number })
+            .collect();
+        let rows: Vec<CvVersionRepo> = parts.into_iter().flat_map(|(_, _, r)| r).collect();
+        let mut out = component_lines(&old_used, &used);
+        out.extend(self.compare_rows(old, &rows, old_name, "draft").await?);
+        Ok(out)
+    }
+
+    /// The `preview` lines of source repository `r`: what it selects now, against its row in `old` (named `old_name`).
+    async fn preview_repo(&self, r: &CvRepo, old: &[CvVersionRepo], old_name: &str) -> Result<Vec<String>> {
+        let repo: Repository = self.client.get(&r.repo_href, &[]).await?;
+        let shown = pulp_named(&r.repo_name, &repo.name);
+        let Some(sv) = repo.latest_version_href else { return Ok(vec![format!("== {shown} has no versions")]) };
+        let sel = self.select(r, &sv, true).await?;
+        let prev = old.iter().find(|o| o.repo().repo_href == r.repo_href).and_then(|o| o.derived_version.clone());
+        let prev_keys = ops::content_keys(&self.client, r.repo_type, prev.as_deref()).await?;
+        let (t, filters) = (r.repo_type.label(), crate::filters::format_rules(&r.filters));
+        let mut out = vec![format!("== {shown} ({t}) from {sv}: {} selected, filters: {filters}", sel.keys.len())];
+        out.extend(ops::diff(&prev_keys, &sel.keys).lines(old_name, "draft"));
+        out.push(String::new());
+        Ok(out)
     }
 
     /// Component changes (composites), then the content difference of each repository.
@@ -2091,11 +2126,25 @@ impl CvService {
         let name = self.store.content_view(v.cv_id).await?.name;
         let (mut objects, mut dists) = (vec![], HashMap::new());
         for vr in self.store.version_repos(v.id).await?.into_iter().filter(|vr| !vr.borrowed) {
-            let not_ours = self.unbound(&name, &vr, &aliases).await?;
-            let pulp = if not_ours.is_none() { self.served_in_pulp(&vr, &mut dists).await? } else { [None, None] };
+            let (not_ours, pulp) = self.kept_in_pulp(&name, &vr, &aliases, &mut dists).await?;
             objects.extend(row_objects(&vr, not_ours, pulp, &mut shared, &served));
         }
         Ok(objects)
+    }
+
+    /// Why Pulp keeps the objects of row `vr` of view `cv`: they are not the view's (`unbound`), else why a distribution
+    /// serves the publication and the snapshot version (`served_in_pulp`).
+    async fn kept_in_pulp(
+        &self,
+        cv: &str,
+        vr: &CvVersionRepo,
+        aliases: &[String],
+        dists: &mut HashMap<RepoType, Vec<Distribution>>,
+    ) -> Result<(Option<String>, [Option<String>; 2])> {
+        if let Some(why) = self.unbound(cv, vr, aliases).await? {
+            return Ok((Some(why), [None, None]));
+        }
+        Ok((None, self.served_in_pulp(vr, dists).await?))
     }
 
     /// Why a distribution serves the publication and the snapshot version of `vr` (`None`: none does), from
@@ -2212,6 +2261,15 @@ fn row_objects(
 /// starts on it (`dest_base_version: 0`), and Pulp refuses that copy once it is gone.
 fn base_version(href: &str) -> bool {
     href.ends_with("/versions/0/")
+}
+
+/// Why `v` cannot be resumed: it was deleted, or its delete stopped. `None`: it can.
+fn deleted(v: &CvVersion) -> Option<String> {
+    match v.state.as_str() {
+        "deleted" => Some(format!("version {} was deleted", v.number)),
+        "deleting" => Some(format!("version {} is being deleted; delete it again to finish", v.number)),
+        _ => None,
+    }
 }
 
 /// Whether `v` is the href of a version of repository `repo`: `<repo>versions/<n>/`.
@@ -3429,6 +3487,27 @@ mod tests {
         assert_eq!(e.to_string(), "the repositories of web changed after the preview; publish again to see the new preview");
         assert!(svc.store.versions(cv).await.unwrap().is_empty(), "refused before any write");
         assert_none(&server, "POST").await;
+    }
+
+    /// Publish records the latest version of each source and the signing choice in one write before its first step, so a
+    /// stop at that step leaves a failed version that Resume continues.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_records_the_sources_before_the_first_step() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let src = "/pulp/api/v3/repositories/rpm/rpm/1/";
+        let r = CvRepo { repo_href: src.into(), repo_name: "os".into(), repo_type: RepoType::Rpm, filters: vec![] };
+        svc.store.set_cv_repo(cv, &r).await.unwrap();
+        let sv = format!("{src}versions/3/");
+        serve_json(&server, src, json!({ "pulp_href": src, "name": "os", "latest_version_href": sv })).await;
+        // Nothing else is served: the look-up of the derived repository fails.
+        let e = svc.publish(cv, Some(std::slice::from_ref(&r)), "", "none", &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert!(format!("{e:#}").starts_with("repository os: "), "{e:#}");
+        let v = svc.store.versions(cv).await.unwrap().remove(0);
+        assert_eq!(v.state, "failed");
+        let row = svc.store.version_repos(v.id).await.unwrap().remove(0);
+        assert_eq!((row.source_version.as_deref(), row.signing.as_str()), (Some(sv.as_str()), "none"));
     }
 
     /// Security audit run-1 (publish, Resume): a peer writes the checkpoints of a stopped version: a source version of

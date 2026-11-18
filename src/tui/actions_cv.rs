@@ -1044,126 +1044,171 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
     let vid = item["id"].as_i64().unwrap_or_default();
     let number = s(&item, "number");
     match act {
-        Act::Promote | Act::Rollback => {
-            if item["state"] != "published" {
-                app.error("only published versions can be bound to environments");
-                return;
-            }
-            let mode = if act == Act::Promote { Mode::Promote } else { Mode::Rollback };
-            let Some(st) = cv_store(app) else { return };
-            let p = scope.to_string();
-            app.spawn("read environments".into(), true, async move {
-                let envs = env_names(&st, &p).await?;
-                ap(move |app| {
-                    app.form(
-                        Form::new(format!("v{number} -> environment"), vec![Field::new("env", "Environment", FieldKind::Choice(envs))]),
-                        move |app, f| {
-                            promote_preview(app, name.clone(), vid, f.get("env").to_string(), mode);
-                            Ok(())
-                        },
-                    )
-                })
-            });
-        }
-        Act::Compare => {
-            let marked: Vec<i64> = app.list.marked.iter().filter_map(|m| m.parse().ok()).filter(|m| *m != vid).collect();
-            let [other] = marked.as_slice() else {
-                app.error("mark exactly one other version with Space, then compare");
-                return;
-            };
-            let (a, b) = if *other < vid { (*other, vid) } else { (vid, *other) };
-            app.job("compare content view versions", move |ctx| async move {
-                let lines = ctx.cv()?.compare_versions(a, b).await?;
-                ap(move |app| app.text(format!("{name}: version comparison"), lines))
-            });
-        }
-        Act::Resume => {
-            let lines = vec![format!("Resume {name} v{number}: it becomes active in Library unless a newer version is published.")];
-            app.load_job(format!("check resume of {name} v{number}"), move |ctx| async move {
-                let svc = ctx.cv()?;
-                let v = svc.store.version(vid).await?;
-                if !svc.resume_left(&v).await? {
-                    return ap(|app| app.notify(Level::Info, "version is already published"));
-                }
-                let protected = svc.library_protected().await?;
-                // Only the auto publish is left (`resume_left`), and it does nothing while Library is protected.
-                if protected && v.state == "published" && !svc.library_interrupted(&v).await? {
-                    let names: Vec<String> = svc.lagging_composites(cv).await?.into_iter().map(|c| c.name).collect();
-                    let names = names.join(", ");
-                    bail!(
-                        "v{number} is published; only the auto publish of {names} is left, and it does not run while Library \
-                         is protected: publish {names} yourself"
-                    );
-                }
-                // As for Publish: every Deb copy step uses `deb/copy/`.
-                let rows = svc.store.version_repos(vid).await?;
-                if rows.iter().any(|r| r.repo().repo_type == RepoType::Deb) {
-                    ctx.caps.require(crate::pulp::Feature::DebCopy)?;
-                }
-                // A confirmation names what the version copies from and what the Library step changes; with no Library
-                // change an open Library resumes at once.
-                let library = resume_library_lines(&svc, &name, &v).await?;
-                let title = (!library.is_empty()).then(|| format!("Resume {name} v{number}"));
-                let sources = if protected || title.is_some() { svc.resume_sources(&rows).await? } else { vec![] };
-                let lines: Vec<String> = lines.into_iter().chain(sources).chain(library).collect();
-                ap(move |app| guard_library(app, protected, lines, title, move |app| resume(app, cv, name, vid, number, rows)))
-            });
-        }
-        Act::Delete => app.load_job(format!("read what deleting {name} v{number} removes"), move |ctx| async move {
-            let objects = ctx.cv()?.delete_version_impact(vid).await?;
-            // Only a composite version has components; it borrows their snapshots and publications.
-            let mut lines = if item["components"].as_array().is_some_and(|c| !c.is_empty()) {
-                vec![
-                    format!("Delete {name} version {number}: only this composite version is removed."),
-                    "The snapshots and publications of its component versions are NOT touched.".into(),
-                ]
-            } else if objects.is_empty() {
-                vec![format!("Delete {name} version {number}. Nothing in Pulp is deleted.")]
-            } else {
-                vec![format!("Delete {name} version {number}. In Pulp:")]
-            };
-            lines.extend(objects.iter().map(|(repo, href, keep)| match keep {
-                None => format!("  {repo}: delete {href}"),
-                Some(why) => format!("  {repo}: keep {href} ({why})"),
-            }));
-            lines.push("The version number is never reused.".into());
-            ap(move |app| {
-                app.confirm_danger(format!("Delete {name} v{number}"), lines, &format!("v{number}"), move |app| {
-                    app.job(format!("delete {name} v{number}"), move |ctx| async move {
-                        let svc = ctx.cv()?.locked(cv, &format!("delete v{number}")).await?;
-                        svc.delete_version(vid, Some(&objects), &ctx.log(), &ctx.on_task()).await?;
-                        ap(move |app| {
-                            app.ok("version deleted");
-                            app.reload();
-                        })
-                    });
-                });
-            })
-        }),
-        Act::WatchTask => {
-            let Some(st) = cv_store(app) else { return };
-            // Read again: the list is stale while another operator publishes.
-            app.spawn("read pending task".into(), true, async move {
-                // Repositories publish one at a time, so at most one row has a pending task.
-                // With a derived version, the task is the publication.
-                let pending = st.version_repos(vid).await?.into_iter().find_map(|r| {
-                    let step = if r.derived_version.is_some() { "publish" } else { "copy" };
-                    Some((step, r.repo().repo_name.clone(), r.pending_task?))
-                });
-                ap(move |app| match pending {
-                    Some((step, repo, h)) => app.watch_task(&h, &format!("{name} v{number}: {step} {repo}"), None),
-                    None => app.notify(
-                        Level::Info,
-                        format!(
-                            "v{number} has no copy or publication task now. W watches only these two steps; \
-                             the session that runs the publish shows the others (settings, cleanup, Library) in Tasks"
-                        ),
-                    ),
-                })
-            });
-        }
+        Act::Promote | Act::Rollback if item["state"] != "published" => app.error("only published versions can be bound to environments"),
+        Act::Promote | Act::Rollback => bind_form(app, scope, name, vid, number, act),
+        Act::Compare => compare_marked(app, name, vid),
+        Act::Resume => resume_check(app, cv, name, vid, number),
+        Act::Delete => delete_confirm(app, cv, name, vid, number, item),
+        Act::WatchTask => watch_pending(app, name, vid, number),
         _ => {}
     }
+}
+
+/// Promote (`act`) or Rollback of version `vid` (`number`) of view `name`: the environment form, then the preview.
+fn bind_form(app: &mut App, scope: &str, name: String, vid: i64, number: String, act: Act) {
+    let mode = if act == Act::Promote { Mode::Promote } else { Mode::Rollback };
+    let Some(st) = cv_store(app) else { return };
+    let p = scope.to_string();
+    app.spawn("read environments".into(), true, async move {
+        let envs = env_names(&st, &p).await?;
+        ap(move |app| {
+            app.form(
+                Form::new(format!("v{number} -> environment"), vec![Field::new("env", "Environment", FieldKind::Choice(envs))]),
+                move |app, f| {
+                    promote_preview(app, name.clone(), vid, f.get("env").to_string(), mode);
+                    Ok(())
+                },
+            )
+        })
+    });
+}
+
+/// Compare version `vid` of view `name` with the one other marked version.
+fn compare_marked(app: &mut App, name: String, vid: i64) {
+    let marked: Vec<i64> = app.list.marked.iter().filter_map(|m| m.parse().ok()).filter(|m| *m != vid).collect();
+    let [other] = marked.as_slice() else {
+        app.error("mark exactly one other version with Space, then compare");
+        return;
+    };
+    let (a, b) = if *other < vid { (*other, vid) } else { (vid, *other) };
+    app.job("compare content view versions", move |ctx| async move {
+        let lines = ctx.cv()?.compare_versions(a, b).await?;
+        ap(move |app| app.text(format!("{name}: version comparison"), lines))
+    });
+}
+
+/// Resume (R) of version `vid` of view `cv` (`name`): its checks, then the confirmation (`resume_lines`), then `resume`.
+fn resume_check(app: &mut App, cv: i64, name: String, vid: i64, number: String) {
+    app.load_job(format!("check resume of {name} v{number}"), move |ctx| async move {
+        let svc = ctx.cv()?;
+        let v = svc.store.version(vid).await?;
+        if !svc.resume_left(&v).await? {
+            return ap(|app| app.notify(Level::Info, "version is already published"));
+        }
+        let protected = refuse_auto_only(&svc, cv, &v).await?;
+        let rows = svc.store.version_repos(vid).await?;
+        require_deb_copy(&ctx.caps, &rows)?;
+        let (lines, title) = resume_lines(&svc, &name, &v, protected, &rows).await?;
+        ap(move |app| guard_library(app, protected, lines, title, move |app| resume(app, cv, name, vid, number, rows)))
+    });
+}
+
+/// As for Publish: refused without the Deb copy API when `rows` have a Deb repository (every Deb copy step uses it).
+fn require_deb_copy(caps: &crate::pulp::Capabilities, rows: &[CvVersionRepo]) -> anyhow::Result<()> {
+    if rows.iter().any(|r| r.repo().repo_type == RepoType::Deb) {
+        caps.require(crate::pulp::Feature::DebCopy)?;
+    }
+    Ok(())
+}
+
+/// Whether Library is protected. Refused while only the auto publish is left for published `v` of view `cv`
+/// (`resume_left`) and Library is protected: it does nothing then.
+async fn refuse_auto_only(svc: &CvService, cv: i64, v: &CvVersion) -> anyhow::Result<bool> {
+    let protected = svc.library_protected().await?;
+    if !protected || v.state != "published" || svc.library_interrupted(v).await? {
+        return Ok(protected);
+    }
+    let names: Vec<String> = svc.lagging_composites(cv).await?.into_iter().map(|c| c.name).collect();
+    let names = names.join(", ");
+    bail!(
+        "v{} is published; only the auto publish of {names} is left, and it does not run while Library is protected: \
+         publish {names} yourself",
+        v.number
+    );
+}
+
+/// The Resume confirmation of `v` of view `name` (with `rows`) and its title. It names what the version copies from
+/// (`CvService::resume_sources`) and what the Library step changes; with no Library change an open Library (not
+/// `protected`) resumes at once (title `None`).
+async fn resume_lines(
+    svc: &CvService,
+    name: &str,
+    v: &CvVersion,
+    protected: bool,
+    rows: &[CvVersionRepo],
+) -> anyhow::Result<(Vec<String>, Option<String>)> {
+    let first = format!("Resume {name} v{}: it becomes active in Library unless a newer version is published.", v.number);
+    let library = resume_library_lines(svc, name, v).await?;
+    let title = (!library.is_empty()).then(|| format!("Resume {name} v{}", v.number));
+    let sources = if protected || title.is_some() { svc.resume_sources(rows).await? } else { vec![] };
+    Ok((std::iter::once(first).chain(sources).chain(library).collect(), title))
+}
+
+/// Delete (d) of version `vid` (`number`, list row `item`) of view `cv` (`name`): what it removes (`delete_lines`), the
+/// typed confirmation, then the delete of what the confirmation showed.
+fn delete_confirm(app: &mut App, cv: i64, name: String, vid: i64, number: String, item: Value) {
+    app.load_job(format!("read what deleting {name} v{number} removes"), move |ctx| async move {
+        let objects = ctx.cv()?.delete_version_impact(vid).await?;
+        let lines = delete_lines(&name, &number, &item, &objects);
+        ap(move |app| {
+            app.confirm_danger(format!("Delete {name} v{number}"), lines, &format!("v{number}"), move |app| {
+                app.job(format!("delete {name} v{number}"), move |ctx| async move {
+                    let svc = ctx.cv()?.locked(cv, &format!("delete v{number}")).await?;
+                    svc.delete_version(vid, Some(&objects), &ctx.log(), &ctx.on_task()).await?;
+                    ap(move |app| {
+                        app.ok("version deleted");
+                        app.reload();
+                    })
+                });
+            });
+        })
+    })
+}
+
+/// The Delete confirmation of version `number` (list row `item`) of view `name`: what happens to each of `objects`
+/// (`CvService::delete_version_impact`).
+fn delete_lines(name: &str, number: &str, item: &Value, objects: &[(String, String, Option<String>)]) -> Vec<String> {
+    // Only a composite version has components; it borrows their snapshots and publications.
+    let mut lines = if item["components"].as_array().is_some_and(|c| !c.is_empty()) {
+        vec![
+            format!("Delete {name} version {number}: only this composite version is removed."),
+            "The snapshots and publications of its component versions are NOT touched.".into(),
+        ]
+    } else if objects.is_empty() {
+        vec![format!("Delete {name} version {number}. Nothing in Pulp is deleted.")]
+    } else {
+        vec![format!("Delete {name} version {number}. In Pulp:")]
+    };
+    lines.extend(objects.iter().map(|(repo, href, keep)| match keep {
+        None => format!("  {repo}: delete {href}"),
+        Some(why) => format!("  {repo}: keep {href} ({why})"),
+    }));
+    lines.push("The version number is never reused.".into());
+    lines
+}
+
+/// Watch task (W) of version `vid` (`number`) of view `name`: the pending task of its copy or publication step.
+fn watch_pending(app: &mut App, name: String, vid: i64, number: String) {
+    let Some(st) = cv_store(app) else { return };
+    // Read again: the list is stale while another operator publishes.
+    app.spawn("read pending task".into(), true, async move {
+        // Repositories publish one at a time, so at most one row has a pending task.
+        // With a derived version, the task is the publication.
+        let pending = st.version_repos(vid).await?.into_iter().find_map(|r| {
+            let step = if r.derived_version.is_some() { "publish" } else { "copy" };
+            Some((step, r.repo().repo_name.clone(), r.pending_task?))
+        });
+        ap(move |app| match pending {
+            Some((step, repo, h)) => app.watch_task(&h, &format!("{name} v{number}: {step} {repo}"), None),
+            None => app.notify(
+                Level::Info,
+                format!(
+                    "v{number} has no copy or publication task now. W watches only these two steps; \
+                     the session that runs the publish shows the others (settings, cleanup, Library) in Tasks"
+                ),
+            ),
+        })
+    });
 }
 
 fn env_action(app: &mut App, scope: &str, act: Act, item: Value) {
@@ -2242,6 +2287,39 @@ mod tests {
         resume(&mut app, "published");
         drain(&mut app, &mut rx).await;
         assert!(app.modal.is_none(), "Library keeps v{}: no Library line, no confirmation", newer.number);
+    }
+
+    /// Compare (m) needs exactly one other marked version; with it, the comparison opens.
+    #[tokio::test]
+    async fn compare_needs_one_other_marked_version() {
+        let server = MockServer::start().await; // the versions have no rows: nothing is read
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let (v1, v2) = (publish_empty(&st, web).await, publish_empty(&st, web).await);
+        let item = json!({ "id": v2.id, "number": v2.number, "state": "published" });
+        version_action(&mut app, "lab", web, "web".into(), Act::Compare, item.clone());
+        assert_eq!(last_notice(&app), (Level::Error, "mark exactly one other version with Space, then compare"));
+        app.list.marked.insert(v1.id.to_string());
+        version_action(&mut app, "lab", web, "web".into(), Act::Compare, item);
+        drain(&mut app, &mut rx).await;
+        let Some(Modal::Text { title, .. }) = app.modal.take() else { panic!("no comparison: {:?}", last_notice(&app)) };
+        assert_eq!(title, "web: version comparison");
+    }
+
+    /// Promote (M) and Rollback (b) need a published version; for one, they ask for the environment.
+    #[tokio::test]
+    async fn promote_and_rollback_ask_for_the_environment_of_a_published_version() {
+        let (mut app, mut rx, st) = composite_app().await;
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let v = publish_empty(&st, web).await;
+        version_action(&mut app, "lab", web, "web".into(), Act::Promote, json!({ "id": v.id, "number": 1, "state": "failed" }));
+        assert_eq!(last_notice(&app), (Level::Error, "only published versions can be bound to environments"));
+        for act in [Act::Promote, Act::Rollback] {
+            version_action(&mut app, "lab", web, "web".into(), act, json!({ "id": v.id, "number": 1, "state": "published" }));
+            drain(&mut app, &mut rx).await;
+            assert_eq!(open_form(&mut app).0.title, "v1 -> environment");
+        }
     }
 
     /// Security audit run-1 (publish, Resume): the Resume confirmation names what the version copies from, with the name
