@@ -152,13 +152,26 @@ Katello: they live in the store of the profile and are built from Pulp objects.
   version delete keeps it: it reads the distributions in Pulp (`CvService::served_in_pulp`), not
   only the binding rows.
 * Labels do not prove ownership: a user who may create such an object may set them, also a
-  copied `pulp_tui_db`. A workflow uses an existing object that it finds **by name** only when
-  this database records its href (a binding or version row of the scope,
-  `Store::recorded_hrefs`), or when no one but the current Pulp user holds an object role on it
-  (`{href}list_roles/`). Pulp gives the creator the owner role, so an object that pulp-tui made
-  before a crash passes. Another user, any group, or roles that this user cannot read: 409, and
-  the message names each role holder. `ops::refuse_foreign` decides; `ops::distribution_target`
-  calls it, so the preview refuses too.
+  copied `pulp_tui_db`. Roles do not prove it either: that user may give the owner role to the
+  operator and drop its own. A workflow uses an existing object that it finds **by name** only
+  when this database records its href (a binding or version row of the scope,
+  `Store::recorded_hrefs`), or when it is as pulp-tui makes it:
+  1. no one but the current Pulp user holds an object role on it (`{href}list_roles/`; none at
+     all is fine), and
+  2. no guarded field differs from a new one made with pulp-tui's create body (`ops::guarded`:
+     content guard, default remote, retention, autopublish, package signing, `repo_config`,
+     TLS and proxy settings, headers, Deb `gpgkey`; a set secret). The expected value is the
+     body's, else Pulp's default; a field the server lacks is not compared.
+
+  Pulp gives the creator the owner role, so an object that pulp-tui made before a crash passes.
+  Anything else: 409, and the message names each role holder or field. `ops::refuse_foreign`
+  decides; `ops::distribution_target` calls it, so the preview refuses too. Metadata and
+  release signing services are not compared: a publish sets them on a snapshot repository, and
+  operators set them on a replica repository.
+* Known limits: a recorded href skips these checks, so a peer of a shared store who also has a
+  Pulp creator role is not covered: it can make an object and write its href into a row. An
+  unrecorded distribution keeps its base path (`CvService::served_path`), so one made at another
+  path passes when its roles and fields do; the preview names that path.
 * The store is shared: a peer with SQL access can write any href into a row. So before a version
   delete or a promotion acts on a version row, `CvService::unbound` binds it in Pulp: the snapshot
   repository has the view's labels (a composite row: those of its component,
@@ -406,8 +419,11 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
     checks of the run (`ops::distribution_target`): a base path that overlaps another
     distribution, or a replica distribution at another base path, is a conflict too.
   * The store records no replica href, so a labeled remote, repository or distribution is used
-    only when no one but the current Pulp user holds a role on it (`ops::refuse_foreign`, in the
-    dry run and the run). A replica that another operator made is a conflict for you.
+    only when it is as the replication makes it (`ops::refuse_foreign` with the create body,
+    `remote_body` / `repo_body`, in the dry run and the run): no other role holder, no guarded
+    field changed (a proxy, no TLS check, a secret, a retention). A replica that another
+    operator made, or that someone changed, is a conflict. The run does not reset those fields:
+    the operator should see the change, not lose it.
   * A File item without a readable served manifest is skipped (no URL guess).
   * A checkpoint distribution: the remote URL is its newest checkpoint publication at
     `<base>/<timestamp>/` (`ops::served_url`); the bare base path only lists the timestamps.

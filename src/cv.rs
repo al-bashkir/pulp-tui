@@ -1023,18 +1023,18 @@ impl CvService {
     ) -> Result<String> {
         let c = &self.client;
         let coll = c.api(repo.repo_type.repositories());
+        let body = json!({
+            "name": name,
+            "description": format!("Content View {cv} snapshot of {} (managed by pulp-tui)", repo.repo_name),
+            "pulp_labels": { LABEL_CV: slug(cv), LABEL_DB: self.store.db_id() },
+        });
         let Some(r) = ops::find_by_name::<Repository>(c, &coll, name).await? else {
             log(format!("creating derived repository {name}"));
-            let body = json!({
-                "name": name,
-                "description": format!("Content View {cv} snapshot of {} (managed by pulp-tui)", repo.repo_name),
-                "pulp_labels": { LABEL_CV: slug(cv), LABEL_DB: self.store.db_id() },
-            });
             self.alive()?;
             return Ok(ops::create(c, &coll, &body, "/repositories/", on).await?);
         };
         match r.pulp_labels.get(LABEL_CV) {
-            Some(v) if *v == slug(cv) => self.take_derived(name, r, aliases, on).await,
+            Some(v) if *v == slug(cv) => self.take_derived(name, r, &body, aliases, on).await,
             Some(other) => bail!(
                 "repository {name} belongs to content view {other} (label {LABEL_CV}={other}): view {cv} with repository {} \
                  derives the same name; refusing to modify it",
@@ -1045,14 +1045,14 @@ impl CvService {
     }
 
     /// Repository `r` of the derived name `name`, with this view's label: refused when another database owns it or
-    /// pulp-tui cannot show that it made it (`ops::refuse_foreign`); labeled for this database when it has no database
-    /// label (or that of an alias).
-    async fn take_derived(&self, name: &str, r: Repository, aliases: &[String], on: OnTask<'_>) -> Result<String> {
+    /// pulp-tui cannot show that it made it with the create `body` (`ops::refuse_foreign`); labeled for this database
+    /// when it has no database label (or that of an alias).
+    async fn take_derived(&self, name: &str, r: Repository, body: &Value, aliases: &[String], on: OnTask<'_>) -> Result<String> {
         let (c, id) = (&self.client, self.store.db_id());
         let adopt = ops::label_owner(&r.pulp_labels, LABEL_DB, id, aliases)
             .map_err(|o| anyhow!("repository {name} is owned by another pulp-tui database ({o})"))?;
         let recorded = self.store.recorded_hrefs(&self.scope).await?.contains(&r.pulp_href);
-        ops::refuse_foreign(c, &format!("repository {name}"), &r.pulp_href, recorded).await?;
+        ops::refuse_foreign(c, &format!("repository {name}"), &json!(r), body, recorded).await?;
         if adopt {
             let mut labels = r.pulp_labels.clone();
             labels.insert(LABEL_DB.into(), id.into());
@@ -3396,25 +3396,40 @@ mod tests {
     }
 
     /// A snapshot repository of the derived name with the view's labels is reused when this database records it
-    /// (another version of the view made it), or when only this Pulp user (`op`) holds roles on it (made before a
-    /// crash). One that another Pulp user made with the labels, also with a copied database id, is refused before any
-    /// write: Pulp gave that user its owner role, and pulp-tui would fill it with the view's content.
+    /// (another version of the view made it), or when only this Pulp user (`op`) or no one holds roles on it and its
+    /// guarded fields are as pulp-tui makes it (made before a crash). One that another Pulp user made with the labels,
+    /// also with a copied database id, is refused before any write: Pulp gave that user its owner role, and pulp-tui
+    /// would fill it with the view's content. So is one with planted fields (retention, autopublish, a signing
+    /// service), whoever holds roles on it: its maker can hand the owner role to this user, or drop it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_snapshot_repository_that_another_user_made_is_refused() {
         use wiremock::matchers::{method, path, query_param};
         let refused = "conflict [409]: repository pulp-tui-cv-web-os exists, but this database does not record it and user eve \
                        has role rpm.rpmrepository_owner on it: delete it, or remove that role, then try again";
-        // (labeled with this database id, holder of its owner role, recorded by version 1, the refusal)
-        for (copied, holder, recorded, want) in [
-            (false, "eve", false, Some(refused)),
-            (true, "eve", false, Some(refused)),
-            (false, "op", false, None),
-            (true, "bob", true, None),
+        let differs = |fields: &str| {
+            format!(
+                "conflict [409]: repository pulp-tui-cv-web-os exists, but this database does not record it and its {fields}: \
+                 delete it, or set {} back, then try again",
+                if fields.contains(';') { "them" } else { "it" }
+            )
+        };
+        let retained = differs("field differs from a new one (retain_repo_versions is 1, not null)");
+        let two = differs("fields differ from a new one (autopublish is true, not false; package_signing_service is \"/s/1/\", not null)");
+        let new = json!({ "retain_repo_versions": null, "autopublish": false, "metadata_signing_service": null, "repo_config": {} });
+        // (labeled with this database id, holders of its owner role, recorded by version 1, its other fields, the refusal)
+        for (copied, holders, recorded, fields, want) in [
+            (false, vec!["eve"], false, json!({}), Some(refused.to_string())),
+            (true, vec!["eve"], false, json!({}), Some(refused.to_string())),
+            (false, vec!["op"], false, new.clone(), None),
+            (false, vec![], false, new, None),
+            (false, vec!["op"], false, json!({ "retain_repo_versions": 1 }), Some(retained)),
+            (false, vec![], false, json!({ "autopublish": true, "package_signing_service": "/s/1/" }), Some(two)),
+            (true, vec!["bob"], true, json!({ "retain_repo_versions": 1 }), None),
         ] {
             let server = wiremock::MockServer::start().await;
             let svc = mock_service(&server).await;
             serve_json(&server, "/pulp/api/v3/login/", json!({ "pulp_href": "/u/1/", "username": "op" })).await;
-            let roles = json!({ "roles": [{ "role": "rpm.rpmrepository_owner", "users": [holder], "groups": [] }] });
+            let roles = json!({ "roles": [{ "role": "rpm.rpmrepository_owner", "users": holders, "groups": [] }] });
             serve_json(&server, &format!("{DERIVED}list_roles/"), roles).await;
             let cv = svc.store.create_cv("k", "web", "").await.unwrap();
             let src = CvRepo { repo_href: "/r/1/".into(), repo_name: "os".into(), repo_type: RepoType::Rpm, filters: vec![] };
@@ -3430,7 +3445,8 @@ mod tests {
             if copied {
                 labels[LABEL_DB] = svc.store.db_id().into();
             }
-            let found = json!({ "pulp_href": DERIVED, "name": "pulp-tui-cv-web-os", "pulp_labels": labels });
+            let mut found = json!({ "pulp_href": DERIVED, "name": "pulp-tui-cv-web-os", "pulp_labels": labels });
+            found.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
             wiremock::Mock::given(method("GET"))
                 .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
                 .and(query_param("name", "pulp-tui-cv-web-os"))
@@ -3442,7 +3458,7 @@ mod tests {
             let res = svc.derived_repo("web", &mut vr, &|_| {}, &ops::no_progress).await;
             assert_none(&server, "POST").await;
             let Some(want) = want else {
-                assert_eq!(res.unwrap(), DERIVED, "{holder}");
+                assert_eq!(res.unwrap(), DERIVED, "{holders:?} {fields}");
                 let saved = svc.store.version_repos(v.id).await.unwrap().remove(0).derived_repo;
                 assert_eq!(saved.as_deref(), Some(DERIVED), "recorded");
                 let sent = server.received_requests().await.unwrap();

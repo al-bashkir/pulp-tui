@@ -388,14 +388,13 @@ pub async fn ensure_distribution(
     if let Some((key, id, ..)) = db {
         labels[key] = id.into();
     }
-    create(
-        c,
-        &c.api(t.distributions()),
-        &json!({ "name": name, "base_path": base_path, "publication": publication, "pulp_labels": labels }),
-        "/distributions/",
-        on,
-    )
-    .await
+    create(c, &c.api(t.distributions()), &distribution_body(name, base_path, publication, &labels), "/distributions/", on).await
+}
+
+/// The create body of a distribution in `ensure_distribution`; `distribution_target` compares an unrecorded one with it
+/// (`refuse_foreign`).
+fn distribution_body(name: &str, base_path: &str, publication: Option<&str>, labels: &Value) -> Value {
+    json!({ "name": name, "base_path": base_path, "publication": publication, "pulp_labels": labels })
 }
 
 /// The PATCH of `ensure_distribution` for the existing distribution `d`: serve `publication` (only), and `adopt` (label
@@ -434,10 +433,11 @@ pub async fn distribution_target(
     labels: &Value,
     db: Option<(&str, &str, &[String], &[String])>,
 ) -> Result<Option<Distribution>> {
-    let Some(d) = find_by_name::<Distribution>(c, &c.api(t.distributions()), name).await? else {
+    let Some(v) = find_by_name::<Value>(c, &c.api(t.distributions()), name).await? else {
         refuse_overlap(c, base_path).await?;
         return Ok(None);
     };
+    let d: Distribution = serde_json::from_value(v.clone()).map_err(|e| PulpError::Decode(format!("distribution {name}: {e}")))?;
     if d.base_path != base_path {
         return Err(PulpError::Api { status: 409, message: format!("distribution {name} serves {} instead of {base_path}", d.base_path) });
     }
@@ -445,38 +445,104 @@ pub async fn distribution_target(
     refuse_checkpoint(name, d.checkpoint)?;
     if labels.as_object().is_some_and(|l| !l.is_empty()) {
         let recorded = db.is_some_and(|(.., hrefs)| hrefs.contains(&d.pulp_href));
-        refuse_foreign(c, &format!("distribution {name}"), &d.pulp_href, recorded).await?;
+        refuse_foreign(c, &format!("distribution {name}"), &v, &distribution_body(name, base_path, None, labels), recorded).await?;
     }
     Ok(Some(d))
 }
 
-/// Refuses (409) to take over `what` (`distribution d`) at `href`, which pulp-tui found by its name, unless this
-/// database records it (`recorded`) or no one but the current Pulp user holds an object role on it
-/// (`{href}list_roles/`). Labels do not prove that pulp-tui made it: any user who may create the object may set them,
-/// and Pulp gives that user the owner role. An object that pulp-tui made before a crash has only its own user. A group
-/// role, or roles that this user may not read, do not prove it either.
-pub async fn refuse_foreign(c: &PulpClient, what: &str, href: &str, recorded: bool) -> Result<()> {
+/// The fields of a repository, remote or distribution that decide where its content comes from, how it is trusted or
+/// signed, who may download it, or which versions it keeps, each with the value that pulpcore 3.123.1 gives it when a
+/// create request leaves it out (read back from new RPM, File and Deb objects). pulp-tui's create bodies set none of
+/// them except a replica repository's `remote`. A field that an object lacks (another type, an older server) is not
+/// compared. Secrets are not readable: `hidden_fields` says which are set. Not the metadata and release signing
+/// services: a publish sets them on a snapshot repository (`CvService::copy_settings`), and operators set them on a
+/// replica repository (USER_GUIDE "Replication").
+fn guarded() -> [(&'static str, Value); 16] {
+    let (null, empty) = (Value::Null, json!({}));
+    [
+        ("content_guard", null.clone()),
+        ("remote", null.clone()),
+        ("retain_repo_versions", null.clone()),
+        ("autopublish", false.into()),
+        ("retain_package_versions", 0.into()),
+        ("package_signing_service", null.clone()),
+        ("package_signing_fingerprint", null.clone()),
+        ("package_signing_fingerprint_release_overrides", empty.clone()),
+        ("repo_config", empty),
+        ("tls_validation", true.into()),
+        ("ca_cert", null.clone()),
+        ("client_cert", null.clone()),
+        ("proxy_url", null.clone()),
+        ("headers", null.clone()),
+        ("sles_auth_token", null.clone()),
+        ("gpgkey", null),
+    ]
+}
+
+/// The guarded fields (`guarded`) of `obj`, as Pulp shows it, that differ from a new one made with the create `body`
+/// (a field in `body`, else Pulp's default): `retain_repo_versions is 1, not null`. Pulp's default is fine also where
+/// `body` sets the field (a replica repository whose remote was deleted has none). Null, `""`, `[]` and `{}` count as
+/// the same (unset). A set secret counts too (`password is set`): pulp-tui sets none.
+fn planted(obj: &Value, body: &Value) -> Vec<String> {
+    let unset =
+        |v: &Value| v.is_null() || v == "" || v.as_array().is_some_and(Vec::is_empty) || v.as_object().is_some_and(|o| o.is_empty());
+    let same = |a: &Value, b: &Value| a == b || (unset(a) && unset(b));
+    let mut out: Vec<String> = guarded()
+        .into_iter()
+        .filter_map(|(k, default)| {
+            let (have, want) = (obj.get(k)?, body.get(k).unwrap_or(&default));
+            (!same(have, want) && !same(have, &default)).then(|| format!("{k} is {have}, not {want}"))
+        })
+        .collect();
+    let secrets = obj["hidden_fields"].as_array().into_iter().flatten().filter(|h| h["is_set"] == true);
+    out.extend(secrets.filter_map(|h| h["name"].as_str()).filter(|n| body.get(n).is_none()).map(|n| format!("{n} is set")));
+    out
+}
+
+/// Refuses (409) to take over `what` (`distribution d`), the object `obj` that pulp-tui found by its name (as Pulp
+/// shows it), unless this database records it (`recorded`), or it is as pulp-tui makes it with the create `body`: no
+/// one but the current Pulp user holds an object role on it (`{href}list_roles/`; none at all is fine), and no guarded
+/// field differs from a new one (`planted`). Labels do not prove that pulp-tui made it: any user who may create the
+/// object may set them, and Pulp gives that user the owner role. Roles do not prove it either: that user may hand the
+/// owner role to this user and drop its own. A group role, or roles that this user may not read, are refused too. An
+/// object that pulp-tui made before a crash passes.
+pub async fn refuse_foreign(c: &PulpClient, what: &str, obj: &Value, body: &Value, recorded: bool) -> Result<()> {
     if recorded {
         return Ok(());
     }
-    let refuse = |why: String, fix: &str| PulpError::Api {
-        status: 409,
-        message: format!("{what} exists, but this database does not record it and {why}: delete it, or {fix}, then try again"),
+    let why = match role_refusal(c, obj["pulp_href"].as_str().unwrap_or_default()).await? {
+        None => field_refusal(obj, body),
+        roles => roles,
     };
+    let Some((why, fix)) = why else { return Ok(()) };
+    let message = format!("{what} exists, but this database does not record it and {why}: delete it, or {fix}, then try again");
+    Err(PulpError::Api { status: 409, message })
+}
+
+/// Why the object roles of the object at `href` do not show that pulp-tui made it (`refuse_foreign`), and what to do: a
+/// role of another principal (`foreign_roles`), or roles that this user may not read.
+async fn role_refusal(c: &PulpClient, href: &str) -> Result<Option<(String, &'static str)>> {
     let roles: Value = match c.get(&format!("{href}list_roles/"), &[]).await {
         Ok(v) => v,
         Err(e) if matches!(e.status(), Some(403 | 404)) => {
-            return Err(refuse(format!("its roles cannot be read ({e})"), "let this Pulp user read its roles"));
+            return Ok(Some((format!("its roles cannot be read ({e})"), "let this Pulp user read its roles")));
         }
         Err(e) => return Err(e),
     };
     // pulpcore 3.63 has no `login/`; without permission to read users, the Basic-auth user is the one Pulp accepted.
     let me = super::caps::current_user(c).await?.map(|u| u.username).or_else(|| c.username().map(String::from));
     let held = foreign_roles(&roles, me.as_deref());
-    if held.is_empty() {
-        return Ok(());
+    Ok((!held.is_empty())
+        .then(|| (format!("{} on it", held.join(", ")), if held.len() == 1 { "remove that role" } else { "remove those roles" })))
+}
+
+/// Why the guarded fields of `obj` do not show that pulp-tui made it with `body` (`planted`), and what to do.
+fn field_refusal(obj: &Value, body: &Value) -> Option<(String, &'static str)> {
+    match planted(obj, body).as_slice() {
+        [] => None,
+        [one] => Some((format!("its field differs from a new one ({one})"), "set it back")),
+        all => Some((format!("its fields differ from a new one ({})", all.join("; ")), "set them back")),
     }
-    Err(refuse(format!("{} on it", held.join(", ")), if held.len() == 1 { "remove that role" } else { "remove those roles" }))
 }
 
 /// The object roles in a `list_roles/` answer that a principal other than user `me` holds: `user eve has role
@@ -1079,6 +1145,30 @@ mod tests {
         assert_eq!(foreign_roles(&two, Some("me")), ["user eve has role x.owner", "group devs has role x.viewer"]);
         let mine = roles(json!([owner(json!(["me"]), json!([]))]));
         assert_eq!(foreign_roles(&mine, None), ["user me has role x.owner"], "an unknown current user proves nothing");
+    }
+
+    /// The guarded fields of an object compare with a new one made with the create body: the body's value, else Pulp's
+    /// default. Pulp's own answer for a new remote (pulpcore 3.123.1) has nothing planted.
+    #[test]
+    fn planted_fields_are_the_guarded_ones_that_differ_from_a_new_object() {
+        let new_remote = json!({ "url": "http://up/", "policy": "immediate", "tls_validation": true, "ca_cert": null,
+            "client_cert": null, "proxy_url": null, "headers": null, "sles_auth_token": null, "download_concurrency": null,
+            "hidden_fields": [{ "name": "client_key", "is_set": false }, { "name": "password", "is_set": false }] });
+        let body = json!({ "url": "http://other/", "name": "os" });
+        assert!(planted(&new_remote, &body).is_empty(), "not guarded: url, policy, download_concurrency");
+        let mut r = new_remote.clone();
+        (r["tls_validation"], r["headers"], r["download_concurrency"]) = (false.into(), json!([{ "X": "1" }]), 9.into());
+        r["hidden_fields"][1]["is_set"] = true.into();
+        assert_eq!(planted(&r, &body), ["tls_validation is false, not true", r#"headers is [{"X":"1"}], not null"#, "password is set"]);
+        r["headers"] = json!([]);
+        assert_eq!(planted(&r, &body).len(), 2, "an empty list is unset");
+        // A replica repository names its remote: the body's value is wanted, not Pulp's default.
+        let repo = json!({ "remote": "/r/1/", "retain_repo_versions": null, "repo_config": {}, "package_signing_fingerprint": "" });
+        assert!(planted(&repo, &json!({ "remote": "/r/1/" })).is_empty());
+        assert_eq!(planted(&repo, &json!({})), [r#"remote is "/r/1/", not null"#]);
+        assert_eq!(planted(&repo, &json!({ "remote": "/r/2/" })), [r#"remote is "/r/1/", not "/r/2/""#]);
+        assert!(planted(&json!({ "remote": null }), &json!({ "remote": "/r/2/" })).is_empty(), "Pulp's default is fine");
+        assert!(planted(&json!({}), &json!({})).is_empty(), "a field the server lacks is not compared");
     }
 
     #[test]

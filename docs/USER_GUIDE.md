@@ -868,6 +868,11 @@ Native Upstream Pulp objects (tech preview).
     role on is a conflict too: `... exists, but this database does not record it and user eve has
     role ... on it`. This includes a replica that another operator made: that operator runs it
     again, or removes the role.
+  * So is one with a field that the replication does not set: a proxy, `tls_validation` off, a CA
+    or client certificate, headers, a user name or password, a Deb `gpgkey`, a content guard, a
+    retention, autopublish or package signing (`... its field differs from a new one (...)`).
+    The run does not reset such a field: set it back, or delete the object. A signing service on
+    the replica repository is allowed (see above).
   * It does not follow an upstream base path change: the dry run row is a conflict
     (`... serves <old> instead of <new>`). Delete or move the replica distribution by hand.
 
@@ -1276,10 +1281,13 @@ carry it as the label `pulp_tui_db=<id>`.
   `... is not labeled pulp_tui_env=Dev`. Delete and unpromote keep such an object.
 * Labels do not prove that pulp-tui made an object: any user who may create it may set them,
   also a copied ID. When publish or promote finds a snapshot repository or distribution by its
-  name, and the database does not record it, pulp-tui uses it only when no one but your Pulp user
-  has a role on it (Pulp gives the creator the owner role, so an object that pulp-tui made before a
-  crash passes). Otherwise the step and its preview refuse it:
-  `distribution ... exists, but this database does not record it and user eve has role rpm.rpmdistribution_owner on it: delete it, or remove that role, then try again`.
+  name, and the database does not record it, pulp-tui uses it only when it is as pulp-tui makes
+  it: no one but your Pulp user has a role on it (Pulp gives the creator the owner role), and its
+  guarded fields are those of a new one (no content guard, default remote, retention,
+  autopublish or package signing). An object that pulp-tui made before a crash passes. Otherwise
+  the step and its preview refuse it:
+  `distribution ... exists, but this database does not record it and user eve has role rpm.rpmdistribution_owner on it: delete it, or remove that role, then try again`,
+  or `... and its field differs from a new one (content_guard is "...", not null): delete it, or set it back, then try again`.
   A group role is refused too, and so are roles that your user cannot read.
 * Two views can derive the same snapshot repository name: view `a-b` with repository `c` and view
   `a` with repository `b-c` both give `pulp-tui-cv-a-b-c`. The second view is refused with

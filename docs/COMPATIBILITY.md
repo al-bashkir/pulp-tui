@@ -649,6 +649,21 @@ Read in pulpcore 3.123.1 (`RolesMixin` in `app/viewsets/base.py`, `NestedRoleSer
   has it). `ops::refuse_foreign` reads it to tell an object that pulp-tui made (only the
   current user holds a role) from one that another user made with the same name and labels
   (`live_rbac` `a_promotion_refuses_a_distribution_that_another_user_made_with_the_labels`).
+* **Roles do not prove the maker** (live, 3.123.1, same test). The owner role has
+  `manage_roles`, so the creator can `add_role/` the owner role for another user (the operator)
+  and `remove_role/` its own. As owner it can also PATCH `content_guard` to a guard that it has
+  no role on (no permission on the guard is checked).
+* **Defaults of the guarded fields** (`ops::guarded`), read back from new RPM, File and Deb
+  objects on 3.123.1: distribution `content_guard` null (no `remote` on these types);
+  repository `remote` null, `retain_repo_versions` null, `autopublish` false, RPM
+  `retain_package_versions` 0, `package_signing_service` and `package_signing_fingerprint` null,
+  `repo_config` `{}`, Deb `package_signing_fingerprint_release_overrides` `{}`; remote
+  `tls_validation` true, `ca_cert`, `client_cert`, `proxy_url`, `headers`, RPM
+  `sles_auth_token`, Deb `gpgkey` null, and `hidden_fields` (`client_key`, `proxy_username`,
+  `proxy_password`, `username`, `password`) not set. The models of 3.63.36 and 3.95.3 have the
+  same defaults; there the serializer default of `package_signing_fingerprint` is `""` (3.95.3)
+  and Deb has no `package_signing_fingerprint_release_overrides`. pulp-tui treats null, `""`,
+  `[]` and `{}` as the same and compares only the fields that an object has.
 
 ### Domains
 

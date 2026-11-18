@@ -189,7 +189,7 @@ pub async fn plan(
             };
             let repo = ops::find_by_name::<Repository>(dst, &dst.api(t.repositories()), &d.name).await?;
             let remote = ops::find_by_name::<Value>(dst, &dst.api(t.remotes()), &d.name).await?;
-            if let Some(why) = conflict(dst, t, &d, src_name, repo.as_ref(), remote.as_ref()).await? {
+            if let Some(why) = conflict(dst, &it, src_name, repo.as_ref(), remote.as_ref()).await? {
                 it.note = format!("conflict: {why}");
             } else if repo.is_some() {
                 it.action = PlanAction::Update;
@@ -215,32 +215,31 @@ pub async fn plan(
     Ok(out)
 }
 
-/// Why the run stops for the replica of upstream distribution `d` (type `t`) on `dst`, before it changes anything: a
-/// local `repo` or `remote` of that name without the label of `src` or that another Pulp user made
+/// Why the run stops for the replica `it` on `dst`, before it changes anything: a local `repo` or `remote` of its name
+/// without the label of `src`, or that pulp-tui cannot show it made with the create body of the run
 /// (`ops::refuse_foreign`, as in `replica_repo` and `replica_remote`), or the refusal of the distribution step
-/// (`ops::distribution_target`, as in `ops::ensure_distribution`: labels, base path, checkpoint, roles, and a base path
-/// that overlaps another one for a new distribution). `None`: the run can make or update the replica.
-async fn conflict(
-    dst: &PulpClient,
-    t: RepoType,
-    d: &Distribution,
-    src: &str,
-    repo: Option<&Repository>,
-    remote: Option<&Value>,
-) -> Result<Option<String>> {
+/// (`ops::distribution_target`, as in `ops::ensure_distribution`: labels, base path, checkpoint, roles and fields, and
+/// a base path that overlaps another one for a new distribution). `None`: the run can make or update the replica.
+async fn conflict(dst: &PulpClient, it: &PlanItem, src: &str, repo: Option<&Repository>, remote: Option<&Value>) -> Result<Option<String>> {
     let foreign = [
         repo.filter(|r| !owned(&r.pulp_labels, src)).map(|_| "repository"),
         remote.filter(|r| !owned(&labels_of(r), src)).map(|_| "remote"),
     ];
     if let Some(kind) = foreign.into_iter().flatten().next() {
-        return Ok(Some(format!("a local {kind} named {} exists and is not managed by this replication", d.name)));
+        return Ok(Some(format!("a local {kind} named {} exists and is not managed by this replication", it.name)));
     }
-    let found = [("repository", repo.map(|r| r.pulp_href.as_str())), ("remote", remote.and_then(|r| r["pulp_href"].as_str()))];
+    let labels = json!({ LABEL_REPLICA: src });
+    // Without a remote, the run makes one first; a repository without a default remote is fine (`ops::refuse_foreign`).
+    let remote_href = remote.and_then(|r| r["pulp_href"].as_str()).unwrap_or_default();
+    let found = [
+        ("repository", repo.map(|r| json!(r)), repo_body(it, remote_href, &labels)),
+        ("remote", remote.cloned(), remote_body(it, &labels)),
+    ];
     let checks = async {
-        for (kind, href) in found.into_iter().filter_map(|(k, h)| h.map(|h| (k, h))) {
-            ops::refuse_foreign(dst, &format!("{kind} {}", d.name), href, false).await?;
+        for (kind, obj, body) in found.into_iter().filter_map(|(k, o, b)| o.map(|o| (k, o, b))) {
+            ops::refuse_foreign(dst, &format!("{kind} {}", it.name), &obj, &body, false).await?;
         }
-        ops::distribution_target(dst, t, &d.name, &d.base_path, &json!({ LABEL_REPLICA: src }), None).await
+        ops::distribution_target(dst, it.t, &it.name, &it.base_path, &labels, None).await
     };
     match checks.await {
         Ok(_) => Ok(None),
@@ -351,58 +350,75 @@ async fn serve_replica(c: &PulpClient, it: &PlanItem, version: &str, labels: &Va
 
 /// The replica `kind` (remote, repository) of `it` in `collection`, with its href, when there is one. Checked again at
 /// run time (an object with the name of `it` may have been created since the dry run): refused without the label of
-/// `src`, or when another Pulp user made it (`ops::refuse_foreign`; replicas are not recorded).
-async fn own_replica(c: &PulpClient, collection: &str, kind: &str, src: &str, it: &PlanItem) -> Result<Option<(String, Value)>> {
+/// `src`, or when pulp-tui cannot show that it made it with the create `body` (`ops::refuse_foreign`; replicas are not
+/// recorded).
+async fn own_replica(
+    c: &PulpClient,
+    (collection, kind): (&str, &str),
+    src: &str,
+    it: &PlanItem,
+    body: &Value,
+) -> Result<Option<(String, Value)>> {
     let Some(r) = ops::find_by_name::<Value>(c, &c.api(collection), &it.name).await? else { return Ok(None) };
     if !owned(&labels_of(&r), src) {
         bail!("a local {kind} named {} exists and is not managed by this replication", it.name);
     }
-    let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
-    ops::refuse_foreign(c, &format!("{kind} {}", it.name), &h, false).await?;
-    Ok(Some((h, r)))
+    ops::refuse_foreign(c, &format!("{kind} {}", it.name), &r, body, false).await?;
+    Ok(Some((r["pulp_href"].as_str().unwrap_or_default().to_string(), r)))
 }
 
-/// The replica remote of `it`, pointed at the upstream URL (Deb: and at the dists that upstream serves).
-async fn replica_remote(c: &PulpClient, src_profile: &str, it: &PlanItem, labels: &Value, on: OnTask<'_>) -> Result<String> {
+/// The fields of the replica remote of `it` that every run keeps in step with upstream: its URL (Deb: and the dists
+/// that upstream serves).
+fn remote_fields(it: &PlanItem) -> Value {
     let mut want = json!({ "url": it.remote_url });
     if let Some(d) = &it.distributions {
         want["distributions"] = d.as_str().into();
     }
-    match own_replica(c, it.t.remotes(), "remote", src_profile, it).await? {
+    want
+}
+
+/// The create body of the replica remote of `it`: `remote_fields`, its name, the `immediate` policy and `labels`.
+fn remote_body(it: &PlanItem, labels: &Value) -> Value {
+    let mut body = remote_fields(it);
+    (body["name"], body["policy"], body["pulp_labels"]) = (it.name.as_str().into(), "immediate".into(), labels.clone());
+    body
+}
+
+/// The create body of the replica repository of `it`, with `remote` as its default remote. File: it publishes under the
+/// manifest name that upstream serves (`ensure_publication` reuses only a publication with the repository's name).
+fn repo_body(it: &PlanItem, remote: &str, labels: &Value) -> Value {
+    let mut body = json!({ "name": it.name, "remote": remote, "pulp_labels": labels });
+    if let Some(m) = &it.manifest {
+        body["manifest"] = m.as_str().into();
+    }
+    body
+}
+
+/// The replica remote of `it`, pointed at the upstream URL (`remote_fields`).
+async fn replica_remote(c: &PulpClient, src_profile: &str, it: &PlanItem, labels: &Value, on: OnTask<'_>) -> Result<String> {
+    let (want, body) = (remote_fields(it), remote_body(it, labels));
+    match own_replica(c, (it.t.remotes(), "remote"), src_profile, it, &body).await? {
         Some((h, r)) => {
             if want.as_object().into_iter().flatten().any(|(k, v)| r[k] != *v) {
                 ops::settle(c, c.patch(&h, &want).await?, on).await?;
             }
             Ok(h)
         }
-        None => {
-            let mut body = want;
-            body["name"] = it.name.as_str().into();
-            body["policy"] = "immediate".into();
-            body["pulp_labels"] = labels.clone();
-            Ok(ops::create(c, &c.api(it.t.remotes()), &body, "/remotes/", on).await?)
-        }
+        None => Ok(ops::create(c, &c.api(it.t.remotes()), &body, "/remotes/", on).await?),
     }
 }
 
-/// The replica repository of `it`. File: it publishes under the manifest name that upstream serves
-/// (`ensure_publication` reuses only a publication with the repository's name).
+/// The replica repository of `it` (`repo_body`), with the manifest name that upstream serves.
 async fn replica_repo(c: &PulpClient, src_profile: &str, it: &PlanItem, remote: &str, labels: &Value, on: OnTask<'_>) -> Result<String> {
-    let manifest = it.manifest.as_ref().map(|m| json!({ "manifest": m }));
-    match own_replica(c, it.t.repositories(), "repository", src_profile, it).await? {
+    let body = repo_body(it, remote, labels);
+    match own_replica(c, (it.t.repositories(), "repository"), src_profile, it, &body).await? {
         Some((h, r)) => {
-            if let Some(m) = manifest.filter(|m| r["manifest"] != m["manifest"]) {
+            if let Some(m) = it.manifest.as_ref().map(|m| json!({ "manifest": m })).filter(|m| r["manifest"] != m["manifest"]) {
                 ops::settle(c, c.patch(&h, &m).await?, on).await?;
             }
             Ok(h)
         }
-        None => {
-            let mut body = json!({ "name": it.name, "remote": remote, "pulp_labels": labels });
-            if let Some(m) = &it.manifest {
-                body["manifest"] = m.as_str().into();
-            }
-            Ok(ops::create(c, &c.api(it.t.repositories()), &body, "/repositories/", on).await?)
-        }
+        None => Ok(ops::create(c, &c.api(it.t.repositories()), &body, "/repositories/", on).await?),
     }
 }
 
@@ -450,22 +466,64 @@ mod tests {
     }
 
     /// Another Pulp user made the remote or the repository of the replica with the replica label (before the first
-    /// run): Pulp gave that user the owner role of it, so the run refuses it before any change. The remote that this Pulp
-    /// user (`op`) made is used.
+    /// run): Pulp gave that user the owner role of it, so the run refuses it before any change. Roles alone do not prove
+    /// who made it (its maker can hand the owner role to this user, or drop it), so a remote or repository with fields
+    /// that the replication does not set (a proxy, no TLS check, a secret, another default remote, a retention) is
+    /// refused too, whoever holds roles on it.
     #[tokio::test]
     async fn run_refuses_a_replica_remote_or_repository_that_another_user_made() {
         use wiremock::matchers::{method, path};
         let get = |p: &str| wiremock::Mock::given(method("GET")).and(path(format!("/pulp/api/v3/{p}")));
         let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
-        for (remote_by, repo_by, kind, refused) in [("eve", "op", "remote", "remotes"), ("op", "eve", "repository", "repositories")] {
+        let role = |kind: &str, coll: &str| {
+            format!(
+                "{kind} os exists, but this database does not record it and user eve has role {coll}_owner on it: delete it, or remove that role"
+            )
+        };
+        let fields = |kind: &str, n: &str, list: &str| {
+            let fix = if n == "s" { "them" } else { "it" };
+            format!(
+                "{kind} os exists, but this database does not record it and its field{n} differ{} from a new one ({list}): delete it, or set {fix} back",
+                if n == "s" { "" } else { "s" }
+            )
+        };
+        let (none, mine) = (json!({}), vec!["op"]);
+        let proxy = json!({ "tls_validation": false, "proxy_url": "http://evil:3128", "ca_cert": null });
+        let secret = json!({ "hidden_fields": [{ "name": "username", "is_set": false }, { "name": "password", "is_set": true }] });
+        let other = json!({ "remote": "/pulp/api/v3/remotes/rpm/rpm/9/", "retain_repo_versions": 2, "autopublish": false });
+        // (remote: holders, other fields; repository: holders, other fields; the refusal)
+        for (remote_by, remote_has, repo_by, repo_has, want) in [
+            (vec!["eve"], &none, mine.clone(), &none, role("remote", "remotes")),
+            (mine.clone(), &none, vec!["eve"], &none, role("repository", "repositories")),
+            (
+                mine.clone(),
+                &proxy,
+                mine.clone(),
+                &none,
+                fields("remote", "s", "tls_validation is false, not true; proxy_url is \"http://evil:3128\", not null"),
+            ),
+            (vec![], &secret, mine.clone(), &none, fields("remote", "", "password is set")),
+            (
+                vec![],
+                &none,
+                vec![],
+                &other,
+                fields(
+                    "repository",
+                    "s",
+                    "remote is \"/pulp/api/v3/remotes/rpm/rpm/9/\", not \"/pulp/api/v3/remotes/rpm/rpm/1/\"; retain_repo_versions is 2, not null",
+                ),
+            ),
+        ] {
             let server = wiremock::MockServer::start().await;
             let c = client(&server, "dst");
             get("login/").respond_with(ok(json!({ "username": "op" }))).mount(&server).await;
-            for (coll, by) in [("remotes", remote_by), ("repositories", repo_by)] {
-                let o = json!({ "pulp_href": format!("/pulp/api/v3/{coll}/rpm/rpm/1/"), "name": "os", "url": "https://up/os/",
+            for (coll, by, has) in [("remotes", remote_by, remote_has), ("repositories", repo_by, repo_has)] {
+                let mut o = json!({ "pulp_href": format!("/pulp/api/v3/{coll}/rpm/rpm/1/"), "name": "os", "url": "https://up/os/",
                     "pulp_labels": { LABEL_REPLICA: "up" } });
+                o.as_object_mut().unwrap().extend(has.as_object().unwrap().clone());
                 get(&format!("{coll}/rpm/rpm/")).respond_with(ok(json!({ "count": 1, "next": null, "results": [o] }))).mount(&server).await;
-                let roles = json!({ "roles": [{ "role": format!("{coll}_owner"), "users": [by], "groups": [] }] });
+                let roles = json!({ "roles": [{ "role": format!("{coll}_owner"), "users": by, "groups": [] }] });
                 get(&format!("{coll}/rpm/rpm/1/list_roles/")).respond_with(ok(roles)).mount(&server).await;
             }
             let it = PlanItem {
@@ -480,11 +538,7 @@ mod tests {
                 note: String::new(),
             };
             let e = replicate_one(&c, "up", &it, true, &ops::no_progress).await.unwrap_err();
-            let want = format!(
-                "conflict [409]: {kind} os exists, but this database does not record it and user eve has role {refused}_owner on it: \
-                 delete it, or remove that role, then try again"
-            );
-            assert_eq!(e.to_string(), want);
+            assert_eq!(e.to_string(), format!("conflict [409]: {want}, then try again"));
             let sent = server.received_requests().await.unwrap();
             assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed: {sent:?}");
         }
@@ -1002,8 +1056,8 @@ mod tests {
 
     /// The dry run says why the run stops for a replica, with the checks of the run (F57): a local repository or remote
     /// of the name without the replica label, a distribution of the name without it, one with it that another Pulp user
-    /// made (it holds the owner role), and a new distribution whose base path overlaps another one. The replica of this
-    /// source that this Pulp user (`op`) made is updated.
+    /// made (it holds the owner role) or with a field that the replication does not set, and a new distribution whose
+    /// base path overlaps another one. The replica of this source that this Pulp user (`op`) made is updated.
     #[tokio::test]
     async fn the_dry_run_names_what_stops_the_run_for_a_replica() {
         use wiremock::Mock;
@@ -1017,27 +1071,34 @@ mod tests {
             json!({ "pulp_href": format!("/pulp/api/v3/distributions/rpm/rpm/{name}/"), "name": name, "base_path": name,
                 "base_url": format!("https://up/pulp/content/{name}/"), "publication": "/pulp/api/v3/publications/rpm/rpm/1/" })
         };
-        let names = ["dsquat", "mine", "over", "remote", "repo", "squat", "taken"];
+        let names = ["dsquat", "mine", "over", "planted", "remote", "repo", "squat", "taken"];
         let dists = Value::Array(names.map(dist).to_vec());
         Mock::given(method("GET")).and(path("/pulp/api/v3/distributions/rpm/rpm/")).respond_with(ok(page(dists))).mount(&up).await;
         let ours = json!({ LABEL_REPLICA: "up" });
-        // (collection, name, labels, the user that holds its owner role): what the destination has of that name.
+        let (new, by_remote) = (json!({}), |name: &str| json!({ "remote": format!("/pulp/api/v3/remotes/rpm/rpm/{name}/") }));
+        let (mine, planted) = (by_remote("mine"), by_remote("planted"));
+        let no_tls = json!({ "tls_validation": false });
+        // (collection, name, labels, the user that holds its owner role, its other fields): what the destination has of that
+        // name. A repository made by the replication has its remote as the default remote.
         let local = [
-            ("repositories", "mine", ours.clone(), "op"),
-            ("remotes", "mine", ours.clone(), "op"),
-            ("distributions", "mine", ours.clone(), "op"),
-            ("remotes", "remote", json!({}), "op"),
-            ("repositories", "repo", json!({}), "op"),
-            ("repositories", "squat", ours.clone(), "eve"),
-            ("remotes", "squat", ours.clone(), "eve"),
-            ("distributions", "squat", ours.clone(), "eve"),
-            ("distributions", "dsquat", ours, "eve"),
-            ("distributions", "taken", json!({ "team": "x" }), "op"),
+            ("repositories", "mine", ours.clone(), "op", &mine),
+            ("remotes", "mine", ours.clone(), "op", &new),
+            ("distributions", "mine", ours.clone(), "op", &new),
+            ("repositories", "planted", ours.clone(), "op", &planted),
+            ("remotes", "planted", ours.clone(), "op", &no_tls),
+            ("remotes", "remote", json!({}), "op", &new),
+            ("repositories", "repo", json!({}), "op", &new),
+            ("repositories", "squat", ours.clone(), "eve", &new),
+            ("remotes", "squat", ours.clone(), "eve", &new),
+            ("distributions", "squat", ours.clone(), "eve", &new),
+            ("distributions", "dsquat", ours, "eve", &new),
+            ("distributions", "taken", json!({ "team": "x" }), "op", &new),
         ];
         let get = |p: String| Mock::given(method("GET")).and(path(p));
-        for (coll, name, labels, holder) in local {
+        for (coll, name, labels, holder, fields) in local {
             let href = format!("/pulp/api/v3/{coll}/rpm/rpm/{name}/");
-            let o = json!({ "pulp_href": href, "name": name, "base_path": name, "pulp_labels": labels });
+            let mut o = json!({ "pulp_href": href, "name": name, "base_path": name, "pulp_labels": labels });
+            o.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
             let m = get(format!("/pulp/api/v3/{coll}/rpm/rpm/")).and(query_param("name", name));
             m.respond_with(ok(page(json!([o])))).with_priority(1).mount(&down).await;
             let roles = json!({ "roles": [{ "role": format!("{coll}_owner"), "users": [holder], "groups": [] }] });
@@ -1060,12 +1121,15 @@ mod tests {
                  delete it, or remove that role, then try again"
             )
         };
+        let no_tls_note = "conflict: remote planted exists, but this database does not record it and its field differs from a \
+                           new one (tls_validation is false, not true): delete it, or set it back, then try again";
         assert_eq!(
             rows,
             [
                 ("dsquat", &PlanAction::Skip, squat("distribution dsquat", "distributions").as_str()),
                 ("mine", &PlanAction::Update, "re-sync existing replica"),
                 ("over", &PlanAction::Skip, "conflict: base path over overlaps base path over/x of distribution local"),
+                ("planted", &PlanAction::Skip, no_tls_note),
                 ("remote", &PlanAction::Skip, foreign("remote", "remote").as_str()),
                 ("repo", &PlanAction::Skip, foreign("repository", "repo").as_str()),
                 ("squat", &PlanAction::Skip, squat("repository squat", "repositories").as_str()),

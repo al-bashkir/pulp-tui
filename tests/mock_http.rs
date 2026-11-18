@@ -514,10 +514,37 @@ async fn a_distribution_that_another_user_made_with_the_labels_is_refused() {
     }
 }
 
+/// Roles do not prove who made a distribution: its maker can give the owner role to this user and drop its own, or
+/// drop all roles. An unrecorded distribution whose guarded fields are not what pulp-tui sets when it creates one (here
+/// a content guard: who may download) is refused before any write, whoever holds roles on it.
+#[tokio::test]
+async fn an_unrecorded_distribution_with_a_planted_field_is_refused_whoever_holds_roles() {
+    let planted = "distribution d exists, but this database does not record it and its field differs from a new one \
+                   (content_guard is \"/pulp/api/v3/contentguards/core/rbac/7/\", not null): delete it, or set it back, then \
+                   try again";
+    for roles in [json!([]), owned_by("admin")] {
+        let server = MockServer::start().await;
+        let mut d = dist(json!({ "pulp_tui_cv": "web" }));
+        d["content_guard"] = format!("{API}contentguards/core/rbac/7/").into();
+        serve_dist(&server, d).await;
+        serve_roles(&server, &format!("{API}distributions/rpm/rpm/1/"), roles.clone()).await;
+        Mock::given(method("PATCH")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        let c = client(&server, |_, _| {});
+        let (labels, pubn) = (json!({ "pulp_tui_cv": "web" }), format!("{API}publications/rpm/rpm/2/"));
+        let db = Some(("pulp_tui_db", "me", &[][..], &[][..]));
+        let err = ops::ensure_distribution(&c, RepoType::Rpm, "d", "bp", Some(&pubn), &labels, db, &no_progress).await.unwrap_err();
+        assert!(matches!(&err, PulpError::Api { status: 409, message } if message == planted), "{roles}: {err}");
+        server.verify().await;
+    }
+}
+
 #[tokio::test]
 async fn distribution_without_database_label_is_adopted_even_when_the_publication_is_right() {
     let server = MockServer::start().await;
-    serve_dist(&server, dist(json!({ "pulp_tui_cv": "web", "keep": "x" }))).await;
+    // As pulp-tui makes it (Pulp's defaults), from a promotion that stopped before it recorded the distribution.
+    let mut d = dist(json!({ "pulp_tui_cv": "web", "keep": "x" }));
+    (d["content_guard"], d["hidden"]) = (Value::Null, false.into());
+    serve_dist(&server, d).await;
     // Made before a crash by this Pulp user (`admin` of `client`): only it holds a role on it.
     serve_roles(&server, &format!("{API}distributions/rpm/rpm/1/"), owned_by("admin")).await;
     Mock::given(method("PATCH"))
@@ -535,12 +562,14 @@ async fn distribution_without_database_label_is_adopted_even_when_the_publicatio
 }
 
 /// A distribution that this database records (a teammate of a shared database promoted the view) is re-pointed,
-/// whoever holds roles on it: its roles are not read.
+/// whoever holds roles on it and whatever its other fields are (an operator may guard it): its roles are not read.
 #[tokio::test]
 async fn a_recorded_distribution_is_re_pointed_whoever_holds_roles_on_it() {
     let server = MockServer::start().await;
     let href = format!("{API}distributions/rpm/rpm/1/");
-    serve_dist(&server, dist(json!({ "pulp_tui_cv": "web", "pulp_tui_db": "me" }))).await;
+    let mut d = dist(json!({ "pulp_tui_cv": "web", "pulp_tui_db": "me" }));
+    d["content_guard"] = format!("{API}contentguards/core/rbac/7/").into();
+    serve_dist(&server, d).await;
     Mock::given(method("GET"))
         .and(path(format!("{href}list_roles/")))
         .respond_with(ResponseTemplate::new(200))

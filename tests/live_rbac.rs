@@ -123,7 +123,8 @@ async fn a_404_of_a_hidden_distribution_keeps_a_content_view_row_for_a_user() {
 
 /// Another Pulp user with only the creator role that the RBAC guide gives to other users makes the distribution that a
 /// promotion of a view to Dev would use, with the view's labels, before the operator promotes. Pulp gives that user the
-/// owner role of it, so the promotion (and its preview) refuses it, and the distribution stays as that user made it.
+/// owner role of it, so the promotion (and its preview) refuses it, and the distribution stays as that user made it. When
+/// that user gives the role to the operator and drops its own, a planted field still makes the promotion refuse it.
 #[tokio::test]
 async fn a_promotion_refuses_a_distribution_that_another_user_made_with_the_labels() {
     if !live_enabled() {
@@ -161,6 +162,25 @@ async fn a_promotion_refuses_a_distribution_that_another_user_made_with_the_labe
     assert_eq!((&d["publication"], &d["base_path"], &d["pulp_labels"]), (&Value::Null, &json!(squat), &labels), "not changed");
     assert!(store.binding_repos(dev, cv).await.unwrap().is_empty(), "nothing recorded");
 
+    // Roles do not prove who made it: the user plants a content guard, hands its owner role to the operator (`admin`)
+    // and drops its own. The guard is not what pulp-tui sets on a new distribution, so the promotion still refuses it.
+    let guard = create(&admin, "contentguards/core/rbac/", json!({ "name": id }), "/contentguards/").await;
+    let squatter = user_client(&id, password);
+    ops::settle(&squatter, squatter.patch(&dist, &json!({ "content_guard": guard })).await.unwrap(), &no_progress).await.unwrap();
+    let role = |u: &str| json!({ "role": "file.filedistribution_owner", "users": [u], "groups": [] });
+    squatter.post(&format!("{dist}add_role/"), &role("admin")).await.unwrap();
+    squatter.post(&format!("{dist}remove_role/"), &role(&id)).await.unwrap();
+    let roles: Value = admin.get(&format!("{dist}list_roles/"), &[]).await.unwrap();
+    assert_eq!(roles["roles"], json!([role("admin")]), "only the operator holds a role now");
+    let planted =
+        format!("its field differs from a new one (content_guard is \"{guard}\", not null): delete it, or set it back, then try again");
+    let line = svc.promote_target(&id, &env, &docs, None).await.unwrap();
+    assert!(line.ends_with(&planted), "{line}");
+    let err = format!("{:#}", svc.promote(cv, v.id, dev, Mode::Promote, &|_| {}, &no_progress).await.unwrap_err());
+    assert!(err.contains(&planted), "{err}");
+    let d: Value = admin.get(&dist, &[]).await.unwrap();
+    assert_eq!((&d["publication"], &d["content_guard"]), (&Value::Null, &json!(guard)), "not changed");
+
     svc.delete_view(cv, &|_| {}, &no_progress).await.unwrap();
-    cleanup(&admin, &[&dist, &repo, &remote, &user]).await;
+    cleanup(&admin, &[&dist, &guard, &repo, &remote, &user]).await;
 }
