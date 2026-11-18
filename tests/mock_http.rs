@@ -457,7 +457,7 @@ async fn distribution_of_another_database_is_refused() {
     let c = client(&server, |_, _| {});
     let labels = json!({ "pulp_tui_cv": "web" });
     let pubn = format!("{API}publications/rpm/rpm/1/");
-    let db = Some(("pulp_tui_db", "me", &[][..]));
+    let db = Some(("pulp_tui_db", "me", &[][..], &[][..]));
     let err = ops::ensure_distribution(&c, RepoType::Rpm, "d", "bp", Some(&pubn), &labels, db, &no_progress).await.unwrap_err();
     let want =
         "distribution d is owned by another pulp-tui database (other): use that database, or delete the distribution, then try again";
@@ -465,10 +465,61 @@ async fn distribution_of_another_database_is_refused() {
     server.verify().await;
 }
 
+/// `{href}list_roles/` answers `roles`, the object roles of the object at `href`.
+async fn serve_roles(server: &MockServer, href: &str, roles: Value) {
+    let get = Mock::given(method("GET")).and(path(format!("{href}list_roles/")));
+    get.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "roles": roles }))).mount(server).await;
+}
+
+/// The roles of an object that only `user` holds: Pulp gives the creator the owner role.
+fn owned_by(user: &str) -> Value {
+    json!([{ "role": "rpm.rpmdistribution_owner", "users": [user], "groups": [] }])
+}
+
+/// Another Pulp user made distribution `d` before pulp-tui, with the ownership labels (and with or without a copied
+/// database id): Pulp gave that user the owner role of it, so the labels do not prove that pulp-tui made it. A group
+/// role, or roles that this user may not read, do not prove it either. Refused before any write.
+#[tokio::test]
+async fn a_distribution_that_another_user_made_with_the_labels_is_refused() {
+    let held = "distribution d exists, but this database does not record it and user eve has role \
+                rpm.rpmdistribution_owner on it: delete it, or remove that role, then try again";
+    let group = json!([{ "role": "rpm.rpmdistribution_owner", "users": ["admin"], "groups": ["devs"] }]);
+    let by_group = "distribution d exists, but this database does not record it and group devs has role \
+                    rpm.rpmdistribution_owner on it: delete it, or remove that role, then try again";
+    let hidden = "distribution d exists, but this database does not record it and its roles cannot be read (permission \
+                  denied [403]): delete it, or let this Pulp user read its roles, then try again";
+    for (labels, roles, want) in [
+        (json!({ "pulp_tui_cv": "web" }), Some(owned_by("eve")), held),
+        (json!({ "pulp_tui_cv": "web", "pulp_tui_db": "me" }), Some(owned_by("eve")), held),
+        (json!({ "pulp_tui_cv": "web" }), Some(group), by_group),
+        (json!({ "pulp_tui_cv": "web" }), None, hidden),
+    ] {
+        let server = MockServer::start().await;
+        serve_dist(&server, dist(labels)).await;
+        let href = format!("{API}distributions/rpm/rpm/1/");
+        match roles {
+            Some(r) => serve_roles(&server, &href, r).await,
+            None => {
+                let get = Mock::given(method("GET")).and(path(format!("{href}list_roles/")));
+                get.respond_with(ResponseTemplate::new(403)).mount(&server).await;
+            }
+        }
+        Mock::given(method("PATCH")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        let c = client(&server, |_, _| {});
+        let (labels, pubn) = (json!({ "pulp_tui_cv": "web" }), format!("{API}publications/rpm/rpm/2/"));
+        let db = Some(("pulp_tui_db", "me", &[][..], &[][..]));
+        let err = ops::ensure_distribution(&c, RepoType::Rpm, "d", "bp", Some(&pubn), &labels, db, &no_progress).await.unwrap_err();
+        assert!(matches!(&err, PulpError::Api { status: 409, message } if message == want), "{err}");
+        server.verify().await;
+    }
+}
+
 #[tokio::test]
 async fn distribution_without_database_label_is_adopted_even_when_the_publication_is_right() {
     let server = MockServer::start().await;
     serve_dist(&server, dist(json!({ "pulp_tui_cv": "web", "keep": "x" }))).await;
+    // Made before a crash by this Pulp user (`admin` of `client`): only it holds a role on it.
+    serve_roles(&server, &format!("{API}distributions/rpm/rpm/1/"), owned_by("admin")).await;
     Mock::given(method("PATCH"))
         .and(body_partial_json(json!({ "pulp_labels": { "pulp_tui_cv": "web", "keep": "x", "pulp_tui_db": "me" } })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
@@ -478,8 +529,32 @@ async fn distribution_without_database_label_is_adopted_even_when_the_publicatio
     let c = client(&server, |_, _| {});
     let labels = json!({ "pulp_tui_cv": "web" });
     let pubn = format!("{API}publications/rpm/rpm/1/");
-    let db = Some(("pulp_tui_db", "me", &[][..]));
+    let db = Some(("pulp_tui_db", "me", &[][..], &[][..]));
     ops::ensure_distribution(&c, RepoType::Rpm, "d", "bp", Some(&pubn), &labels, db, &no_progress).await.unwrap();
+    server.verify().await;
+}
+
+/// A distribution that this database records (a teammate of a shared database promoted the view) is re-pointed,
+/// whoever holds roles on it: its roles are not read.
+#[tokio::test]
+async fn a_recorded_distribution_is_re_pointed_whoever_holds_roles_on_it() {
+    let server = MockServer::start().await;
+    let href = format!("{API}distributions/rpm/rpm/1/");
+    serve_dist(&server, dist(json!({ "pulp_tui_cv": "web", "pulp_tui_db": "me" }))).await;
+    Mock::given(method("GET"))
+        .and(path(format!("{href}list_roles/")))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let patch = Mock::given(method("PATCH"))
+        .and(path(&href))
+        .and(body_json(json!({ "publication": format!("{API}publications/rpm/rpm/2/"), "repository": null })));
+    patch.respond_with(ResponseTemplate::new(200).set_body_json(json!({}))).expect(1).mount(&server).await;
+    let c = client(&server, |_, _| {});
+    let (labels, pubn, recorded) = (json!({ "pulp_tui_cv": "web" }), format!("{API}publications/rpm/rpm/2/"), [href.clone()]);
+    let db = Some(("pulp_tui_db", "me", &[][..], &recorded[..]));
+    assert_eq!(ops::ensure_distribution(&c, RepoType::Rpm, "d", "bp", Some(&pubn), &labels, db, &no_progress).await.unwrap(), href);
     server.verify().await;
 }
 
@@ -504,6 +579,7 @@ async fn an_existing_distribution_is_re_pointed_only_when_it_serves_something_el
         let mut d = dist(json!({ "pulp_tui_cv": "web" }));
         d.as_object_mut().unwrap().extend(serves.as_object().unwrap().clone());
         serve_dist(&server, d).await;
+        serve_roles(&server, &format!("{API}distributions/rpm/rpm/1/"), owned_by("admin")).await;
         let sent = Mock::given(method("PATCH")).and(path(format!("{API}distributions/rpm/rpm/1/")));
         let sent = match &patch {
             Some(body) => sent.and(body_json(body)).respond_with(ResponseTemplate::new(200).set_body_json(json!({}))).expect(1),

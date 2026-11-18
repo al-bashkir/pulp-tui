@@ -4,10 +4,10 @@
 mod common;
 
 use common::*;
-use pulp_tui::cv::{CvService, LeftOut};
+use pulp_tui::cv::{CvService, LeftOut, Mode, distribution_name};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{PulpClient, RepoType};
-use pulp_tui::store::{BindingRepo, Store};
+use pulp_tui::store::{BindingRepo, CvRepo, Store};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -119,4 +119,48 @@ async fn a_404_of_a_hidden_distribution_keeps_a_content_view_row_for_a_user() {
     assert_eq!(svc(&admin).left_out("web", &env, &[], &row).await.unwrap(), Some(gone));
 
     cleanup(&admin, &[&user]).await;
+}
+
+/// Another Pulp user with only the creator role that the RBAC guide gives to other users makes the distribution that a
+/// promotion of a view to Dev would use, with the view's labels, before the operator promotes. Pulp gives that user the
+/// owner role of it, so the promotion (and its preview) refuses it, and the distribution stays as that user made it.
+#[tokio::test]
+async fn a_promotion_refuses_a_distribution_that_another_user_made_with_the_labels() {
+    if !live_enabled() {
+        return;
+    }
+    let admin = client();
+    let id = unique("squat");
+    let password = "Rbac-test-Pw-9a!";
+    let user = create(&admin, "users/", json!({ "username": id, "password": password }), "/users/").await;
+    let creator = json!({ "role": "file.filedistribution_creator", "content_object": null });
+    admin.post(&format!("{user}roles/"), &creator).await.unwrap();
+    let (repo, remote) = synced_repo(&admin, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let scope = admin.profile().to_string();
+    let svc = CvService { client: admin.clone(), store: store.clone(), scope: scope.clone(), actor: "t".into(), lock: None };
+    let cv = store.create_cv(&scope, &id, "").await.unwrap();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    store.set_cv_repo(cv, &docs).await.unwrap();
+    let (v, _) = svc.publish(cv, "", "", &|_| {}, &no_progress).await.unwrap();
+    let lib = store.ensure_library(&scope).await.unwrap();
+    let dev = store.create_env(&scope, "Dev", lib, false).await.unwrap();
+    let env = store.environments(&scope).await.unwrap().into_iter().find(|e| e.id == dev).unwrap();
+
+    let name = distribution_name(&id, "Dev", "docs");
+    let labels = json!({ "pulp_tui_cv": id, "pulp_tui_env": "Dev", "pulp_tui_db": store.db_id() }); // a copied id too
+    let squat = format!("{id}-squat");
+    let body = json!({ "name": name, "base_path": squat, "pulp_labels": labels });
+    let dist = create(&user_client(&id, password), RepoType::File.distributions(), body, "/distributions/").await;
+    let holds = format!("user {id} has role file.filedistribution_owner on it: delete it, or remove that role, then try again");
+    let line = svc.promote_target(&id, &env, &docs, None).await.unwrap();
+    assert!(line.contains(&format!("the promotion fails for it: distribution {name} exists, but")) && line.ends_with(&holds), "{line}");
+    let err = format!("{:#}", svc.promote(cv, v.id, dev, Mode::Promote, &|_| {}, &no_progress).await.unwrap_err());
+    assert!(err.contains(&holds), "{err}");
+    let d: Value = admin.get(&dist, &[]).await.unwrap();
+    assert_eq!((&d["publication"], &d["base_path"], &d["pulp_labels"]), (&Value::Null, &json!(squat), &labels), "not changed");
+    assert!(store.binding_repos(dev, cv).await.unwrap().is_empty(), "nothing recorded");
+
+    svc.delete_view(cv, &|_| {}, &no_progress).await.unwrap();
+    cleanup(&admin, &[&dist, &repo, &remote, &user]).await;
 }

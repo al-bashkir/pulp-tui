@@ -151,8 +151,17 @@ Katello: they live in the store of the profile and are built from Pulp objects.
   promotion and Library step. When that distribution still serves a publication of the view, a
   version delete keeps it: it reads the distributions in Pulp (`CvService::served_in_pulp`), not
   only the binding rows.
+* Labels do not prove ownership: a user who may create such an object may set them, also a
+  copied `pulp_tui_db`. A workflow uses an existing object that it finds **by name** only when
+  this database records its href (a binding or version row of the scope,
+  `Store::recorded_hrefs`), or when no one but the current Pulp user holds an object role on it
+  (`{href}list_roles/`). Pulp gives the creator the owner role, so an object that pulp-tui made
+  before a crash passes. Another user, any group, or roles that this user cannot read: 409, and
+  the message names each role holder. `ops::refuse_foreign` decides; `ops::distribution_target`
+  calls it, so the preview refuses too.
 * An object without `pulp_tui_db`, or with an id in the aliases (`meta` key `alias:<id>`),
-  is adopted: the workflow sets this database's id when it touches the object.
+  that passes these checks is adopted: the workflow sets this database's id when it touches
+  the object.
 
 ### Publish
 
@@ -161,7 +170,8 @@ time) and the Deb signing choice (`cv_version_repos.signing`: `''` = as source, 
 a signing service href). Then for each repository (`publish_repo`):
 
 1. Find or create the derived repository (labeled, no retention limit). A repository of
-   that name without the view's label is refused.
+   that name without the view's label is refused, and so is one that another user made
+   (`ops::refuse_foreign`, see Ownership).
 2. Fill it (`snapshot`):
    * No filters (RPM, Deb): one `rpm/copy/` or `deb/copy/` onto `dest_base_version: 0`.
    * Filters (File: always): change the latest derived version only where it differs.
@@ -367,6 +377,9 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
   * Objects without the label are conflicts and are skipped. The dry run asks the distribution
     checks of the run (`ops::distribution_target`): a base path that overlaps another
     distribution, or a replica distribution at another base path, is a conflict too.
+  * The store records no replica href, so a labeled remote, repository or distribution is used
+    only when no one but the current Pulp user holds a role on it (`ops::refuse_foreign`, in the
+    dry run and the run). A replica that another operator made is a conflict for you.
   * A File item without a readable served manifest is skipped (no URL guess).
   * A checkpoint distribution: the remote URL is its newest checkpoint publication at
     `<base>/<timestamp>/` (`ops::served_url`); the bare base path only lists the timestamps.

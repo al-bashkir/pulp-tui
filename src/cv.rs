@@ -893,7 +893,8 @@ impl CvService {
     }
 
     /// The derived repository of `vr`: the recorded one, if this view still owns it; else the one of its name that this
-    /// view owns (labeled for this database when unlabeled), or a new one. Recorded before it is returned.
+    /// view owns (labels, and `ops::refuse_foreign`; labeled for this database when unlabeled), or a new one. Recorded
+    /// before it is returned.
     async fn derived_repo(&self, cv: &str, vr: &mut CvVersionRepo, log: Log<'_>, on: OnTask<'_>) -> Result<String> {
         let c = &self.client;
         let repo = vr.repo().clone();
@@ -911,16 +912,16 @@ impl CvService {
                 // Never write into a repository this view does not own (name collision).
                 Some(r) if r.pulp_labels.get(LABEL_CV).map(String::as_str) == Some(slug(cv).as_str()) => {
                     let id = self.store.db_id();
-                    match ops::label_owner(&r.pulp_labels, LABEL_DB, id, &aliases) {
-                        Err(o) => bail!("repository {name} is owned by another pulp-tui database ({o})"),
-                        Ok(true) => {
-                            let mut labels = r.pulp_labels.clone();
-                            labels.insert(LABEL_DB.into(), id.into());
-                            self.alive()?;
-                            let m = c.patch(&r.pulp_href, &json!({ "pulp_labels": labels })).await?;
-                            ops::settle(c, m, on).await?;
-                        }
-                        Ok(false) => {}
+                    let adopt = ops::label_owner(&r.pulp_labels, LABEL_DB, id, &aliases)
+                        .map_err(|o| anyhow!("repository {name} is owned by another pulp-tui database ({o})"))?;
+                    let recorded = self.store.recorded_hrefs(&self.scope).await?.contains(&r.pulp_href);
+                    ops::refuse_foreign(c, &format!("repository {name}"), &r.pulp_href, recorded).await?;
+                    if adopt {
+                        let mut labels = r.pulp_labels.clone();
+                        labels.insert(LABEL_DB.into(), id.into());
+                        self.alive()?;
+                        let m = c.patch(&r.pulp_href, &json!({ "pulp_labels": labels })).await?;
+                        ops::settle(c, m, on).await?;
                     }
                     r.pulp_href
                 }
@@ -1466,7 +1467,8 @@ impl CvService {
         let named = self.named_distribution(cv, env, repo).await?;
         let path = named.as_ref().map_or_else(|| base_path(cv, &env.label, &repo.repo_name), |d| d.base_path.clone());
         let (name, aliases) = (distribution_name(cv, &env.name, &repo.repo_name), self.store.aliases().await?);
-        let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice()));
+        let recorded = self.store.recorded_hrefs(&self.scope).await?;
+        let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice(), recorded.as_slice()));
         let refusal = match ops::distribution_target(&self.client, repo.repo_type, &name, &path, &dist_labels(cv, &env.name), db).await {
             Ok(_) => None,
             // `distribution_target` only reads; a 409 is its refusal (Pulp answers no read with 409).
@@ -1526,9 +1528,9 @@ impl CvService {
         let name = distribution_name(cv, &env.name, &repo.repo_name);
         let bp = self.served_path(cv, env, repo).await?;
         let labels = dist_labels(cv, &env.name);
-        let aliases = self.store.aliases().await?;
+        let (aliases, recorded) = (self.store.aliases().await?, self.store.recorded_hrefs(&self.scope).await?);
         self.alive()?;
-        let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice()));
+        let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice(), recorded.as_slice()));
         let href = ops::ensure_distribution(&self.client, repo.repo_type, &name, &bp, Some(publication), &labels, db, on).await?;
         let cv_id = vr_cv(&self.store, vr.version_id).await?;
         self.alive()?;
@@ -2308,6 +2310,13 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
             .mount(server)
             .await;
+    }
+
+    /// Only this Pulp user (`op`, from `login/`) holds a role on the object at `href`, as on one that pulp-tui made
+    /// (`ops::refuse_foreign`).
+    async fn serve_made_by_me(server: &wiremock::MockServer, href: &str) {
+        serve_json(server, "/pulp/api/v3/login/", json!({ "pulp_href": "/u/1/", "username": "op" })).await;
+        serve_json(server, &format!("{href}list_roles/"), json!({ "roles": [{ "role": "owner", "users": ["op"], "groups": [] }] })).await;
     }
 
     /// No request of this HTTP method reached the server.
@@ -3131,6 +3140,62 @@ mod tests {
         }
     }
 
+    /// A snapshot repository of the derived name with the view's labels is reused when this database records it
+    /// (another version of the view made it), or when only this Pulp user (`op`) holds roles on it (made before a
+    /// crash). One that another Pulp user made with the labels, also with a copied database id, is refused before any
+    /// write: Pulp gave that user its owner role, and pulp-tui would fill it with the view's content.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_snapshot_repository_that_another_user_made_is_refused() {
+        use wiremock::matchers::{method, path, query_param};
+        let refused = "conflict [409]: repository pulp-tui-cv-web-os exists, but this database does not record it and user eve \
+                       has role rpm.rpmrepository_owner on it: delete it, or remove that role, then try again";
+        // (labeled with this database id, holder of its owner role, recorded by version 1, the refusal)
+        for (copied, holder, recorded, want) in [
+            (false, "eve", false, Some(refused)),
+            (true, "eve", false, Some(refused)),
+            (false, "op", false, None),
+            (true, "bob", true, None),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            serve_json(&server, "/pulp/api/v3/login/", json!({ "pulp_href": "/u/1/", "username": "op" })).await;
+            let roles = json!({ "roles": [{ "role": "rpm.rpmrepository_owner", "users": [holder], "groups": [] }] });
+            serve_json(&server, &format!("{DERIVED}list_roles/"), roles).await;
+            let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+            let src = CvRepo { repo_href: "/r/1/".into(), repo_name: "os".into(), repo_type: RepoType::Rpm, filters: vec![] };
+            if recorded {
+                let v1 = svc.store.begin_version(cv, "", std::slice::from_ref(&src)).await.unwrap();
+                let mut vr1 = svc.store.version_repos(v1.id).await.unwrap().remove(0);
+                vr1.derived_repo = Some(DERIVED.into());
+                svc.store.save_version_repo(&vr1).await.unwrap();
+            }
+            let v = svc.store.begin_version(cv, "", &[src]).await.unwrap();
+            let mut vr = svc.store.version_repos(v.id).await.unwrap().remove(0);
+            let mut labels = json!({ LABEL_CV: "web" });
+            if copied {
+                labels[LABEL_DB] = svc.store.db_id().into();
+            }
+            let found = json!({ "pulp_href": DERIVED, "name": "pulp-tui-cv-web-os", "pulp_labels": labels });
+            wiremock::Mock::given(method("GET"))
+                .and(path("/pulp/api/v3/repositories/rpm/rpm/"))
+                .and(query_param("name", "pulp-tui-cv-web-os"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [found] })))
+                .mount(&server)
+                .await;
+            let patch = wiremock::Mock::given(method("PATCH")).and(path(DERIVED));
+            patch.respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({}))).mount(&server).await;
+            let res = svc.derived_repo("web", &mut vr, &|_| {}, &ops::no_progress).await;
+            assert_none(&server, "POST").await;
+            let Some(want) = want else {
+                assert_eq!(res.unwrap(), DERIVED, "{holder}");
+                continue;
+            };
+            assert_eq!(res.unwrap_err().to_string(), want);
+            assert_eq!(vr.derived_repo, None, "nothing recorded");
+            assert_none(&server, "PATCH").await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn publish_refuses_a_snapshot_repository_as_source() {
         let server = wiremock::MockServer::start().await;
@@ -3557,6 +3622,7 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [os] })))
             .mount(&server)
             .await;
+        serve_made_by_me(&server, "/pulp/api/v3/distributions/rpm/rpm/6/").await;
         // "old" is no longer part of the version, and Pulp refuses the unbind of its distribution.
         let old = BindingRepo {
             env_id: lib,
@@ -4089,6 +4155,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [d] })))
             .mount(&server)
             .await;
+        serve_made_by_me(&server, DIST).await; // interrupted before it recorded the distribution
         svc.store.promoted(lib, cv, v.id, "promoting").await.unwrap(); // an interrupted promotion
         svc.promote(cv, v.id, lib, Mode::Promote, &|_| {}, &ops::no_progress).await.unwrap();
         assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().active(), Some(v.id), "promote again recovers it");

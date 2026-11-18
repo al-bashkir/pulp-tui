@@ -361,8 +361,9 @@ pub async fn publication_body(c: &PulpClient, t: RepoType, version: &str, mode: 
 
 /// Create or re-point a distribution. Refuses to take over a base path owned by a
 /// different distribution, or an existing distribution that lacks the given `labels`
-/// (labels mark ownership; pass `{}` for no ownership check). `db` = (label key, database id,
-/// aliases): a distribution of another database is refused; an unlabeled one is adopted.
+/// (labels mark ownership; pass `{}` for no ownership check) or that pulp-tui cannot prove it made
+/// (`refuse_foreign`). `db` = (label key, database id, aliases, the hrefs that the database records): a
+/// distribution of another database is refused; one without the database label is adopted.
 #[allow(clippy::too_many_arguments)]
 pub async fn ensure_distribution(
     c: &PulpClient,
@@ -371,11 +372,12 @@ pub async fn ensure_distribution(
     base_path: &str,
     publication: Option<&str>,
     labels: &Value,
-    db: Option<(&str, &str, &[String])>,
+    db: Option<(&str, &str, &[String], &[String])>,
     on: OnTask<'_>,
 ) -> Result<String> {
     if let Some(d) = distribution_target(c, t, name, base_path, labels, db).await? {
-        let adopt = owner_check(&d, labels, db)?; // passed in `distribution_target`; this gives the label to adopt
+        // Passed in `distribution_target`; this gives the label to adopt.
+        let adopt = owner_check(&d, labels, db.map(|(key, id, aliases, _)| (key, id, aliases)))?;
         if let Some(body) = repoint_body(&d, publication, adopt) {
             let m = c.patch(&d.pulp_href, &body).await?;
             settle(c, m, on).await?;
@@ -383,7 +385,7 @@ pub async fn ensure_distribution(
         return Ok(d.pulp_href);
     }
     let mut labels = labels.clone();
-    if let Some((key, id, _)) = db {
+    if let Some((key, id, ..)) = db {
         labels[key] = id.into();
     }
     create(
@@ -421,15 +423,16 @@ fn repoint_body(d: &Distribution, publication: Option<&str>, adopt: Option<(Stri
 
 /// What `ensure_distribution` does with distribution `name` at `base_path`, read from Pulp before any write: re-point
 /// the one of that name (`Some`), or create one (`None`). `Err` (409) is its refusal: the one of that name serves
-/// another base path, lacks the ownership `labels`, belongs to another database (`db`) or is a checkpoint distribution;
-/// a new one overlaps the base path of another one (`refuse_overlap`). A preview that calls it says what the run does.
+/// another base path, lacks the ownership `labels`, belongs to another database (`db`), is a checkpoint distribution
+/// or, with `labels`, is not provably pulp-tui's (`refuse_foreign`); a new one overlaps the base path of another one
+/// (`refuse_overlap`). A preview that calls it says what the run does.
 pub async fn distribution_target(
     c: &PulpClient,
     t: RepoType,
     name: &str,
     base_path: &str,
     labels: &Value,
-    db: Option<(&str, &str, &[String])>,
+    db: Option<(&str, &str, &[String], &[String])>,
 ) -> Result<Option<Distribution>> {
     let Some(d) = find_by_name::<Distribution>(c, &c.api(t.distributions()), name).await? else {
         refuse_overlap(c, base_path).await?;
@@ -438,9 +441,55 @@ pub async fn distribution_target(
     if d.base_path != base_path {
         return Err(PulpError::Api { status: 409, message: format!("distribution {name} serves {} instead of {base_path}", d.base_path) });
     }
-    owner_check(&d, labels, db)?;
+    owner_check(&d, labels, db.map(|(key, id, aliases, _)| (key, id, aliases)))?;
     refuse_checkpoint(name, d.checkpoint)?;
+    if labels.as_object().is_some_and(|l| !l.is_empty()) {
+        let recorded = db.is_some_and(|(.., hrefs)| hrefs.contains(&d.pulp_href));
+        refuse_foreign(c, &format!("distribution {name}"), &d.pulp_href, recorded).await?;
+    }
     Ok(Some(d))
+}
+
+/// Refuses (409) to take over `what` (`distribution d`) at `href`, which pulp-tui found by its name, unless this
+/// database records it (`recorded`) or no one but the current Pulp user holds an object role on it
+/// (`{href}list_roles/`). Labels do not prove that pulp-tui made it: any user who may create the object may set them,
+/// and Pulp gives that user the owner role. An object that pulp-tui made before a crash has only its own user. A group
+/// role, or roles that this user may not read, do not prove it either.
+pub async fn refuse_foreign(c: &PulpClient, what: &str, href: &str, recorded: bool) -> Result<()> {
+    if recorded {
+        return Ok(());
+    }
+    let refuse = |why: String, fix: &str| PulpError::Api {
+        status: 409,
+        message: format!("{what} exists, but this database does not record it and {why}: delete it, or {fix}, then try again"),
+    };
+    let roles: Value = match c.get(&format!("{href}list_roles/"), &[]).await {
+        Ok(v) => v,
+        Err(e) if matches!(e.status(), Some(403 | 404)) => {
+            return Err(refuse(format!("its roles cannot be read ({e})"), "let this Pulp user read its roles"));
+        }
+        Err(e) => return Err(e),
+    };
+    // pulpcore 3.63 has no `login/`; without permission to read users, the Basic-auth user is the one Pulp accepted.
+    let me = super::caps::current_user(c).await?.map(|u| u.username).or_else(|| c.username().map(String::from));
+    let held = foreign_roles(&roles, me.as_deref());
+    if held.is_empty() {
+        return Ok(());
+    }
+    Err(refuse(format!("{} on it", held.join(", ")), if held.len() == 1 { "remove that role" } else { "remove those roles" }))
+}
+
+/// The object roles in a `list_roles/` answer that a principal other than user `me` holds: `user eve has role
+/// rpm.rpmdistribution_owner`. Every group counts: pulp-tui cannot tell whether `me` is its only member.
+fn foreign_roles(roles: &Value, me: Option<&str>) -> Vec<String> {
+    let names = |v: &Value| v.as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>();
+    let mut out = vec![];
+    for r in roles["roles"].as_array().into_iter().flatten() {
+        let users = names(&r["users"]).into_iter().filter(|u| Some(u.as_str()) != me).map(|u| format!("user {u}"));
+        let groups = names(&r["groups"]).into_iter().map(|g| format!("group {g}"));
+        out.extend(users.chain(groups).map(|p| format!("{p} has role {}", r["role"].as_str().unwrap_or_default())));
+    }
+    out
 }
 
 /// Refuse a new distribution at `base_path` that another distribution has, contains or is inside of
@@ -1017,6 +1066,19 @@ mod tests {
         assert_eq!(label_owner(&l(None), "pulp_tui_db", "me", &aliases), Ok(true));
         assert_eq!(label_owner(&l(Some("old")), "pulp_tui_db", "me", &aliases), Ok(true));
         assert_eq!(label_owner(&l(Some("other")), "pulp_tui_db", "me", &aliases), Err("other".into()));
+    }
+
+    #[test]
+    fn only_roles_of_other_principals_are_foreign() {
+        let roles = |r: Value| json!({ "roles": r });
+        let owner = |users: Value, groups: Value| json!({ "role": "x.owner", "users": users, "groups": groups });
+        assert!(foreign_roles(&roles(json!([owner(json!(["me"]), json!([]))])), Some("me")).is_empty(), "made by me");
+        assert!(foreign_roles(&roles(json!([])), Some("me")).is_empty(), "no role at all");
+        assert!(foreign_roles(&json!({}), None).is_empty());
+        let two = roles(json!([owner(json!(["me", "eve"]), json!([])), { "role": "x.viewer", "users": [], "groups": ["devs"] }]));
+        assert_eq!(foreign_roles(&two, Some("me")), ["user eve has role x.owner", "group devs has role x.viewer"]);
+        let mine = roles(json!([owner(json!(["me"]), json!([]))]));
+        assert_eq!(foreign_roles(&mine, None), ["user me has role x.owner"], "an unknown current user proves nothing");
     }
 
     #[test]

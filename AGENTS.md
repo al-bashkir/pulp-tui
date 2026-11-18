@@ -29,7 +29,10 @@ Read `docs/ARCHITECTURE.md` before changing workflows.
   202; wait for the task and, where it matters, verify served content.
 * Content View objects in Pulp carry ownership labels (`pulp_tui_cv`, `pulp_tui_env`,
   `pulp_tui_replica`) and the database id (`pulp_tui_db`). Never modify objects without
-  their ownership labels, or with the id of another database.
+  their ownership labels, or with the id of another database. Labels alone do not prove
+  ownership (any creator can set them): reuse an object found by name only after
+  `ops::refuse_foreign` (the store records its href, or only the current Pulp user holds a
+  role on it).
 * Keep code small and direct; prefer existing helpers over new abstractions.
 * Each action key must be unique per screen and must not collide with list keys (a unit
   test checks this).

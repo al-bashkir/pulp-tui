@@ -216,9 +216,10 @@ pub async fn plan(
 }
 
 /// Why the run stops for the replica of upstream distribution `d` (type `t`) on `dst`, before it changes anything: a
-/// local `repo` or `remote` of that name without the label of `src`, or the refusal of the distribution step
-/// (`ops::distribution_target`, as in `ops::ensure_distribution`: labels, base path, checkpoint, and a base path that
-/// overlaps another one for a new distribution). `None`: the run can make or update the replica.
+/// local `repo` or `remote` of that name without the label of `src` or that another Pulp user made
+/// (`ops::refuse_foreign`, as in `replica_repo` and `replica_remote`), or the refusal of the distribution step
+/// (`ops::distribution_target`, as in `ops::ensure_distribution`: labels, base path, checkpoint, roles, and a base path
+/// that overlaps another one for a new distribution). `None`: the run can make or update the replica.
 async fn conflict(
     dst: &PulpClient,
     t: RepoType,
@@ -234,9 +235,16 @@ async fn conflict(
     if let Some(kind) = foreign.into_iter().flatten().next() {
         return Ok(Some(format!("a local {kind} named {} exists and is not managed by this replication", d.name)));
     }
-    match ops::distribution_target(dst, t, &d.name, &d.base_path, &json!({ LABEL_REPLICA: src }), None).await {
+    let found = [("repository", repo.map(|r| r.pulp_href.as_str())), ("remote", remote.and_then(|r| r["pulp_href"].as_str()))];
+    let checks = async {
+        for (kind, href) in found.into_iter().filter_map(|(k, h)| h.map(|h| (k, h))) {
+            ops::refuse_foreign(dst, &format!("{kind} {}", d.name), href, false).await?;
+        }
+        ops::distribution_target(dst, t, &d.name, &d.base_path, &json!({ LABEL_REPLICA: src }), None).await
+    };
+    match checks.await {
         Ok(_) => Ok(None),
-        // `distribution_target` only reads; a 409 is its refusal.
+        // Both only read; a 409 is their refusal.
         Err(PulpError::Api { status: 409, message }) => Ok(Some(message)),
         Err(e) => Err(e.into()),
     }
@@ -356,6 +364,7 @@ async fn replica_remote(c: &PulpClient, src_profile: &str, it: &PlanItem, labels
         Some(r) if !owned(&labels_of(&r), src_profile) => Err(foreign("remote", it)),
         Some(r) => {
             let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
+            ops::refuse_foreign(c, &format!("remote {}", it.name), &h, false).await?; // replicas are not recorded
             if want.as_object().into_iter().flatten().any(|(k, v)| r[k] != *v) {
                 ops::settle(c, c.patch(&h, &want).await?, on).await?;
             }
@@ -379,6 +388,7 @@ async fn replica_repo(c: &PulpClient, src_profile: &str, it: &PlanItem, remote: 
         Some(r) if !owned(&labels_of(&r), src_profile) => Err(foreign("repository", it)),
         Some(r) => {
             let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
+            ops::refuse_foreign(c, &format!("repository {}", it.name), &h, false).await?; // replicas are not recorded
             if let Some(m) = manifest.filter(|m| r["manifest"] != m["manifest"]) {
                 ops::settle(c, c.patch(&h, &m).await?, on).await?;
             }
@@ -435,6 +445,47 @@ mod tests {
         assert_eq!(e.to_string(), "a local remote named os exists and is not managed by this replication");
         let sent = server.received_requests().await.unwrap();
         assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed: {sent:?}");
+    }
+
+    /// Another Pulp user made the remote or the repository of the replica with the replica label (before the first
+    /// run): Pulp gave that user the owner role of it, so the run refuses it before any change. The remote that this Pulp
+    /// user (`op`) made is used.
+    #[tokio::test]
+    async fn run_refuses_a_replica_remote_or_repository_that_another_user_made() {
+        use wiremock::matchers::{method, path};
+        let get = |p: &str| wiremock::Mock::given(method("GET")).and(path(format!("/pulp/api/v3/{p}")));
+        let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+        for (remote_by, repo_by, kind, refused) in [("eve", "op", "remote", "remotes"), ("op", "eve", "repository", "repositories")] {
+            let server = wiremock::MockServer::start().await;
+            let c = client(&server, "dst");
+            get("login/").respond_with(ok(json!({ "username": "op" }))).mount(&server).await;
+            for (coll, by) in [("remotes", remote_by), ("repositories", repo_by)] {
+                let o = json!({ "pulp_href": format!("/pulp/api/v3/{coll}/rpm/rpm/1/"), "name": "os", "url": "https://up/os/",
+                    "pulp_labels": { LABEL_REPLICA: "up" } });
+                get(&format!("{coll}/rpm/rpm/")).respond_with(ok(json!({ "count": 1, "next": null, "results": [o] }))).mount(&server).await;
+                let roles = json!({ "roles": [{ "role": format!("{coll}_owner"), "users": [by], "groups": [] }] });
+                get(&format!("{coll}/rpm/rpm/1/list_roles/")).respond_with(ok(roles)).mount(&server).await;
+            }
+            let it = PlanItem {
+                t: RepoType::Rpm,
+                name: "os".into(),
+                base_path: "os".into(),
+                remote_url: "https://up/os/".into(),
+                manifest: None,
+                distributions: None,
+                mode: json!({}),
+                action: PlanAction::Update,
+                note: String::new(),
+            };
+            let e = replicate_one(&c, "up", &it, true, &ops::no_progress).await.unwrap_err();
+            let want = format!(
+                "conflict [409]: {kind} os exists, but this database does not record it and user eve has role {refused}_owner on it: \
+                 delete it, or remove that role, then try again"
+            );
+            assert_eq!(e.to_string(), want);
+            let sent = server.received_requests().await.unwrap();
+            assert!(sent.iter().all(|r| r.method.as_str() == "GET"), "nothing changed: {sent:?}");
+        }
     }
 
     /// A Deb replica syncs the `dists/` directories that the upstream publication serves (`deb::layout`) and
@@ -648,6 +699,7 @@ mod tests {
             wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/remotes/deb/apt/")).respond_with(one(r)).mount(&server).await;
             let done = wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": remote }));
             wiremock::Mock::given(method("PATCH")).and(path(remote)).respond_with(done).mount(&server).await;
+            serve_made_by_me(&server, &[remote]).await;
             // A repository of the same name that is not this replication's: the run stops there.
             let r = json!({ "pulp_href": "/pulp/api/v3/repositories/deb/apt/1/", "name": "apt", "pulp_labels": {} });
             wiremock::Mock::given(method("GET")).and(path("/pulp/api/v3/repositories/deb/apt/")).respond_with(one(r)).mount(&server).await;
@@ -674,6 +726,17 @@ mod tests {
     fn client(s: &wiremock::MockServer, name: &str) -> PulpClient {
         let p = crate::config::Profile { url: s.uri(), auth: crate::config::AuthMethod::None, ..Default::default() };
         PulpClient::new(name, &p, &crate::config::Settings::default()).unwrap()
+    }
+
+    /// Only this Pulp user (`op`, from `login/`) holds a role on the objects at `hrefs`: replicas that it made
+    /// (`ops::refuse_foreign`).
+    async fn serve_made_by_me(s: &wiremock::MockServer, hrefs: &[&str]) {
+        let get = |p: String| wiremock::Mock::given(wiremock::matchers::method("GET")).and(wiremock::matchers::path(p));
+        let ok = |b: Value| wiremock::ResponseTemplate::new(200).set_body_json(b);
+        get("/pulp/api/v3/login/".into()).respond_with(ok(json!({ "username": "op" }))).mount(s).await;
+        for h in hrefs {
+            get(format!("{h}list_roles/")).respond_with(ok(json!({ "roles": [{ "role": "owner", "users": ["op"] }] }))).mount(s).await;
+        }
     }
 
     /// `status/` of a server with `plugins` (before any catch-all mock).
@@ -731,6 +794,7 @@ mod tests {
             let r = json!({ "pulp_href": repo, "name": "files", "latest_version_href": v1, "manifest": "PULP_MANIFEST", "pulp_labels": labels });
             wiremock::Mock::given(method("GET")).and(path(repos)).respond_with(ok(one(r.clone()))).mount(&server).await;
             wiremock::Mock::given(method("GET")).and(path(repo.as_str())).respond_with(ok(r)).mount(&server).await;
+            serve_made_by_me(&server, &[&remote, &repo]).await;
             wiremock::Mock::given(method("POST"))
                 .and(path(format!("{repo}sync/")))
                 .respond_with(wiremock::ResponseTemplate::new(202).set_body_json(json!({ "task": "/pulp/api/v3/tasks/1/" })))
@@ -935,8 +999,9 @@ mod tests {
     }
 
     /// The dry run says why the run stops for a replica, with the checks of the run (F57): a local repository or remote
-    /// of the name without the replica label, a distribution of the name without it, and a new distribution whose base
-    /// path overlaps another one. The replica of this source is updated.
+    /// of the name without the replica label, a distribution of the name without it, one with it that another Pulp user
+    /// made (it holds the owner role), and a new distribution whose base path overlaps another one. The replica of this
+    /// source that this Pulp user (`op`) made is updated.
     #[tokio::test]
     async fn the_dry_run_names_what_stops_the_run_for_a_replica() {
         use wiremock::Mock;
@@ -950,25 +1015,33 @@ mod tests {
             json!({ "pulp_href": format!("/pulp/api/v3/distributions/rpm/rpm/{name}/"), "name": name, "base_path": name,
                 "base_url": format!("https://up/pulp/content/{name}/"), "publication": "/pulp/api/v3/publications/rpm/rpm/1/" })
         };
-        let names = ["mine", "over", "remote", "repo", "taken"];
+        let names = ["dsquat", "mine", "over", "remote", "repo", "squat", "taken"];
         let dists = Value::Array(names.map(dist).to_vec());
         Mock::given(method("GET")).and(path("/pulp/api/v3/distributions/rpm/rpm/")).respond_with(ok(page(dists))).mount(&up).await;
         let ours = json!({ LABEL_REPLICA: "up" });
-        // (collection, name, labels): what the destination has of that name.
+        // (collection, name, labels, the user that holds its owner role): what the destination has of that name.
         let local = [
-            ("repositories", "mine", ours.clone()),
-            ("remotes", "mine", ours.clone()),
-            ("distributions", "mine", ours),
-            ("remotes", "remote", json!({})),
-            ("repositories", "repo", json!({})),
-            ("distributions", "taken", json!({ "team": "x" })),
+            ("repositories", "mine", ours.clone(), "op"),
+            ("remotes", "mine", ours.clone(), "op"),
+            ("distributions", "mine", ours.clone(), "op"),
+            ("remotes", "remote", json!({}), "op"),
+            ("repositories", "repo", json!({}), "op"),
+            ("repositories", "squat", ours.clone(), "eve"),
+            ("remotes", "squat", ours.clone(), "eve"),
+            ("distributions", "squat", ours.clone(), "eve"),
+            ("distributions", "dsquat", ours, "eve"),
+            ("distributions", "taken", json!({ "team": "x" }), "op"),
         ];
-        for (coll, name, labels) in local {
-            let o = json!({ "pulp_href": format!("/pulp/api/v3/{coll}/rpm/rpm/{name}/"), "name": name, "base_path": name,
-                "pulp_labels": labels });
-            let m = Mock::given(method("GET")).and(path(format!("/pulp/api/v3/{coll}/rpm/rpm/"))).and(query_param("name", name));
+        let get = |p: String| Mock::given(method("GET")).and(path(p));
+        for (coll, name, labels, holder) in local {
+            let href = format!("/pulp/api/v3/{coll}/rpm/rpm/{name}/");
+            let o = json!({ "pulp_href": href, "name": name, "base_path": name, "pulp_labels": labels });
+            let m = get(format!("/pulp/api/v3/{coll}/rpm/rpm/")).and(query_param("name", name));
             m.respond_with(ok(page(json!([o])))).with_priority(1).mount(&down).await;
+            let roles = json!({ "roles": [{ "role": format!("{coll}_owner"), "users": [holder], "groups": [] }] });
+            get(format!("{href}list_roles/")).respond_with(ok(roles)).with_priority(1).mount(&down).await;
         }
+        get("/pulp/api/v3/login/".into()).respond_with(ok(json!({ "username": "op" }))).with_priority(1).mount(&down).await;
         let below = json!([{ "pulp_href": "/pulp/api/v3/distributions/file/file/9/", "name": "local", "base_path": "over/x" }]);
         let m = Mock::given(method("GET")).and(path("/pulp/api/v3/distributions/")).and(query_param("base_path__contains", "over/"));
         m.respond_with(ok(page(below))).with_priority(1).mount(&down).await;
@@ -979,13 +1052,21 @@ mod tests {
         let foreign =
             |kind: &str, name: &str| format!("conflict: a local {kind} named {name} exists and is not managed by this replication");
         let taken = r#"conflict: distribution taken exists but lacks ownership labels {"pulp_tui_replica":"up"}: restore them or delete the distribution, then try again"#;
+        let squat = |what: &str, coll: &str| {
+            format!(
+                "conflict: {what} exists, but this database does not record it and user eve has role {coll}_owner on it: \
+                 delete it, or remove that role, then try again"
+            )
+        };
         assert_eq!(
             rows,
             [
+                ("dsquat", &PlanAction::Skip, squat("distribution dsquat", "distributions").as_str()),
                 ("mine", &PlanAction::Update, "re-sync existing replica"),
                 ("over", &PlanAction::Skip, "conflict: base path over overlaps base path over/x of distribution local"),
                 ("remote", &PlanAction::Skip, foreign("remote", "remote").as_str()),
                 ("repo", &PlanAction::Skip, foreign("repository", "repo").as_str()),
+                ("squat", &PlanAction::Skip, squat("repository squat", "repositories").as_str()),
                 ("taken", &PlanAction::Skip, taken),
             ]
         );
@@ -1016,6 +1097,7 @@ mod tests {
             .mount(&server)
             .await;
         wiremock::Mock::given(method("GET")).and(path(repo)).respond_with(ok(r)).mount(&server).await;
+        serve_made_by_me(&server, &[remote, repo]).await;
         wiremock::Mock::given(method("PATCH")).and(path(repo)).respond_with(ok(json!({}))).mount(&server).await;
         // After the PATCH, the repository names the upstream manifest.
         wiremock::Mock::given(method("GET"))

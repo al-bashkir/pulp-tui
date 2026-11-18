@@ -639,6 +639,16 @@ Read in pulpcore 3.123.1 (`RolesMixin` in `app/viewsets/base.py`, `NestedRoleSer
 * `add_role/` and `remove_role/` take `{role, users, groups}` and answer 201. They refuse
   (400) a role without a permission for the object type, an assignment that exists, and the
   removal of one that does not.
+* **Creator role** (read in 3.63.36, 3.95.3 and 3.123.1). A user with only the model-level
+  `*_creator` role may create an RPM, File or Deb repository, remote or distribution. The
+  `creation_hooks` of these viewsets (`add_roles_for_object_creator`) then give that user the
+  `*_owner` object role, also a superuser. A distribution is created in a task, and the task
+  runs as its user: `with_user(task.user)` in 3.95.3 and 3.123.1; in 3.63.36 the user that
+  holds `core.add_task` or `core.manage_roles_task` on the task. All three servers have
+  `list_roles/` on these types (`RolesMixin`); it needs `manage_roles_<type>` (the owner role
+  has it). `ops::refuse_foreign` reads it to tell an object that pulp-tui made (only the
+  current user holds a role) from one that another user made with the same name and labels
+  (`live_rbac` `a_promotion_refuses_a_distribution_that_another_user_made_with_the_labels`).
 
 ### Domains
 

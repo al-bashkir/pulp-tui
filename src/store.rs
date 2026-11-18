@@ -1104,6 +1104,19 @@ impl Store {
         .await?)
     }
 
+    /// The distributions and snapshot repositories that rows of scope `profile` record: the Pulp objects that pulp-tui
+    /// made or took over there (`ops::refuse_foreign`).
+    pub async fn recorded_hrefs(&self, profile: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT b.distribution FROM binding_repos b JOIN content_views c ON c.id = b.cv_id WHERE c.profile = $1
+             UNION SELECT vr.derived_repo FROM cv_version_repos vr JOIN cv_versions v ON v.id = vr.version_id
+             JOIN content_views c ON c.id = v.cv_id WHERE c.profile = $1 AND vr.derived_repo IS NOT NULL",
+        )
+        .bind(profile)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Versions of the derived repository `repo` that a non-deleted Content View version uses, in any scope.
     pub async fn used_versions(&self, repo: &str) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar(

@@ -2863,6 +2863,9 @@ mod tests {
         serve(&server, "GET", "/pulp/api/v3/distributions/file/file/".into(), 200, json!({ "count": 1, "next": null, "results": [d] }))
             .await;
         serve(&server, "GET", dist.into(), 200, d).await;
+        // Only this Pulp user holds a role on it: pulp-tui made it (`ops::refuse_foreign`).
+        serve(&server, "GET", "/pulp/api/v3/login/".into(), 200, json!({ "username": "op" })).await;
+        serve(&server, "GET", format!("{dist}list_roles/"), 200, json!({ "roles": [{ "role": "owner", "users": ["op"] }] })).await;
         let p = json!({ "pulp_href": publication, "repository_version": dv, "manifest": null });
         serve(&server, "GET", publication.into(), 200, p).await;
         serve(&server, "GET", dv.clone(), 200, json!({ "pulp_href": dv })).await;

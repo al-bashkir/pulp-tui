@@ -849,6 +849,10 @@ Native Upstream Pulp objects (tech preview).
   * The dry run does the distribution checks of the run. A local distribution with the base path,
     or a base path above or below it (Pulp refuses overlapping base paths), makes the row a
     conflict (`SKIP`), before anything is created.
+  * A labeled replica remote, repository or distribution that another Pulp user (or a group) has a
+    role on is a conflict too: `... exists, but this database does not record it and user eve has
+    role ... on it`. This includes a replica that another operator made: that operator runs it
+    again, or removes the role.
   * It does not follow an upstream base path change: the dry run row is a conflict
     (`... serves <old> instead of <new>`). Delete or move the replica distribution by hand.
 
@@ -1255,6 +1259,13 @@ carry it as the label `pulp_tui_db=<id>`.
   `... is owned by another pulp-tui database (<id>)`.
 * It also refuses an object without the labels of its view and environment:
   `... is not labeled pulp_tui_env=Dev`. Delete and unpromote keep such an object.
+* Labels do not prove that pulp-tui made an object: any user who may create it may set them,
+  also a copied ID. When publish or promote finds a snapshot repository or distribution by its
+  name, and the database does not record it, pulp-tui uses it only when no one but your Pulp user
+  has a role on it (Pulp gives the creator the owner role, so an object that pulp-tui made before a
+  crash passes). Otherwise the step and its preview refuse it:
+  `distribution ... exists, but this database does not record it and user eve has role rpm.rpmdistribution_owner on it: delete it, or remove that role, then try again`.
+  A group role is refused too, and so are roles that your user cannot read.
 * Two views can derive the same snapshot repository name: view `a-b` with repository `c` and view
   `a` with repository `b-c` both give `pulp-tui-cv-a-b-c`. The second view is refused with
   `... belongs to content view a-b (label pulp_tui_cv=a-b): view a with repository b-c derives
@@ -1298,7 +1309,9 @@ Only Pulp RBAC stops this:
    `file.fileremote_viewer`, `file.filepublication_viewer`, `file.filedistribution_viewer`) and
    creator roles (for example `rpm.rpmrepository_creator`, `rpm.rpmremote_creator`,
    `rpm.rpmpublication_creator`, `rpm.rpmdistribution_creator`, `file.file…_creator`). Pulp gives
-   the creator the owner role of each new object only.
+   the creator the owner role of each new object only. When such a user makes a snapshot
+   repository, Content View distribution or replica with the pulp-tui name and labels first,
+   pulp-tui refuses it (see Database ID).
 3. **Do not give** `rpm.admin` or a global `*_owner` role to other users.
 
 Assign roles on **Users** or **Groups**: **R**, then **c** with the role and an empty object. A
