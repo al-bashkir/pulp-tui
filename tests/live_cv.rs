@@ -18,6 +18,7 @@ use pulp_tui::tui::actions::run;
 use pulp_tui::tui::app::{App, Modal, Msg};
 use pulp_tui::tui::kinds::{Act, Kind, s};
 use serde_json::{Value, json};
+use sqlx::{AssertSqlSafe, Connection, Executor};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -113,7 +114,7 @@ async fn content_view_lifecycle() {
     // Retention protection: referenced snapshots are listed; bound versions cannot be deleted.
     let protected = store.protected_versions(&profile).await.unwrap();
     assert!(protected.contains(os_v1.derived_version.as_ref().unwrap()));
-    assert!(svc.delete_version(v1.id, &quiet, &no_progress).await.unwrap_err().to_string().contains("bound to Dev"));
+    assert!(svc.delete_version(v1.id, None, &quiet, &no_progress).await.unwrap_err().to_string().contains("bound to Dev"));
 
     // Advisory filtering: excluding the package referenced by the advisory drops it.
     os.filters = parse_rules("exclude name=*-debuginfo; exclude name=fixture-beta", RepoType::Rpm).unwrap();
@@ -180,7 +181,7 @@ async fn content_view_lifecycle() {
     assert_eq!(os_v4.content_count, Some(6), "5 packages + advisory");
 
     // Unbound versions can be deleted; their Pulp objects go away unless shared.
-    svc.delete_version(v2.id, &quiet, &no_progress).await.unwrap();
+    svc.delete_version(v2.id, None, &quiet, &no_progress).await.unwrap();
     assert_eq!(store.version(v2.id).await.unwrap().state, "deleted");
 
     // Full cleanup through the service removes distributions and derived repositories.
@@ -349,7 +350,7 @@ async fn unpromote_goes_back_along_the_path() {
         svc.unpromote(cv, env, &quiet, &no_progress).await.unwrap();
     }
     assert_eq!(c.fetch_content(&readme("dev"), 1 << 20).await.unwrap().0, 404);
-    svc.delete_version(v1.id, &quiet, &no_progress).await.unwrap();
+    svc.delete_version(v1.id, None, &quiet, &no_progress).await.unwrap();
 
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &[&repo, &remote]).await;
@@ -413,7 +414,7 @@ async fn a_failed_promotion_keeps_the_served_version() {
     assert_eq!(list[0]["bound"], "Library:v2  Dev:v1 (v2 failed)");
     // Pulp still serves v1 in Dev: only the failed attempt is reported.
     assert_eq!(svc.verify(cv, dev).await.unwrap(), ["promotion of v2 is failed"]);
-    let e = svc.delete_version(v1.id, &quiet, &no_progress).await.unwrap_err().to_string();
+    let e = svc.delete_version(v1.id, None, &quiet, &no_progress).await.unwrap_err().to_string();
     assert_eq!(e, "version 1 is bound to Dev");
     assert_eq!(store.version(v1.id).await.unwrap().state, "published", "the rollback target stays");
 
@@ -512,7 +513,7 @@ async fn a_left_out_distribution_deleted_outside_pulp_tui_does_not_block_the_env
     let b = store.binding(dev, cv).await.unwrap().unwrap();
     assert_eq!((b.served, b.attempt), (Some(v2.id), None));
     assert!(svc.verify(cv, dev).await.unwrap().is_empty());
-    svc.delete_version(v1.id, &quiet, &no_progress).await.unwrap();
+    svc.delete_version(v1.id, None, &quiet, &no_progress).await.unwrap();
 
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &sources.iter().map(String::as_str).collect::<Vec<_>>()).await;
@@ -736,12 +737,12 @@ async fn composite_content_view_rocky9() {
     assert_eq!(c.fetch_content(&url("dev", "docs", "docs/readme.txt"), 1 << 20).await.unwrap().0, 200);
 
     // Refusals name what uses the component; deleting the old composite version keeps the borrowed objects.
-    let e = svc.delete_version(extras_v1.id, &quiet, &no_progress).await.unwrap_err().to_string();
+    let e = svc.delete_version(extras_v1.id, None, &quiet, &no_progress).await.unwrap_err().to_string();
     assert!(e.contains(&format!("used by {id} v1")), "{e}");
     let e = svc.delete_view(os, &quiet, &no_progress).await.unwrap_err().to_string();
     assert!(e.contains("is used by"), "{e}");
     let extras_pub = store.version_repos(extras_v1.id).await.unwrap().remove(0).publication.unwrap();
-    svc.delete_version(c1.id, &quiet, &no_progress).await.unwrap();
+    svc.delete_version(c1.id, None, &quiet, &no_progress).await.unwrap();
     assert_eq!(store.version(c1.id).await.unwrap().state, "deleted");
     assert!(c.get::<serde_json::Value>(&extras_pub, &[]).await.is_ok(), "the borrowed publication stays");
 
@@ -841,7 +842,7 @@ async fn deletes_keep_what_a_plain_distribution_serves() {
     let want = vec![("docs".to_string(), p.clone(), Some(why.clone())), ("docs".to_string(), dv.clone(), Some(why.clone()))];
     assert_eq!(svc.delete_version_impact(v1.id).await.unwrap(), want);
     let lines = Mutex::new(vec![]);
-    svc.delete_version(v1.id, &|s| lines.lock().unwrap().push(s), &no_progress).await.unwrap();
+    svc.delete_version(v1.id, None, &|s| lines.lock().unwrap().push(s), &no_progress).await.unwrap();
     assert_eq!(*lines.lock().unwrap(), [format!("keeping {p}: {why}"), format!("keeping {dv}: {why}")]);
     assert_eq!(store.version(v1.id).await.unwrap().state, "deleted");
     assert!(c.get::<serde_json::Value>(&p, &[]).await.is_ok(), "the served publication was deleted");
@@ -1553,6 +1554,75 @@ async fn a_version_delete_keeps_version_0_and_the_next_publish_works_through_the
 
     tui_publish(&mut app, &mut rx, &id, "").await;
     assert_eq!(version(3).await.state, "published", "{:?}", texts(&app));
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote]).await;
+}
+
+/// Run `sql` on the store file `file` as a peer who shares the store would: with SQL, not through pulp-tui.
+async fn peer_sql(file: &std::path::Path, sql: String) {
+    sqlx::any::install_default_drivers();
+    let mut c = sqlx::AnyConnection::connect(&format!("sqlite://{}", file.display())).await.unwrap();
+    c.execute(sqlx::raw_sql(AssertSqlSafe(sql))).await.unwrap();
+}
+
+/// Versions (v) of view `name`, then Delete (d) of version `number`: the confirmation is open.
+async fn open_delete(app: &mut App, rx: &mut UnboundedReceiver<Msg>, name: &str, number: i64) {
+    let r = cv_row(app, rx, name).await;
+    run(app, Act::CvVersions, r);
+    settle(app, rx).await;
+    let row = app.list.items.iter().find(|v| v["number"] == number).cloned().unwrap();
+    run(app, Act::Delete, row);
+    settle(app, rx).await;
+}
+
+/// Security audit run-1 (version_objects), through the TUI: a peer who shares the store writes the row of v1 with SQL.
+/// After the delete confirmation was shown (no snapshot repository, the source repository as the snapshot version):
+/// the delete is refused, and the source repository stays. Before it (a version of the source repository as the
+/// snapshot version): the confirmation says that it is kept, and the delete keeps it.
+#[tokio::test]
+async fn a_version_delete_keeps_what_a_peer_wrote_into_its_row_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvpeer"));
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("shared.db");
+    let (mut app, mut rx) = app_with(Arc::new(Store::open(&file).await.unwrap())).await;
+    let svc = service(&app, &c);
+    let (st, scope) = (svc.store.clone(), svc.scope.clone());
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let source = latest(&c, &repo).await;
+    let cv = st.create_cv(&scope, &id, "").await.unwrap();
+    st.set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] })
+        .await
+        .unwrap();
+    tui_publish(&mut app, &mut rx, &id, "").await;
+    tui_publish(&mut app, &mut rx, &id, "").await; // v2 is active in Library, so v1 can be deleted
+    let v1 = st.versions(cv).await.unwrap().into_iter().find(|v| v.number == 1).unwrap();
+    let derived = st.version_repos(v1.id).await.unwrap().remove(0).derived_repo.unwrap();
+
+    open_delete(&mut app, &mut rx, &id, 1).await;
+    let set = |row: String| format!("UPDATE cv_version_repos SET {row} WHERE version_id = {}", v1.id);
+    peer_sql(&file, set(format!("derived_repo = NULL, publication = NULL, derived_version = '{repo}'"))).await;
+    yes(&mut app);
+    settle(&mut app, &mut rx).await;
+    let refused = "what deleting version 1 removes changed after it was shown; delete it again to see what it removes now";
+    assert!(texts(&app).iter().any(|t| t.ends_with(refused)), "{:?}", texts(&app));
+    assert_eq!(st.version(v1.id).await.unwrap().state, "published");
+    assert!(c.get::<Value>(&repo, &[]).await.is_ok(), "the source repository was deleted");
+    app.back();
+    settle(&mut app, &mut rx).await;
+
+    peer_sql(&file, set(format!("derived_repo = '{derived}', publication = NULL, derived_version = '{source}'"))).await;
+    open_delete(&mut app, &mut rx, &id, 1).await;
+    let (lines, typed) = yes(&mut app);
+    assert_eq!(typed.as_deref(), Some("v1"));
+    let why = format!("{source} is not a version of the snapshot repository {derived}");
+    assert!(lines.contains(&format!("  docs: keep {source} ({why})")), "{lines:?}");
+    settle(&mut app, &mut rx).await;
+    shown(&app, "version deleted");
+    assert!(c.get::<RepoVersion>(&source, &[]).await.is_ok(), "the source version was deleted");
 
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &[&repo, &remote]).await;

@@ -479,6 +479,27 @@ impl CvService {
         Ok(lacks.map(|(k, v)| format!("not labeled {k}={}", v.as_str().unwrap_or_default())))
     }
 
+    /// Why the objects that row `vr` records are not the snapshot of view `cv` (`None`: they are, or it records none).
+    /// The store is shared, so a peer can write any href into a row: each one is bound in Pulp again. The snapshot
+    /// repository must be the view's (`not_ours`), and the snapshot version and the publication must be of it.
+    async fn unbound(&self, cv: &str, vr: &CvVersionRepo, aliases: &[String]) -> Result<Option<String>> {
+        if let Some(why) = stray_version(vr) {
+            return Ok(Some(why));
+        }
+        let Some(r) = &vr.derived_repo else { return Ok(None) };
+        if let Some(why) = self.not_ours(r, &json!({ LABEL_CV: slug(cv) }), aliases).await? {
+            return Ok(Some(why));
+        }
+        let Some(p) = &vr.publication else { return Ok(None) };
+        let pv: Value = match self.client.get(p, &[]).await {
+            Ok(v) => v,
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let of = pv["repository_version"].as_str().is_some_and(|v| version_of(v, r));
+        Ok((!of).then(|| format!("{p} is not a publication of the snapshot repository {r}")))
+    }
+
     /// The derived repositories of the view's own (not borrowed) version rows (href -> source repository). Refused
     /// while another view serves one of their publications: deleting the repository deletes its publications.
     async fn snapshot_repos(&self, cv: &ContentView) -> Result<BTreeMap<String, CvRepo>> {
@@ -1536,13 +1557,29 @@ impl CvService {
         Ok(ours.then_some(d))
     }
 
+    /// The view whose snapshot row `vr` of view `cv` records: `cv`; for a composite's (borrowed) row, the component
+    /// whose version has its repository (`cv` when none has: the composite labels no snapshot repository).
+    async fn row_view(&self, cv: &str, vr: &CvVersionRepo) -> Result<String> {
+        if vr.borrowed {
+            for u in self.store.version_components(vr.version_id).await? {
+                if self.store.version_repos(u.version_id).await?.iter().any(|c| c.repo().repo_href == vr.repo().repo_href) {
+                    return Ok(u.name);
+                }
+            }
+        }
+        Ok(cv.into())
+    }
+
     async fn bind_repo(&self, cv: &str, env: &Environment, vr: &CvVersionRepo, on: OnTask<'_>) -> Result<()> {
         let repo = vr.repo();
         let publication = vr.publication.as_deref().ok_or_else(|| anyhow!("version has no publication"))?;
+        let (aliases, recorded) = self.known().await?;
+        if let Some(why) = self.unbound(&self.row_view(cv, vr).await?, vr, &aliases).await? {
+            bail!("not serving {publication}: {why}");
+        }
         let name = distribution_name(cv, &env.name, &repo.repo_name);
         let bp = self.served_path(cv, env, repo).await?;
         let labels = dist_labels(cv, &env.name);
-        let (aliases, recorded) = self.known().await?;
         self.alive()?;
         let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice(), recorded.as_slice()));
         let href = ops::ensure_distribution(&self.client, repo.repo_type, &name, &bp, Some(publication), &labels, db, on).await?;
@@ -1927,10 +1964,17 @@ impl CvService {
 
     /// Delete a version's Pulp objects unless shared with another live version or bound. Refused while a
     /// composite uses or pins it; a composite version's borrowed rows are kept (they are the component's).
-    pub async fn delete_version(&self, version_id: i64, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
+    /// `seen`: what the confirmation showed (`delete_version_impact`).
+    pub async fn delete_version(
+        &self,
+        version_id: i64,
+        seen: Option<&[(String, String, Option<String>)]>,
+        log: Log<'_>,
+        on: OnTask<'_>,
+    ) -> Result<()> {
         let v = self.store.version(version_id).await?;
         self.mark_deleting(&v).await?;
-        self.delete_objects(&v, log, on).await?;
+        self.delete_objects(&v, seen, log, on).await?;
         self.alive()?;
         self.store.finish_version(version_id, "deleted", None).await?;
         let name = self.store.content_view(v.cv_id).await?.name;
@@ -1954,9 +1998,21 @@ impl CvService {
         Ok(())
     }
 
-    /// Delete the objects of `v` that `version_objects` does not keep; a kept one is logged with why.
-    async fn delete_objects(&self, v: &CvVersion, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
-        for (_, href, keep) in self.version_objects(v).await? {
+    /// Delete the objects of `v` that `version_objects` does not keep; a kept one is logged with why. Refused, and `v`
+    /// gets its state back, when they are not `seen`: the store is shared, so a row can change after the confirmation.
+    async fn delete_objects(
+        &self,
+        v: &CvVersion,
+        seen: Option<&[(String, String, Option<String>)]>,
+        log: Log<'_>,
+        on: OnTask<'_>,
+    ) -> Result<()> {
+        let objects = self.version_objects(v).await?;
+        if seen.is_some_and(|s| s != objects) {
+            self.store.set_version_state(v.id, "deleting", &v.state).await?;
+            bail!("what deleting version {} removes changed after it was shown; delete it again to see what it removes now", v.number);
+        }
+        for (_, href, keep) in objects {
             match keep {
                 Some(why) => log(format!("keeping {href}: {why}")),
                 None => self.delete_href(&href, on).await?,
@@ -1977,9 +2033,7 @@ impl CvService {
         let name = self.store.content_view(v.cv_id).await?.name;
         let (mut objects, mut dists) = (vec![], HashMap::new());
         for vr in self.store.version_repos(v.id).await?.into_iter().filter(|vr| !vr.borrowed) {
-            // Publications and versions belong to the derived repository.
-            let not_ours =
-                if let Some(r) = &vr.derived_repo { self.not_ours(r, &json!({ LABEL_CV: slug(&name) }), &aliases).await? } else { None };
+            let not_ours = self.unbound(&name, &vr, &aliases).await?;
             let pulp = if not_ours.is_none() { self.served_in_pulp(&vr, &mut dists).await? } else { [None, None] };
             objects.extend(row_objects(&vr, not_ours, pulp, &mut shared, &served));
         }
@@ -2100,6 +2154,22 @@ fn row_objects(
 /// starts on it (`dest_base_version: 0`), and Pulp refuses that copy once it is gone.
 fn base_version(href: &str) -> bool {
     href.ends_with("/versions/0/")
+}
+
+/// Whether `v` is the href of a version of repository `repo`: `<repo>versions/<n>/`.
+fn version_of(v: &str, repo: &str) -> bool {
+    let n = v.strip_prefix(repo).and_then(|v| v.strip_prefix("versions/")?.strip_suffix('/'));
+    n.is_some_and(|n| n.parse::<u64>().is_ok())
+}
+
+/// Why the snapshot objects that row `vr` records cannot be of its snapshot repository, from the row alone: there is
+/// none recorded, or the snapshot version is not a version of it. `None`: they can be.
+fn stray_version(vr: &CvVersionRepo) -> Option<String> {
+    let Some(r) = &vr.derived_repo else {
+        return (vr.derived_version.is_some() || vr.publication.is_some()).then(|| "no snapshot repository recorded".into());
+    };
+    let dv = vr.derived_version.as_deref().filter(|dv| !version_of(dv, r))?;
+    Some(format!("{dv} is not a version of the snapshot repository {r}"))
 }
 
 /// Whether distribution `d` serves something: a publication, or (set outside pulp-tui) a repository or a repository version.
@@ -3281,7 +3351,7 @@ mod tests {
             svc.store.save_version_repo(&vr).await.unwrap();
             serve_labels(&server, DERIVED, json!({ LABEL_CV: cv, LABEL_DB: db.unwrap_or(svc.store.db_id()) })).await;
             let logs = Mutex::new(vec![]);
-            svc.delete_version(vr.version_id, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+            svc.delete_version(vr.version_id, None, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
             assert_none(&server, "DELETE").await;
             let logs = logs.into_inner().unwrap();
             let kept = |h: &str| format!("keeping {h}: {why}");
@@ -3307,10 +3377,10 @@ mod tests {
         Mock::given(method("DELETE")).and(path(p.as_str())).respond_with(ResponseTemplate::new(404)).mount(&server).await;
         Mock::given(method("DELETE")).and(path(dv.as_str())).respond_with(ResponseTemplate::new(403)).up_to_n_times(1).mount(&server).await;
         Mock::given(method("DELETE")).and(path(dv.as_str())).respond_with(ResponseTemplate::new(204)).mount(&server).await;
-        let e = svc.delete_version(vr.version_id, &|_| {}, &ops::no_progress).await.unwrap_err();
+        let e = svc.delete_version(vr.version_id, None, &|_| {}, &ops::no_progress).await.unwrap_err();
         assert_eq!(e.to_string(), "permission denied [403]");
         assert_eq!(svc.store.version(vr.version_id).await.unwrap().state, "deleting", "a failed delete stays deleting");
-        svc.delete_version(vr.version_id, &|_| {}, &ops::no_progress).await.unwrap();
+        svc.delete_version(vr.version_id, None, &|_| {}, &ops::no_progress).await.unwrap();
         assert_eq!(svc.store.version(vr.version_id).await.unwrap().state, "deleted", "the rerun deletes what is left");
         let sent = server.received_requests().await.unwrap();
         let deletes: Vec<_> = sent.iter().filter(|r| r.method.as_str() == "DELETE").map(|r| r.url.path().to_string()).collect();
@@ -3337,7 +3407,7 @@ mod tests {
         let impact = svc.delete_version_impact(vr.version_id).await.unwrap();
         assert_eq!(impact, [(vr.repo().repo_name.clone(), p.clone(), None), (vr.repo().repo_name.clone(), v0.clone(), Some(why.into()))]);
         let logs = Mutex::new(vec![]);
-        svc.delete_version(vr.version_id, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+        svc.delete_version(vr.version_id, None, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
         assert_eq!(logs.into_inner().unwrap(), [format!("keeping {v0}: {why}")]);
         let sent = server.received_requests().await.unwrap();
         let deletes: Vec<_> = sent.iter().filter(|r| r.method.as_str() == "DELETE").map(|r| r.url.path().to_string()).collect();
@@ -3360,9 +3430,85 @@ mod tests {
             .await;
         let e = svc.delete_version_impact(vr.version_id).await.unwrap_err();
         assert_eq!(e.to_string(), "permission denied [403]");
-        let e = svc.delete_version(vr.version_id, &|_| {}, &ops::no_progress).await.unwrap_err();
+        let e = svc.delete_version(vr.version_id, None, &|_| {}, &ops::no_progress).await.unwrap_err();
         assert_eq!(e.to_string(), "permission denied [403]");
         assert_none(&server, "DELETE").await;
+    }
+
+    /// Security audit run-1 (version_objects): a peer who can write the shared store points the row of a version at
+    /// objects that are not those of its snapshot: (A) any href, with no snapshot repository recorded, (B) a version of
+    /// another repository, (C) a publication of another repository. The preview says each one is kept and why; the
+    /// delete sends no DELETE and logs what it kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_version_keeps_what_a_peer_wrote_into_its_row() {
+        let (foreign, fv, fp) = (
+            "/pulp/api/v3/repositories/rpm/rpm/99/",
+            "/pulp/api/v3/repositories/rpm/rpm/99/versions/4/",
+            "/pulp/api/v3/publications/rpm/rpm/77/",
+        );
+        let no_repo = "no snapshot repository recorded".to_string();
+        let not_version = format!("{fv} is not a version of the snapshot repository {DERIVED}");
+        let not_publication = format!("{fp} is not a publication of the snapshot repository {DERIVED}");
+        for (derived, version, publication, why) in [
+            (None, foreign.to_string(), None, no_repo),
+            (Some(DERIVED), fv.to_string(), Some(fp), not_version),
+            (Some(DERIVED), format!("{DERIVED}versions/1/"), Some(fp), not_publication),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let (_, mut vr) = rpm_version(&svc).await;
+            (vr.derived_repo, vr.derived_version, vr.publication) = (derived.map(Into::into), Some(version), publication.map(Into::into));
+            svc.store.save_version_repo(&vr).await.unwrap();
+            svc.store.finish_version(vr.version_id, "published", None).await.unwrap();
+            serve_owner(&server, DERIVED, svc.store.db_id()).await;
+            serve_json(&server, fp, json!({ "pulp_href": fp, "repository_version": fv })).await;
+            serve_snapshot(&server, json!([]), json!([])).await; // no distribution serves them
+            wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+                .respond_with(wiremock::ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+            let objects: Vec<String> = vr.publication.iter().chain(&vr.derived_version).cloned().collect();
+            let impact = svc.delete_version_impact(vr.version_id).await.unwrap();
+            assert_eq!(impact, objects.iter().map(|h| ("os".to_string(), h.clone(), Some(why.clone()))).collect::<Vec<_>>());
+            let logs = Mutex::new(vec![]);
+            svc.delete_version(vr.version_id, None, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+            assert_none(&server, "DELETE").await;
+            assert_eq!(logs.into_inner().unwrap(), objects.iter().map(|h| format!("keeping {h}: {why}")).collect::<Vec<_>>());
+        }
+    }
+
+    /// Security audit run-1 (version_objects): the peer writes the row after the preview (variants A and B of the
+    /// probe). The delete is refused before any DELETE, and the version keeps its state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_version_refuses_a_row_that_changed_after_the_preview() {
+        let (fv, fp) = ("/pulp/api/v3/repositories/rpm/rpm/99/versions/4/", "/pulp/api/v3/publications/rpm/rpm/77/");
+        for (derived, version, publication) in [(None, "/pulp/api/v3/repositories/rpm/rpm/99/", None), (Some(DERIVED), fv, Some(fp))] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let (_, mut vr) = rpm_version(&svc).await;
+            (vr.publication, vr.derived_version) =
+                (Some("/pulp/api/v3/publications/rpm/rpm/3/".into()), Some(format!("{DERIVED}versions/1/")));
+            svc.store.save_version_repo(&vr).await.unwrap();
+            svc.store.finish_version(vr.version_id, "published", None).await.unwrap();
+            serve_owner(&server, DERIVED, svc.store.db_id()).await;
+            serve_snapshot(&server, json!([]), json!([])).await; // no distribution serves them
+            wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+                .respond_with(wiremock::ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+            let seen = svc.delete_version_impact(vr.version_id).await.unwrap();
+            assert!(seen.iter().all(|(_, _, keep)| keep.is_none()), "{seen:?}");
+            (vr.derived_repo, vr.derived_version, vr.publication) =
+                (derived.map(Into::into), Some(version.into()), publication.map(Into::into));
+            svc.store.save_version_repo(&vr).await.unwrap(); // the peer's write
+            let e = svc.delete_version(vr.version_id, Some(&seen), &|_| {}, &ops::no_progress).await.unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "what deleting version 1 removes changed after it was shown; delete it again to see what it removes now"
+            );
+            assert_none(&server, "DELETE").await;
+            assert_eq!(svc.store.version(vr.version_id).await.unwrap().state, "published");
+        }
     }
 
     /// F56: Library serves the publication of v1 that the row of `old` records, from a distribution that is not the
@@ -3413,7 +3559,7 @@ mod tests {
             serve_labels(&server, DERIVED, json!({ LABEL_CV: "web", LABEL_DB: svc.store.db_id() })).await;
             serve_snapshot(&server, json!([{ "pulp_href": p, "repository_version": dv }]), json!([theirs])).await;
             let logs = Mutex::new(vec![]);
-            svc.delete_version(v1.id, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+            svc.delete_version(v1.id, None, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
             let kept = |h: &str| format!("keeping {h}: served by theirs (pinned to a publication of this version)");
             assert_eq!(logs.into_inner().unwrap(), [kept(&p), kept(&dv)]);
             assert_none(&server, "DELETE").await;
@@ -4293,6 +4439,63 @@ mod tests {
         assert_eq!((served[0].distribution.as_str(), served[0].base_path.as_str()), (DIST, "library/rocky9/os"));
     }
 
+    /// Security audit run-1 (version_objects, the promote variant): a peer points the row of a published version at a
+    /// publication of another repository. The promotion serves it nowhere. A composite's row is the snapshot of its
+    /// component: served while the snapshot repository has the component's label, refused once the peer points the row
+    /// at a snapshot of another view.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_promotion_serves_no_publication_that_a_peer_wrote_into_a_row() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let os = svc.store.create_cv("k", "os", "").await.unwrap();
+        let v1 = published(&svc, os, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
+        let mut row = svc.store.version_repos(v1.id).await.unwrap().remove(0);
+        let own = row.publication.clone().unwrap();
+        let (foreign, other) = ("/pulp/api/v3/publications/rpm/rpm/77/", "/pulp/api/v3/repositories/rpm/rpm/8/");
+        serve_labels(&server, DERIVED, json!({ LABEL_CV: "os", LABEL_DB: svc.store.db_id() })).await;
+        serve_labels(&server, other, json!({ LABEL_CV: "web", LABEL_DB: svc.store.db_id() })).await;
+        serve_json(&server, &own, json!({ "repository_version": format!("{DERIVED}versions/1/") })).await;
+        serve_json(&server, foreign, json!({ "repository_version": format!("{other}versions/1/") })).await;
+        let empty = json!({ "count": 0, "next": null, "results": [] });
+        for p in ["/pulp/api/v3/distributions/rpm/rpm/", "/pulp/api/v3/distributions/"] {
+            Mock::given(method("GET")).and(path(p)).respond_with(ResponseTemplate::new(200).set_body_json(&empty)).mount(&server).await;
+        }
+        let t = "/pulp/api/v3/tasks/7/";
+        Mock::given(method("POST"))
+            .and(path("/pulp/api/v3/distributions/rpm/rpm/"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "task": t })))
+            .mount(&server)
+            .await;
+        let done = json!({ "pulp_href": t, "state": "completed", "created_resources": [DIST] });
+        Mock::given(method("GET")).and(path(t)).respond_with(ResponseTemplate::new(200).set_body_json(done)).mount(&server).await;
+        let lib = svc.store.ensure_library("k").await.unwrap();
+        let posts = async || server.received_requests().await.unwrap().iter().filter(|r| r.method.as_str() == "POST").count();
+
+        row.publication = Some(foreign.into());
+        svc.store.save_version_repo(&row).await.unwrap(); // the peer's write
+        let e = svc.promote(os, v1.id, lib, Mode::Promote, &|_| {}, &ops::no_progress).await.unwrap_err();
+        let why = format!("{foreign} is not a publication of the snapshot repository {DERIVED}");
+        assert_eq!(e.to_string(), format!("os in Library: failed: os: not serving {foreign}: {why}"));
+        assert_eq!(posts().await, 0);
+
+        row.publication = Some(own);
+        svc.store.save_version_repo(&row).await.unwrap();
+        let c = svc.store.create_composite("k", "rocky9", "").await.unwrap();
+        svc.store.set_component(c, os, None).await.unwrap();
+        let (v, note) = svc.publish(c, "", "", &|_| {}, &ops::no_progress).await.unwrap();
+        assert_eq!((note, posts().await), (None, 1), "the composite serves the snapshot of os");
+        let mut borrowed = svc.store.version_repos(v.id).await.unwrap().remove(0);
+        (borrowed.derived_repo, borrowed.derived_version) = (Some(other.into()), Some(format!("{other}versions/1/")));
+        borrowed.publication = Some(foreign.into());
+        svc.store.save_version_repo(&borrowed).await.unwrap(); // the peer's write
+        let e = svc.promote(c, v.id, lib, Mode::Rollback, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), format!("rocky9 in Library: failed: os: not serving {foreign}: not labeled pulp_tui_cv=os"));
+        assert_eq!(posts().await, 1);
+        assert_none(&server, "PATCH").await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn deletes_keep_borrowed_objects_and_refuse_used_components() {
         let server = wiremock::MockServer::start().await;
@@ -4306,7 +4509,7 @@ mod tests {
         svc.store.finish_version(cv1.id, "published", None).await.unwrap();
         let err = |r: Result<()>| r.unwrap_err().to_string();
 
-        assert_eq!(err(svc.delete_version(v1.id, &|_| {}, &ops::no_progress).await), "version 1 is used by rocky9 v1");
+        assert_eq!(err(svc.delete_version(v1.id, None, &|_| {}, &ops::no_progress).await), "version 1 is used by rocky9 v1");
         assert_eq!(svc.store.version(v1.id).await.unwrap().state, "published", "a refused delete keeps the state");
         // While a delete of v1 runs, a composite publish does not borrow it and Resume does not publish it again.
         assert!(svc.store.set_version_state(v1.id, "published", "deleting").await.unwrap());
@@ -4319,7 +4522,7 @@ mod tests {
         assert!(svc.store.set_version_state(v1.id, "deleting", "published").await.unwrap());
         let e = err(svc.delete_view(os, &|_| {}, &ops::no_progress).await);
         assert!(e.starts_with("content view os is used by rocky9 (component), rocky9 v1"), "{e}");
-        svc.delete_version(cv1.id, &|_| {}, &ops::no_progress).await.unwrap();
+        svc.delete_version(cv1.id, None, &|_| {}, &ops::no_progress).await.unwrap();
         assert_eq!(svc.store.version(cv1.id).await.unwrap().state, "deleted");
         svc.delete_view(c, &|_| {}, &ops::no_progress).await.unwrap();
         assert_none(&server, "DELETE").await;
@@ -4365,7 +4568,7 @@ mod tests {
         let dists = json!([{ "pulp_href": DIST, "name": "pulp-tui-cv-rocky9-Dev-os", "base_path": "x", "publication": row.publication }]);
         serve_snapshot(&server, pubs, dists).await;
         let logs = Mutex::new(vec![]);
-        svc.delete_version(row.version_id, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+        svc.delete_version(row.version_id, None, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
         assert_none(&server, "DELETE").await;
         let (p, dv) = (row.publication.unwrap(), row.derived_version.unwrap());
         // Pulp deletes a repository version's publications with it, so the version is kept too.
@@ -4433,7 +4636,7 @@ mod tests {
             serve_snapshot(&server, pubs, json!([plain_dist(field, serves.unwrap_or(&p))])).await;
             Mock::given(method("DELETE")).and(path(p.as_str())).respond_with(ResponseTemplate::new(204)).mount(&server).await;
             let logs = Mutex::new(vec![]);
-            svc.delete_version(v.id, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+            svc.delete_version(v.id, None, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
             let kept = |h: &str| format!("keeping {h}: served by partial ({why})");
             let sent = server.received_requests().await.unwrap();
             let deleted: Vec<&str> = sent.iter().filter(|r| r.method.as_str() == "DELETE").map(|r| r.url.path()).collect();
@@ -4515,7 +4718,7 @@ mod tests {
                 assert_eq!(svc.store.content_view(cv).await.unwrap().name, "web");
             } else {
                 // A rerun after an interrupted delete: the repository is already gone.
-                svc.delete_version(v.id, &|_| {}, &ops::no_progress).await.unwrap();
+                svc.delete_version(v.id, None, &|_| {}, &ops::no_progress).await.unwrap();
                 svc.delete_view(cv, &|_| {}, &ops::no_progress).await.unwrap();
                 assert!(svc.store.content_views("k").await.unwrap().is_empty());
             }

@@ -1113,7 +1113,7 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
             } else {
                 vec![format!("Delete {name} version {number}. In Pulp:")]
             };
-            lines.extend(objects.into_iter().map(|(repo, href, keep)| match keep {
+            lines.extend(objects.iter().map(|(repo, href, keep)| match keep {
                 None => format!("  {repo}: delete {href}"),
                 Some(why) => format!("  {repo}: keep {href} ({why})"),
             }));
@@ -1121,7 +1121,8 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
             ap(move |app| {
                 app.confirm_danger(format!("Delete {name} v{number}"), lines, &format!("v{number}"), move |app| {
                     app.job(format!("delete {name} v{number}"), move |ctx| async move {
-                        ctx.cv()?.locked(cv, &format!("delete v{number}")).await?.delete_version(vid, &ctx.log(), &ctx.on_task()).await?;
+                        let svc = ctx.cv()?.locked(cv, &format!("delete v{number}")).await?;
+                        svc.delete_version(vid, Some(&objects), &ctx.log(), &ctx.on_task()).await?;
                         ap(move |app| {
                             app.ok("version deleted");
                             app.reload();
@@ -2849,6 +2850,7 @@ mod tests {
             "/pulp/api/v3/distributions/file/file/3/",
         );
         let row = crate::store::CvVersionRepo {
+            derived_repo: Some(format!("{REPOS}file/file/2/")),
             derived_version: Some(dv.clone()),
             publication: Some(publication.into()),
             ..st.version_repos(v.id).await.unwrap().remove(0)

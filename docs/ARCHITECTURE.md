@@ -159,6 +159,12 @@ Katello: they live in the store of the profile and are built from Pulp objects.
   before a crash passes. Another user, any group, or roles that this user cannot read: 409, and
   the message names each role holder. `ops::refuse_foreign` decides; `ops::distribution_target`
   calls it, so the preview refuses too.
+* The store is shared: a peer with SQL access can write any href into a row. So before a version
+  delete or a promotion acts on a version row, `CvService::unbound` binds it in Pulp: the snapshot
+  repository has the view's labels (a composite row: those of its component,
+  `CvService::row_view`), the snapshot version is `<snapshot repository>versions/<n>/`, and the
+  `repository_version` of the publication is a version of it. A row with objects and no snapshot
+  repository fails too. A delete keeps the row's objects and logs why; a promotion refuses the row.
 * An object without `pulp_tui_db`, or with an id in the aliases (`meta` key `alias:<id>`),
   that passes these checks is adopted: the workflow sets this database's id when it touches
   the object.
@@ -335,6 +341,9 @@ deleting a publication silently stops its distributions (COMPATIBILITY.md).
   conditional). A later composite publish refuses it; an earlier one is found by the check
   (PostgreSQL: `FOR SHARE` in `Store::begin`). A refused delete restores the state; a
   failed one stays `deleting` until *Delete* again.
+* The run reads the rows again after the typed confirmation. When what it deletes or keeps
+  differs from what the confirmation showed, it is refused before any DELETE, and the version
+  gets its state back.
 * **View** (`CvService::delete_view`): refused while a composite uses it, or another view
   serves a publication of one of its derived repositories.
 

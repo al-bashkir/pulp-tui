@@ -778,7 +778,10 @@ A composite view joins other Content Views (its **components**). Example: `rocky
   of it did not complete (`bound to Dev (failed)`, as the *environments* column says), or while a
   composite uses it. The confirm lists each publication and snapshot version that it deletes, and
   each one that it keeps (still served by an environment) with the reason. Version 0 of a
-  snapshot repository is always kept: each unfiltered RPM or Deb copy starts on it.
+  snapshot repository is always kept: each unfiltered RPM or Deb copy starts on it. An object that
+  is not part of the version's snapshot repository (its row was changed in the shared database) is
+  kept too. When this list changes after the confirm, the delete stops before Pulp is asked:
+  press **d** again to see the new list.
 * **i** details: source versions, snapshot versions, publications, unit counts, component
   versions.
 
