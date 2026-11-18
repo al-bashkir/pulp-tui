@@ -197,3 +197,49 @@ async fn a_promotion_refuses_a_distribution_that_another_user_made_with_the_labe
     svc.delete_view(cv, &|_| {}, &no_progress).await.unwrap();
     cleanup(&admin, &[&dist, &guard, &repo, &remote, &user]).await;
 }
+
+/// A user with view permission on repositories and the publication creator role (the RBAC guide gives other users
+/// such roles) publishes the snapshot version of a view. The next publish with an unchanged source makes no new
+/// version, so it finds that publication first (Pulp lists the newest first). It does not reuse it: the user holds its
+/// owner role. It reuses the publication that the store records, and Library keeps serving that one.
+#[tokio::test]
+async fn a_publish_does_not_reuse_a_publication_that_another_user_made_of_the_snapshot() {
+    if !live_enabled() {
+        return;
+    }
+    let admin = client();
+    let id = unique("pubsquat");
+    let password = "Rbac-test-Pw-9a!";
+    let user = create(&admin, "users/", json!({ "username": id, "password": password }), "/users/").await;
+    for role in ["file.filepublication_creator", "file.filerepository_viewer"] {
+        admin.post(&format!("{user}roles/"), &json!({ "role": role, "content_object": null })).await.unwrap();
+    }
+    let (repo, remote) = synced_repo(&admin, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let scope = admin.profile().to_string();
+    let svc = CvService { client: admin.clone(), store: store.clone(), scope: scope.clone(), actor: "t".into(), lock: None };
+    let cv = store.create_cv(&scope, &id, "").await.unwrap();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    store.set_cv_repo(cv, &docs).await.unwrap();
+    let repos = store.cv_repos(cv).await.unwrap();
+    let (v1, _) = svc.publish(cv, Some(&repos), "", "", &|_| {}, &no_progress).await.unwrap();
+    let row = store.version_repos(v1.id).await.unwrap().remove(0);
+    let (snapshot, own) = (row.derived_version.unwrap(), row.publication.unwrap());
+
+    let body = json!({ "repository_version": snapshot, "manifest": "PULP_MANIFEST" });
+    let foreign = create(&user_client(&id, password), "publications/file/file/", body, "/publications/").await;
+    let logs = std::sync::Mutex::new(vec![]);
+    let (v2, _) = svc.publish(cv, Some(&repos), "", "", &|m| logs.lock().unwrap().push(m), &no_progress).await.unwrap();
+    let row = store.version_repos(v2.id).await.unwrap().remove(0);
+    assert_eq!((row.derived_version.as_deref(), row.publication.as_deref()), (Some(snapshot.as_str()), Some(own.as_str())));
+    let why = format!("docs: publication {foreign} is not reused: user {id} has role file.filepublication_owner on it");
+    let logs = logs.into_inner().unwrap();
+    assert!(logs.contains(&why), "{logs:?}");
+    let lib = store.ensure_library(&scope).await.unwrap();
+    let served = store.binding_repos(lib, cv).await.unwrap().remove(0).distribution;
+    let d: Value = admin.get(&served, &[]).await.unwrap();
+    assert_eq!(d["publication"], json!(own), "Library serves the recorded publication, not the other user's");
+
+    svc.delete_view(cv, &|_| {}, &no_progress).await.unwrap();
+    cleanup(&admin, &[&repo, &remote, &user]).await;
+}

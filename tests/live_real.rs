@@ -177,10 +177,10 @@ async fn rocky9_baseos_real() {
     eprintln!("{name}: {} advisories in the snapshot, {} in the source", advisories(&c, &snapshot).await, advisories(&c, &v).await);
 
     // Operator Publish after a settings change: a reused publication keeps the settings of its time.
-    let p1 = ops::ensure_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap();
+    let p1 = ops::ensure_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap().0;
     let m = c.patch(&repo, &json!({ "checksum_type": "sha512" })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    assert_eq!(ops::ensure_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap(), p1, "ensure_publication reuses p1");
+    assert_eq!(ops::ensure_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap().0, p1, "ensure_publication reuses p1");
     let p2 = ops::create_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap();
     assert_ne!(p2, p1, "create_publication makes a new one");
     let (old, new): (Value, Value) = (c.get(&p1, &[]).await.unwrap(), c.get(&p2, &[]).await.unwrap());

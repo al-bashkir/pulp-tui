@@ -30,13 +30,13 @@ fn upstream_from_downstream() -> String {
 async fn upstream_content(up: &PulpClient, prefix: &str) -> (String, String) {
     let (rpm_repo, _) = synced_repo(up, RepoType::Rpm, &format!("{prefix}-os"), "rpm/", "additive").await;
     let v = latest(up, &rpm_repo).await;
-    let p = ops::ensure_publication(up, RepoType::Rpm, &v, &json!({}), &no_progress).await.unwrap();
+    let p = ops::ensure_publication(up, RepoType::Rpm, &v, &json!({}), &no_progress).await.unwrap().0;
     ops::ensure_distribution(up, RepoType::Rpm, &format!("{prefix}-os"), &format!("{prefix}/os"), Some(&p), &json!({}), None, &no_progress)
         .await
         .unwrap();
     let (file_repo, _) = synced_repo(up, RepoType::File, &format!("{prefix}-docs"), "file/PULP_MANIFEST", "mirror").await;
     let v = latest(up, &file_repo).await;
-    let p = ops::ensure_publication(up, RepoType::File, &v, &json!({}), &no_progress).await.unwrap();
+    let p = ops::ensure_publication(up, RepoType::File, &v, &json!({}), &no_progress).await.unwrap().0;
     ops::ensure_distribution(
         up,
         RepoType::File,
@@ -59,7 +59,7 @@ async fn update_upstream_rpm(up: &PulpClient, prefix: &str, rpm_repo: &str) {
     ops::settle(up, up.patch(&remote, &json!({ "url": format!("{}/rpm2/", upstream()) })).await.unwrap(), &no_progress).await.unwrap();
     ops::settle(up, ops::sync(up, RepoType::Rpm, rpm_repo, None, "additive").await.unwrap(), &no_progress).await.unwrap();
     let v = latest(up, rpm_repo).await;
-    let p = ops::ensure_publication(up, RepoType::Rpm, &v, &json!({}), &no_progress).await.unwrap();
+    let p = ops::ensure_publication(up, RepoType::Rpm, &v, &json!({}), &no_progress).await.unwrap().0;
     ops::ensure_distribution(up, RepoType::Rpm, &format!("{prefix}-os"), &format!("{prefix}/os"), Some(&p), &json!({}), None, &no_progress)
         .await
         .unwrap();
@@ -385,7 +385,7 @@ async fn deb_flat_verbatim_fallback_replication() {
     for (file, path) in &uploads {
         ops::upload(&up, files, file, Some(path), Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
     }
-    let p = ops::ensure_publication(&up, files, &latest(&up, &repo).await, &json!({}), &no_progress).await.unwrap();
+    let p = ops::ensure_publication(&up, files, &latest(&up, &repo).await, &json!({}), &no_progress).await.unwrap().0;
     let (name, base_path) = (format!("{prefix}-files"), format!("{prefix}/files"));
     let d = ops::ensure_distribution(&up, files, &name, &base_path, Some(&p), &json!({}), None, &no_progress).await.unwrap();
     let flat_url = up.get::<Distribution>(&d, &[]).await.unwrap().base_url.unwrap();

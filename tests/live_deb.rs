@@ -69,7 +69,7 @@ async fn deb_mirror_copy_publish_verify() {
     assert!(releases.count >= 1, "the copy has a Release");
 
     // Publish the copy, serve it, and check what clients would download.
-    let publication = ops::ensure_publication(&c, t, &v2, &json!({}), &no_progress).await.unwrap();
+    let publication = ops::ensure_publication(&c, t, &v2, &json!({}), &no_progress).await.unwrap().0;
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let d: Value = c.get(&dist, &[]).await.unwrap();
     let base = d["base_url"].as_str().unwrap().to_string();
@@ -86,13 +86,13 @@ async fn deb_mirror_copy_publish_verify() {
     let service: Value =
         ops::find_by_name(&c, &c.api("signing-services/"), "pulp-tui-deb-test").await.unwrap().expect("Deb test signing service");
     let service = service["pulp_href"].as_str().unwrap();
-    let signed = ops::ensure_publication(&c, t, &v1, &json!({ "signing_service": service }), &no_progress).await.unwrap();
+    let signed = ops::ensure_publication(&c, t, &v1, &json!({ "signing_service": service }), &no_progress).await.unwrap().0;
     assert_eq!(
-        ops::ensure_publication(&c, t, &v1, &json!({ "signing_service": service }), &no_progress).await.unwrap(),
+        ops::ensure_publication(&c, t, &v1, &json!({ "signing_service": service }), &no_progress).await.unwrap().0,
         signed,
         "signed publication is reused"
     );
-    let plain = ops::ensure_publication(&c, t, &v1, &json!({ "signing_service": null }), &no_progress).await.unwrap();
+    let plain = ops::ensure_publication(&c, t, &v1, &json!({ "signing_service": null }), &no_progress).await.unwrap().0;
     assert_ne!(plain, signed, "a signed publication is not reused for the repository default");
     let signed_name = format!("{name}-signed");
     let signed_dist =
@@ -128,7 +128,7 @@ async fn a_removed_deb_package_is_no_longer_served() {
     let m = ops::remove_content(&c, &repo, units).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
 
-    let publication = ops::ensure_publication(&c, t, &latest(&c, &repo).await, &json!({}), &no_progress).await.unwrap();
+    let publication = ops::ensure_publication(&c, t, &latest(&c, &repo).await, &json!({}), &no_progress).await.unwrap().0;
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let d: Value = c.get(&dist, &[]).await.unwrap();
     let base = d["base_url"].as_str().unwrap();
@@ -242,7 +242,7 @@ async fn a_verbatim_publication_is_made_distributed_verified_and_deleted() {
     assert!(p.contains("/publications/deb/verbatim/"), "{p}");
     let pv: Value = c.get(&p, &[]).await.unwrap();
     assert_eq!(ops::publication_mode(t, &pv), verbatim, "a rollback keeps it verbatim");
-    assert_eq!(ops::ensure_publication(&c, t, &v1, &verbatim, &no_progress).await.unwrap(), p, "reused");
+    assert_eq!(ops::ensure_publication(&c, t, &v1, &verbatim, &no_progress).await.unwrap().0, p, "reused");
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
     let d: Value = c.get(&dist, &[]).await.unwrap();
     let base = d["base_url"].as_str().unwrap().to_string();
@@ -645,7 +645,7 @@ async fn deb_rollback_keeps_a_simple_publication() {
     // Roll back to v1 in the served mode.
     let mode = ops::publication_mode(t, &now);
     assert_eq!((mode["simple"].clone(), mode["structured"].clone()), (json!(true), json!(false)), "{mode}");
-    let p = ops::ensure_publication(&c, t, &v1, &mode, &no_progress).await.unwrap();
+    let p = ops::ensure_publication(&c, t, &v1, &mode, &no_progress).await.unwrap().0;
     assert_ne!(p, structured, "the structured publication of v1 is not reused");
     ops::ensure_distribution(&c, t, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
     let pv: Value = c.get(&p, &[]).await.unwrap();

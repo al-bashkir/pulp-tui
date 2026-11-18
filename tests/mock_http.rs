@@ -722,6 +722,7 @@ async fn deb_publication_reuse_respects_signing_service() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [listed] })))
         .mount(&server)
         .await;
+    serve_roles(&server, &format!("{coll}1/"), owned_by("admin")).await; // made by this user (`ops::own_publication`)
     Mock::given(method("POST"))
         .and(path(&coll))
         .and(body_json(json!({ "repository_version": "/v/", "signing_service": "/ss/1/" })))
@@ -730,9 +731,9 @@ async fn deb_publication_reuse_respects_signing_service() {
         .mount(&server)
         .await;
     let c = client(&server, |_, _| {});
-    let signed = ops::ensure_publication(&c, RepoType::Deb, "/v/", &json!({ "signing_service": "/ss/1/" }), &no_progress).await.unwrap();
+    let signed = ops::ensure_publication(&c, RepoType::Deb, "/v/", &json!({ "signing_service": "/ss/1/" }), &no_progress).await.unwrap().0;
     assert_eq!(signed, format!("{coll}2/"));
-    let plain = ops::ensure_publication(&c, RepoType::Deb, "/v/", &json!({ "signing_service": null }), &no_progress).await.unwrap();
+    let plain = ops::ensure_publication(&c, RepoType::Deb, "/v/", &json!({ "signing_service": null }), &no_progress).await.unwrap().0;
     assert_eq!(plain, format!("{coll}1/"));
     server.verify().await;
 }
@@ -752,6 +753,7 @@ async fn deb_verbatim_mode_reuses_or_makes_a_verbatim_publication() {
             .mount(&server)
             .await;
     }
+    serve_roles(&server, &format!("{coll}1/"), owned_by("admin")).await; // made by this user (`ops::own_publication`)
     Mock::given(method("POST"))
         .and(path(&coll))
         .and(body_json(json!({ "repository_version": "/v2/" })))
@@ -762,8 +764,8 @@ async fn deb_verbatim_mode_reuses_or_makes_a_verbatim_publication() {
     let c = client(&server, |_, _| {});
     let verbatim = json!({ "verbatim": true });
     assert_eq!(ops::publication_mode(RepoType::Deb, &json!({ "pulp_href": format!("{coll}1/"), "repository_version": "/v1/" })), verbatim);
-    assert_eq!(ops::ensure_publication(&c, RepoType::Deb, "/v1/", &verbatim, &no_progress).await.unwrap(), format!("{coll}1/"));
-    assert_eq!(ops::ensure_publication(&c, RepoType::Deb, "/v2/", &verbatim, &no_progress).await.unwrap(), format!("{coll}2/"));
+    assert_eq!(ops::ensure_publication(&c, RepoType::Deb, "/v1/", &verbatim, &no_progress).await.unwrap().0, format!("{coll}1/"));
+    assert_eq!(ops::ensure_publication(&c, RepoType::Deb, "/v2/", &verbatim, &no_progress).await.unwrap().0, format!("{coll}2/"));
     server.verify().await;
 }
 
@@ -1414,6 +1416,7 @@ async fn rpm_publication_is_new_when_the_repository_signs_its_metadata() {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [listed] })))
             .mount(&server)
             .await;
+        serve_roles(&server, &format!("{coll}1/"), owned_by("admin")).await; // made by this user (`ops::own_publication`)
         Mock::given(method("POST"))
             .and(path(&coll))
             .and(body_json(json!({ "repository_version": RPM_V, "checksum_type": "sha256" })))
@@ -1423,7 +1426,7 @@ async fn rpm_publication_is_new_when_the_repository_signs_its_metadata() {
             .await;
         let c = client(&server, |_, _| {});
         assert_eq!(
-            ops::ensure_publication(&c, RepoType::Rpm, RPM_V, &mode, &no_progress).await.unwrap(),
+            ops::ensure_publication(&c, RepoType::Rpm, RPM_V, &mode, &no_progress).await.unwrap().0,
             format!("{coll}{want}"),
             "{repo}"
         );

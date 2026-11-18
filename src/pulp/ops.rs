@@ -301,25 +301,28 @@ pub fn publications_for(t: RepoType, mode: &Value) -> &'static str {
     if mode[deb::VERBATIM] == true { deb::VERBATIM_PUBLICATIONS } else { t.publications() }
 }
 
-/// Reuse a publication of the version that has `mode` (`reusable_publication`), else create one with it.
-/// `mode`: publication fields that must match (`null`: must be unset); other fields may be anything.
-/// A reused publication keeps the repository settings of the time it was made; the operator's
-/// Publish uses `create_publication` instead.
-pub async fn ensure_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value, on: OnTask<'_>) -> Result<String> {
-    if let Some(p) = reusable_publication(c, t, version, mode).await? {
-        return Ok(p);
-    }
-    create_publication(c, t, version, mode, on).await
+/// Reuse a publication of the version that has `mode` (`reusable_publication`), else create one with it; with the
+/// notes that say why a found one was not reused. `mode`: publication fields that must match (`null`: must be unset).
+/// A reused publication keeps the repository settings of the time it was made; the operator's Publish uses
+/// `create_publication` instead.
+pub async fn ensure_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value, on: OnTask<'_>) -> Result<(String, Vec<String>)> {
+    let (found, notes) = reusable_publication(c, t, version, mode).await?;
+    let p = match found {
+        Some(p) => p,
+        None => create_publication(c, t, version, mode, on).await?,
+    };
+    Ok((p, notes))
 }
 
-/// The publication that `ensure_publication` reuses: `find_publication`, but none when the RPM repository signs
-/// its metadata. pulp_rpm stores no signing service in a publication, so one made before the repository got its
-/// service (or with another key) cannot be told apart; Pulp signs a new one with the service of now.
-pub async fn reusable_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> Result<Option<String>> {
+/// The publication that `ensure_publication` reuses, and why a found one is not: `own_publication`, where no store
+/// records a publication of an operator's repository, so every one found must be as pulp-tui makes it. None when the
+/// RPM repository signs its metadata: pulp_rpm stores no signing service in a publication, so one made before the
+/// repository got its service (or with another key) cannot be told apart; Pulp signs a new one with the service of now.
+pub async fn reusable_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> Result<(Option<String>, Vec<String>)> {
     if t == RepoType::Rpm && rpm::signs_metadata(c, version).await? {
-        return Ok(None);
+        return Ok((None, vec![]));
     }
-    find_publication(c, t, version, mode).await
+    own_publication(c, t, version, mode, &[]).await
 }
 
 /// A publication of the version that has `mode` and, for File, the manifest name that a new one would get.

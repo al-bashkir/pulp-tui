@@ -2334,11 +2334,11 @@ fn distribute_form(app: &mut App, t: RepoType, name: String, version: Option<Str
         let (shown, target, path) = (binding.as_ref().ok().cloned(), dist.clone(), bp.clone());
         let go = move |app: &mut App| {
             app.job(format!("distribute {dist}"), move |ctx| async move {
-                let href = distribute(&ctx, t, &dist, &bp, binding).await?;
+                let (href, skipped) = distribute(&ctx, t, &dist, &bp, binding).await?;
                 let d: Value = ctx.client.get(&href, &[]).await?;
                 let url = s(&d, "base_url");
                 ap(move |app| {
-                    app.ok(format!("distribution {dist} serves {url}"));
+                    app.ok(format!("distribution {dist} serves {url}{}", notes(&skipped)));
                     app.reload();
                 })
             })
@@ -2397,17 +2397,29 @@ impl Binding {
     }
 }
 
-/// Create or re-point distribution `dist` at base path `bp`, and return its href. `binding` is an error
-/// when the form had nothing to bind to; it is reported after the Content View refusal.
-async fn distribute(ctx: &Ctx, t: RepoType, dist: &str, bp: &str, binding: anyhow::Result<Binding>) -> anyhow::Result<String> {
+/// Create or re-point distribution `dist` at base path `bp`, and return its href, with why a found publication was not
+/// reused (`ops::ensure_publication`). `binding` is an error when the form had nothing to bind to; it is reported after
+/// the Content View refusal.
+async fn distribute(
+    ctx: &Ctx,
+    t: RepoType,
+    dist: &str,
+    bp: &str,
+    binding: anyhow::Result<Binding>,
+) -> anyhow::Result<(String, Vec<String>)> {
     let (c, on) = (&ctx.client, ctx.on_task());
     let existing = existing_distribution(c, t, dist).await?;
-    let p = match binding? {
-        Binding::Follow(repo) => return follow_repository(c, t, existing, dist, bp, &repo, &on).await,
-        Binding::Publication(p) => p,
+    let (p, skipped) = match binding? {
+        Binding::Follow(repo) => return Ok((follow_repository(c, t, existing, dist, bp, &repo, &on).await?, vec![])),
+        Binding::Publication(p) => (p, vec![]),
         Binding::Version(v, signing) => pinned_publication(ctx, t, existing.as_ref(), &v, signing).await?,
     };
-    Ok(ops::ensure_distribution(c, t, dist, bp, Some(&p), &json!({}), None, &on).await?)
+    Ok((ops::ensure_distribution(c, t, dist, bp, Some(&p), &json!({}), None, &on).await?, skipped))
+}
+
+/// `; <note>` for each note (why a found publication was not reused), to end a result line.
+fn notes(skipped: &[String]) -> String {
+    skipped.iter().map(|n| format!("; {n}")).collect()
 }
 
 /// The distribution of type `t` named `name`, if any; one that a Content View owns is refused.
@@ -2417,8 +2429,15 @@ async fn existing_distribution(c: &PulpClient, t: RepoType, name: &str) -> anyho
     Ok(d)
 }
 
-/// A publication of version `v` in the mode that distribution `existing` serves now (`pinned_mode`), reused or new.
-async fn pinned_publication(ctx: &Ctx, t: RepoType, existing: Option<&Value>, v: &str, signing: Option<String>) -> anyhow::Result<String> {
+/// A publication of version `v` in the mode that distribution `existing` serves now (`pinned_mode`), reused or new
+/// (`ops::ensure_publication`, with its notes).
+async fn pinned_publication(
+    ctx: &Ctx,
+    t: RepoType,
+    existing: Option<&Value>,
+    v: &str,
+    signing: Option<String>,
+) -> anyhow::Result<(String, Vec<String>)> {
     let c = &ctx.client;
     let served = match existing {
         Some(d) => {
@@ -3093,13 +3112,15 @@ fn rollback_preview(app: &mut App, t: RepoType, dist: String, version: String) {
     });
 }
 
-/// The publication line of a rollback preview: the publication of `version` in `mode` that it reuses, or a new one.
+/// The publication line of a rollback preview: the publication of `version` in `mode` that it reuses, or a new one
+/// (and why a found one is not reused, `ops::reusable_publication`).
 async fn rollback_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> anyhow::Result<String> {
     let signs = t == RepoType::Rpm && rpm::signs_metadata(c, version).await?;
     Ok(match ops::reusable_publication(c, t, version, mode).await? {
-        Some(p) => format!("existing {}", short(&p)),
-        None if signs => "new, signed with the repository's metadata signing service".into(),
-        None => "new".into(),
+        (Some(p), _) => format!("existing {}", short(&p)),
+        (None, _) if signs => "new, signed with the repository's metadata signing service".into(),
+        (None, skipped) if skipped.is_empty() => "new".into(),
+        (None, skipped) => format!("new ({})", skipped.join("; ")),
     })
 }
 
@@ -3120,16 +3141,17 @@ fn rollback_run(app: &mut App, t: RepoType, d: Value, dist: String, version: Str
         // Checkpoint may have been set since the preview: refuse before the publication is made.
         let now: Value = c.get(&s(&d, "pulp_href"), &[]).await?;
         ops::refuse_checkpoint(&dist, now["checkpoint"] == true)?;
-        let p = ops::ensure_publication(c, t, &version, &mode, &on).await?;
+        let (p, skipped) = ops::ensure_publication(c, t, &version, &mode, &on).await?;
         let base = s(&d, "base_path");
         ops::ensure_distribution(c, t, &dist, &base, Some(&p), &json!({}), None, &on).await?;
         let pv: Value = c.get(&p, &[]).await?;
         let check = ops::verify_served(c, t, &s(&d, "base_url"), &version, &pv).await;
+        let skipped = notes(&skipped);
         ap(move |app| {
             match check {
-                Ok(m) => app.ok(format!("{dist} now serves {}: {m}", short(&version))),
-                Err(e @ PulpError::NotCompared(_)) => app.ok(format!("{dist} now serves {}: {e}", short(&version))),
-                Err(e) => app.notify(Level::Warn, format!("{dist} re-pointed, but verification failed: {e}")),
+                Ok(m) => app.ok(format!("{dist} now serves {}: {m}{skipped}", short(&version))),
+                Err(e @ PulpError::NotCompared(_)) => app.ok(format!("{dist} now serves {}: {e}{skipped}", short(&version))),
+                Err(e) => app.notify(Level::Warn, format!("{dist} re-pointed, but verification failed: {e}{skipped}")),
             }
             app.reload();
         })
@@ -3864,9 +3886,9 @@ fn distribution_save(
     let (edited, shown) = (current.clone().filter(|_| will.is_some() || changes), b.clone());
     let go = move |app: &mut App| {
         app.job(label.clone(), move |ctx| async move {
-            save_distribution(&ctx, t, current.as_ref(), b, serve).await?;
+            let skipped = save_distribution(&ctx, t, current.as_ref(), b, serve).await?;
             ap(move |app| {
-                app.ok(format!("{label}: done"));
+                app.ok(format!("{label}: done{}", notes(&skipped)));
                 app.reload();
             })
         })
@@ -4045,34 +4067,42 @@ async fn repo_by_name(c: &PulpClient, t: RepoType, name: &str) -> anyhow::Result
 }
 
 /// The binding fields to send for `serve` (none: the binding stays), also `repository_version: null` for a
-/// distribution on a version. `current`: the distribution that is edited (a pinned one keeps the mode of what it
-/// serves).
-async fn binding_fields(ctx: &Ctx, t: RepoType, current: Option<&Value>, serve: Serve) -> anyhow::Result<serde_json::Map<String, Value>> {
+/// distribution on a version, with why a found publication was not reused (`pinned_publication`). `current`: the
+/// distribution that is edited (a pinned one keeps the mode of what it serves).
+async fn binding_fields(
+    ctx: &Ctx,
+    t: RepoType,
+    current: Option<&Value>,
+    serve: Serve,
+) -> anyhow::Result<(serde_json::Map<String, Value>, Vec<String>)> {
     let c = &ctx.client;
-    let (repository, publication) = match serve {
-        Serve::Keep => return Ok(serde_json::Map::new()),
-        Serve::Nothing => (Value::Null, Value::Null),
-        Serve::Follow(r) => (s(&repo_by_name(c, t, &r).await?, "pulp_href").into(), Value::Null),
+    let (repository, publication, skipped) = match serve {
+        Serve::Keep => return Ok((serde_json::Map::new(), vec![])),
+        Serve::Nothing => (Value::Null, Value::Null, vec![]),
+        Serve::Follow(r) => (s(&repo_by_name(c, t, &r).await?, "pulp_href").into(), Value::Null, vec![]),
         Serve::Pin(r, n, signing) => {
             let v = version_or_latest(&repo_by_name(c, t, &r).await?, n)?;
-            (Value::Null, pinned_publication(ctx, t, current, &v, signing).await?.into())
+            let (p, skipped) = pinned_publication(ctx, t, current, &v, signing).await?;
+            (Value::Null, p.into(), skipped)
         }
     };
     // Pulp keeps a field that a PATCH leaves out, and refuses two bindings (HTTP 400).
     let on_version = current.filter(|d| d["repository_version"].is_string()).map(|_| ("repository_version".into(), Value::Null));
-    Ok([("repository".into(), repository), ("publication".into(), publication)].into_iter().chain(on_version).collect())
+    Ok(([("repository".into(), repository), ("publication".into(), publication)].into_iter().chain(on_version).collect(), skipped))
 }
 
-/// Create a distribution with `b` and the binding of `serve`, or PATCH `current` with them.
-async fn save_distribution(ctx: &Ctx, t: RepoType, current: Option<&Value>, mut b: Value, serve: Serve) -> anyhow::Result<()> {
+/// Create a distribution with `b` and the binding of `serve`, or PATCH `current` with them; why a found publication
+/// was not reused (`binding_fields`).
+async fn save_distribution(ctx: &Ctx, t: RepoType, current: Option<&Value>, mut b: Value, serve: Serve) -> anyhow::Result<Vec<String>> {
     let (c, on) = (&ctx.client, ctx.on_task());
-    b.as_object_mut().expect("an object").extend(binding_fields(ctx, t, current, serve).await?);
+    let (fields, skipped) = binding_fields(ctx, t, current, serve).await?;
+    b.as_object_mut().expect("an object").extend(fields);
     let m = match current {
         Some(d) => c.patch(&s(d, "pulp_href"), &b).await?,
         None => c.post(&c.api(t.distributions()), &b).await?,
     };
     ops::settle(c, m, &on).await?;
-    Ok(())
+    Ok(skipped)
 }
 
 // ---- tasks ----------------------------------------------------------------------------------
@@ -6694,6 +6724,7 @@ mod tests {
                 .await;
             get(&server, &pubs, page(json!([{ "pulp_href": format!("{pubs}1/"), "repository_version": old, "checksum_type": "sha256" }])))
                 .await;
+            made_by_me(&server, &format!("{pubs}1/")).await;
             for p in ["1/", "9/"] {
                 get(&server, &format!("{pubs}{p}"), json!({ "pulp_href": format!("{pubs}{p}"), "repository_version": old })).await;
             }
@@ -6718,6 +6749,71 @@ mod tests {
             let sent = server.received_requests().await.unwrap();
             let patch: Value = sent.iter().find(|r| r.method.as_str() == "PATCH").unwrap().body_json().unwrap();
             assert_eq!(patch["publication"], json!(format!("{pubs}{served}")));
+        }
+    }
+
+    /// Anyone who may view a repository and has a publication creator role can publish its versions with other
+    /// settings. A rollback reuses a publication of the old version only when it is as pulp-tui makes it: no one but
+    /// this Pulp user (`op`) holds a role on it, and its settings are those of a new one. Else the preview, the
+    /// confirm and the result say that a new one is made, and why.
+    #[tokio::test]
+    async fn a_rollback_does_not_reuse_a_publication_that_another_user_made() {
+        use crate::tui::app::Modal;
+        use wiremock::matchers::{method, path};
+        let (r, pubs, dists) =
+            (format!("{API}repositories/rpm/rpm/r/"), format!("{API}publications/rpm/rpm/"), format!("{API}distributions/rpm/rpm/"));
+        let (old, now, d, found) = (format!("{r}versions/1/"), format!("{pubs}5/"), format!("{dists}1/"), format!("{pubs}1/"));
+        let role = "user eve has role rpm.rpmpublication_owner on it";
+        let field = r#"its field differs from a new one (repo_config is {"gpgcheck":0}, not {})"#;
+        // (holders of its owner role, its repo_config, why it is not reused)
+        for (holders, config, skipped) in
+            [(vec!["eve"], json!({}), Some(role)), (vec!["op"], json!({ "gpgcheck": 0 }), Some(field)), (vec!["op"], json!({}), None)]
+        {
+            let server = wiremock::MockServer::start().await;
+            let dist = json!({ "pulp_href": d, "name": "prod", "base_path": "prod", "base_url": "http://h/prod/", "publication": now });
+            get(&server, &dists, page(json!([dist]))).await;
+            get(&server, &d, dist).await; // the confirm reads it again
+            get(&server, &format!("{API}distributions/"), page(json!([]))).await;
+            get(&server, &r, json!({ "metadata_signing_service": null })).await;
+            get(&server, &now, json!({ "pulp_href": now, "repository_version": format!("{r}versions/2/"), "checksum_type": "sha256" }))
+                .await;
+            let candidate = json!({ "pulp_href": found, "repository_version": old, "checksum_type": "sha256", "repo_config": config });
+            get(&server, &pubs, page(json!([candidate]))).await;
+            get(&server, &format!("{API}login/"), json!({ "username": "op" })).await;
+            let roles = json!({ "roles": [{ "role": "rpm.rpmpublication_owner", "users": holders, "groups": [] }] });
+            get(&server, &format!("{found}list_roles/"), roles).await;
+            for p in ["1/", "9/"] {
+                get(&server, &format!("{pubs}{p}"), json!({ "pulp_href": format!("{pubs}{p}"), "repository_version": old })).await;
+            }
+            wiremock::Mock::given(method("POST"))
+                .and(path(pubs.clone()))
+                .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{pubs}9/") })))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(method("PATCH"))
+                .and(path(d.clone()))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "pulp_href": d })))
+                .mount(&server)
+                .await;
+            let (mut app, mut rx) = connected(&server).await;
+            rollback_preview(&mut app, RepoType::Rpm, "prod".into(), old.clone());
+            settle(&mut app, &mut rx).await;
+            let Some(Modal::Confirm { on_yes, lines, .. }) = app.modal.take() else { panic!("no confirm") };
+            on_yes.unwrap()(&mut app);
+            settle(&mut app, &mut rx).await;
+            let sent = server.received_requests().await.unwrap();
+            let patch: Value = sent.iter().find(|r| r.method.as_str() == "PATCH").unwrap().body_json().unwrap();
+            let notices: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+            let Some(why) = skipped else {
+                assert!(lines.contains(&"  publication: existing 1 (checksum_type=sha256)".to_string()), "{lines:?}");
+                assert_eq!((posts_to(&server, &pubs).await.len(), &patch["publication"]), (0, &json!(found)), "reused");
+                continue;
+            };
+            let note = format!("publication {found} is not reused: {why}");
+            assert!(lines.contains(&format!("  publication: new ({note}) (checksum_type=sha256)")), "{lines:?}");
+            assert_eq!((posts_to(&server, &pubs).await.len(), &patch["publication"]), (1, &json!(format!("{pubs}9/"))), "{holders:?}");
+            // The test client cannot reach the content app, so the result is the warning of a failed verify.
+            assert!(notices.iter().any(|n| n.starts_with("prod re-pointed") && n.ends_with(&format!("; {note}"))), "{notices:?}");
         }
     }
 
@@ -7022,6 +7118,13 @@ mod tests {
     const API: &str = "/pulp/api/v3/";
 
     /// An app connected to `server` as profile `lab`, with an in-memory store.
+    /// Only this Pulp user (`op`, from `login/`) holds a role on the publication at `href`: one that pulp-tui made, so
+    /// `ops::own_publication` reuses it.
+    async fn made_by_me(server: &wiremock::MockServer, href: &str) {
+        get(server, &format!("{API}login/"), json!({ "username": "op" })).await;
+        get(server, &format!("{href}list_roles/"), json!({ "roles": [{ "role": "owner", "users": ["op"], "groups": [] }] })).await;
+    }
+
     async fn connected(server: &wiremock::MockServer) -> (App, tokio::sync::mpsc::UnboundedReceiver<super::super::app::Msg>) {
         // The app is on the Dashboard, which a finished task reloads; every Pulp answers status/.
         get(server, &format!("{API}status/"), json!({ "versions": [] })).await;
@@ -8491,6 +8594,7 @@ mod tests {
         get(&server, &r, repo.clone()).await;
         get(&server, &format!("{API}repositories/file/file/"), page(json!([repo]))).await;
         get(&server, &pubs, page(json!([publication(2)]))).await;
+        made_by_me(&server, &format!("{pubs}2/")).await; // so the re-pin reuses it
         answer(&server, "PATCH", &d, 200, json!({ "pulp_href": d })).await;
         let (mut app, mut rx) = connected(&server).await;
         let follow = "  will serve:  the newest publication of repository r (follows it)";

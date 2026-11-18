@@ -63,8 +63,8 @@ async fn rpm_lifecycle() {
     assert!(d.removed.is_empty());
 
     // Publish exact version and distribute it.
-    let pub1 = ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
-    assert_eq!(ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap(), pub1, "publication is reused");
+    let pub1 = ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap().0;
+    assert_eq!(ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap().0, pub1, "publication is reused");
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
     let msg = ops::verify_served(&c, t, &base, &v1, &json!({ "layout": "nested_alphabetically" })).await.unwrap();
@@ -84,7 +84,7 @@ async fn rpm_lifecycle() {
     assert_eq!(d.added, vec!["fixture-alpha-1.1-1.noarch", "fixture-gamma-0.5-1.noarch"]);
     assert!(d.removed.is_empty());
 
-    let pub2 = ops::ensure_publication(&c, t, &v2, &json!({}), &no_progress).await.unwrap();
+    let pub2 = ops::ensure_publication(&c, t, &v2, &json!({}), &no_progress).await.unwrap().0;
     ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), None, &no_progress).await.unwrap();
     assert_eq!(served(&c, &alpha11).await.0, 200);
     assert_ne!(served(&c, &format!("{base}repodata/repomd.xml")).await.1, repomd1);
@@ -129,7 +129,7 @@ async fn rpm_rollback_of_a_signing_repository_serves_signed_metadata() {
     let name = unique("it-rpm-signed");
     let (repo, remote) = synced_repo(&c, t, &name, "rpm/", "additive").await;
     let v1 = latest(&c, &repo).await;
-    let unsigned = ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
+    let unsigned = ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap().0;
     ops::settle(&c, c.patch(&remote, &json!({ "url": format!("{}/rpm2/", upstream()) })).await.unwrap(), &no_progress).await.unwrap();
     ops::settle(&c, ops::sync(&c, t, &repo, None, "additive").await.unwrap(), &no_progress).await.unwrap();
     let v2 = latest(&c, &repo).await;
@@ -144,7 +144,7 @@ async fn rpm_rollback_of_a_signing_repository_serves_signed_metadata() {
 
     let d: Value = c.get(&dist, &[]).await.unwrap();
     let now = ops::served_publication(&c, &Capabilities::default(), t, &d).await.unwrap().unwrap();
-    let p = ops::ensure_publication(&c, t, &v1, &ops::publication_mode(t, &now), &no_progress).await.unwrap();
+    let p = ops::ensure_publication(&c, t, &v1, &ops::publication_mode(t, &now), &no_progress).await.unwrap().0;
     assert_ne!(p, unsigned, "the unsigned publication of v1 is not reused");
     ops::ensure_distribution(&c, t, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
@@ -240,7 +240,7 @@ async fn file_lifecycle() {
     let (repo, remote) = synced_repo(&c, t, &name, "file/PULP_MANIFEST", "mirror").await;
     let v1 = latest(&c, &repo).await;
     assert_eq!(file::files_in(&c, &v1).await.unwrap().len(), 3);
-    let pub1 = ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap();
+    let pub1 = ops::ensure_publication(&c, t, &v1, &json!({}), &no_progress).await.unwrap().0;
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&pub1), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
     ops::verify_served(&c, t, &base, &v1, &c.get(&pub1, &[]).await.unwrap()).await.unwrap();
@@ -252,7 +252,7 @@ async fn file_lifecycle() {
     let m = c.post(&format!("{repo}modify/"), &json!({ "add_content_units": [&big.pulp_href] })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
     let v2 = latest(&c, &repo).await;
-    let pub2 = ops::ensure_publication(&c, t, &v2, &json!({}), &no_progress).await.unwrap();
+    let pub2 = ops::ensure_publication(&c, t, &v2, &json!({}), &no_progress).await.unwrap().0;
     ops::ensure_distribution(&c, t, &name, &name, Some(&pub2), &json!({}), None, &no_progress).await.unwrap();
     assert_eq!(served(&c, &format!("{base}big.bin")).await.0, 200);
     ops::verify_served(&c, t, &base, &v2, &c.get(&pub2, &[]).await.unwrap()).await.unwrap();
@@ -302,7 +302,7 @@ async fn served_versions_are_protected_from_delete() {
         ops::ensure_publication(&c, t, &version, &json!({}), &no_progress).await.unwrap();
         v.push(version);
     }
-    let pub2 = ops::ensure_publication(&c, t, &v[1], &json!({}), &no_progress).await.unwrap();
+    let pub2 = ops::ensure_publication(&c, t, &v[1], &json!({}), &no_progress).await.unwrap().0;
     let pin = ops::ensure_distribution(&c, t, &format!("{name}-pin"), &format!("{name}-pin"), Some(&pub2), &json!({}), None, &no_progress)
         .await
         .unwrap();
@@ -349,7 +349,7 @@ async fn file_path_with_a_comma_is_served_and_verified() {
     std::fs::write(&path, format!("{name}\n")).unwrap();
     ops::upload(&c, t, &path, Some("reports/q1,2024.txt"), Some(&repo), true, &|_, _| {}, &no_progress).await.unwrap();
     let version = latest(&c, &repo).await;
-    let publication = ops::ensure_publication(&c, t, &version, &json!({}), &no_progress).await.unwrap();
+    let publication = ops::ensure_publication(&c, t, &version, &json!({}), &no_progress).await.unwrap().0;
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&publication), &json!({}), None, &no_progress).await.unwrap();
     let base = dist_url(&c, &dist).await;
     let msg = ops::verify_served(&c, t, &base, &version, &c.get(&publication, &[]).await.unwrap()).await;
@@ -591,7 +591,7 @@ async fn re_point_checks_the_version_and_warns_about_another_repository() {
     let (a, b) = (format!("{name}-a"), format!("{name}-b"));
     let ra = create(&c, t.repositories(), json!({ "name": a }), "/repositories/").await;
     let rb = create(&c, t.repositories(), json!({ "name": b }), "/repositories/").await;
-    let p = ops::ensure_publication(&c, t, &format!("{ra}versions/0/"), &json!({}), &no_progress).await.unwrap();
+    let p = ops::ensure_publication(&c, t, &format!("{ra}versions/0/"), &json!({}), &no_progress).await.unwrap().0;
     let dist = ops::ensure_distribution(&c, t, &name, &name, Some(&p), &json!({}), None, &no_progress).await.unwrap();
     let item: Value = c.get(&dist, &[]).await.unwrap();
     let (mut app, mut rx) = app().await;

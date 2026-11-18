@@ -180,7 +180,9 @@ Katello: they live in the store of the profile and are built from Pulp objects.
   the publish body, else for RPM the repository's (Pulp copies them), else Pulp's default. Here
   Pulp's default does not pass by itself: a publication with the default `repo_config` drops the
   repository's `gpgcheck`. A candidate that fails is skipped, not refused: pulp-tui makes its
-  own and logs why (a replica's result line names it).
+  own and logs why (a replica's result line names it). The TUI's pinned Distribute, rollback
+  and distribution edit (`ops::ensure_publication` / `reusable_publication`) ask the same, with
+  no store record (operator repositories): their preview and result name a skipped one.
 * Known limit: a recorded href skips these checks, so a peer of a shared store who also has a
   Pulp creator role is not covered: it can make an object and write its href into a row.
 * The store is shared: a peer with SQL access can write any href into a row. So before a version

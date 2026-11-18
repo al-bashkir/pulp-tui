@@ -264,6 +264,14 @@ pulp_deb. The list hides Content View snapshot repositories; `t` shows them (the
   **P** also asks for the kind: `apt`, or `verbatim` (see Publications).
   **D** reuses a publication only when its signing service is the same. On RPM, **D** never
   reuses a publication when the repository has a metadata signing service: Pulp signs a new one.
+* **D** with a pinned version, **b** (rollback) and a distribution edit that pins a version reuse
+  a publication of that version only when it is as pulp-tui makes it: no one but your Pulp user
+  has a role on it, and its publish settings are those of a new one (RPM: the repository's
+  `repo_config`, checksum, compression and layout). Anyone who may view the repository and has a
+  publication creator role can publish its versions with other settings, for example
+  `gpgcheck` off. Such a publication is skipped: pulp-tui makes its own, and the preview and the
+  result say why (`publication ... is not reused: user eve has role ... on it`). **P** always
+  makes a new publication.
 * **C** copies content from another repository, with the filter rules of Content Views (see
   "Filters"). RPM can copy dependencies. With filter rules, RPM takes what a Content View filter
   takes: the chosen packages, each advisory whose packages are all chosen, and the comps, modules
@@ -419,7 +427,8 @@ removed counts.
   the distributions that follow the repository and the next sync still use the newest version. On
   Deb, the new publication keeps the signing service of the one the distribution serves now, and
   stays verbatim when that one is verbatim (**D** too, unless you pick a signing service). The
-  preview says if it reuses a publication of the version or makes a new one. On RPM, a repository
+  preview says if it reuses a publication of the version or makes a new one (and why it does not
+  reuse one that another user made, see Repositories). On RPM, a repository
   with a metadata signing service always gets a new publication, signed with that service: an
   older one can be unsigned. A checkpoint distribution is refused before any change (see
   Distributions). When the version is of another repository than the one the distribution
@@ -1342,9 +1351,9 @@ Only Pulp RBAC stops this:
    `rpm.rpmpublication_creator`, `rpm.rpmdistribution_creator`, `file.file…_creator`). Pulp gives
    the creator the owner role of each new object only. When such a user makes a snapshot
    repository, Content View distribution or replica with the pulp-tui name and labels first,
-   pulp-tui refuses it (see Database ID). A publication of a snapshot or replica version that
-   such a user made (view permission on the repository is enough) is not reused: pulp-tui makes
-   its own and logs `publication ... is not reused: ...`.
+   pulp-tui refuses it (see Database ID). A publication of a snapshot or replica version, or of
+   a version that **D** or **b** pins, that such a user made (view permission on the repository
+   is enough) is not reused: pulp-tui makes its own and says `publication ... is not reused: ...`.
 3. **Do not give** `rpm.admin` or a global `*_owner` role to other users.
 
 Assign roles on **Users** or **Groups**: **R**, then **c** with the role and an empty object. A
