@@ -349,9 +349,17 @@ async fn serve_replica(c: &PulpClient, it: &PlanItem, version: &str, labels: &Va
     Ok(format!("{} served at {base} ({check})", short_version(version)))
 }
 
-/// Checked again at run time: an object with the name of `it` may have been created since the dry run.
-fn foreign(kind: &str, it: &PlanItem) -> anyhow::Error {
-    anyhow!("a local {kind} named {} exists and is not managed by this replication", it.name)
+/// The replica `kind` (remote, repository) of `it` in `collection`, with its href, when there is one. Checked again at
+/// run time (an object with the name of `it` may have been created since the dry run): refused without the label of
+/// `src`, or when another Pulp user made it (`ops::refuse_foreign`; replicas are not recorded).
+async fn own_replica(c: &PulpClient, collection: &str, kind: &str, src: &str, it: &PlanItem) -> Result<Option<(String, Value)>> {
+    let Some(r) = ops::find_by_name::<Value>(c, &c.api(collection), &it.name).await? else { return Ok(None) };
+    if !owned(&labels_of(&r), src) {
+        bail!("a local {kind} named {} exists and is not managed by this replication", it.name);
+    }
+    let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
+    ops::refuse_foreign(c, &format!("{kind} {}", it.name), &h, false).await?;
+    Ok(Some((h, r)))
 }
 
 /// The replica remote of `it`, pointed at the upstream URL (Deb: and at the dists that upstream serves).
@@ -360,11 +368,8 @@ async fn replica_remote(c: &PulpClient, src_profile: &str, it: &PlanItem, labels
     if let Some(d) = &it.distributions {
         want["distributions"] = d.as_str().into();
     }
-    match ops::find_by_name::<Value>(c, &c.api(it.t.remotes()), &it.name).await? {
-        Some(r) if !owned(&labels_of(&r), src_profile) => Err(foreign("remote", it)),
-        Some(r) => {
-            let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
-            ops::refuse_foreign(c, &format!("remote {}", it.name), &h, false).await?; // replicas are not recorded
+    match own_replica(c, it.t.remotes(), "remote", src_profile, it).await? {
+        Some((h, r)) => {
             if want.as_object().into_iter().flatten().any(|(k, v)| r[k] != *v) {
                 ops::settle(c, c.patch(&h, &want).await?, on).await?;
             }
@@ -384,11 +389,8 @@ async fn replica_remote(c: &PulpClient, src_profile: &str, it: &PlanItem, labels
 /// (`ensure_publication` reuses only a publication with the repository's name).
 async fn replica_repo(c: &PulpClient, src_profile: &str, it: &PlanItem, remote: &str, labels: &Value, on: OnTask<'_>) -> Result<String> {
     let manifest = it.manifest.as_ref().map(|m| json!({ "manifest": m }));
-    match ops::find_by_name::<Value>(c, &c.api(it.t.repositories()), &it.name).await? {
-        Some(r) if !owned(&labels_of(&r), src_profile) => Err(foreign("repository", it)),
-        Some(r) => {
-            let h = r["pulp_href"].as_str().unwrap_or_default().to_string();
-            ops::refuse_foreign(c, &format!("repository {}", it.name), &h, false).await?; // replicas are not recorded
+    match own_replica(c, it.t.repositories(), "repository", src_profile, it).await? {
+        Some((h, r)) => {
             if let Some(m) = manifest.filter(|m| r["manifest"] != m["manifest"]) {
                 ops::settle(c, c.patch(&h, &m).await?, on).await?;
             }
