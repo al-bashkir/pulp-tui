@@ -164,7 +164,10 @@ Katello: they live in the store of the profile and are built from Pulp objects.
   repository has the view's labels (a composite row: those of its component,
   `CvService::row_view`), the snapshot version is `<snapshot repository>versions/<n>/`, and the
   `repository_version` of the publication is a version of it. A row with objects and no snapshot
-  repository fails too. A delete keeps the row's objects and logs why; a promotion refuses the row.
+  repository fails too. Each href must be written as Pulp writes one (`cv::pulp_href`: a path of
+  letters, digits, `_` and `-`): with a `#`, `?`, `%` or `.`, a request reaches another object
+  than the one that the string checks see. A delete keeps the row's objects and logs why; a
+  promotion refuses the row.
 * An object without `pulp_tui_db`, or with an id in the aliases (`meta` key `alias:<id>`),
   that passes these checks is adopted: the workflow sets this database's id when it touches
   the object.

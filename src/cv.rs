@@ -893,16 +893,20 @@ impl CvService {
         Ok(lines)
     }
 
-    /// Why row `vr` must not be published from what it records, read from the row alone (`None`: it may): its source
-    /// version is not a version of its source repository, its Deb signing is not "", "none" or a signing service, or
-    /// its snapshot version is not of its snapshot repository (`stray_version`). A peer can write these columns.
+    /// Why row `vr` must not be published from what it records, read from the row alone (`None`: it may): an href is not
+    /// written as Pulp writes one (`not_hrefs`), its source version is not a version of its source repository, its Deb
+    /// signing is not "", "none" or a signing service, or its snapshot version is not of its snapshot repository
+    /// (`stray_version`). A peer can write these columns.
     fn stray_row(&self, vr: &CvVersionRepo) -> Option<String> {
-        let src = &vr.repo().repo_href;
+        let (src, s) = (&vr.repo().repo_href, vr.signing.as_str());
+        let service = (!["", "none"].contains(&s)).then_some(s);
+        if let Some(why) = not_hrefs([Some(src.as_str()), vr.source_version.as_deref(), service]) {
+            return Some(why);
+        }
         if let Some(sv) = vr.source_version.as_deref().filter(|sv| !version_of(sv, src)) {
             return Some(format!("{sv} is not a version of the source repository {src}"));
         }
-        let s = vr.signing.as_str();
-        if !["", "none"].contains(&s) && !s.starts_with(&self.client.api("signing-services/")) {
+        if service.is_some_and(|s| !s.starts_with(&self.client.api("signing-services/"))) {
             return Some(format!("signing {s} is not a signing service"));
         }
         stray_version(vr)
@@ -2274,6 +2278,21 @@ fn deleted(v: &CvVersion) -> Option<String> {
     }
 }
 
+/// Whether `href` is written as Pulp writes an href: an absolute path of letters, digits, `_` and `-` that ends with `/`.
+/// A row can hold any text (the store is shared): a `#`, `?`, `%` or `.` would make the request reach another object
+/// than the one that the string checks (`version_of`) see.
+fn pulp_href(href: &str) -> bool {
+    href.starts_with('/')
+        && href.ends_with('/')
+        && !href.contains("//")
+        && href.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-".contains(&b))
+}
+
+/// "`<href> is not a Pulp href`" for the first of `hrefs` that is not one (`pulp_href`).
+fn not_hrefs<'a>(hrefs: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    hrefs.into_iter().flatten().find(|h| !pulp_href(h)).map(|h| format!("{h} is not a Pulp href"))
+}
+
 /// Whether `v` is the href of a version of repository `repo`: `<repo>versions/<n>/`.
 fn version_of(v: &str, repo: &str) -> bool {
     let n = v.strip_prefix(repo).and_then(|v| v.strip_prefix("versions/")?.strip_suffix('/'));
@@ -2283,6 +2302,9 @@ fn version_of(v: &str, repo: &str) -> bool {
 /// Why the snapshot objects that row `vr` records cannot be of its snapshot repository, from the row alone: there is
 /// none recorded, or the snapshot version is not a version of it. `None`: they can be.
 fn stray_version(vr: &CvVersionRepo) -> Option<String> {
+    if let Some(why) = not_hrefs([vr.derived_repo.as_deref(), vr.derived_version.as_deref(), vr.publication.as_deref()]) {
+        return Some(why);
+    }
     let Some(r) = &vr.derived_repo else {
         return (vr.derived_version.is_some() || vr.publication.is_some()).then(|| "no snapshot repository recorded".into());
     };
@@ -3709,6 +3731,32 @@ mod tests {
             svc.delete_version(vr.version_id, None, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
             assert_none(&server, "DELETE").await;
             assert_eq!(logs.into_inner().unwrap(), objects.iter().map(|h| format!("keeping {h}: {why}")).collect::<Vec<_>>());
+        }
+    }
+
+    /// Review of the run-1 fix: `unbound` bound the row's hrefs as strings. A peer writes the snapshot repository href
+    /// with a fragment (or a query): Pulp reads the view's own labeled repository, and `<that>versions/1/` passed
+    /// `version_of`, but the DELETE of the "version" went to the whole snapshot repository. Such an href is kept now.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_version_never_deletes_the_snapshot_repository_of_a_row_href_with_a_fragment() {
+        for suffix in ["#", "?x="] {
+            let server = wiremock::MockServer::start().await;
+            let svc = mock_service(&server).await;
+            let (_, mut vr) = rpm_version(&svc).await;
+            let r = format!("{DERIVED}{suffix}");
+            (vr.derived_repo, vr.derived_version, vr.publication) = (Some(r.clone()), Some(format!("{r}versions/1/")), None);
+            svc.store.save_version_repo(&vr).await.unwrap();
+            svc.store.finish_version(vr.version_id, "published", None).await.unwrap();
+            serve_owner(&server, DERIVED, svc.store.db_id()).await;
+            serve_snapshot(&server, json!([]), json!([])).await;
+            wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+                .respond_with(wiremock::ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+            let logs = Mutex::new(vec![]);
+            svc.delete_version(vr.version_id, None, &|m| logs.lock().unwrap().push(m), &ops::no_progress).await.unwrap();
+            assert_none(&server, "DELETE").await;
+            assert_eq!(logs.into_inner().unwrap(), [format!("keeping {r}versions/1/: {r} is not a Pulp href")]);
         }
     }
 
