@@ -200,7 +200,9 @@ The store is shared, so a row can change between a confirmation and its run, and
 write any href into it:
 
 * `CvService::preview` returns the rows that it read; `publish` refuses when the view's rows
-  differ (`seen`). The preview names a source with the name that Pulp gives the repository at
+  differ (`seen`), and refuses a view that is not a composite without them: only its preview
+  publishes it. Auto publish takes composites only (`Store::auto_composites`), also when a row
+  of `cv_components` names a plain view. The preview names a source with the name that Pulp gives the repository at
   its href when that differs from the recorded name (`cv::pulp_named`).
 * `publish_repo` refuses a row whose source version is not `<source repository>versions/<n>/`,
   whose signing is not `''`, `none` or under `signing-services/`, or whose snapshot version is

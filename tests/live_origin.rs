@@ -56,7 +56,7 @@ async fn served_content_is_found_on_a_server_without_a_content_origin_through_th
     let cv = st.create_cv(&scope, &id, "").await.unwrap();
     let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
     st.set_cv_repo(cv, &docs).await.unwrap();
-    svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, Some(&svc.store.cv_repos(cv).await.unwrap()), "", "", &quiet, &no_progress).await.unwrap();
     open_list(&mut app, &mut rx, Kind::ContentViews, "").await;
     let r = row(&app, "name", &id).unwrap();
     run(&mut app, Act::CvDrift, r);

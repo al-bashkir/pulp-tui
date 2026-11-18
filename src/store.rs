@@ -874,7 +874,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT c.id, c.name, c.description, c.created_at, c.composite, c.auto_publish
              FROM cv_components k JOIN content_views c ON c.id = k.composite_id
-             WHERE k.component_id = $1 AND k.version_id IS NULL AND c.auto_publish != 0 ORDER BY c.name",
+             WHERE k.component_id = $1 AND k.version_id IS NULL AND c.auto_publish != 0 AND c.composite != 0 ORDER BY c.name",
         )
         .bind(component_id)
         .fetch_all(&self.pool)
@@ -3540,6 +3540,10 @@ mod tests {
         assert!(s.auto_composites(os).await.unwrap().is_empty(), "a pinned component does not trigger it");
         s.set_component(c, os, None).await.unwrap(); // upsert: os is latest now
         assert_eq!(s.auto_composites(os).await.unwrap().len(), 1);
+        let composite = |on: bool| sqlx::query("UPDATE content_views SET composite = $2 WHERE id = $1").bind(c).bind(on as i64);
+        composite(false).execute(&s.pool).await.unwrap(); // a peer's write in a shared store
+        assert!(s.auto_composites(os).await.unwrap().is_empty(), "a plain view never auto publishes");
+        composite(true).execute(&s.pool).await.unwrap();
         s.remove_component(c, extras).await.unwrap();
         assert_eq!(s.components(c).await.unwrap().iter().map(|x| x.cv_id).collect::<Vec<_>>(), [os]);
     }

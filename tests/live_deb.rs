@@ -555,7 +555,7 @@ async fn deb_content_view() {
     let service: Value =
         ops::find_by_name(&c, &c.api("signing-services/"), "pulp-tui-deb-test").await.unwrap().expect("Deb test signing service");
     let service = service["pulp_href"].as_str().unwrap().to_string();
-    let (v1, _) = svc.publish(cv, None, "signed", &service, &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, Some(&svc.store.cv_repos(cv).await.unwrap()), "signed", &service, &quiet, &no_progress).await.unwrap();
     let lib = store.ensure_library(&profile).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
     let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
@@ -570,7 +570,7 @@ async fn deb_content_view() {
     assert!(index.contains("Package: fixture-alpha\n") && !index.contains("fixture-beta-dbg"), "{index}");
 
     // Unsigned: the derived repository loses its key, and Library serves no signature.
-    let (v2, _) = svc.publish(cv, None, "unsigned", "none", &quiet, &no_progress).await.unwrap();
+    let (v2, _) = svc.publish(cv, Some(&svc.store.cv_repos(cv).await.unwrap()), "unsigned", "none", &quiet, &no_progress).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
     assert!(!signed(&c, &served_base(&c, &store, lib, cv).await).await, "v{} is unsigned", v2.number);
     assert!(signed(&c, &dev_base).await, "Dev still serves v1");
@@ -599,9 +599,9 @@ async fn deb_content_view() {
     // (pulp_deb changes only the per-release keys that a PATCH names).
     let m = c.patch(&repo, &json!({ "signing_service_release_overrides": { "fixture": service } })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    svc.publish(cv, None, "release key", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, Some(&svc.store.cv_repos(cv).await.unwrap()), "release key", "", &quiet, &no_progress).await.unwrap();
     assert!(signed(&c, &served_base(&c, &store, lib, cv).await).await, "the per-release key of the source signs");
-    svc.publish(cv, None, "unsigned again", "none", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, Some(&svc.store.cv_repos(cv).await.unwrap()), "unsigned again", "none", &quiet, &no_progress).await.unwrap();
     let base = served_base(&c, &store, lib, cv).await;
     assert_eq!(served(&c, &format!("{base}dists/fixture/Release.gpg")).await.0, 404, "none removes the per-release key");
     assert!(!signed(&c, &base).await);

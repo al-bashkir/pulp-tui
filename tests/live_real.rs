@@ -106,7 +106,7 @@ async fn debian_main_real() {
     let (svc, cv, lib) = content_view(&c, &name, &main).await;
     let preview = svc.preview(cv, None).await.unwrap().0.join("\n");
     assert!(preview.contains("+ hello_") && preview.contains("+ nginx"), "{preview}");
-    svc.publish(cv, None, "v1", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, Some(&svc.store.cv_repos(cv).await.unwrap()), "v1", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
     let index_url = format!("{}dists/{dist}/main/binary-amd64/Packages", served_base(&svc, lib, cv).await);
     let (status, index) = served_text(&c, &index_url).await;
@@ -117,7 +117,7 @@ async fn debian_main_real() {
     // v2: hello only; the snapshot removes the nginx packages and their release records, then copies.
     main.filters = parse_rules("include name=hello", t).unwrap();
     svc.store.set_cv_repo(cv, &main).await.unwrap();
-    svc.publish(cv, None, "v2", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, Some(&svc.store.cv_repos(cv).await.unwrap()), "v2", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
     let (status, index) = served_text(&c, &index_url).await;
     assert_eq!(status, 200, "{index}");
@@ -171,7 +171,7 @@ async fn rocky9_baseos_real() {
     let (svc, cv, lib) = content_view(&c, &name, &baseos).await;
     let preview = svc.preview(cv, None).await.unwrap().0.join("\n");
     assert!(preview.contains("+ kernel-") && !preview.contains("+ bash-"), "{preview}");
-    let (v1, _) = svc.publish(cv, None, "v1", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, Some(&svc.store.cv_repos(cv).await.unwrap()), "v1", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
     let snapshot = svc.store.version_repos(v1.id).await.unwrap().remove(0).derived_version.unwrap();
     eprintln!("{name}: {} advisories in the snapshot, {} in the source", advisories(&c, &snapshot).await, advisories(&c, &v).await);

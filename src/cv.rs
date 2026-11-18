@@ -664,9 +664,11 @@ impl CvService {
         if cv.composite {
             return self.publish_composite(&cv, notes, log, on).await;
         }
+        // A plain view copies what its rows name, so it publishes only the rows that its preview showed: the store is
+        // shared, and a row can change after the preview (auto publish has no preview: composites only).
+        let Some(seen) = seen else { bail!("{} is not a composite: publish it from its preview (P)", cv.name) };
         let repos = self.view_repos(&cv).await?;
-        // The store is shared: a row can change after the preview.
-        if seen.is_some_and(|s| s != repos) {
+        if seen != repos {
             bail!("the repositories of {} changed after the preview; publish again to see the new preview", cv.name);
         }
         check_repo_clash(&[(cv.name.clone(), repos.clone())])?;
@@ -3456,7 +3458,7 @@ mod tests {
                 "latest_version_href": format!("{DERIVED}versions/1/"), "pulp_labels": { LABEL_CV: "web" } })))
             .mount(&server)
             .await;
-        let e = svc.publish(cv, None, "", "", &|_| {}, &ops::no_progress).await.unwrap_err();
+        let e = svc.publish(cv, Some(&svc.store.cv_repos(cv).await.unwrap()), "", "", &|_| {}, &ops::no_progress).await.unwrap_err();
         assert_eq!(
             e.to_string(),
             "pulp-tui-cv-web-os is a snapshot repository of content view web; remove it from outer and add its source"
@@ -4559,7 +4561,7 @@ mod tests {
             let r = CvRepo { repo_href: h.into(), repo_name: n.into(), repo_type: RepoType::Rpm, filters: vec![] };
             s.set_cv_repo(web, &r).await.unwrap();
         }
-        let e = svc.publish(web, None, "", "", &|_| {}, &ops::no_progress).await.unwrap_err();
+        let e = svc.publish(web, Some(&s.cv_repos(web).await.unwrap()), "", "", &|_| {}, &ops::no_progress).await.unwrap_err();
         assert_eq!(e.to_string(), "repositories base os (web) and base-os (web) would be served at the same path segment base-os");
         assert!(s.versions(web).await.unwrap().is_empty());
         assert!(server.received_requests().await.unwrap().is_empty(), "no Pulp call");
@@ -4956,6 +4958,40 @@ mod tests {
                 assert!(svc.store.content_views("k").await.unwrap().is_empty());
             }
         }
+    }
+
+    /// Review of the run-1 fix: a peer who writes the shared store makes the composite `t` a plain view that follows `x`
+    /// (its `cv_components` row and auto publish stay) and points its repository anywhere. Auto publish after `x` never
+    /// publishes `t`, and `publish` refuses a plain view without the repositories that its preview showed (`seen`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_publish_never_publishes_a_plain_view() {
+        use sqlx::{AssertSqlSafe, Connection, Executor};
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shared.db");
+        let svc = CvService { store: Arc::new(Store::open(&file).await.unwrap()), ..mock_service(&server).await };
+        let s = &svc.store;
+        let x = s.create_cv("k", "x", "").await.unwrap();
+        let v = s.begin_version(x, "", &[]).await.unwrap();
+        s.finish_version(v.id, "published", None).await.unwrap();
+        let t = s.create_composite("k", "t", "").await.unwrap();
+        s.set_component(t, x, None).await.unwrap();
+        s.set_auto_publish(t, true).await.unwrap();
+        let r = CvRepo {
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/9/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            filters: vec![],
+        };
+        s.set_cv_repo(t, &r).await.unwrap();
+        sqlx::any::install_default_drivers();
+        let mut peer = sqlx::AnyConnection::connect(&format!("sqlite://{}", file.display())).await.unwrap();
+        peer.execute(sqlx::raw_sql(AssertSqlSafe(format!("UPDATE content_views SET composite = 0 WHERE id = {t}")))).await.unwrap();
+        assert_eq!(svc.auto_publish(x, &|_| {}, &ops::no_progress).await, vec![]);
+        let e = svc.publish(t, None, "", "", &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), "t is not a composite: publish it from its preview (P)");
+        assert!(s.versions(t).await.unwrap().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty(), "no request to Pulp");
     }
 
     #[tokio::test(flavor = "multi_thread")]
