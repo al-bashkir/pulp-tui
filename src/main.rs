@@ -71,7 +71,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {}", pulp_tui::session_log::masked(format!("{e:#}")));
+            eprintln!("error: {}", term(&pulp_tui::session_log::masked(format!("{e:#}"))));
             ExitCode::FAILURE
         }
     }
@@ -99,9 +99,9 @@ async fn run() -> Result<()> {
             let name = profile.context("no profile configured")?;
             let c = PulpClient::new(&name, &cfg.profiles[&name], &cfg.settings)?;
             let caps = Capabilities::detect(&c).await?;
-            println!("profile {name}: connected as {}", caps.user.as_ref().map(|u| u.username.as_str()).unwrap_or("anonymous"));
+            println!("profile {name}: connected as {}", term(caps.user.as_ref().map(|u| u.username.as_str()).unwrap_or("anonymous")));
             for l in caps.summary_lines() {
-                println!("  {l}");
+                println!("  {}", term(&l));
             }
             Ok(())
         }
@@ -151,7 +151,7 @@ async fn run() -> Result<()> {
             let json = serde_json::to_string_pretty(&pulp_tui::cv::export(&c, &cv, &cv.scope(&name, &cfg.profiles[&name])).await?)?;
             match output {
                 Some(p) => std::fs::write(&p, json).with_context(|| format!("write {}", p.display()))?,
-                None => println!("{json}"),
+                None => println!("{}", term(&json)),
             }
             Ok(())
         }
@@ -165,7 +165,7 @@ async fn run() -> Result<()> {
             let (cvs, envs, warnings) = pulp_tui::cv::import(&c, &caps, &cv, &cv.scope(&name, &cfg.profiles[&name]), &ex).await?;
             println!("imported {cvs} content view(s) and {envs} environment(s) into profile {name}");
             for w in warnings {
-                println!("warning: {w}");
+                println!("warning: {}", term(&w));
             }
             Ok(())
         }
@@ -176,11 +176,11 @@ async fn run() -> Result<()> {
             let json = serde_json::to_string_pretty(&ex)?;
             match output {
                 Some(p) => std::fs::write(&p, json).with_context(|| format!("write {}", p.display()))?,
-                None => println!("{json}"),
+                None => println!("{}", term(&json)),
             }
             // stderr: stdout may be the export itself.
             for n in notes {
-                eprintln!("note: {n}");
+                eprintln!("note: {}", term(&n));
             }
             Ok(())
         }
@@ -192,7 +192,7 @@ async fn run() -> Result<()> {
             let (created, kept, notes) = repo_export::import(&c, &Capabilities::detect(&c).await?, &ex).await?;
             println!("profile {name}: created {created}, kept {kept} existing (remotes and repositories)");
             for n in notes {
-                println!("warning: {n}");
+                println!("warning: {}", term(&n));
             }
             Ok(())
         }
@@ -207,6 +207,12 @@ async fn run() -> Result<()> {
             pulp_tui::tui::run(app, profile).await
         }
     }
+}
+
+/// Text from the server or an import file, for the terminal: each control character except a newline as an escape
+/// (`\u001b`), so it cannot move the cursor or set the title. It is a JSON escape too: a JSON export stays the same.
+fn term(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() && c != '\n' { format!("\\u{:04x}", u32::from(c)) } else { c.to_string() }).collect()
 }
 
 /// The Content View store of a profile: its external database when it has one (no fallback to the local file), else the local store.
@@ -260,6 +266,20 @@ mod tests {
         let local = Arc::new(Store::open_in_memory().await.unwrap());
         let e = cv_store(&cfg, "lab", &local).await.unwrap_err();
         assert!(e.ends_with("; run pulp-tui db migrate --profile lab"), "{e}");
+    }
+
+    /// Audit: server and import-file text reach the terminal with control characters as escapes.
+    #[test]
+    fn term_shows_control_characters_as_escapes() {
+        assert_eq!(
+            term("a\u{1b}[2K\r\u{7}\u{9b}\u{7f}\0\tb\nc é"),
+            r"a\u001b[2K\u000d\u0007\u009b\u007f\u0000\u0009b".to_owned() + "\nc é"
+        );
+        // serde_json escapes C0 itself, not DEL or C1; the export on stdout is still the same JSON.
+        let v = serde_json::json!({ "name": "x\u{9b}\u{7f}\u{1b}\n" });
+        let json = serde_json::to_string_pretty(&v).unwrap();
+        assert!(json.contains('\u{9b}') && !term(&json).contains('\u{9b}'));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&term(&json)).unwrap(), v);
     }
 
     /// Audit F47: a line of `pulp-tui.log` names each URL without its user info. The file has no color codes.

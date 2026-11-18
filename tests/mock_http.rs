@@ -1738,20 +1738,57 @@ async fn deb_source_upload_refuses_another_dsc_of_a_kept_source_and_version_befo
     }
 }
 
+/// Run the CLI with `args`, the profile `lab` on `server` and a new data directory.
+async fn cli(server: &MockServer, args: &[&str]) -> std::process::Output {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, format!("[profiles.lab]\nurl = \"{}\"\nauth = \"none\"\n", server.uri())).unwrap();
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_pulp-tui"))
+        .args(["--config", &config.display().to_string(), "--data-dir", &dir.path().display().to_string()])
+        .args(args)
+        .output()
+        .await
+        .unwrap()
+}
+
 /// Audit F64: the error that the CLI prints names a URL without its user info.
 #[tokio::test]
 async fn cli_errors_show_no_user_info_of_a_url() {
     let server = MockServer::start().await;
     let refused = ResponseTemplate::new(400).set_body_json(json!({ "detail": "proxy http://u:p@h/ refused" }));
     Mock::given(method("GET")).respond_with(refused).mount(&server).await;
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    std::fs::write(&config, format!("[profiles.lab]\nurl = \"{}\"\nauth = \"none\"\n", server.uri())).unwrap();
-    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_pulp-tui"))
-        .args(["--config", &config.display().to_string(), "--data-dir", &dir.path().display().to_string(), "check"])
-        .output()
-        .await
-        .unwrap();
+    let out = cli(&server, &["check"]).await;
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && err.contains("proxy http://•••@h/ refused") && !err.contains("u:p@"), "{err}");
+}
+
+/// Audit: the CLI wrote server text raw to the terminal, so its escape sequences changed the title or hid lines.
+/// Control characters other than a newline are shown as escapes (`\u001b`).
+#[tokio::test]
+async fn cli_shows_control_characters_of_server_text_as_escapes() {
+    let raw = |s: &[u8]| String::from_utf8_lossy(s).contains(|c: char| c.is_control() && c != '\n');
+    let server = MockServer::start().await;
+    let refused = ResponseTemplate::new(400).set_body_json(json!({ "detail": "x\u{1b}]0;T\u{7}\u{1b}[2K\rok\u{9b}31m" }));
+    Mock::given(method("GET")).respond_with(refused).mount(&server).await;
+    let out = cli(&server, &["check"]).await;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!raw(&out.stderr) && err.contains(r"x\u001b]0;T\u0007\u001b[2K\u000dok\u009b31m"), "{err:?}");
+
+    server.reset().await;
+    let versions = json!({ "versions": [{ "component": "core", "version": "3.63.0\u{1b}]0;V\u{7}" }] });
+    Mock::given(method("GET"))
+        .and(path(format!("{API}status/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(versions))
+        .mount(&server)
+        .await;
+    let user = json!({ "pulp_href": format!("{API}users/1/"), "username": "adm\u{1b}[8min", "is_staff": true });
+    Mock::given(method("GET"))
+        .and(path(format!("{API}login/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(user))
+        .mount(&server)
+        .await;
+    let out = cli(&server, &["check"]).await;
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && !raw(&out.stdout) && !raw(&out.stderr), "{text:?} {:?}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains(r"connected as adm\u001b[8min") && text.contains(r"3.63.0\u001b]0;V\u0007"), "{text:?}");
 }

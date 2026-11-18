@@ -1321,7 +1321,9 @@ pulp-tui config-example              print an example config
 
 The global options also come from `$PULP_TUI_CONFIG`, `$PULP_TUI_PROFILE` and `$PULP_TUI_DATA_DIR`.
 Logs go to `<data-dir>/pulp-tui.log`. Set the level with `PULP_TUI_LOG` (for example
-`PULP_TUI_LOG=pulp_tui=debug`). Secrets are never logged.
+`PULP_TUI_LOG=pulp_tui=debug`). Secrets are never logged. The commands show a control character
+in text from the server or a file as an escape, for example `\u001b`, so it cannot change the
+terminal.
 
 **`export-cv`, `import-cv`, `db migrate`, `db copy`** use the Content View database of the
 selected profile. `export-cv` and `import-cv` also use the Pulp server of the profile. `db migrate`
