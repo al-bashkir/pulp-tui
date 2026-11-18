@@ -421,9 +421,9 @@ fn repoint_body(d: &Distribution, publication: Option<&str>, adopt: Option<(Stri
 }
 
 /// What `ensure_distribution` does with distribution `name` at `base_path`, read from Pulp before any write: re-point
-/// the one of that name (`Some`), or create one (`None`). `Err` (409) is its refusal: the one of that name serves
-/// another base path, lacks the ownership `labels`, belongs to another database (`db`), is a checkpoint distribution
-/// or, with `labels`, is not provably pulp-tui's (`refuse_foreign`); a new one overlaps the base path of another one
+/// the one of that name (`Some`), or create one (`None`). `Err` (409) is its refusal: the one of that name lacks the
+/// ownership `labels`, belongs to another database (`db`), serves another base path, is a checkpoint distribution or,
+/// with `labels`, is not provably pulp-tui's (`refuse_foreign`); a new one overlaps the base path of another one
 /// (`refuse_overlap`). A preview that calls it says what the run does.
 pub async fn distribution_target(
     c: &PulpClient,
@@ -438,10 +438,11 @@ pub async fn distribution_target(
         return Ok(None);
     };
     let d: Distribution = serde_json::from_value(v.clone()).map_err(|e| PulpError::Decode(format!("distribution {name}: {e}")))?;
+    // Ownership first: it says more than the path of a distribution that is not ours.
+    owner_check(&d, labels, db.map(|(key, id, aliases, _)| (key, id, aliases)))?;
     if d.base_path != base_path {
         return Err(PulpError::Api { status: 409, message: format!("distribution {name} serves {} instead of {base_path}", d.base_path) });
     }
-    owner_check(&d, labels, db.map(|(key, id, aliases, _)| (key, id, aliases)))?;
     refuse_checkpoint(name, d.checkpoint)?;
     if labels.as_object().is_some_and(|l| !l.is_empty()) {
         let recorded = db.is_some_and(|(.., hrefs)| hrefs.contains(&d.pulp_href));

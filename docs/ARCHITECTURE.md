@@ -136,7 +136,10 @@ Katello: they live in the store of the profile and are built from Pulp objects.
 | CV distribution    | `pulp-tui-cv-<view>-<env>-<repo>` | also `pulp_tui_env`          |
 
 * A new distribution serves at `<env label>/<view>/<repo>` (`cv::base_path`). An existing
-  one keeps its path (`CvService::served_path`; older servers use `cv/...`).
+  one that this database records keeps its path (`CvService::served_path`; older servers use
+  `cv/...`, and an operator may move one). An unrecorded one does not choose the path: its maker
+  may have, so a promotion and its preview refuse it at another path (`... serves <path>
+  instead of <computed path>`).
 * Names and `pulp_tui_env` use the environment **name**; only the path uses its **label**.
 
 ### Ownership
@@ -168,10 +171,8 @@ Katello: they live in the store of the profile and are built from Pulp objects.
   decides; `ops::distribution_target` calls it, so the preview refuses too. Metadata and
   release signing services are not compared: a publish sets them on a snapshot repository, and
   operators set them on a replica repository.
-* Known limits: a recorded href skips these checks, so a peer of a shared store who also has a
-  Pulp creator role is not covered: it can make an object and write its href into a row. An
-  unrecorded distribution keeps its base path (`CvService::served_path`), so one made at another
-  path passes when its roles and fields do; the preview names that path.
+* Known limit: a recorded href skips these checks, so a peer of a shared store who also has a
+  Pulp creator role is not covered: it can make an object and write its href into a row.
 * The store is shared: a peer with SQL access can write any href into a row. So before a version
   delete or a promotion acts on a version row, `CvService::unbound` binds it in Pulp: the snapshot
   repository has the view's labels (a composite row: those of its component,

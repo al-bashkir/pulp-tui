@@ -1537,14 +1537,22 @@ impl CvService {
         self.alive() // before the checkpoint in unbind_removed
     }
 
-    /// Where `repo` of view `cv` is served in `env`: an existing distribution keeps its path (older
-    /// servers use a `cv/` prefix, and an operator may move a distribution), a new one gets `base_path`.
-    /// Refuses the distribution of another view or environment that has the same derived name.
-    pub async fn served_path(&self, cv: &str, env: &Environment, repo: &CvRepo) -> Result<String> {
-        Ok(match self.named_distribution(cv, env, repo).await? {
-            Some(d) => d.base_path,
-            None => base_path(cv, &env.label, &repo.repo_name),
-        })
+    /// The distribution of the derived name of `repo` (view `cv`, `env`; `named_distribution`), and where a promotion
+    /// serves `repo` in `env`: the path of that distribution when this database records it (older servers use a `cv/`
+    /// prefix, and an operator may move a distribution), else `base_path`. An unrecorded one does not choose the path:
+    /// its maker may have, so `ops::distribution_target` refuses it at another path. The preview (`bind_target`) and the
+    /// run (`bind_repo`) ask this.
+    pub async fn served_path(&self, cv: &str, env: &Environment, repo: &CvRepo) -> Result<(Option<Distribution>, String)> {
+        let named = self.named_distribution(cv, env, repo).await?;
+        let recorded = match &named {
+            Some(d) => self.store.recorded_hrefs(&self.scope).await?.contains(&d.pulp_href),
+            None => false,
+        };
+        let path = match &named {
+            Some(d) if recorded => d.base_path.clone(),
+            _ => base_path(cv, &env.label, &repo.repo_name),
+        };
+        Ok((named, path))
     }
 
     /// The distribution of the derived name of `repo` (view `cv`, `env`), which a promotion re-points. Refuses the
@@ -1576,11 +1584,10 @@ impl CvService {
 
     /// What a promotion does for `repo` of view `cv` in `env` (`bind_repo`), read from Pulp before any write: the
     /// distribution of the derived name that it re-points (`None`: it makes one), and why it fails for `repo` (`None`:
-    /// it does not). The checks are those of the run: `named_distribution` (in `served_path`), then
-    /// `ops::distribution_target` (in `ops::ensure_distribution`). So a preview says what the run does.
+    /// it does not). The checks are those of the run: `served_path`, then `ops::distribution_target` (in
+    /// `ops::ensure_distribution`). So a preview says what the run does.
     pub async fn bind_target(&self, cv: &str, env: &Environment, repo: &CvRepo) -> Result<(Option<Distribution>, Option<String>)> {
-        let named = self.named_distribution(cv, env, repo).await?;
-        let path = named.as_ref().map_or_else(|| base_path(cv, &env.label, &repo.repo_name), |d| d.base_path.clone());
+        let (named, path) = self.served_path(cv, env, repo).await?;
         let (name, (aliases, recorded)) = (distribution_name(cv, &env.name, &repo.repo_name), self.known().await?);
         let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice(), recorded.as_slice()));
         let refusal = match ops::distribution_target(&self.client, repo.repo_type, &name, &path, &dist_labels(cv, &env.name), db).await {
@@ -1663,7 +1670,7 @@ impl CvService {
         let (aliases, recorded) = self.known().await?;
         self.refuse_unbound(cv, vr, publication, &aliases).await?;
         let name = distribution_name(cv, &env.name, &repo.repo_name);
-        let bp = self.served_path(cv, env, repo).await?;
+        let (_, bp) = self.served_path(cv, env, repo).await?;
         let labels = dist_labels(cv, &env.name);
         self.alive()?;
         let db = Some((LABEL_DB, self.store.db_id(), aliases.as_slice(), recorded.as_slice()));
@@ -4666,6 +4673,7 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty(), "no Pulp call");
     }
 
+    /// An operator moved a distribution that this database records: a promotion keeps its path.
     #[tokio::test(flavor = "multi_thread")]
     async fn promote_keeps_the_path_of_a_moved_distribution() {
         use wiremock::matchers::{method, path};
@@ -4685,13 +4693,65 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [d] })))
             .mount(&server)
             .await;
-        serve_made_by_me(&server, DIST).await; // interrupted before it recorded the distribution
+        // An earlier promotion recorded it at the path that the operator then changed.
+        let row = BindingRepo {
+            env_id: lib,
+            cv_id: cv,
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/1/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            distribution: DIST.into(),
+            base_path: "library/web/os".into(),
+            publication: p.clone(),
+        };
+        svc.store.save_binding_repo(&row).await.unwrap();
         svc.store.promoted(lib, cv, v.id, "promoting").await.unwrap(); // an interrupted promotion
         svc.promote(cv, v.id, lib, Mode::Promote, &|_| {}, &ops::no_progress).await.unwrap();
         assert_eq!(svc.store.binding(lib, cv).await.unwrap().unwrap().active(), Some(v.id), "promote again recovers it");
         assert_none(&server, "PATCH").await;
         assert_none(&server, "POST").await;
         assert_eq!(svc.store.binding_repos(lib, cv).await.unwrap()[0].base_path, "custom/os");
+    }
+
+    /// A distribution of the derived name that this database does not record does not choose where the view is served:
+    /// its maker may have chosen that path (here a Prod path for Library content). It gave its owner role to this Pulp
+    /// user and left every guarded field as a new one has, so only the path tells. The preview and the promotion refuse
+    /// it at the computed path, and nothing is sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unrecorded_distribution_at_another_path_is_refused_by_the_preview_and_the_promotion() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        serve_published(&server).await;
+        let svc = mock_service(&server).await;
+        let cv = svc.store.create_cv("k", "web", "").await.unwrap();
+        let v = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
+        let lib = svc.store.ensure_library("k").await.unwrap();
+        let env = svc.store.environments("k").await.unwrap().into_iter().find(|e| e.id == lib).unwrap();
+        let name = distribution_name("web", LIBRARY, "os");
+        let labels = json!({ LABEL_CV: "web", LABEL_ENV: LIBRARY, LABEL_DB: svc.store.db_id() });
+        let d = json!({ "pulp_href": DIST, "name": name, "base_path": "prod/web/os", "publication": null, "content_guard": null,
+            "pulp_labels": labels });
+        Mock::given(method("GET"))
+            .and(path("/pulp/api/v3/distributions/rpm/rpm/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [d] })))
+            .mount(&server)
+            .await;
+        serve_made_by_me(&server, DIST).await;
+        let why = format!("distribution {name} serves prod/web/os instead of library/web/os");
+        let repo = CvRepo {
+            repo_href: "/pulp/api/v3/repositories/rpm/rpm/1/".into(),
+            repo_name: "os".into(),
+            repo_type: RepoType::Rpm,
+            filters: vec![],
+        };
+        let line = svc.promote_target("web", &env, &repo, None).await.unwrap();
+        assert_eq!(line, format!("  os (RPM): distribution {name} at /prod/web/os; the promotion fails for it: {why}"));
+        let e = svc.promote(cv, v.id, lib, Mode::Promote, &|_| {}, &ops::no_progress).await.unwrap_err();
+        assert_eq!(e.to_string(), format!("web in Library: failed: os: conflict [409]: {why}"));
+        assert_none(&server, "PATCH").await;
+        assert_none(&server, "POST").await;
+        assert!(svc.store.binding_repos(lib, cv).await.unwrap().is_empty(), "nothing recorded");
     }
 
     /// View `web` in Library with repository `b-c` derives the distribution name of view `web-Library` in environment

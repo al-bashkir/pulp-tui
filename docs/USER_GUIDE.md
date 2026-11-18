@@ -870,9 +870,12 @@ Native Upstream Pulp objects (tech preview).
     again, or removes the role.
   * So is one with a field that the replication does not set: a proxy, `tls_validation` off, a CA
     or client certificate, headers, a user name or password, a Deb `gpgkey`, a content guard, a
-    retention, autopublish or package signing (`... its field differs from a new one (...)`).
-    The run does not reset such a field: set it back, or delete the object. A signing service on
-    the replica repository is allowed (see above).
+    retention, autopublish or package signing. pulp-tui records no replica, so it cannot tell
+    such a replica from one that another user made. **If you change one of these fields by hand
+    on a replica remote or repository, the next rerun stops with a 409 that names the field**
+    (`... its field differs from a new one (proxy_url is "...", not null)`): set it back, or
+    delete the replica (the next run makes it again). The run does not reset the field for you.
+    A signing service on the replica repository is allowed (see above).
   * It does not follow an upstream base path change: the dry run row is a conflict
     (`... serves <old> instead of <new>`). Delete or move the replica distribution by hand.
 
@@ -1289,6 +1292,11 @@ carry it as the label `pulp_tui_db=<id>`.
   `distribution ... exists, but this database does not record it and user eve has role rpm.rpmdistribution_owner on it: delete it, or remove that role, then try again`,
   or `... and its field differs from a new one (content_guard is "...", not null): delete it, or set it back, then try again`.
   A group role is refused too, and so are roles that your user cannot read.
+* Such an unrecorded distribution must also be at the path that pulp-tui gives a new one
+  (`<env label>/<view>/<repo>`): its maker may have chosen another path, for example a Prod path
+  for Dev content. Promote and its preview refuse it there:
+  `distribution ... serves prod/web/os instead of dev/web/os`. Move it back or delete it. A
+  distribution that the database records keeps its path, also after you move it.
 * Two views can derive the same snapshot repository name: view `a-b` with repository `c` and view
   `a` with repository `b-c` both give `pulp-tui-cv-a-b-c`. The second view is refused with
   `... belongs to content view a-b (label pulp_tui_cv=a-b): view a with repository b-c derives
