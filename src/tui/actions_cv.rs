@@ -484,7 +484,7 @@ fn cv_action(app: &mut App, scope: &str, act: Act, item: Value) {
         Act::CvPreview => app.job(format!("preview {name}"), move |ctx| async move {
             let svc = ctx.cv()?;
             let latest = svc.store.versions(id).await?.into_iter().find(|v| v.state == "published").map(|v| v.id);
-            let lines = svc.preview(id, latest).await?;
+            let (lines, _) = svc.preview(id, latest).await?;
             ap(move |app| app.text(format!("Preview of {name} (draft vs latest published)"), lines))
         }),
         Act::CvPublish => {
@@ -972,9 +972,10 @@ fn cv_publish(app: &mut App, id: i64, name: String, deb: bool) {
         let (notes, signing) = (f.get("notes").to_string(), publish_signing(f)?);
         let name = name.clone();
         app.job(format!("preview {name}"), move |ctx| async move {
-            let (lines, protected) = publish_preview(&ctx.cv()?, id, &name).await?;
+            let (lines, repos, protected) = publish_preview(&ctx.cv()?, id, &name).await?;
             ap(move |app| {
-                guard_library(app, protected, lines, Some(format!("Publish {name}")), move |app| run_publish(app, id, name, notes, signing))
+                let title = Some(format!("Publish {name}"));
+                guard_library(app, protected, lines, title, move |app| run_publish(app, id, name, repos, notes, signing))
             })
         });
         Ok(())
@@ -991,20 +992,24 @@ fn publish_signing(f: &Form) -> Result<String, String> {
 }
 
 /// The Publish preview of view `id` (`name`): the content against the newest published version and what the Library
-/// step changes (`library_lines`); and whether Library is protected.
-async fn publish_preview(svc: &CvService, id: i64, name: &str) -> anyhow::Result<(Vec<String>, bool)> {
+/// step changes (`library_lines`); the repositories that it shows (`CvService::preview`); and whether Library is
+/// protected.
+async fn publish_preview(svc: &CvService, id: i64, name: &str) -> anyhow::Result<(Vec<String>, Vec<CvRepo>, bool)> {
     let latest = svc.store.versions(id).await?.into_iter().find(|v| v.state == "published").map(|v| v.id);
-    let mut lines = svc.preview(id, latest).await?;
+    let (mut lines, repos) = svc.preview(id, latest).await?;
     lines.insert(0, "Publishing creates a new immutable version and makes it active in Library.".into());
     lines.insert(1, String::new());
     lines.extend(library_lines(svc, id, name, &svc.draft_rows(id).await?, "the new version").await?);
-    Ok((lines, svc.library_protected().await?))
+    Ok((lines, repos, svc.library_protected().await?))
 }
 
 /// The confirmed Publish of view `id` (`name`) under its lock, then the auto publish of the composites that use it.
-fn run_publish(app: &mut App, id: i64, name: String, notes: String, signing: String) {
+/// `repos`: those that the preview showed.
+fn run_publish(app: &mut App, id: i64, name: String, repos: Vec<CvRepo>, notes: String, signing: String) {
     app.job(format!("publish {name}"), move |ctx| async move {
-        let (v, note) = ctx.cv()?.locked(id, "publish").await?.publish(id, &notes, &signing, &ctx.log(), &ctx.on_task()).await?;
+        let svc = ctx.cv()?.locked(id, "publish").await?;
+        let (v, note) = svc.publish(id, Some(&repos), &notes, &signing, &ctx.log(), &ctx.on_task()).await?;
+        drop(svc);
         // After the lock of this view is released; composites take their own locks.
         let auto = ctx.cv()?.auto_publish(id, &ctx.log(), &ctx.on_task()).await;
         ap(move |app| {
@@ -1016,11 +1021,12 @@ fn run_publish(app: &mut App, id: i64, name: String, notes: String, signing: Str
     });
 }
 
-/// Resume the publish of version `vid` (number `number`) of view `cv`, then auto publish its composites.
-fn resume(app: &mut App, cv: i64, name: String, vid: i64, number: String) {
+/// Resume the publish of version `vid` (number `number`) of view `cv`, then auto publish its composites. `rows`: those
+/// of the version that the confirmation read (`CvService::resume_sources`).
+fn resume(app: &mut App, cv: i64, name: String, vid: i64, number: String, rows: Vec<CvVersionRepo>) {
     app.job(format!("resume {name} v{number}"), move |ctx| async move {
         let svc = ctx.cv()?.locked(cv, &format!("resume v{number}")).await?;
-        let (v, note) = svc.resume(vid, &ctx.log(), &ctx.on_task()).await?;
+        let (v, note) = svc.resume(vid, Some(&rows), &ctx.log(), &ctx.on_task()).await?;
         // Composites follow the newest version: an older one gives them nothing new. Only composites that lack it
         // publish (`lagging_composites`), also when a stopped client never ran their auto publish.
         let newest = svc.store.versions(cv).await?.into_iter().find(|n| n.state == "published").is_some_and(|n| n.id == v.id);
@@ -1090,14 +1096,17 @@ fn version_action(app: &mut App, scope: &str, cv: i64, name: String, act: Act, i
                     );
                 }
                 // As for Publish: every Deb copy step uses `deb/copy/`.
-                if svc.store.version_repos(vid).await?.iter().any(|r| r.repo().repo_type == RepoType::Deb) {
+                let rows = svc.store.version_repos(vid).await?;
+                if rows.iter().any(|r| r.repo().repo_type == RepoType::Deb) {
                     ctx.caps.require(crate::pulp::Feature::DebCopy)?;
                 }
-                // A confirmation names what the Library step changes; with no change an open Library resumes at once.
+                // A confirmation names what the version copies from and what the Library step changes; with no Library
+                // change an open Library resumes at once.
                 let library = resume_library_lines(&svc, &name, &v).await?;
                 let title = (!library.is_empty()).then(|| format!("Resume {name} v{number}"));
-                let lines: Vec<String> = lines.into_iter().chain(library).collect();
-                ap(move |app| guard_library(app, protected, lines, title, move |app| resume(app, cv, name, vid, number)))
+                let sources = if protected || title.is_some() { svc.resume_sources(&rows).await? } else { vec![] };
+                let lines: Vec<String> = lines.into_iter().chain(sources).chain(library).collect();
+                ap(move |app| guard_library(app, protected, lines, title, move |app| resume(app, cv, name, vid, number, rows)))
             });
         }
         Act::Delete => app.load_job(format!("read what deleting {name} v{number} removes"), move |ctx| async move {
@@ -2235,6 +2244,47 @@ mod tests {
         assert!(app.modal.is_none(), "Library keeps v{}: no Library line, no confirmation", newer.number);
     }
 
+    /// Security audit run-1 (publish, Resume): the Resume confirmation names what the version copies from, with the name
+    /// that Pulp gives the repository; a source version of another repository is refused before the confirmation.
+    #[tokio::test]
+    async fn the_resume_confirmation_names_the_sources() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(&server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        let lib = st.ensure_library("lab").await.unwrap();
+        let old = left_out(&st, lib, web, "2", Some("/p/2/")).await;
+        let ours = json!({ crate::cv::LABEL_CV: "web", crate::cv::LABEL_ENV: LIBRARY, crate::cv::LABEL_DB: st.db_id() });
+        serve(&server, "GET", old.distribution, 200, json!({ "name": "d2", "publication": "/p/2/", "pulp_labels": ours })).await;
+        serve_distributions(&server, &[], None).await; // the Library target of os: nothing refuses it
+        let os = cv_repo("os", "rpm", "1");
+        serve(&server, "GET", os.repo_href.clone(), 200, json!({ "pulp_href": os.repo_href, "name": "rocky-baseos" })).await;
+        let v = st.begin_version(web, "", std::slice::from_ref(&os)).await.unwrap();
+        st.finish_version(v.id, "failed", None).await.unwrap();
+        let item = json!({ "id": v.id, "number": v.number, "state": "failed" });
+        for (sv, want) in [
+            (
+                format!("{}versions/3/", os.repo_href),
+                format!("  os (Pulp repository rocky-baseos) (RPM): from {}versions/3/", os.repo_href),
+            ),
+            (format!("{REPOS}rpm/rpm/9/versions/3/"), String::new()),
+        ] {
+            let row = CvVersionRepo { source_version: Some(sv.clone()), ..st.version_repos(v.id).await.unwrap().remove(0) };
+            st.save_version_repo(&row).await.unwrap();
+            version_action(&mut app, "lab", web, "web".into(), Act::Resume, item.clone());
+            drain(&mut app, &mut rx).await;
+            if want.is_empty() {
+                assert!(app.modal.is_none(), "no confirmation");
+                let why = format!("{sv} is not a version of the source repository {}", os.repo_href);
+                assert!(last_notice(&app).1.ends_with(&format!("repository os: {why}; delete this version and publish again")));
+                continue;
+            }
+            let lines = confirm_lines(&mut app);
+            assert_eq!((lines[1].as_str(), &lines[2..4]), (want.as_str(), ["".to_string(), "In Library:".into()].as_slice()), "{lines:?}");
+        }
+        assert_eq!(st.version(v.id).await.unwrap().state, "failed", "nothing before the confirmation");
+    }
+
     #[tokio::test]
     async fn a_failed_resume_shows_the_failed_version_without_a_reload() {
         let server = MockServer::start().await; // 404 for the rest: the derived repository cannot be found
@@ -2441,7 +2491,7 @@ mod tests {
         let (c, _, extras, _) = rocky(&st).await;
         st.set_auto_publish(c, true).await.unwrap();
         let svc = crate::cv::CvService { client: client(&server), store: st.clone(), scope: "lab".into(), actor: "t".into(), lock: None };
-        svc.publish(c, "", "", &|_| {}, &ops::no_progress).await.unwrap(); // rocky9 v1 uses extras v1
+        svc.publish(c, None, "", "", &|_| {}, &ops::no_progress).await.unwrap(); // rocky9 v1 uses extras v1
         let v2 = publish_empty(&st, extras).await; // the aborted job: published, no auto publish
         app.push(Kind::CvVersions { cv: extras, name: "extras".into() });
         let (v1, resume) = (st.versions(extras).await.unwrap()[1].clone(), |app: &mut App, v: &CvVersion| {
@@ -2473,7 +2523,7 @@ mod tests {
         let (c, _, extras, _) = rocky(&st).await;
         st.set_auto_publish(c, true).await.unwrap();
         let svc = crate::cv::CvService { client: client(&server), store: st.clone(), scope: "lab".into(), actor: "t".into(), lock: None };
-        svc.publish(c, "", "", &|_| {}, &ops::no_progress).await.unwrap(); // rocky9 v1 uses extras v1
+        svc.publish(c, None, "", "", &|_| {}, &ops::no_progress).await.unwrap(); // rocky9 v1 uses extras v1
         let v2 = publish_empty(&st, extras).await; // the aborted job: published, no auto publish
         st.set_env_protected(st.ensure_library("lab").await.unwrap(), true).await.unwrap();
         let item = json!({ "id": v2.id, "number": v2.number, "state": "published" });

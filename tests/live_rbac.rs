@@ -142,7 +142,7 @@ async fn a_promotion_refuses_a_distribution_that_another_user_made_with_the_labe
     let cv = store.create_cv(&scope, &id, "").await.unwrap();
     let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
     store.set_cv_repo(cv, &docs).await.unwrap();
-    let (v, _) = svc.publish(cv, "", "", &|_| {}, &no_progress).await.unwrap();
+    let (v, _) = svc.publish(cv, None, "", "", &|_| {}, &no_progress).await.unwrap();
     let lib = store.ensure_library(&scope).await.unwrap();
     let dev = store.create_env(&scope, "Dev", lib, false).await.unwrap();
     let env = store.environments(&scope).await.unwrap().into_iter().find(|e| e.id == dev).unwrap();

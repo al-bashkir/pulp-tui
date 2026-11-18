@@ -196,6 +196,19 @@ a signing service href). Then for each repository (`publish_repo`):
 
 Then the version is stored `published` and the Library step runs.
 
+The store is shared, so a row can change between a confirmation and its run, and a peer can
+write any href into it:
+
+* `CvService::preview` returns the rows that it read; `publish` refuses when the view's rows
+  differ (`seen`). The preview names a source with the name that Pulp gives the repository at
+  its href when that differs from the recorded name (`cv::pulp_named`).
+* `publish_repo` refuses a row whose source version is not `<source repository>versions/<n>/`,
+  whose signing is not `''`, `none` or under `signing-services/`, or whose snapshot version is
+  not of its snapshot repository (`CvService::stray_row`), before any request.
+* The Resume confirmation names the source version, the repository and the Deb signing of each
+  row that is not published yet (`CvService::resume_sources`, with the same refusals);
+  `resume` refuses when these differ from the rows that the confirmation read.
+
 ### Checkpoints and Resume
 
 Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from them.

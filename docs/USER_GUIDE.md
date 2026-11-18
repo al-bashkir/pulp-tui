@@ -617,6 +617,11 @@ retry, or roll back to the served version to clear the failed attempt.
   fails for, with the same reason and way out as the **M** preview.
 * **P** refuses a view that holds a snapshot repository. Remove it (**x**) and add its source. To
   use the content of another view, make a composite.
+* The preview names each repository as the view records it. When Pulp has another name for it
+  (it was renamed, or its row was changed in the shared database), the line says
+  `os (Pulp repository <name>)`: that repository is what the publish copies. When the
+  repositories of the view change after the preview, **P** stops before it makes anything: press
+  **P** again to see the new preview.
 * **v** versions. **i** full JSON.
 * **M** promotes a version to an environment, with a preview of every distribution. The preview
   reads the distributions from Pulp and does the checks of the promotion. When the distribution of
@@ -767,7 +772,13 @@ A composite view joins other Content Views (its **components**). Example: `rocky
   published version, it runs the auto publish of each composite that does not have it yet. Auto
   publish does not run while Library is protected: when only that is left, **R** refuses and names
   the composites to publish yourself. When its Library step changes Library distributions (as
-  **P** does), **R** asks first and names each change under `In Library:`.
+  **P** does), **R** asks first and names each change under `In Library:`. This confirmation (and
+  the one of a protected Library) also names what each repository that is not published yet
+  copies from: its source version, the Pulp name of the repository as the **P** preview gives it,
+  and the Deb signing. When these change after the confirmation, **R** stops: press **R** again.
+  **R** refuses a version whose row names a source version of another repository, a signing that
+  is not a signing service, or a snapshot version of another repository (a change in the shared
+  database): delete the version and publish again.
 * **W** watches the task of the copy step or the publication step. Other steps show their tasks
   only in the session that runs the publish.
 * The *environments* column names each environment that serves the version, and an attempted

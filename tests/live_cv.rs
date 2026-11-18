@@ -56,14 +56,14 @@ async fn content_view_lifecycle() {
     store.set_cv_repo(cv, &docs).await.unwrap();
 
     // Preview shows the exact selection.
-    let preview = svc.preview(cv, None).await.unwrap().join("\n");
+    let preview = svc.preview(cv, None).await.unwrap().0.join("\n");
     assert!(preview.contains("+ fixture-alpha-1.0-1.noarch"), "{preview}");
     assert!(!preview.contains("+ fixture-beta-debuginfo"), "{preview}");
     assert!(preview.contains("+ docs/readme.txt"), "{preview}");
     assert!(!preview.contains("boot.iso"), "{preview}");
 
     // v1: publish auto-binds Library and is verified against served content.
-    let (v1, _) = svc.publish(cv, "first", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, None, "first", "", &quiet, &no_progress).await.unwrap();
     assert_eq!((v1.number, v1.state.as_str()), (1, "published"));
     let lib = store.ensure_library(&profile).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
@@ -92,7 +92,7 @@ async fn content_view_lifecycle() {
     ops::settle(&c, m, &no_progress).await.unwrap();
     let m = ops::sync(&c, RepoType::Rpm, &rpm_repo, None, "additive").await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    let (v2, _) = svc.publish(cv, "upstream update", "", &quiet, &no_progress).await.unwrap();
+    let (v2, _) = svc.publish(cv, None, "upstream update", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(v2.number, 2);
     assert_eq!(store.binding(lib, cv).await.unwrap().unwrap().active(), Some(v2.id));
     svc.promote(cv, v2.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
@@ -119,7 +119,7 @@ async fn content_view_lifecycle() {
     // Advisory filtering: excluding the package referenced by the advisory drops it.
     os.filters = parse_rules("exclude name=*-debuginfo; exclude name=fixture-beta", RepoType::Rpm).unwrap();
     store.set_cv_repo(cv, &os).await.unwrap();
-    let (v3, _) = svc.publish(cv, "no beta", "", &quiet, &no_progress).await.unwrap();
+    let (v3, _) = svc.publish(cv, None, "no beta", "", &quiet, &no_progress).await.unwrap();
     let os_v3 = store.version_repos(v3.id).await.unwrap().into_iter().find(|v| v.repo().repo_name == "os").unwrap();
     let rv: RepoVersion = c.get(os_v3.derived_version.as_deref().unwrap(), &[]).await.unwrap();
     assert!(!rv.content_summary.present.contains_key("rpm.advisory"));
@@ -165,7 +165,7 @@ async fn content_view_lifecycle() {
     }
     let seen: Mutex<Vec<Task>> = Mutex::new(vec![]);
     let on = |t: &Task| seen.lock().unwrap().push(t.clone());
-    let (v4, _) = svc.resume(v4.id, &quiet, &on).await.unwrap();
+    let (v4, _) = svc.resume(v4.id, None, &quiet, &on).await.unwrap();
     assert_eq!(v4.state, "published");
     let copies: Vec<String> = seen
         .lock()
@@ -207,7 +207,7 @@ async fn environment_relabel_moves_served_paths() {
         .set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] })
         .await
         .unwrap();
-    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let lib = store.ensure_library(&profile).await.unwrap();
     let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
@@ -253,7 +253,7 @@ async fn a_file_view_serves_the_manifest_name_of_its_source() {
     let cv = store.create_cv(&profile, &id, "").await.unwrap();
     let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
     store.set_cv_repo(cv, &docs).await.unwrap();
-    svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let url = |f: &str| format!("http://127.0.0.1:8080/pulp/content/{}/{f}", base_path(&id, "library", "docs"));
     assert_eq!(served(&c, &url("CUSTOM_MANIFEST")).await.0, 200);
     assert_eq!(served(&c, &url("PULP_MANIFEST")).await.0, 404, "the default name is not served");
@@ -285,10 +285,10 @@ async fn resume_of_an_older_version_keeps_library_on_the_newer_one() {
     row.source_version = Some(latest(&c, &repo).await);
     store.save_version_repo(&row).await.unwrap();
     store.finish_version(v1.id, "failed", Some("stopped")).await.unwrap();
-    let (v2, note) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v2, note) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(note, None);
 
-    let (v1, note) = svc.resume(v1.id, &quiet, &no_progress).await.unwrap();
+    let (v1, note) = svc.resume(v1.id, None, &quiet, &no_progress).await.unwrap();
     assert_eq!(v1.state, "published");
     assert_eq!(note.as_deref(), Some("Library not changed: v2 is newer (use Rollback to serve v1)"));
     let lib = store.ensure_library(&profile).await.unwrap();
@@ -320,7 +320,7 @@ async fn unpromote_goes_back_along_the_path() {
         .set_cv_repo(cv, &CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] })
         .await
         .unwrap();
-    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let lib = store.ensure_library(&profile).await.unwrap();
     let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
     let test = store.create_env(&profile, "Test", dev, false).await.unwrap();
@@ -376,11 +376,11 @@ async fn a_failed_promotion_keeps_the_served_version() {
         store.set_cv_repo(cv, &r).await.unwrap();
         sources.extend([repo, remote]);
     }
-    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let lib = store.ensure_library(&profile).await.unwrap();
     let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
-    let (v2, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v2, _) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
 
     // Renamed outside pulp-tui: the promotion finds no distribution of its name, and their base paths are taken.
     let rows = store.binding_repos(dev, cv).await.unwrap();
@@ -444,7 +444,7 @@ async fn a_promotion_to_a_base_path_that_overlaps_another_fails_as_the_preview_s
     let cv = store.create_cv(&profile, &id, "").await.unwrap();
     let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
     store.set_cv_repo(cv, &docs).await.unwrap();
-    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let lib = store.ensure_library(&profile).await.unwrap();
     let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
     let env = store.environments(&profile).await.unwrap().into_iter().find(|e| e.id == dev).unwrap();
@@ -494,14 +494,14 @@ async fn a_left_out_distribution_deleted_outside_pulp_tui_does_not_block_the_env
         store.set_cv_repo(cv, &r).await.unwrap();
         sources.extend([repo, remote]);
     }
-    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let lib = store.ensure_library(&profile).await.unwrap();
     let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
     let more = store.binding_repos(dev, cv).await.unwrap().into_iter().find(|b| b.repo_name == "more").unwrap();
     cleanup(&c, &[&more.distribution]).await;
     store.remove_cv_repo(cv, &more.repo_href).await.unwrap();
-    let (v2, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v2, _) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
 
     let vrs = store.version_repos(v2.id).await.unwrap();
     let env = store.environments(&profile).await.unwrap().into_iter().find(|e| e.id == dev).unwrap();
@@ -540,15 +540,15 @@ async fn publish_leaves_alone_a_kept_library_distribution_taken_over_outside_pul
         store.set_cv_repo(cv, &r).await.unwrap();
         sources.extend([repo, remote]);
     }
-    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let lib = store.ensure_library(&profile).await.unwrap();
     let more = store.binding_repos(lib, cv).await.unwrap().into_iter().find(|b| b.repo_name == "more").unwrap();
     store.remove_cv_repo(cv, &more.repo_href).await.unwrap();
-    svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let m = c.patch(&more.distribution, &json!({ "publication": more.publication, "pulp_labels": {} })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
 
-    let (v3, note) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v3, note) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(note, None, "the Library step completes");
     let b = store.binding(lib, cv).await.unwrap().unwrap();
     assert_eq!((b.served, b.attempt), (Some(v3.id), None));
@@ -586,17 +586,17 @@ async fn a_kept_library_distribution_bound_to_a_repository_is_reported_and_unbou
         store.set_cv_repo(cv, &r).await.unwrap();
         sources.extend([repo, remote]);
     }
-    svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let lib = store.ensure_library(&profile).await.unwrap();
     let more = store.binding_repos(lib, cv).await.unwrap().into_iter().find(|b| b.repo_name == "more").unwrap();
     store.remove_cv_repo(cv, &more.repo_href).await.unwrap();
-    svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let m = c.patch(&more.distribution, &json!({ "repository": more.repo_href })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
 
     let found = svc.verify(cv, lib).await.unwrap();
     assert_eq!(found, [format!("more: distribution serves {}, expected nothing", more.repo_href)]);
-    let (_, note) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (_, note) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(note, None, "the Library step completes");
     let d: Value = c.get(&more.distribution, &[]).await.unwrap();
     assert_eq!((&d["publication"], &d["repository"]), (&Value::Null, &Value::Null), "unbound");
@@ -632,7 +632,7 @@ async fn content_view_owned_by_another_database() {
     };
 
     // A publishes and promotes to Library: its derived repository and distribution carry A's id.
-    let (v, _) = a.publish(a_cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v, _) = a.publish(a_cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let derived = a.store.version_repos(v.id).await.unwrap().remove(0).derived_repo.unwrap();
     let lib = a.store.ensure_library(&profile).await.unwrap();
     let dist = a.store.binding_repos(lib, a_cv).await.unwrap().remove(0).distribution;
@@ -640,14 +640,14 @@ async fn content_view_owned_by_another_database() {
     assert_eq!(label(dist.clone()).await.as_deref(), Some(a.store.db_id()));
 
     // B refuses the foreign derived repository, and writes nothing.
-    let err = format!("{:#}", b.publish(b_cv, "", "", &quiet, &no_progress).await.unwrap_err());
+    let err = format!("{:#}", b.publish(b_cv, None, "", "", &quiet, &no_progress).await.unwrap_err());
     let foreign = format!("is owned by another pulp-tui database ({})", a.store.db_id());
     assert!(err.contains(&foreign), "{err}");
     assert_eq!(label(derived.clone()).await.as_deref(), Some(a.store.db_id()));
 
     // Once B knows A's id as an alias, B adopts both objects.
     b.store.add_alias(a.store.db_id()).await.unwrap();
-    b.publish(b_cv, "", "", &quiet, &no_progress).await.unwrap();
+    b.publish(b_cv, None, "", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(label(derived.clone()).await.as_deref(), Some(b.store.db_id()));
     assert_eq!(label(dist.clone()).await.as_deref(), Some(b.store.db_id()));
 
@@ -684,15 +684,15 @@ async fn composite_content_view_rocky9() {
     let repo = |href: &str, name: &str, t| CvRepo { repo_href: href.into(), repo_name: name.into(), repo_type: t, filters: vec![] };
     store.set_cv_repo(os, &repo(&file_repo, "docs", RepoType::File)).await.unwrap();
     store.set_cv_repo(extras, &repo(&rpm_repo, "os", RepoType::Rpm)).await.unwrap();
-    let (os_v1, _) = svc.publish(os, "", "", &quiet, &no_progress).await.unwrap();
-    let (extras_v1, _) = svc.publish(extras, "", "", &quiet, &no_progress).await.unwrap();
+    let (os_v1, _) = svc.publish(os, None, "", "", &quiet, &no_progress).await.unwrap();
+    let (extras_v1, _) = svc.publish(extras, None, "", "", &quiet, &no_progress).await.unwrap();
 
     // v1: os pinned, extras latest; nothing is copied, and Library serves the composite's own paths.
     let comp = store.create_composite(&profile, &id, "").await.unwrap();
     store.set_component(comp, os, Some(os_v1.id)).await.unwrap();
     store.set_component(comp, extras, None).await.unwrap();
     store.set_auto_publish(comp, true).await.unwrap();
-    let (c1, _) = svc.publish(comp, "first", "", &quiet, &no_progress).await.unwrap();
+    let (c1, _) = svc.publish(comp, None, "first", "", &quiet, &no_progress).await.unwrap();
     assert_eq!((c1.number, c1.state.as_str()), (1, "published"));
     let lib = store.ensure_library(&profile).await.unwrap();
     assert_eq!(svc.verify(comp, lib).await.unwrap(), Vec::<String>::new());
@@ -713,7 +713,7 @@ async fn composite_content_view_rocky9() {
     ops::settle(&c, m, &no_progress).await.unwrap();
     let m = ops::sync(&c, RepoType::Rpm, &rpm_repo, None, "additive").await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    let (extras_v2, _) = svc.publish(extras, "update", "", &quiet, &no_progress).await.unwrap();
+    let (extras_v2, _) = svc.publish(extras, None, "update", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(extras_v2.number, 2);
     let auto = svc.auto_publish(extras, &quiet, &no_progress).await;
     let want: Vec<Result<String, String>> = vec![Ok(format!("{id} v2 published"))];
@@ -783,7 +783,7 @@ async fn publish_cleanup_keeps_a_served_version_that_no_view_version_records() {
     let cv = store.create_cv(&profile, &id, "").await.unwrap();
     let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
     store.set_cv_repo(cv, &docs).await.unwrap();
-    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let row = store.version_repos(v1.id).await.unwrap().remove(0);
     let derived = row.derived_repo.clone().unwrap();
 
@@ -797,7 +797,7 @@ async fn publish_cleanup_keeps_a_served_version_that_no_view_version_records() {
 
     // The next publish copies onto that version, so it is no longer the latest one and no view version records it.
     let lines = Mutex::new(vec![]);
-    svc.publish(cv, "", "", &|s| lines.lock().unwrap().push(s), &no_progress).await.unwrap();
+    svc.publish(cv, None, "", "", &|s| lines.lock().unwrap().push(s), &no_progress).await.unwrap();
     assert_ne!(latest(&c, &derived).await, unrecorded, "the publish made a newer version");
     assert!(c.get::<RepoVersion>(&unrecorded, &[]).await.is_ok(), "the served version was deleted");
     let d: serde_json::Value = c.get(&dist, &[]).await.unwrap();
@@ -826,7 +826,7 @@ async fn deletes_keep_what_a_plain_distribution_serves() {
     let cv = store.create_cv(&profile, &id, "").await.unwrap();
     let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
     store.set_cv_repo(cv, &docs).await.unwrap();
-    let (v1, _) = svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap();
     let row = store.version_repos(v1.id).await.unwrap().remove(0);
     let (p, dv, derived) = (row.publication.unwrap(), row.derived_version.unwrap(), row.derived_repo.unwrap());
 
@@ -905,7 +905,7 @@ async fn import_cv_maps_repositories_by_name_to_the_target_server() {
     let cv1 = store.content_views(&p1).await.unwrap()[0].id;
     assert_eq!(store.cv_repos(cv1).await.unwrap(), [file(&repo1, &docs)]);
     let svc = CvService { client: c1.clone(), store: store.clone(), scope: p1.clone(), actor: "test@live".into(), lock: None };
-    svc.publish(cv1, "", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv1, None, "", "", &quiet, &no_progress).await.unwrap();
     let url = |f: &str| format!("http://127.0.0.1:8080/pulp/content/{}/{f}", base_path(&id, "library", &docs));
     let (status, body) = served(&c1, &url("docs/readme.txt")).await;
     assert_eq!((status, body.len()), (200, 10), "served from pulp1's {docs}");
@@ -1477,7 +1477,7 @@ async fn a_version_that_dev_serves_in_part_is_not_deleted_through_the_tui() {
             filters: parse_rules(filters, RepoType::File).unwrap(),
         };
         st.set_cv_repo(cv, &docs).await.unwrap();
-        svc.publish(cv, "", "", &quiet, &no_progress).await.unwrap().0
+        svc.publish(cv, None, "", "", &quiet, &no_progress).await.unwrap().0
     };
     let v1 = publish("").await;
     svc.promote(cv, v1.id, dev, Mode::Promote, &quiet, &no_progress).await.unwrap();
@@ -1628,6 +1628,73 @@ async fn a_version_delete_keeps_what_a_peer_wrote_into_its_row_through_the_tui()
     cleanup(&c, &[&repo, &remote]).await;
 }
 
+/// Publish (P) of view `name` up to its preview: the confirmation is open.
+async fn open_publish(app: &mut App, rx: &mut UnboundedReceiver<Msg>, name: &str) {
+    let r = cv_row(app, rx, name).await;
+    run(app, Act::CvPublish, r);
+    settle(app, rx).await;
+    fill(app, &[("notes", "")]);
+    settle(app, rx).await;
+}
+
+/// Security audit run-1 (publish), through the TUI: a peer who shares the store points the row docs of the view at
+/// another repository with SQL. After the Publish preview was shown: the publish is refused, and no version is made.
+/// Before it: the preview names the repository that Pulp has at that href. A stopped version whose source version the
+/// peer changed: Resume refuses it before the snapshot repository is made.
+#[tokio::test]
+async fn publish_and_resume_refuse_a_source_that_a_peer_changed_through_the_tui() {
+    if !live_enabled() {
+        return;
+    }
+    let (c, id) = (client(), unique("cvsrc"));
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("shared.db");
+    let (mut app, mut rx) = app_with(Arc::new(Store::open(&file).await.unwrap())).await;
+    let svc = service(&app, &c);
+    let (st, scope) = (svc.store.clone(), svc.scope.clone());
+    let (repo, remote) = synced_repo(&c, RepoType::File, &format!("{id}-docs"), "file/PULP_MANIFEST", "mirror").await;
+    let (other, other_remote) = synced_repo(&c, RepoType::File, &format!("{id}-other"), "file/PULP_MANIFEST", "mirror").await;
+    let cv = st.create_cv(&scope, &id, "").await.unwrap();
+    let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
+    st.set_cv_repo(cv, &docs).await.unwrap();
+
+    open_publish(&mut app, &mut rx, &id).await;
+    let swap = |href: &str| format!("UPDATE cv_repos SET repo_href = '{href}' WHERE cv_id = {cv}");
+    peer_sql(&file, swap(&other)).await;
+    yes(&mut app);
+    settle(&mut app, &mut rx).await;
+    let refused = format!("the repositories of {id} changed after the preview; publish again to see the new preview");
+    assert!(texts(&app).iter().any(|t| t.ends_with(&refused)), "{:?}", texts(&app));
+    assert!(st.versions(cv).await.unwrap().is_empty(), "a version was made");
+    open_publish(&mut app, &mut rx, &id).await;
+    let Some(Modal::Confirm { lines, .. }) = app.modal.take() else { panic!("no preview: {:?}", texts(&app)) };
+    let named = format!("== docs (Pulp repository {id}-other) (File) from {other}versions/");
+    assert!(lines.iter().any(|l| l.starts_with(&named)), "{lines:?}");
+
+    peer_sql(&file, swap(&repo)).await;
+    let v1 = st.begin_version(cv, "", &[docs]).await.unwrap();
+    let row = st.version_repos(v1.id).await.unwrap().remove(0);
+    st.save_version_repo(&pulp_tui::store::CvVersionRepo { source_version: Some(latest(&c, &repo).await), ..row }).await.unwrap();
+    st.finish_version(v1.id, "failed", Some("stopped")).await.unwrap();
+    let foreign = latest(&c, &other).await;
+    peer_sql(&file, format!("UPDATE cv_version_repos SET source_version = '{foreign}' WHERE version_id = {}", v1.id)).await;
+    let r = cv_row(&mut app, &mut rx, &id).await;
+    run(&mut app, Act::CvVersions, r);
+    settle(&mut app, &mut rx).await;
+    let v1_row = app.list.items.iter().find(|v| v["number"] == 1).cloned().unwrap();
+    run(&mut app, Act::Resume, v1_row);
+    settle(&mut app, &mut rx).await;
+    let why = format!("repository docs: {foreign} is not a version of the source repository {repo}; delete this version and publish again");
+    assert!(texts(&app).iter().any(|t| t.ends_with(&why)), "{:?}", texts(&app));
+    assert_eq!(st.version(v1.id).await.unwrap().state, "failed");
+    let derived = format!("pulp-tui-cv-{id}-docs");
+    let found: Page<Value> = c.list(&c.api(RepoType::File.repositories()), &[("name", derived)]).await.unwrap();
+    assert!(found.results.is_empty(), "the snapshot repository was made");
+
+    svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
+    cleanup(&c, &[&repo, &remote, &other, &other_remote]).await;
+}
+
 /// Resume (R) of the newest component version whose auto publish never ran (the client stopped first): the composite
 /// that follows it publishes, and Library serves it. A second Resume has nothing left to do.
 #[tokio::test]
@@ -1644,14 +1711,14 @@ async fn resume_publishes_a_lagging_composite_through_the_tui() {
     let extras = st.create_cv(&scope, &extras_name, "").await.unwrap();
     let docs = CvRepo { repo_href: repo.clone(), repo_name: "docs".into(), repo_type: RepoType::File, filters: vec![] };
     st.set_cv_repo(extras, &docs).await.unwrap();
-    svc.publish(extras, "", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(extras, None, "", "", &quiet, &no_progress).await.unwrap();
     let comp = st.create_composite(&scope, &id, "").await.unwrap();
     st.set_component(comp, extras, None).await.unwrap();
     st.set_auto_publish(comp, true).await.unwrap();
-    svc.publish(comp, "", "", &quiet, &no_progress).await.unwrap(); // composite v1 uses extras v1
+    svc.publish(comp, None, "", "", &quiet, &no_progress).await.unwrap(); // composite v1 uses extras v1
     // extras v2 without the ISO; the client stopped before the auto publish.
     st.set_cv_repo(extras, &CvRepo { filters: parse_rules("exclude path=isos/*", RepoType::File).unwrap(), ..docs }).await.unwrap();
-    let (e2, _) = svc.publish(extras, "", "", &quiet, &no_progress).await.unwrap();
+    let (e2, _) = svc.publish(extras, None, "", "", &quiet, &no_progress).await.unwrap();
 
     // Resume (R) of extras v2 on its Versions screen: the composite publishes with extras v2.
     let r = cv_row(&mut app, &mut rx, &extras_name).await;

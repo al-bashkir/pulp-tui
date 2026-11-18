@@ -547,7 +547,7 @@ async fn deb_content_view() {
     let apt =
         CvRepo { repo_href: repo.clone(), repo_name: "apt".into(), repo_type: t, filters: parse_rules("exclude name=*-dbg", t).unwrap() };
     store.set_cv_repo(cv, &apt).await.unwrap();
-    let preview = svc.preview(cv, None).await.unwrap().join("\n");
+    let preview = svc.preview(cv, None).await.unwrap().0.join("\n");
     assert!(preview.contains("+ fixture-alpha_1.0-1_amd64"), "{preview}");
     assert!(!preview.contains("fixture-beta-dbg"), "{preview}");
 
@@ -555,7 +555,7 @@ async fn deb_content_view() {
     let service: Value =
         ops::find_by_name(&c, &c.api("signing-services/"), "pulp-tui-deb-test").await.unwrap().expect("Deb test signing service");
     let service = service["pulp_href"].as_str().unwrap().to_string();
-    let (v1, _) = svc.publish(cv, "signed", &service, &quiet, &no_progress).await.unwrap();
+    let (v1, _) = svc.publish(cv, None, "signed", &service, &quiet, &no_progress).await.unwrap();
     let lib = store.ensure_library(&profile).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
     let dev = store.create_env(&profile, "Dev", lib, false).await.unwrap();
@@ -570,7 +570,7 @@ async fn deb_content_view() {
     assert!(index.contains("Package: fixture-alpha\n") && !index.contains("fixture-beta-dbg"), "{index}");
 
     // Unsigned: the derived repository loses its key, and Library serves no signature.
-    let (v2, _) = svc.publish(cv, "unsigned", "none", &quiet, &no_progress).await.unwrap();
+    let (v2, _) = svc.publish(cv, None, "unsigned", "none", &quiet, &no_progress).await.unwrap();
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
     assert!(!signed(&c, &served_base(&c, &store, lib, cv).await).await, "v{} is unsigned", v2.number);
     assert!(signed(&c, &dev_base).await, "Dev still serves v1");
@@ -582,7 +582,7 @@ async fn deb_content_view() {
         vr.signing = service.clone();
         store.save_version_repo(&vr).await.unwrap();
     }
-    let (v3, _) = svc.resume(v3.id, &quiet, &no_progress).await.unwrap();
+    let (v3, _) = svc.resume(v3.id, None, &quiet, &no_progress).await.unwrap();
     assert_eq!(v3.state, "published");
     assert_eq!(svc.verify(cv, lib).await.unwrap(), Vec::<String>::new());
     assert!(signed(&c, &served_base(&c, &store, lib, cv).await).await, "the resumed version is signed");
@@ -590,7 +590,7 @@ async fn deb_content_view() {
     // A composite borrows the rows of the component version: nothing to sign or copy.
     let comp = store.create_composite(&profile, &format!("{id}-all"), "").await.unwrap();
     store.set_component(comp, cv, None).await.unwrap();
-    let (c1, _) = svc.publish(comp, "", "", &quiet, &no_progress).await.unwrap();
+    let (c1, _) = svc.publish(comp, None, "", "", &quiet, &no_progress).await.unwrap();
     assert_eq!(c1.state, "published");
     assert_eq!(svc.verify(comp, lib).await.unwrap(), Vec::<String>::new());
     assert!(signed(&c, &served_base(&c, &store, lib, comp).await).await, "the composite serves the publication of v3");
@@ -599,9 +599,9 @@ async fn deb_content_view() {
     // (pulp_deb changes only the per-release keys that a PATCH names).
     let m = c.patch(&repo, &json!({ "signing_service_release_overrides": { "fixture": service } })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    svc.publish(cv, "release key", "", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, None, "release key", "", &quiet, &no_progress).await.unwrap();
     assert!(signed(&c, &served_base(&c, &store, lib, cv).await).await, "the per-release key of the source signs");
-    svc.publish(cv, "unsigned again", "none", &quiet, &no_progress).await.unwrap();
+    svc.publish(cv, None, "unsigned again", "none", &quiet, &no_progress).await.unwrap();
     let base = served_base(&c, &store, lib, cv).await;
     assert_eq!(served(&c, &format!("{base}dists/fixture/Release.gpg")).await.0, 404, "none removes the per-release key");
     assert!(!signed(&c, &base).await);
