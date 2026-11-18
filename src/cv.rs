@@ -495,7 +495,14 @@ impl CvService {
         if let Some(why) = self.not_ours(r, &json!({ LABEL_CV: slug(cv) }), aliases).await? {
             return Ok(Some(why));
         }
-        let Some(p) = &vr.publication else { return Ok(None) };
+        match &vr.publication {
+            Some(p) => self.foreign_publication(p, r, serve).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Why publication `p` is not one of a version of snapshot repository `r` (`unbound`, with `serve`).
+    async fn foreign_publication(&self, p: &str, r: &str, serve: bool) -> Result<Option<String>> {
         let pv: Value = match self.client.get(p, &[]).await {
             Ok(v) => v,
             Err(e) if e.is_not_found() && serve => return Ok(Some(cannot_read(p))),
@@ -1116,18 +1123,7 @@ impl CvService {
             };
             task = Some(self.tracked_task(vr, "copy", copy, log, on).await?);
         }
-        // No new version is created when the content equals the latest version.
-        let version = match task.as_ref().and_then(|t| t.created_matching("/versions/")) {
-            Some(v) => v,
-            None => {
-                let r: Repository = c.get(derived, &[]).await?;
-                r.latest_version_href.ok_or_else(|| anyhow!("derived repository has no version"))?
-            }
-        };
-        // A recorded task is a row href (the store is shared): what it made must be a version of this snapshot.
-        if !version_of(&version, derived) {
-            bail!("{version} is not a version of the snapshot repository {derived}; delete this version and publish again");
-        }
+        let version = self.copied_version(task.as_ref(), derived).await?;
         let rv: RepoVersion = c.get(&version, &[]).await?;
         vr.content_count = Some(rv.content_summary.present_count() as i64);
         vr.derived_version = Some(version.clone());
@@ -1138,6 +1134,23 @@ impl CvService {
             log(format!("{}: cleanup of unused versions stopped: {e:#}", repo.repo_name));
         }
         Ok(())
+    }
+
+    /// The snapshot version that the copy steps made: the one that the last `task` created, else the latest version of
+    /// `derived` (no new version is created when the content equals it). A recorded task is a row href (the store is
+    /// shared): a version of another repository is refused.
+    async fn copied_version(&self, task: Option<&Task>, derived: &str) -> Result<String> {
+        let version = match task.and_then(|t| t.created_matching("/versions/")) {
+            Some(v) => v,
+            None => {
+                let r: Repository = self.client.get(derived, &[]).await?;
+                r.latest_version_href.ok_or_else(|| anyhow!("derived repository has no version"))?
+            }
+        };
+        if !version_of(&version, derived) {
+            bail!("{version} is not a version of the snapshot repository {derived}; delete this version and publish again");
+        }
+        Ok(version)
     }
 
     /// Give `derived` the publish settings of the source of `vr` (RPM, File) or its signing choice (Deb). Returns
