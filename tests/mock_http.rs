@@ -714,28 +714,54 @@ async fn deb_sync_maps_rpm_mirror_policies_to_mirror() {
 #[tokio::test]
 async fn deb_publication_reuse_respects_signing_service() {
     let server = MockServer::start().await;
-    let coll = format!("{API}publications/deb/apt/");
-    let listed = json!({ "pulp_href": format!("{coll}1/"), "repository_version": "/v/", "signing_service": null });
+    let (coll, repo) = (format!("{API}publications/deb/apt/"), format!("{API}repositories/deb/apt/1/"));
+    let v = format!("{repo}versions/1/");
+    let listed = json!({ "pulp_href": format!("{coll}1/"), "repository_version": v, "signing_service": null });
     Mock::given(method("GET"))
         .and(path(&coll))
-        .and(query_param("repository_version", "/v/"))
+        .and(query_param("repository_version", &v))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 1, "next": null, "results": [listed] })))
         .mount(&server)
         .await;
+    Mock::given(method("GET")).and(path(&repo)).respond_with(ResponseTemplate::new(200).set_body_json(json!({}))).mount(&server).await;
     serve_roles(&server, &format!("{coll}1/"), owned_by("admin")).await; // made by this user (`ops::own_publication`)
     Mock::given(method("POST"))
         .and(path(&coll))
-        .and(body_json(json!({ "repository_version": "/v/", "signing_service": "/ss/1/" })))
+        .and(body_json(json!({ "repository_version": v, "signing_service": "/ss/1/" })))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{coll}2/") })))
         .expect(1)
         .mount(&server)
         .await;
     let c = client(&server, |_, _| {});
-    let signed = ops::ensure_publication(&c, RepoType::Deb, "/v/", &json!({ "signing_service": "/ss/1/" }), &no_progress).await.unwrap().0;
+    let signed = ops::ensure_publication(&c, RepoType::Deb, &v, &json!({ "signing_service": "/ss/1/" }), &no_progress).await.unwrap().0;
     assert_eq!(signed, format!("{coll}2/"));
-    let plain = ops::ensure_publication(&c, RepoType::Deb, "/v/", &json!({ "signing_service": null }), &no_progress).await.unwrap().0;
+    let plain = ops::ensure_publication(&c, RepoType::Deb, &v, &json!({ "signing_service": null }), &no_progress).await.unwrap().0;
     assert_eq!(plain, format!("{coll}1/"));
     server.verify().await;
+}
+
+/// pulp_deb takes `excluded_package_metadata_fields` from the repository when the publish request leaves it out: a
+/// publication with the repository's list is as a new one, and is reused; one with another list is not.
+#[tokio::test]
+async fn a_deb_publication_has_the_excluded_fields_of_its_repository() {
+    let (coll, repo) = (format!("{API}publications/deb/apt/"), format!("{API}repositories/deb/apt/1/"));
+    let version = format!("{repo}versions/1/");
+    for (excluded, reused) in [(json!(["Maintainer"]), true), (json!([]), false)] {
+        let server = MockServer::start().await;
+        let listed = json!({ "pulp_href": format!("{coll}1/"), "repository_version": version, "simple": false, "structured": true,
+            "signing_service": null, "excluded_package_metadata_fields": excluded });
+        let page = json!({ "count": 1, "next": null, "results": [listed] });
+        Mock::given(method("GET")).and(path(&coll)).respond_with(ResponseTemplate::new(200).set_body_json(page)).mount(&server).await;
+        let r = json!({ "pulp_href": repo, "excluded_package_metadata_fields": ["Maintainer"] });
+        Mock::given(method("GET")).and(path(&repo)).respond_with(ResponseTemplate::new(200).set_body_json(r)).mount(&server).await;
+        serve_roles(&server, &format!("{coll}1/"), owned_by("admin")).await;
+        let made = ResponseTemplate::new(201).set_body_json(json!({ "pulp_href": format!("{coll}2/") }));
+        Mock::given(method("POST")).and(path(&coll)).respond_with(made).expect(u64::from(!reused)).mount(&server).await;
+        let c = client(&server, |_, _| {});
+        let (p, notes) = ops::ensure_publication(&c, RepoType::Deb, &version, &json!({}), &no_progress).await.unwrap();
+        assert_eq!((p, notes.len()), (format!("{coll}{}/", if reused { 1 } else { 2 }), usize::from(!reused)), "{excluded}");
+        server.verify().await;
+    }
 }
 
 /// The mode of a verbatim publication is `verbatim`: a publication in that mode is a verbatim one of the version,

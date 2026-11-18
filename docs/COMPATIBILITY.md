@@ -676,6 +676,16 @@ Read in pulpcore 3.123.1 (`RolesMixin` in `app/viewsets/base.py`, `NestedRoleSer
   `PULP_MANIFEST`; Deb `simple` false, `structured` true, `signing_service` null,
   `publish_legacy_release_files` false, `excluded_package_metadata_fields` `[]`, `layout`
   `nested_alphabetically` (`publish_upstream_release_fields` is write-only).
+* **Publication settings that the API does not decide alone** (read in the sources of 3.63.36,
+  3.95.3 and 3.123.1). pulp_rpm 3.27.12 (3.63.36) takes a new publication's `checksum_type` from
+  the upstream metadata of the repository (`original_checksum_types["primary"]`, not shown in
+  the API) when neither the request nor the repository sets one; 3.34 and 3.39 use `sha256`. A
+  `mirror_complete` sync publication has `checksum_type` `unknown`. So `ops::own_publication`
+  compares an RPM publication's `checksum_type` only when the publish body or the repository
+  sets one (a request accepts only SHA-2). pulp_deb (3.123.1) takes
+  `excluded_package_metadata_fields` from the repository when the request leaves it out; older
+  pulp_deb has no such field. Deb `publish_upstream_release_fields` is write-only on every
+  server: a publication's value cannot be read, so it is never compared (known limit).
 
 ### Domains
 

@@ -303,8 +303,8 @@ pub fn publications_for(t: RepoType, mode: &Value) -> &'static str {
 
 /// Reuse a publication of the version that has `mode` (`reusable_publication`), else create one with it; with the
 /// notes that say why a found one was not reused. `mode`: publication fields that must match (`null`: must be unset).
-/// A reused publication keeps the repository settings of the time it was made; the operator's Publish uses
-/// `create_publication` instead.
+/// Only one with the publish settings of a new one is reused: after a change of the repository's settings, one made
+/// before is not, and a new one has the new settings. The operator's Publish always uses `create_publication`.
 pub async fn ensure_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value, on: OnTask<'_>) -> Result<(String, Vec<String>)> {
     let (found, notes) = reusable_publication(c, t, version, mode).await?;
     let p = match found {
@@ -369,19 +369,31 @@ pub async fn own_publication(
 }
 
 /// The publish settings that a new publication of `version` made with `mode` gets: those of its body
-/// (`publication_body`); for RPM, the ones that the body leaves out come from the repository (pulp_rpm
-/// `RpmPublicationViewSet.create`), else from Pulp's defaults (`guarded`).
+/// (`publication_body`); the ones that the body leaves out and that Pulp takes from the repository
+/// (`from_repository`) come from it, else from Pulp's defaults (`guarded`).
 async fn new_publication(c: &PulpClient, t: RepoType, version: &str, mode: &Value) -> Result<Value> {
     let mut body = publication_body(c, t, version, mode).await?;
-    if t == RepoType::Rpm {
+    // A Deb verbatim publication has no settings.
+    if !from_repository(t).is_empty() && mode[deb::VERBATIM] != true {
         let repo: Value = c.get(&repo_of_version(version), &[]).await?;
-        for &k in mode_fields(t) {
+        for &k in from_repository(t) {
             if body.get(k).is_none() && !repo[k].is_null() {
                 body[k] = repo[k].clone();
             }
         }
     }
     Ok(body)
+}
+
+/// The publish settings that Pulp takes from the repository when a publish request leaves them out: pulp_rpm
+/// `RpmPublicationViewSet.create` all of them; pulp_deb `publish` the excluded package fields (the field only exists in
+/// newer pulp_deb). pulp_file's `manifest` is in `publication_body` already.
+fn from_repository(t: RepoType) -> &'static [&'static str] {
+    match t {
+        RepoType::Rpm => mode_fields(t),
+        RepoType::Deb => &["excluded_package_metadata_fields"],
+        RepoType::File => &[],
+    }
 }
 
 /// A new publication of `version`, made with `mode` and else the repository settings of now.
@@ -506,40 +518,44 @@ pub async fn distribution_target(
 /// server) is not compared. Secrets are not readable: `hidden_fields` says which are set.
 ///
 /// A publication: its publish settings (`mode_fields` of every type), which decide what clients trust (`repo_config`:
-/// `gpgcheck`; the Deb signing service) and how the metadata is made.
+/// `gpgcheck`; the Deb signing service) and how the metadata is made. No default (`None`): RPM `checksum_type`, which
+/// pulp_rpm 3.27 takes from the upstream metadata when neither the request nor the repository sets it (not shown in
+/// the API), and a mirror_complete sync publication has as `unknown`; it is compared only when the body or the
+/// repository sets it (a publish request accepts only SHA-2, so nothing weaker hides there). Deb
+/// `publish_upstream_release_fields` is write-only: never shown, never compared.
 ///
 /// A repository, remote or distribution: the fields that decide where its content comes from, how it is trusted or
 /// signed, who may download it, or which versions it keeps. pulp-tui's create bodies set none of them except a replica
 /// repository's `remote`. Not the metadata and release signing services: a publish sets them on a snapshot repository
 /// (`CvService::copy_settings`), and operators set them on a replica repository (USER_GUIDE "Replication").
-fn guarded(href: &str) -> Vec<(&'static str, Value)> {
-    let (null, empty) = (Value::Null, json!({}));
+fn guarded(href: &str) -> Vec<(&'static str, Option<Value>)> {
+    let (null, empty) = (Some(Value::Null), Some(json!({})));
     if href.contains("/publications/") {
         return vec![
-            ("checksum_type", "sha256".into()),
+            ("checksum_type", None),
             ("compression_type", null.clone()),
-            ("layout", "nested_alphabetically".into()),
+            ("layout", Some("nested_alphabetically".into())),
             ("repo_config", empty),
-            ("manifest", "PULP_MANIFEST".into()),
-            ("simple", false.into()),
-            ("structured", true.into()),
+            ("manifest", Some("PULP_MANIFEST".into())),
+            ("simple", Some(false.into())),
+            ("structured", Some(true.into())),
             ("signing_service", null.clone()),
-            ("publish_legacy_release_files", false.into()),
-            ("publish_upstream_release_fields", null), // write-only: not shown
-            ("excluded_package_metadata_fields", json!([])),
+            ("publish_legacy_release_files", Some(false.into())),
+            ("publish_upstream_release_fields", None),
+            ("excluded_package_metadata_fields", Some(json!([]))),
         ];
     }
     vec![
         ("content_guard", null.clone()),
         ("remote", null.clone()),
         ("retain_repo_versions", null.clone()),
-        ("autopublish", false.into()),
-        ("retain_package_versions", 0.into()),
+        ("autopublish", Some(false.into())),
+        ("retain_package_versions", Some(0.into())),
         ("package_signing_service", null.clone()),
         ("package_signing_fingerprint", null.clone()),
         ("package_signing_fingerprint_release_overrides", empty.clone()),
         ("repo_config", empty),
-        ("tls_validation", true.into()),
+        ("tls_validation", Some(true.into())),
         ("ca_cert", null.clone()),
         ("client_cert", null.clone()),
         ("proxy_url", null.clone()),
@@ -550,26 +566,31 @@ fn guarded(href: &str) -> Vec<(&'static str, Value)> {
 }
 
 /// The guarded fields (`guarded`) of `obj`, as Pulp shows it, that differ from a new one made with the create `body`
-/// (a field in `body`, else Pulp's default): `retain_repo_versions is 1, not null`. Null, `""`, `[]` and `{}` count as
+/// (a field in `body`, else Pulp's default; neither: not compared): `retain_repo_versions is 1, not null`. Null, `""`, `[]` and `{}` count as
 /// the same (unset). A set secret counts too (`password is set`): pulp-tui sets none. Pulp's default is fine also where
 /// `body` sets the field, except on a publication: there it adds no trust (a replica repository whose remote was
 /// deleted has none), but a publication with the default `repo_config` drops the repository's `gpgcheck`.
 fn planted(obj: &Value, body: &Value) -> Vec<String> {
-    let unset =
-        |v: &Value| v.is_null() || v == "" || v.as_array().is_some_and(Vec::is_empty) || v.as_object().is_some_and(|o| o.is_empty());
-    let same = |a: &Value, b: &Value| a == b || (unset(a) && unset(b));
     let href = obj["pulp_href"].as_str().unwrap_or_default();
     let lenient = !href.contains("/publications/");
     let mut out: Vec<String> = guarded(href)
         .into_iter()
         .filter_map(|(k, default)| {
-            let (have, want) = (obj.get(k)?, body.get(k).unwrap_or(&default));
-            (!same(have, want) && !(lenient && same(have, &default))).then(|| format!("{k} is {have}, not {want}"))
+            let (have, want) = (obj.get(k)?, body.get(k).or(default.as_ref())?);
+            let fine = default.as_ref().is_some_and(|d| lenient && same(have, d));
+            (!same(have, want) && !fine).then(|| format!("{k} is {have}, not {want}"))
         })
         .collect();
     let secrets = obj["hidden_fields"].as_array().into_iter().flatten().filter(|h| h["is_set"] == true);
     out.extend(secrets.filter_map(|h| h["name"].as_str()).filter(|n| body.get(n).is_none()).map(|n| format!("{n} is set")));
     out
+}
+
+/// Whether two values of a field are the same (`planted`): equal, or both unset (null, `""`, `[]` or `{}`).
+fn same(a: &Value, b: &Value) -> bool {
+    let unset =
+        |v: &Value| v.is_null() || v == "" || v.as_array().is_some_and(Vec::is_empty) || v.as_object().is_some_and(|o| o.is_empty());
+    a == b || (unset(a) && unset(b))
 }
 
 /// Refuses (409) to take over `what` (`distribution d`), the object `obj` that pulp-tui found by its name (as Pulp
@@ -1265,6 +1286,14 @@ mod tests {
             "signing_service": "/s/9/", "publish_legacy_release_files": false, "excluded_package_metadata_fields": [],
             "layout": "nested_alphabetically" });
         assert_eq!(planted(&deb, &json!({})), [r#"signing_service is "/s/9/", not null"#]);
+        // pulp_rpm 3.27 takes the checksum of the upstream metadata when neither the request nor the repository sets
+        // one, and a mirror_complete sync publication has "unknown": not compared then (a request accepts only SHA-2).
+        for checksum in ["sha1", "unknown", "sha512"] {
+            let mut p = rpm.clone();
+            p["checksum_type"] = checksum.into();
+            assert!(planted(&p, &json!({})).is_empty(), "{checksum}");
+        }
+        assert_eq!(planted(&rpm, &json!({ "checksum_type": "sha512" })), [r#"checksum_type is "sha256", not "sha512""#]);
         let table: Vec<&str> = guarded("/publications/").into_iter().map(|(k, _)| k).collect();
         for t in [RepoType::Rpm, RepoType::File, RepoType::Deb] {
             assert!(mode_fields(t).iter().all(|k| table.contains(k)), "{t:?}");

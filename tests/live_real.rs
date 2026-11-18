@@ -176,14 +176,23 @@ async fn rocky9_baseos_real() {
     let snapshot = svc.store.version_repos(v1.id).await.unwrap().remove(0).derived_version.unwrap();
     eprintln!("{name}: {} advisories in the snapshot, {} in the source", advisories(&c, &snapshot).await, advisories(&c, &v).await);
 
-    // Operator Publish after a settings change: a reused publication keeps the settings of its time.
+    // A settings change: a publication made before has the old settings, so ensure_publication does not reuse it
+    // (`ops::own_publication`) and makes one with the new settings; the operator's Publish always makes a new one.
     let p1 = ops::ensure_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap().0;
     let m = c.patch(&repo, &json!({ "checksum_type": "sha512" })).await.unwrap();
     ops::settle(&c, m, &no_progress).await.unwrap();
-    assert_eq!(ops::ensure_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap().0, p1, "ensure_publication reuses p1");
-    let p2 = ops::create_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap();
-    assert_ne!(p2, p1, "create_publication makes a new one");
-    let (old, new): (Value, Value) = (c.get(&p1, &[]).await.unwrap(), c.get(&p2, &[]).await.unwrap());
+    let (p2, notes) = ops::ensure_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap();
+    let shown = c.get::<Value>(&p1, &[]).await.unwrap().get("checksum_type").is_some();
+    if shown {
+        assert_ne!(p2, p1, "p1 has the old checksum: not reused");
+        assert!(notes.iter().any(|n| n.contains(r#"not "sha512""#)), "{notes:?}");
+    } else {
+        assert_eq!(p2, p1, "a server that does not show the checksum: reused");
+    }
+    assert_eq!(ops::ensure_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap().0, p2, "p2 is reused");
+    let p3 = ops::create_publication(&c, t, &v, &json!({}), &no_progress).await.unwrap();
+    assert!(p3 != p1 && p3 != p2, "create_publication makes a new one");
+    let (old, new): (Value, Value) = (c.get(&p1, &[]).await.unwrap(), c.get(&p3, &[]).await.unwrap());
 
     svc.delete_view(cv, &quiet, &no_progress).await.unwrap();
     cleanup(&c, &[&repo, &remote]).await;

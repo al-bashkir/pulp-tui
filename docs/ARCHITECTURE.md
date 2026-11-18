@@ -177,14 +177,20 @@ Katello: they live in the store of the profile and are built from Pulp objects.
   reuse a publication of the version only when the store records it (a version row) or it is as
   pulp-tui makes it (`ops::own_publication`, the same decision, `ops::foreign_reason`): no other
   role holder, and its publish settings (`mode_fields`, all guarded) equal those of a new one:
-  the publish body, else for RPM the repository's (Pulp copies them), else Pulp's default. Here
+  the publish body, else the repository's where Pulp copies them (RPM: all; Deb:
+  `excluded_package_metadata_fields`; `ops::from_repository`), else Pulp's default. Here
   Pulp's default does not pass by itself: a publication with the default `repo_config` drops the
   repository's `gpgcheck`. A candidate that fails is skipped, not refused: pulp-tui makes its
-  own and logs why (a replica's result line names it). The TUI's pinned Distribute, rollback
-  and distribution edit (`ops::ensure_publication` / `reusable_publication`) ask the same, with
-  no store record (operator repositories): their preview and result name a skipped one.
-* Known limit: a recorded href skips these checks, so a peer of a shared store who also has a
-  Pulp creator role is not covered: it can make an object and write its href into a row.
+  own and logs why (a replica's result line names it). The TUI's pinned Distribute, rollback,
+  distribution edit and publication export (`ops::ensure_publication` /
+  `reusable_publication`) ask the same, with no store record (operator repositories): their
+  preview and result name a skipped one.
+* Known limits: a recorded href skips these checks, so a peer of a shared store who also has a
+  Pulp creator role is not covered: it can make an object and write its href into a row. An
+  RPM publication's `checksum_type` is compared only when the publish body or the repository
+  sets one (pulp_rpm 3.27 takes the upstream's otherwise, and does not show it; a request
+  accepts only SHA-2). A Deb publication's `publish_upstream_release_fields` is write-only, so
+  it is never compared.
 * The store is shared: a peer with SQL access can write any href into a row. So before a version
   delete or a promotion acts on a version row, `CvService::unbound` binds it in Pulp: the snapshot
   repository has the view's labels (a composite row: those of its component,
