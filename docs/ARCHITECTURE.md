@@ -182,7 +182,8 @@ Katello: they live in the store of the profile and are built from Pulp objects.
   letters, digits, `_` and `-`): with a `#`, `?`, `%` or `.`, a request reaches another object
   than the one that the string checks see. A delete keeps the row's objects and logs why; a
   promotion refuses the row. A gone object (404) is nothing to delete, but a promotion refuses a
-  publication that it cannot read: under RBAC a 404 also hides the objects of another user.
+  snapshot repository or a publication that it cannot read: under RBAC a 404 also hides the
+  objects of another user (and `not_ours` takes a 404 as gone).
 * An object without `pulp_tui_db`, or with an id in the aliases (`meta` key `alias:<id>`),
   that passes these checks is adopted: the workflow sets this database's id when it touches
   the object.

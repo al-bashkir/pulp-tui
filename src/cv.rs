@@ -482,23 +482,23 @@ impl CvService {
     /// Why the objects that row `vr` records are not the snapshot of view `cv` (`None`: they are, or it records none).
     /// The store is shared, so a peer can write any href into a row: each one is bound in Pulp again. The snapshot
     /// repository must be the view's (`not_ours`), and the snapshot version and the publication must be of it. A gone
-    /// object (404) is no object to delete, but one to `serve` must be readable: under RBAC a 404 also hides the objects
-    /// of another user. Pulp lets a user read a publication only with view permission on its repository, so a readable
-    /// publication of the repository also proves that `not_ours` read its labels.
+    /// object (404) is no object to delete, but the snapshot repository and the publication to `serve` must both be
+    /// readable: under RBAC a 404 also hides the objects of another user, and `not_ours` takes a 404 as gone.
     async fn unbound(&self, cv: &str, vr: &CvVersionRepo, aliases: &[String], serve: bool) -> Result<Option<String>> {
         if let Some(why) = stray_version(vr) {
             return Ok(Some(why));
         }
         let Some(r) = &vr.derived_repo else { return Ok(None) };
+        if serve && self.client.get::<Value>(r, &[]).await.is_err_and(|e| e.is_not_found()) {
+            return Ok(Some(cannot_read(r)));
+        }
         if let Some(why) = self.not_ours(r, &json!({ LABEL_CV: slug(cv) }), aliases).await? {
             return Ok(Some(why));
         }
         let Some(p) = &vr.publication else { return Ok(None) };
         let pv: Value = match self.client.get(p, &[]).await {
             Ok(v) => v,
-            Err(e) if e.is_not_found() && serve => {
-                return Ok(Some(format!("{p} cannot be read (it is gone, or this Pulp user may not view it)")));
-            }
+            Err(e) if e.is_not_found() && serve => return Ok(Some(cannot_read(p))),
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e.into()),
         };
@@ -2307,6 +2307,11 @@ fn pulp_href(href: &str) -> bool {
         && href.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-".contains(&b))
 }
 
+/// Why a promotion does not serve the object at `href` that answers 404 (`CvService::unbound`).
+fn cannot_read(href: &str) -> String {
+    format!("{href} cannot be read (it is gone, or this Pulp user may not view it)")
+}
+
 /// "`<href> is not a Pulp href`" for the first of `hrefs` that is not one (`pulp_href`).
 fn not_hrefs<'a>(hrefs: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
     hrefs.into_iter().flatten().find(|h| !pulp_href(h)).map(|h| format!("{h} is not a Pulp href"))
@@ -2574,14 +2579,20 @@ mod tests {
         serve_json(server, &format!("{href}list_roles/"), json!({ "roles": [{ "role": "owner", "users": ["op"], "groups": [] }] })).await;
     }
 
-    /// GET of an RPM publication that no other mock serves answers one of a version of `DERIVED`, as the publications
-    /// that `published` records are (a promotion reads the publication it serves, `unbound`).
-    async fn serve_published(server: &wiremock::MockServer) {
+    /// What `published` records, as a promotion reads it (`unbound`), where no other mock serves it: `DERIVED` with the
+    /// label of view `cv`, and each RPM publication as one of a version of `DERIVED`.
+    async fn serve_published(server: &wiremock::MockServer, cv: &str) {
+        let ok = |body: Value| wiremock::ResponseTemplate::new(200).set_body_json(body);
+        let repo = json!({ "pulp_href": DERIVED, "pulp_labels": { LABEL_CV: cv } });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(DERIVED))
+            .respond_with(ok(repo))
+            .with_priority(10)
+            .mount(server)
+            .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path_regex(r"^/pulp/api/v3/publications/rpm/rpm/[0-9]+/$"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(json!({ "repository_version": format!("{DERIVED}versions/1/") })),
-            )
+            .respond_with(ok(json!({ "repository_version": format!("{DERIVED}versions/1/") })))
             .with_priority(10)
             .mount(server)
             .await;
@@ -3849,6 +3860,21 @@ mod tests {
         }
     }
 
+    /// Second review of the run-1 fix: a promotion does not rely on "a readable publication proves that its repository
+    /// is readable" (pulp_rpm and pulp_file may scope the reads of publications by publication permission). A snapshot
+    /// repository that answers 404 refuses the row, also when its publication can be read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_promotion_refuses_a_snapshot_repository_that_it_cannot_read() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let (_, mut vr) = rpm_version(&svc).await;
+        let (r, p) = ("/pulp/api/v3/repositories/rpm/rpm/99/", "/pulp/api/v3/publications/rpm/rpm/77/");
+        (vr.derived_repo, vr.derived_version, vr.publication) = (Some(r.into()), Some(format!("{r}versions/1/")), Some(p.into()));
+        serve_json(&server, p, json!({ "pulp_href": p, "repository_version": format!("{r}versions/1/") })).await;
+        let e = svc.refuse_unbound("web", &vr, p, &[]).await.unwrap_err();
+        assert_eq!(e.to_string(), format!("not serving {p}: {r} cannot be read (it is gone, or this Pulp user may not view it)"));
+    }
+
     /// Review of the run-1 fix: for a promotion, a row whose snapshot repository and publication this user cannot read
     /// (404: gone, or no permission under RBAC) passed `refuse_unbound`; the distribution would serve that publication.
     #[tokio::test(flavor = "multi_thread")]
@@ -3859,7 +3885,7 @@ mod tests {
         let (r, p) = ("/pulp/api/v3/repositories/rpm/rpm/99/", "/pulp/api/v3/publications/rpm/rpm/77/");
         (vr.derived_repo, vr.derived_version, vr.publication) = (Some(r.into()), Some(format!("{r}versions/1/")), Some(p.into()));
         let e = svc.refuse_unbound("web", &vr, p, &[]).await.unwrap_err();
-        assert_eq!(e.to_string(), format!("not serving {p}: {p} cannot be read (it is gone, or this Pulp user may not view it)"));
+        assert_eq!(e.to_string(), format!("not serving {p}: {r} cannot be read (it is gone, or this Pulp user may not view it)"));
     }
 
     /// Security audit run-1 (version_objects): the peer writes the row after the preview (variants A and B of the
@@ -4188,7 +4214,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_unbind_alone_makes_the_promotion_partial() {
         let server = wiremock::MockServer::start().await;
-        serve_published(&server).await;
+        serve_published(&server, "web").await;
         let svc = mock_service(&server).await;
         let cv = svc.store.create_cv("k", "web", "").await.unwrap();
         let v = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
@@ -4560,7 +4586,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         let server = wiremock::MockServer::start().await;
-        serve_published(&server).await;
+        serve_published(&server, "web").await;
         let svc = mock_service(&server).await;
         let lib = svc.store.ensure_library("k").await.unwrap();
         let dev = svc.store.create_env("k", "Dev", lib, false).await.unwrap();
@@ -4593,7 +4619,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         let server = wiremock::MockServer::start().await;
-        serve_published(&server).await;
+        serve_published(&server, "web").await;
         let svc = mock_service(&server).await;
         let lib = svc.store.ensure_library("k").await.unwrap();
         let test = svc.store.create_env("k", "Test", lib, false).await.unwrap();
@@ -4726,7 +4752,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         let server = wiremock::MockServer::start().await;
-        serve_published(&server).await;
+        serve_published(&server, "web").await;
         let svc = mock_service(&server).await;
         let cv = svc.store.create_cv("k", "web", "").await.unwrap();
         let v = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
@@ -4769,7 +4795,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         let server = wiremock::MockServer::start().await;
-        serve_published(&server).await;
+        serve_published(&server, "web").await;
         let svc = mock_service(&server).await;
         let cv = svc.store.create_cv("k", "web", "").await.unwrap();
         let v = published(&svc, cv, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
@@ -4813,7 +4839,7 @@ mod tests {
         let unlabeled = r#"web in Library: failed: b-c: conflict [409]: distribution pulp-tui-cv-web-Library-b-c exists but lacks ownership labels {"pulp_tui_cv":"web","pulp_tui_env":"Library"}: restore them or delete the distribution, then try again"#;
         for (labels, want) in [(json!({ LABEL_CV: "web-Library", LABEL_ENV: "b" }), other), (json!({}), unlabeled)] {
             let server = wiremock::MockServer::start().await;
-            serve_published(&server).await;
+            serve_published(&server, "web").await;
             let svc = mock_service(&server).await;
             let cv = svc.store.create_cv("k", "web", "").await.unwrap();
             let v = published(&svc, cv, "b-c", "/pulp/api/v3/repositories/rpm/rpm/1/").await;
@@ -4837,7 +4863,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         let server = wiremock::MockServer::start().await;
-        serve_published(&server).await;
+        serve_published(&server, "os").await;
         let svc = mock_service(&server).await;
         let os = svc.store.create_cv("k", "os", "").await.unwrap();
         let v1 = published(&svc, os, "os", "/pulp/api/v3/repositories/rpm/rpm/1/").await;

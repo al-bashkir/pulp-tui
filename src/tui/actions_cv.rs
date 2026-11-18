@@ -3028,6 +3028,8 @@ mod tests {
         let p = json!({ "pulp_href": publication, "repository_version": dv, "manifest": null });
         serve(&server, "GET", publication.into(), 200, p).await;
         serve(&server, "GET", dv.clone(), 200, json!({ "pulp_href": dv })).await;
+        let snapshot = json!({ "pulp_href": format!("{REPOS}file/file/2/"), "pulp_labels": { crate::cv::LABEL_CV: "web" } });
+        serve(&server, "GET", format!("{REPOS}file/file/2/"), 200, snapshot).await;
         promote_preview(&mut app, "web".into(), v.id, LIBRARY.into(), Mode::Rollback);
         drain(&mut app, &mut rx).await;
         let Some(Modal::Confirm { on_yes, .. }) = app.modal.take() else { panic!("no confirmation: {:?}", last_notice(&app)) };
