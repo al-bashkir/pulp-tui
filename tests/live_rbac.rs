@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use pulp_tui::cv::{CvService, LeftOut, Mode, distribution_name};
+use pulp_tui::cv::{CvService, LeftOut, Mode, base_path, distribution_name};
 use pulp_tui::pulp::ops::{self, no_progress};
 use pulp_tui::pulp::{PulpClient, RepoType};
 use pulp_tui::store::{BindingRepo, CvRepo, Store};
@@ -122,9 +122,10 @@ async fn a_404_of_a_hidden_distribution_keeps_a_content_view_row_for_a_user() {
 }
 
 /// Another Pulp user with only the creator role that the RBAC guide gives to other users makes the distribution that a
-/// promotion of a view to Dev would use, with the view's labels, before the operator promotes. Pulp gives that user the
-/// owner role of it, so the promotion (and its preview) refuses it, and the distribution stays as that user made it. When
-/// that user gives the role to the operator and drops its own, a planted field still makes the promotion refuse it.
+/// promotion of a view to Dev would use, with the view's labels, before the operator promotes. At a path of its choice
+/// the promotion (and its preview) refuses it for the path; at the computed path, for the owner role that Pulp gave that
+/// user. When that user gives the role to the operator and drops its own, a planted field still makes the promotion
+/// refuse it. The distribution stays as that user made it.
 #[tokio::test]
 async fn a_promotion_refuses_a_distribution_that_another_user_made_with_the_labels() {
     if !live_enabled() {
@@ -150,36 +151,48 @@ async fn a_promotion_refuses_a_distribution_that_another_user_made_with_the_labe
 
     let name = distribution_name(&id, "Dev", "docs");
     let labels = json!({ "pulp_tui_cv": id, "pulp_tui_env": "Dev", "pulp_tui_db": store.db_id() }); // a copied id too
-    let squat = format!("{id}-squat");
+    let (squat, path) = (format!("{id}-squat"), base_path(&id, &env.label, "docs"));
     let body = json!({ "name": name, "base_path": squat, "pulp_labels": labels });
-    let dist = create(&user_client(&id, password), RepoType::File.distributions(), body, "/distributions/").await;
-    let holds = format!("user {id} has role file.filedistribution_owner on it: delete it, or remove that role, then try again");
-    let line = svc.promote_target(&id, &env, &docs, None).await.unwrap();
-    assert!(line.contains(&format!("the promotion fails for it: distribution {name} exists, but")) && line.ends_with(&holds), "{line}");
-    let err = format!("{:#}", svc.promote(cv, v.id, dev, Mode::Promote, &|_| {}, &no_progress).await.unwrap_err());
-    assert!(err.contains(&holds), "{err}");
+    let squatter = user_client(&id, password);
+    let dist = create(&squatter, RepoType::File.distributions(), body, "/distributions/").await;
+    // Each step that the user takes is refused, by the preview and the promotion, before any change.
+    let (s, d, e, i) = (&svc, &docs, &env, id.as_str());
+    let refused = move |why: String| {
+        let (svc, docs, env, id) = (s, d, e, i);
+        async move {
+            let line = svc.promote_target(id, env, docs, None).await.unwrap();
+            assert!(line.ends_with(&format!("the promotion fails for it: {why}")), "{line}");
+            let err = format!("{:#}", svc.promote(cv, v.id, dev, Mode::Promote, &|_| {}, &no_progress).await.unwrap_err());
+            assert!(err.contains(&why), "{err}");
+            assert!(svc.store.binding_repos(dev, cv).await.unwrap().is_empty(), "nothing recorded");
+        }
+    };
+    // At a path of its choice: an unrecorded distribution does not choose where the view is served.
+    refused(format!("distribution {name} serves {squat} instead of {path}")).await;
     let d: Value = admin.get(&dist, &[]).await.unwrap();
     assert_eq!((&d["publication"], &d["base_path"], &d["pulp_labels"]), (&Value::Null, &json!(squat), &labels), "not changed");
-    assert!(store.binding_repos(dev, cv).await.unwrap().is_empty(), "nothing recorded");
+
+    // At the path that pulp-tui would choose: the user holds the owner role of it.
+    ops::settle(&squatter, squatter.patch(&dist, &json!({ "base_path": path })).await.unwrap(), &no_progress).await.unwrap();
+    let holds = format!("user {id} has role file.filedistribution_owner on it: delete it, or remove that role, then try again");
+    refused(format!("distribution {name} exists, but this database does not record it and {holds}")).await;
 
     // Roles do not prove who made it: the user plants a content guard, hands its owner role to the operator (`admin`)
     // and drops its own. The guard is not what pulp-tui sets on a new distribution, so the promotion still refuses it.
     let guard = create(&admin, "contentguards/core/rbac/", json!({ "name": id }), "/contentguards/").await;
-    let squatter = user_client(&id, password);
     ops::settle(&squatter, squatter.patch(&dist, &json!({ "content_guard": guard })).await.unwrap(), &no_progress).await.unwrap();
     let role = |u: &str| json!({ "role": "file.filedistribution_owner", "users": [u], "groups": [] });
     squatter.post(&format!("{dist}add_role/"), &role("admin")).await.unwrap();
     squatter.post(&format!("{dist}remove_role/"), &role(&id)).await.unwrap();
     let roles: Value = admin.get(&format!("{dist}list_roles/"), &[]).await.unwrap();
     assert_eq!(roles["roles"], json!([role("admin")]), "only the operator holds a role now");
-    let planted =
-        format!("its field differs from a new one (content_guard is \"{guard}\", not null): delete it, or set it back, then try again");
-    let line = svc.promote_target(&id, &env, &docs, None).await.unwrap();
-    assert!(line.ends_with(&planted), "{line}");
-    let err = format!("{:#}", svc.promote(cv, v.id, dev, Mode::Promote, &|_| {}, &no_progress).await.unwrap_err());
-    assert!(err.contains(&planted), "{err}");
+    refused(format!(
+        "distribution {name} exists, but this database does not record it and its field differs from a new one \
+         (content_guard is \"{guard}\", not null): delete it, or set it back, then try again"
+    ))
+    .await;
     let d: Value = admin.get(&dist, &[]).await.unwrap();
-    assert_eq!((&d["publication"], &d["content_guard"]), (&Value::Null, &json!(guard)), "not changed");
+    assert_eq!((&d["publication"], &d["base_path"], &d["content_guard"]), (&Value::Null, &json!(path), &json!(guard)), "not changed");
 
     svc.delete_view(cv, &|_| {}, &no_progress).await.unwrap();
     cleanup(&admin, &[&dist, &guard, &repo, &remote, &user]).await;
