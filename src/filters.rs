@@ -87,69 +87,63 @@ pub fn parse_rule(s: &str, t: RepoType) -> Result<FilterRule, String> {
         Some("exclude") => Action::Exclude,
         other => return Err(format!("rule must start with include/exclude, got {other:?}")),
     };
-    let mut r = FilterRule { action, name: None, arch: None, evr: None, version: None, path: None };
+    let empty = FilterRule { action, name: None, arch: None, evr: None, version: None, path: None };
+    let mut r = empty.clone();
     for w in words {
-        // A value must be what the TUI shows: ratatui drops control characters, and a NUL ends a version early.
-        if w.contains(char::is_control) {
-            return Err(format!("control character in {w:?}"));
-        }
-        if let Some(v) = w.strip_prefix("name=") {
-            r.name = Some(v.into());
-        } else if let Some(v) = w.strip_prefix("arch=") {
-            r.arch = Some(v.into());
-        } else if let Some(v) = w.strip_prefix("path=") {
-            r.path = Some(v.into());
-        } else if let Some(rest) = w.strip_prefix("evr") {
-            r.evr = Some(parse_cmp(w, rest, "evr")?);
-        } else if let Some(rest) = w.strip_prefix("version") {
-            r.version = Some(parse_cmp(w, rest, "version")?);
-        } else {
-            return Err(format!("unknown criterion {w:?} (use name=, arch=, evr<op>, version<op>, path=)"));
-        }
+        criterion(&mut r, w)?;
     }
-    let rpm_crit = r.name.is_some() || r.arch.is_some() || r.evr.is_some();
-    // Each type refuses the criteria it lacks and names the types that have them.
-    let (path_only, evr_only, version_only) = (
-        "path= applies to File repositories only",
-        "evr applies to RPM repositories only (use version for Deb)",
-        "version applies to Deb repositories only",
-    );
-    match t {
-        RepoType::Rpm => {
-            if r.path.is_some() {
-                return Err(path_only.into());
-            }
-            if r.version.is_some() {
-                return Err(version_only.into());
-            }
-        }
-        RepoType::File => {
-            if r.name.is_some() || r.arch.is_some() {
-                return Err("name=/arch= apply to RPM and Deb repositories only".into());
-            }
-            if r.evr.is_some() {
-                return Err(evr_only.into());
-            }
-            if r.version.is_some() {
-                return Err(version_only.into());
-            }
-        }
-        RepoType::Deb => {
-            if r.path.is_some() {
-                return Err(path_only.into());
-            }
-            if r.evr.is_some() {
-                return Err(evr_only.into());
-            }
-        }
+    if let Some(e) = refused_criterion(&r, t) {
+        return Err(e.into());
     }
-    if !rpm_crit && r.version.is_none() && r.path.is_none() {
+    if r == empty {
         return Err(format!("rule {s:?} has no criteria"));
     }
+    check_globs(&r)?;
+    Ok(r)
+}
+
+/// Refuse a name, arch or path pattern that does not compile.
+fn check_globs(r: &FilterRule) -> Result<(), String> {
     for g in [&r.name, &r.arch, &r.path].into_iter().flatten() {
         Glob::new(g).map_err(|e| format!("bad pattern {g}: {e}"))?;
     }
-    Ok(r)
+    Ok(())
+}
+
+/// Set the criterion of the word `w` on `r`.
+fn criterion(r: &mut FilterRule, w: &str) -> Result<(), String> {
+    // A value must be what the TUI shows: ratatui drops control characters, and a NUL ends a version early.
+    if w.contains(char::is_control) {
+        return Err(format!("control character in {w:?}"));
+    }
+    if let Some(v) = w.strip_prefix("name=") {
+        r.name = Some(v.into());
+    } else if let Some(v) = w.strip_prefix("arch=") {
+        r.arch = Some(v.into());
+    } else if let Some(v) = w.strip_prefix("path=") {
+        r.path = Some(v.into());
+    } else if let Some(rest) = w.strip_prefix("evr") {
+        r.evr = Some(parse_cmp(w, rest, "evr")?);
+    } else if let Some(rest) = w.strip_prefix("version") {
+        r.version = Some(parse_cmp(w, rest, "version")?);
+    } else {
+        return Err(format!("unknown criterion {w:?} (use name=, arch=, evr<op>, version<op>, path=)"));
+    }
+    Ok(())
+}
+
+/// The error for the first criterion of `r` that type `t` lacks; it names the types that have it.
+fn refused_criterion(r: &FilterRule, t: RepoType) -> Option<&'static str> {
+    let path = (r.path.is_some(), "path= applies to File repositories only");
+    let evr = (r.evr.is_some(), "evr applies to RPM repositories only (use version for Deb)");
+    let version = (r.version.is_some(), "version applies to Deb repositories only");
+    let names = (r.name.is_some() || r.arch.is_some(), "name=/arch= apply to RPM and Deb repositories only");
+    let refused: &[(bool, &'static str)] = match t {
+        RepoType::Rpm => &[path, version],
+        RepoType::File => &[names, evr, version],
+        RepoType::Deb => &[path, evr],
+    };
+    refused.iter().find(|(set, _)| *set).map(|(_, e)| *e)
 }
 
 /// Refuse a rule that the TUI form would not give from its text: an imported or stored rule must select what it
@@ -271,51 +265,66 @@ pub fn deb_version_matches(have: &str, op: &str, want: &str) -> bool {
 /// Port of dpkg's `verrevcmp` (lib/dpkg/version.c) for an upstream version or a revision.
 pub fn dpkg_verrevcmp(a: &str, b: &str) -> Ordering {
     let (a, b) = (a.as_bytes(), b.as_bytes());
-    let at = |s: &[u8], i: usize| s.get(i).copied().unwrap_or(0); // 0 = end of string
-    let order = |c: u8| match c {
+    let (mut i, mut j) = (0, 0);
+    // The sentinel that the inner loops stop on: with the lengths, an inner NUL made the loop endless.
+    while at(a, i) != 0 || at(b, j) != 0 {
+        let ord = dpkg_non_digits(a, b, &mut i, &mut j).then_with(|| dpkg_digits(a, b, &mut i, &mut j));
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// The byte at `i`; 0 (the end of a C string) past the end.
+fn at(s: &[u8], i: usize) -> u8 {
+    s.get(i).copied().unwrap_or(0)
+}
+
+/// The first inner loop of `verrevcmp`: compare the non-digit parts at `i` and `j` and move past them.
+fn dpkg_non_digits(a: &[u8], b: &[u8], i: &mut usize, j: &mut usize) -> Ordering {
+    let non_digit = |c: u8| c != 0 && !c.is_ascii_digit();
+    while non_digit(at(a, *i)) || non_digit(at(b, *j)) {
+        let (ac, bc) = (dpkg_order(at(a, *i)), dpkg_order(at(b, *j)));
+        if ac != bc {
+            return ac.cmp(&bc);
+        }
+        *i += 1;
+        *j += 1;
+    }
+    Ordering::Equal
+}
+
+/// dpkg's `order` of a character: `~` first, then the end and digits, letters, other characters.
+fn dpkg_order(c: u8) -> i32 {
+    match c {
         b'~' => -1,
         c if c == 0 || c.is_ascii_digit() => 0,
         c if c.is_ascii_alphabetic() => c as i32,
         c => c as i32 + 256,
-    };
-    let non_digit = |c: u8| c != 0 && !c.is_ascii_digit();
-    let (mut i, mut j) = (0, 0);
-    // The sentinel that the inner loops stop on: with the lengths, an inner NUL made the loop endless.
-    while at(a, i) != 0 || at(b, j) != 0 {
-        while non_digit(at(a, i)) || non_digit(at(b, j)) {
-            let (ac, bc) = (order(at(a, i)), order(at(b, j)));
-            if ac != bc {
-                return ac.cmp(&bc);
-            }
-            i += 1;
-            j += 1;
-        }
-        while at(a, i) == b'0' {
-            i += 1;
-        }
-        while at(b, j) == b'0' {
-            j += 1;
-        }
-        let mut first_diff = 0;
-        while at(a, i).is_ascii_digit() && at(b, j).is_ascii_digit() {
-            if first_diff == 0 {
-                first_diff = at(a, i) as i32 - at(b, j) as i32;
-            }
-            i += 1;
-            j += 1;
-        }
-        // The longer digit run is the bigger number.
-        if at(a, i).is_ascii_digit() {
-            return Ordering::Greater;
-        }
-        if at(b, j).is_ascii_digit() {
-            return Ordering::Less;
-        }
-        if first_diff != 0 {
-            return first_diff.cmp(&0);
-        }
     }
-    Ordering::Equal
+}
+
+/// The digit loops of `verrevcmp`: compare the numbers at `i` and `j` (leading zeros skipped) and move past them.
+fn dpkg_digits(a: &[u8], b: &[u8], i: &mut usize, j: &mut usize) -> Ordering {
+    while at(a, *i) == b'0' {
+        *i += 1;
+    }
+    while at(b, *j) == b'0' {
+        *j += 1;
+    }
+    let mut first_diff = Ordering::Equal;
+    while at(a, *i).is_ascii_digit() && at(b, *j).is_ascii_digit() {
+        first_diff = first_diff.then(at(a, *i).cmp(&at(b, *j)));
+        *i += 1;
+        *j += 1;
+    }
+    // The longer digit run is the bigger number.
+    match (at(a, *i).is_ascii_digit(), at(b, *j).is_ascii_digit()) {
+        (true, _) => Ordering::Greater,
+        (_, true) => Ordering::Less,
+        _ => first_diff,
+    }
 }
 
 /// Port of rpm's `rpmvercmp` (including `~` pre-release and `^` post-release handling).
