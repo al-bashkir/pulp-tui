@@ -2,6 +2,8 @@
 
 Date: 2026-11-10 (audit 8). Revision: `v0.6.0` (`git describe`), `f980f36` (`main`, clean tree).
 Audit only: no source, test, doc or config change. This file is the only output.
+**Status update 2026-11-19:** section 0 lists the findings fixed since this audit (F76, F78, F98, F105, F113, one
+polish item; F99 partly).
 
 This is a re-audit of audit 7 (2026-11-09, of `a0aaca9`). The three commits after it (this file, the 0.6.0 version
 number, one test helper) fix no finding, so F66–F97, G19, G20, T05 and T06 are all still open; section 6.1 gives the
@@ -9,6 +11,38 @@ status of each one. The work of this audit went into what the seven audits befor
 theirs (below). New findings continue the numbering: F98–F132, G21, G22 and T07, so an ID never means two things. The
 findings of the older audits (F01–F65, E01–E03, G01–G18, T01–T04) stay as recorded: fixed, with G03–G18 open by the
 user's decision.
+
+## 0. Remediation status (updated 2026-11-19, `main` at `9068f2d`)
+
+Each open ID of this audit was checked again against the code at `9068f2d` (48 commits after `f980f36`). An item is
+closed only when the acceptance criteria of its section 9 row hold in the code and a test covers it. The sections
+below stay as written on 2026-11-10; this section is the current status.
+
+| ID | Status | Commits | Evidence |
+|---|---|---|---|
+| F76 | **fixed** | `dfb9eed`, `b9b35aa` | The Reclaim confirm says that shared units lose their files too, and names the other repositories that hold units of the first 200 (a user who cannot see everything gets a caveat line). Unit `reclaim_space_names_the_other_repositories_that_have_its_units`, `reclaim_says_what_it_read_about_other_repositories`; live `reclaim_space_names_a_repository_with_the_same_units_through_the_tui` |
+| F78 | **fixed** | `bdf878e` | `row_objects` and `drop_unused_versions` keep `versions/0/` (`cv::base_version`). Unit `delete_version_keeps_version_0_of_the_snapshot_repository`; live `a_version_delete_keeps_version_0_and_the_next_publish_works_through_the_tui` |
+| F98 | **fixed** | `00fe7d0`, `844a807` | Connect clears the history, closes the open modal, leaves a sub-list that names an object for the Dashboard, and offers no action while there is no connection. Unit `a_connect_leaves_the_forms_and_sub_lists_of_the_previous_server`; live `a_connect_leaves_the_forms_and_sub_lists_of_the_previous_server_through_the_tui` |
+| F99 | **partly fixed** | `c5798fc`, `7c74bf4` | `PulpClient::content_url` joins a `base_url` that starts with `/` with the profile URL (Verify, drift, Rollback check, Copy URL, fallback replication); live `served_content_is_found_on_a_server_without_a_content_origin_through_the_tui` passes on 3.123.1 and 3.95.3. **Open on 3.63.36**: without `CONTENT_ORIGIN` that server gives `base_url` without the leading `/` (`pulp/content/...`), and the same live test fails there (fresh-pod run of 2026-11-19) |
+| F105 | **fixed** | `ecbe6d1`, `3e66385` | Served-content checks follow up to 5 redirects by hand, send no `Authorization` to another origin, and mask the query in texts. Mock `served_content_follows_a_redirect_to_object_storage`; a loop stops after exactly 5 redirects |
+| F113 | **fixed** | `8ee2f77`, `5edd244` | A 401/403 of the content app is "NOT COMPARED: <why>", not MISMATCH; drift gives `Fix::Unchecked`; fallback replication completes with a note. Mock `a_content_guard_refusal_is_not_compared`; live `verify_of_a_guarded_distribution_is_not_compared`, guarded replica step in `fallback_replication` |
+| Polish (6.2): `fs_export_source` reads only APT publications | **fixed** | `9dee460`, `87956c3` | The filesystem export lists every publication of the version (Deb verbatim too), exports the newest one that no other user holds a role on, and names it in a confirmation. Unit `a_filesystem_export_sends_the_publication_or_the_repository_version` |
+| T06 | partly done | `dfb9eed`, `bdf878e` | Live tests for F76 and F78 exist; F77, F79–F81 and the T05 tests do not |
+| T07 | partly done | `00fe7d0`, `c5798fc`, `8ee2f77` | Live tests for F98, F99 and F113 exist; the other listed live tests do not |
+
+Changed by other work, still open: F95 (since `92baa26` another Pulp user's objects are refused, but the same Pulp
+user in two scopes of one server still adopts the other scope's objects); F96 (since `44639a7` the Resume confirmation
+names the source, but a deleted source version still gives a raw error); F108 (since `16933cc`/`a94d970` a publication
+that the store does not record is reused only with the settings of a new one, but a recorded one is still reused after
+a signing or mode change).
+
+Still open, with no change: F66–F75, F77, F79–F94, F97, F100–F104, F106, F107, F109–F112, F114–F132, G19–G22, T05,
+the audit-6 and audit-7 polish items, and the other audit-8 polish items.
+
+The security audit of 2026-11-18 (outside this file; its 7 confirmed findings are fixed by `75db5e1`..`87956c3`) also
+changed ownership rules that some findings above name: an object found by name is adopted only when the store records
+it, or when no other user holds a role on it and its guarded fields are as pulp-tui makes them (`ops::refuse_foreign`,
+`ops::own_publication`; docs/ARCHITECTURE.md "Ownership").
 
 ## 1. Executive summary
 
@@ -449,7 +483,7 @@ Root causes of the audit-7 findings, so that a fix closes a class and not one ca
 * **RC3 — Choices and refusals copied by hand from one plugin rule** (F81, F83, F84): the form offers what Pulp
   refuses, or a refusal covers RPM but not File.
 
-#### F76 — P2 — Reclaim deletes the files of content that other repositories share; the confirm says the opposite (runtime)
+#### F76 — P2 — Reclaim deletes the files of content that other repositories share; the confirm says the opposite (runtime) — **FIXED** (`dfb9eed`)
 
 * Where: `reclaim` (`src/tui/actions.rs:2018`): "Reclaim disk space of {name}: Pulp deletes the stored files of its
   synced content that no other repository has." The same claim is in `docs/COMPATIBILITY.md:367-369` and
@@ -490,7 +524,7 @@ Root causes of the audit-7 findings, so that a fix closes a class and not one ca
   the `""` row back except by adding and removing a path. The Task Center message is false (nothing was purged).
 * Deb is not affected (its form sends no paths, its refresh ignores them).
 
-#### F78 — P2 — Deleting a Content View version can delete version 0 of a snapshot repository; every later unfiltered RPM or Deb publish fails (runtime)
+#### F78 — P2 — Deleting a Content View version can delete version 0 of a snapshot repository; every later unfiltered RPM or Deb publish fails (runtime) — **FIXED** (`bdf878e`)
 
 * Where: `CvService::version_objects` → `row_objects` (`src/cv.rs:1959-1975`, `:2055-2084`) list the recorded
   `derived_version` whatever its number; `delete_objects` (`:1946-1954`) deletes it. `drop_unused_versions`
@@ -710,7 +744,7 @@ Root causes of this audit, so that a fix closes a class and not one case:
 * **RC8 — Two `modify/` requests where Pulp reacts to the first one** (F107): Pulp's module rule changes the
   version between the remove step and the add step, and the add list was computed before.
 
-#### F98 — P2 — After Connect from a sub-list, a form opened while "connecting..." writes to the new server with the object of the old server (runtime)
+#### F98 — P2 — After Connect from a sub-list, a form opened while "connecting..." writes to the new server with the object of the old server (runtime) — **FIXED** (`00fe7d0`)
 
 * Where: `App::connect_now` (`src/tui/app.rs:783-844`) sets `conn = None` and then keeps the screen: `if let
   Screen::List(k) = self.screen.clone() && !matches!(k, Kind::Profiles | Kind::Logs { .. }) { self.replace(k); }`
@@ -739,7 +773,7 @@ Root causes of this audit, so that a fix closes a class and not one case:
 * Smallest reproduction: [R48]. No test covers it: `a_failed_connect_drops_the_rows_of_the_previous_server`
   (`app.rs:3073`) checks rows and marks only.
 
-#### F99 — P2 — With `CONTENT_ORIGIN` not set (the default of pulpcore 3.95.3 and 3.123.1), Verify, the drift check, the Rollback check and fallback replication fail for served content that is correct (runtime)
+#### F99 — P2 — With `CONTENT_ORIGIN` not set (the default of pulpcore 3.95.3 and 3.123.1), Verify, the drift check, the Rollback check and fallback replication fail for served content that is correct (runtime) — **PARTLY FIXED** (`c5798fc`; open on 3.63.36, section 0)
 
 * Where: `PulpClient::fetch_content` (`src/pulp/client.rs:346-349`): `url::Url::parse(url).map_err(|_|
   PulpError::BadHref(url.into()))?` accepts only an absolute URL. The callers pass `base_url` as Pulp returns it:
@@ -864,7 +898,7 @@ Root causes of this audit, so that a fix closes a class and not one case:
   (`actions_admin.rs:1328`; `ctx.caps` is the destination), and let `find_publication` ignore fields that the
   destination does not have.
 
-#### F105 — P2 — On object storage (S3, Azure, GCS) every served-content check reads Pulp's 302 as a mismatch (static)
+#### F105 — P2 — On object storage (S3, Azure, GCS) every served-content check reads Pulp's 302 as a mismatch (static) — **FIXED** (`ecbe6d1`)
 
 * Where: the only HTTP client has `.redirect(reqwest::redirect::Policy::none())` (`src/pulp/client.rs:144`), and
   `fetch_content` (`:346-361`) returns the 302. Each probe accepts only 200: `src/pulp/rpm.rs:220-224` and `:250-251`,
@@ -985,7 +1019,7 @@ Root causes of this audit, so that a fix closes a class and not one case:
   sets have only exact `relative_path` and `sha256` (`pulp_file/app/viewsets.py:57-66` in 3.95.3, `:53-62` in
   3.63.36). [R51] (`old`): File Repositories → `o` → `/` `a` Enter → "Error: rejected [400]: errors: Invalid Filter:
   'relative_path__icontains'". 3.95.3: source only.
-* **F113 — Verify of a distribution with a content guard that the API user does not pass says MISMATCH.**
+* **F113 — Verify of a distribution with a content guard that the API user does not pass says MISMATCH.** **FIXED** (`8ee2f77`).
   `fetch_content` sends only the API authorization; `file::verify` (`src/pulp/file.rs:22-25`) and the RPM and Deb
   probes turn each non-200 into a mismatch; the Content View drift maps it to `Fix::Repair` (`cv.rs:1773-1774`, hint
   `actions_cv.rs:740-743`). [R57] (`old`, header guard on a File distribution): `V` → "MISMATCH: served content
@@ -1093,7 +1127,7 @@ Root causes of this audit, so that a fix closes a class and not one case:
   2.2 Mbit/s every chunk times out and the upload is deleted. `docs/USER_GUIDE.md:1073` names the setting with no
   word about uploads.
 * `fs_export_source` (`actions_admin.rs:1633-1634`) reads only APT publications: a Deb version with only a verbatim
-  publication gets "has no publication". Use `ops::publications_where`.
+  publication gets "has no publication". Use `ops::publications_where`. **Fixed** (`87956c3`, section 0).
 * `upstream_body` trims the secret `password` (`actions_admin.rs:1083`); Pulp keeps leading and trailing spaces.
 * `patch_repo` (`actions.rs:1215-1230`): a label edit of an RPM repository with an OSV config is two PATCHes; when
   the second one is refused or does not run, the label edit is saved and the OSV config is gone, with no word about it.
@@ -1295,9 +1329,9 @@ is the suggested order of work.
 
 | Pri | ID | Action | Plugins / features | Likely fix location | Acceptance criteria | Suggested test |
 |---|---|---|---|---|---|---|
-| P2 | F98 (RC4) | On Connect, leave every parameterised sub-list (open the Dashboard or the root list at once) and close an open form, menu or confirm; offer no action on a kind that needs a connection while `conn` is `None`; check the scope of the view in the `CvVersions` load | all servers; users, groups, Content View versions | `connect_now` `app.rs:803-807`, connect result `:825-838`, `available_actions` `:1414-1427`, `kinds.rs:1172-1178` | from "Roles of user X", Connect then `c` opens no form; a form open before the connect result is closed; the new server gets no `POST users/<n>/roles/` | unit: `connect_now` on `Kind::UserRoles`, then `c`; mock: two servers, assert no POST on B; live: R48 |
+| P2 | F98 (RC4) | **Fixed** (`00fe7d0`, section 0). On Connect, leave every parameterised sub-list (open the Dashboard or the root list at once) and close an open form, menu or confirm; offer no action on a kind that needs a connection while `conn` is `None`; check the scope of the view in the `CvVersions` load | all servers; users, groups, Content View versions | `connect_now` `app.rs:803-807`, connect result `:825-838`, `available_actions` `:1414-1427`, `kinds.rs:1172-1178` | from "Roles of user X", Connect then `c` opens no form; a form open before the connect result is closed; the new server gets no `POST users/<n>/roles/` | unit: `connect_now` on `Kind::UserRoles`, then `c`; mock: two servers, assert no POST on B; live: R48 |
 | P2 | F107 (RC8) | Make the filtered RPM snapshot equal to the selection: send the modulemd removals with the adds in one `modify/`, or run `changes` again after the steps and add what is missing; compare the final keys with the selection before the version is recorded | RPM Content Views with filters | `CvService::snapshot` `cv.rs:972-1015`, `changes` `:1098-1118` | R60: v2 has both packages; the preview and the snapshot agree | live: a fixture with a modulemd (`m:1:1` {a, b} replaced by `m:1:2` {b}), filtered view, two publishes, assert snapshot keys = selected keys; mock of the request order |
-| P2 | F99, F105, F113 (RC5) | One served-content fetch for all checks: join a `base_url` that starts with `/` with the profile URL (the source profile URL in the fallback plan); follow a few redirects by hand with no `Authorization` to another origin and a masked query in the log; report 401 / 403 as "content guard refuses this client: not compared", not as MISMATCH; Copy URL and the Dashboard use the joined URL | all types: Verify, Rollback check, Content View drift, fallback replication, Copy URL | `fetch_content` `client.rs:346-361`; `rpm.rs:220-251`, `file.rs:22-25`, `deb.rs:79-166`; `cv.rs:1768-1774`; `replication.rs:126-164`, `:320`; `actions.rs:3655-3670` | R44, R45: OK for a correct distribution without `CONTENT_ORIGIN`; a mock 302 is followed; a mock 403 gives "not compared" | mock HTTP: relative `base_url`; 302 to a second mock server (assert no auth header there); 403; live: one server of the test environment without `CONTENT_ORIGIN` |
+| P2 | F99, F105, F113 (RC5) | **F105 and F113 fixed; F99 partly fixed** (open on 3.63.36; section 0). One served-content fetch for all checks: join a `base_url` that starts with `/` with the profile URL (the source profile URL in the fallback plan); follow a few redirects by hand with no `Authorization` to another origin and a masked query in the log; report 401 / 403 as "content guard refuses this client: not compared", not as MISMATCH; Copy URL and the Dashboard use the joined URL | all types: Verify, Rollback check, Content View drift, fallback replication, Copy URL | `fetch_content` `client.rs:346-361`; `rpm.rs:220-251`, `file.rs:22-25`, `deb.rs:79-166`; `cv.rs:1768-1774`; `replication.rs:126-164`, `:320`; `actions.rs:3655-3670` | R44, R45: OK for a correct distribution without `CONTENT_ORIGIN`; a mock 302 is followed; a mock 403 gives "not compared" | mock HTTP: relative `base_url`; 302 to a second mock server (assert no auth header there); 403; live: one server of the test environment without `CONTENT_ORIGIN` |
 | P2 | F100 (RC1) | Read the remote's `policy`; for a policy other than `immediate` replace "not affected" by "content of this remote that Pulp has not downloaded yet cannot be served any more"; name every repository that has such content where it can be read cheaply, else say so | all remote types | `remote_delete_impact` `actions.rs:1477-1492`; `docs/USER_GUIDE.md:338-342` | the confirm of an `on_demand` remote has that line and no "not affected" | unit of the lines; live: R46 (404 after the delete, and the confirm said so) |
 | P2 | F101 (RC1) | Before the confirm say what Pulp does for each policy: "a local repository, remote or distribution with the name (3.123: or the base path) of an upstream distribution is taken over: content replaced by a mirror sync, labels replaced, distribution re-pointed"; list the local distributions without this upstream's label when the filter is empty or simple; typed name for every policy; correct the form note | native replication | `replicate` `actions_admin.rs:1138-1169`, note `:1060`, `deletion_warning` `:925-935`; `docs/USER_GUIDE.md:801-817`, `docs/COMPATIBILITY.md:707-755` | R52: the confirm names `a8-take` and asks for the typed name | unit of the confirm lines; live: local repository + distribution with the upstream name |
 | P2 | F102, F112, F129, F130 (RC6) | Gate by the server schema: `autopublish` in the repository form (`has("autopublish")`); the File path search (`relative_path__icontains` only when the filter exists, else exact `relative_path` or a note); the fingerprint help and `""` for a non-nullable field; `dists/default/` only for pulp_deb with the empty-release branch. Add a live test that creates a repository of **each** type through the form | Deb 3.5.4; File 3.95 / 3.63; RPM 3.34 / 3.27 | `actions.rs:1106`, `:1015`, `:1157`; `kinds.rs:598`; `deb.rs:105-107` | R49 creates the repository; R51 searches or says why not | unit: `repo_form(Deb, caps without autopublish)` has no such field; live on the 3.63.36 image: `Act::Create` for File and Deb repositories, File Content search |
@@ -1322,11 +1356,11 @@ is the suggested order of work.
 | P3 | F131 | Add a keyring delete and call it (in `spawn_blocking`) after a profile Delete, for both users; at least a confirm line | config | `actions.rs:813-839`, `config.rs:355-369` | no entry left; the confirm names it | unit of the confirm lines |
 | P3 | F132 | Refuse `.` and `..` in `validate_name` | Content Views | `store.rs:2225-2230` | refused | unit |
 | P3 | G21 | Add `content/deb/source_release_components/` to the Deb record Create (form: source package, release component); say in the upload result of a `.dsc`, `.udeb` or generic file which publication serves it | Deb | `deb::RECORDS` `deb.rs:355-356`, the record forms `actions.rs:3329-3506` | R43: `dists/stable/main/source/Sources` lists the package after the record is made | live next to `the_tui_creates_release_records_that_a_publication_serves` |
-| P3 | T07 | Live tests through the TUI for F98–F104, F107, F110–F117 as listed above; a form Create test for every repository type; one scenario on a server without `CONTENT_ORIGIN`; run the form tests on the old images | various | `tests/live_*.rs`, `tests/env/pulp-env.sh` | each test fails before its fix | — |
+| P3 | T07 | **Partly done** (F98, F99, F113; section 0). Live tests through the TUI for F98–F104, F107, F110–F117 as listed above; a form Create test for every repository type; one scenario on a server without `CONTENT_ORIGIN`; run the form tests on the old images | various | `tests/live_*.rs`, `tests/env/pulp-env.sh` | each test fails before its fix | — |
 | P3 | polish (audit 8) | The 11 items of "Other P3 polish of this audit" in section 6.2; add `actions.rs:1695`, `:1840` to F94; fix F67 in `save_distribution` too | various | section 6.2 | — | unit |
-| P2 | F76 | Say what Pulp does: the files of every synced unit of the repository go, also of units that other repositories (Content View snapshots) share; name those repositories (or at least the snapshot repositories) in the impact; fix `COMPATIBILITY.md:367-369`, `USER_GUIDE.md:273-274` | all types | `reclaim` `actions.rs:1995-2040` | the confirm of a repository that shares units names the other repositories; no "no other repository" text | live: R29 (two File repositories, check that the confirm names `a7-copy`); unit of the lines |
+| P2 | F76 | **Fixed** (`dfb9eed`, section 0). Say what Pulp does: the files of every synced unit of the repository go, also of units that other repositories (Content View snapshots) share; name those repositories (or at least the snapshot repositories) in the impact; fix `COMPATIBILITY.md:367-369`, `USER_GUIDE.md:273-274` | all types | `reclaim` `actions.rs:1995-2040` | the confirm of a repository that shares units names the other repositories; no "no other repository" text | live: R29 (two File repositories, check that the confirm names `a7-copy`); unit of the lines |
 | P2 | F77 | Build `old` from the raw `paths` (keep `""`, shown as "(the remote URL itself)"), so the existing scan names every other ACS with `""` and asks first | RPM, File ACS | `acs_edit` `actions.rs:2711-2760`, `acs_paths` `:2652` | an edit of `[""]` → `["sub/"]` lists the other ACSs with no paths and sends nothing before the confirm | mock: item `{"paths": [""]}`, ACS list with another `[""]`; live: R30 |
-| P2 | F78 | Never delete `…/versions/0/` in `row_objects` (keep it with "base of every unfiltered copy", the rule of `drop_unused_versions`) | RPM, Deb Content Views | `cv.rs:2055-2084` | v1 that records `versions/0/` deletes only its publication; v3 publishes | mock (`delete_version_impact` keeps v0); live TUI: R31 |
+| P2 | F78 | **Fixed** (`bdf878e`, section 0). Never delete `…/versions/0/` in `row_objects` (keep it with "base of every unfiltered copy", the rule of `drop_unused_versions`) | RPM, Deb Content Views | `cv.rs:2055-2084` | v1 that records `versions/0/` deletes only its publication; v3 publishes | mock (`delete_version_impact` keeps v0); live TUI: R31 |
 | — | RC1 | Each confirm text that states a Pulp rule (reclaim, restore, staff, follow) gets a live test that checks the rule on the server | all | tests | — | — |
 | P3 | F79 | With no publication, say "no publication yet: publish (P) to serve" | all types | `follow_repository` `actions.rs:2393-2417`, `distribute_form` `:2287-2291` | R32 gives that text | mock |
 | P3 | F80 | Call `a.dismiss_finished_tasks()` and `a.reload()` in the palette entry | Task Center | `app.rs:1609-1615` | R33: no row after restart | unit with an in-memory store |
@@ -1347,7 +1381,7 @@ is the suggested order of work.
 | P3 | F95 | Refuse a view name that another local scope of the same server key uses (or use one scope per server key) | Content Views | `App::scope` `app.rs:356-371`, `store.rs` | the second profile cannot publish into the first's objects | store unit |
 | P3 | F96 | Check the recorded source version on Resume; name it and say "delete vN and publish again" | Content Views | `cv.rs:783-827`, `:955-959` | clear refusal, no copy | mock |
 | P3 | F97 | In Rollback/Promote of a renamed row, name (or unbind) the other derived-name distribution; drift lists unrecorded derived distributions | Content Views | `promote_target` `cv.rs:1485-1505`, `bind_repo` `:1523-1546` | preview names it | mock |
-| P3 | T06 | Live tests for F76–F81 as listed; the T05 tests | various | `tests/live_*.rs` | each fails before its fix | — |
+| P3 | T06 | **Partly done** (F76, F78; section 0). Live tests for F76–F81 as listed; the T05 tests | various | `tests/live_*.rs` | each fails before its fix | — |
 | P3 | polish | ULN "-" help; ACS "1 path(s)"; Watch of a finished row reads the task; an empty group is not "purged" | various | section 6.2 | — | unit |
 | P2 | F66 | Build the "becomes public" lines of the Delete with `guard_reach`: every distribution behind a composite that has no guards left, at any depth; say "No distribution uses it" only when that list is empty | pulpcore content guards | Delete impact `actions_admin.rs:505-531`, `guard_reach` `:671-684` | Delete of a guard that is the only member of X, with X in Y on distribution D, names D as PUBLIC | unit (two composite levels); live TUI next to `content_guard_create_edit_and_delete_name_its_distribution` |
 | P3 | F67 | For a new distribution, run `ops::distribution_target` (read only) in `confirm_distribute` before the job, or call it in `distribute` before `pinned_publication` | all repository types | `confirm_distribute` `actions.rs:2312-2314`, `distribute` `:2354-2362` | `D` onto an overlapping path refuses with no POST | mock (no POST of a publication before the 409) |
