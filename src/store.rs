@@ -961,13 +961,19 @@ impl Store {
     }
 
     pub async fn finish_version(&self, id: i64, state: &str, error: Option<&str>) -> Result<()> {
-        sqlx::query("UPDATE cv_versions SET state = $2, error = $3, finished_at = $4 WHERE id = $1")
-            .bind(id)
-            .bind(state)
-            .bind(error)
-            .bind(now())
-            .execute(&self.pool)
-            .await?;
+        finish_version_in(&mut *self.pool.acquire().await?, id, state, error).await
+    }
+
+    /// Record version `id` of view `cv_id` published and, in the same write, when `library` is set, the start of its
+    /// promotion there (`start_promotion` with lock `token`): a stop between the two would leave a published version
+    /// whose Library step nothing shows or resumes.
+    pub async fn publish_version(&self, id: i64, cv_id: i64, library: Option<i64>, token: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        finish_version_in(&mut tx, id, "published", None).await?;
+        if let Some(env_id) = library {
+            start_promotion_in(&mut tx, env_id, cv_id, id, token).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1274,19 +1280,7 @@ impl Store {
 
     /// Record that the promotion of `version_id` holding lock `token` starts. The served version stays.
     pub async fn start_promotion(&self, env_id: i64, cv_id: i64, version_id: i64, token: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO promotions(env_id, cv_id, version_id, state, token, updated_at) VALUES ($1, $2, $3, 'promoting', $4, $5)
-             ON CONFLICT(env_id, cv_id) DO UPDATE SET version_id = excluded.version_id, state = excluded.state,
-                token = excluded.token, updated_at = excluded.updated_at",
-        )
-        .bind(env_id)
-        .bind(cv_id)
-        .bind(version_id)
-        .bind(token)
-        .bind(now())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        start_promotion_in(&mut *self.pool.acquire().await?, env_id, cv_id, version_id, token).await
     }
 
     /// End the promotion that `start_promotion` recorded with the same lock `token`: `active` makes its version the
@@ -2174,6 +2168,33 @@ async fn upsert_component(c: &mut AnyConnection, composite_id: i64, component_id
     .bind(component_id)
     .bind(pinned)
     .execute(&mut *c)
+    .await?;
+    Ok(())
+}
+
+async fn finish_version_in(c: &mut AnyConnection, id: i64, state: &str, error: Option<&str>) -> Result<()> {
+    sqlx::query("UPDATE cv_versions SET state = $2, error = $3, finished_at = $4 WHERE id = $1")
+        .bind(id)
+        .bind(state)
+        .bind(error)
+        .bind(now())
+        .execute(c)
+        .await?;
+    Ok(())
+}
+
+async fn start_promotion_in(c: &mut AnyConnection, env_id: i64, cv_id: i64, version_id: i64, token: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO promotions(env_id, cv_id, version_id, state, token, updated_at) VALUES ($1, $2, $3, 'promoting', $4, $5)
+         ON CONFLICT(env_id, cv_id) DO UPDATE SET version_id = excluded.version_id, state = excluded.state,
+            token = excluded.token, updated_at = excluded.updated_at",
+    )
+    .bind(env_id)
+    .bind(cv_id)
+    .bind(version_id)
+    .bind(token)
+    .bind(now())
+    .execute(c)
     .await?;
     Ok(())
 }

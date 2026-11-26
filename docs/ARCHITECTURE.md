@@ -241,7 +241,8 @@ a signing service href). Then for each repository (`publish_repo`):
    publication that the store records, or that is as pulp-tui makes it, is reused
    (`ops::own_publication`, see Ownership); another is skipped and logged.
 
-Then the version is stored `published` and the Library step runs.
+Then the version is stored `published`, with the start of its Library step in the same write,
+and the Library step runs.
 
 The store is shared, so a row can change between a confirmation and its run, and a peer can
 write any href into it:
@@ -302,8 +303,9 @@ Every step writes a checkpoint in `cv_version_repos`; *Resume* continues from th
 * A stop in this step leaves the promotion `(version, promoting)`; under the view's lock such
   a row is an interrupted one (`CvService::library_interrupted`). Resume of that version
   runs the step again; Resume of another published version refuses.
-* Not covered: a stop between `published` and the `promoting` row. Library then serves
-  the older version, like after a rollback.
+* The `published` state and that `promoting` row are saved in one transaction
+  (`Store::publish_version`), so no stop falls between them. `CvService::library_target`
+  decides, before that write, whether the step runs.
 
 ### Promote, rollback, unpromote
 

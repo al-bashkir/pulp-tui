@@ -850,10 +850,12 @@ impl CvService {
         Err(e)
     }
 
-    /// Record `v` of view `cv` published, then run its Library step. Returns what `resume` returns.
+    /// Record `v` of view `cv` published, with the start of its Library step in the same write, then run that step.
+    /// Returns what `resume` returns.
     async fn published(&self, v: &CvVersion, cv: &str, log: Log<'_>, on: OnTask<'_>) -> Result<(CvVersion, Option<String>)> {
         self.alive()?;
-        self.store.finish_version(v.id, "published", None).await?;
+        let library = self.library_target(v).await?.ok();
+        self.store.publish_version(v.id, v.cv_id, library, self.token()).await?;
         self.audit("cv.publish.done", &format!("{cv} version {}", v.number)).await;
         log(format!("{cv} v{} published", v.number));
         let note = self.library_step(v, log, on).await;
@@ -956,16 +958,24 @@ impl CvService {
         }
     }
 
-    /// Make the just-published `v` active in Library, unless a newer version is published: resuming an
-    /// older version must not take Library back from it. Returns why Library does not serve `v`.
+    /// Make the just-published `v` active in Library (`library_target`). Returns why Library does not serve `v`.
     async fn bind_library(&self, v: &CvVersion, log: Log<'_>, on: OnTask<'_>) -> Result<Option<String>> {
-        let newest = self.store.versions(v.cv_id).await?.into_iter().find(|n| n.state == "published");
-        if let Some(n) = newest.filter(|n| n.id != v.id) {
-            return Ok(Some(format!("Library not changed: v{} is newer (use Rollback to serve v{})", n.number, v.number)));
-        }
-        let lib = self.store.ensure_library(&self.scope).await?;
+        let lib = match self.library_target(v).await? {
+            Ok(lib) => lib,
+            Err(note) => return Ok(Some(note)),
+        };
         self.promote(v.cv_id, v.id, lib, Mode::Rollback, log, on).await?;
         Ok(None)
+    }
+
+    /// The Library that the Library step of `v` promotes it to, or why it does not: a newer version is published, and
+    /// resuming an older version must not take Library back from it. The same before and after `v` is published.
+    async fn library_target(&self, v: &CvVersion) -> Result<std::result::Result<i64, String>> {
+        let newest = self.store.versions(v.cv_id).await?.into_iter().find(|n| n.state == "published");
+        if let Some(n) = newest.filter(|n| n.number > v.number) {
+            return Ok(Err(format!("Library not changed: v{} is newer (use Rollback to serve v{})", n.number, v.number)));
+        }
+        Ok(Ok(self.store.ensure_library(&self.scope).await?))
     }
 
     async fn publish_repo(&self, cv: &str, vr: &mut CvVersionRepo, log: Log<'_>, on: OnTask<'_>) -> Result<()> {
@@ -5426,6 +5436,29 @@ mod tests {
         assert_eq!(v1.state, "published");
         assert_eq!(note.as_deref(), Some("Library not changed: v2 is newer (use Rollback to serve v1)"));
         assert_eq!(s.binding(lib, web).await.unwrap().unwrap().active(), Some(v2.id), "Library keeps the newer v2");
+        assert!(!svc.resume_left(&v1).await.unwrap(), "no Library step of v1 is left to resume");
+    }
+
+    /// A stop right after the version is recorded published (here the lock is lost at that log line) leaves its Library
+    /// step `interrupted`, so Resume runs it: both are saved in one write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_right_after_the_publish_leaves_the_library_step_to_resume() {
+        let server = wiremock::MockServer::start().await;
+        let svc = mock_service(&server).await;
+        let web = svc.store.create_cv("k", "web", "").await.unwrap();
+        // A version without repositories: the publish sends nothing to Pulp.
+        let v = svc.store.begin_version(web, "", &[]).await.unwrap();
+        let svc = publishing(svc, web, v.id).await;
+        let lost = svc.lock.as_ref().unwrap().lost.clone();
+        let log = move |line: String| {
+            if line == "web v1 published" {
+                *lost.lock().unwrap() = Some("stopped".into());
+            }
+        };
+        let (v, note) = svc.resume(v.id, None, &log, &ops::no_progress).await.unwrap();
+        assert_eq!(v.state, "published");
+        assert_eq!(note.as_deref(), Some("Library step failed: lock on web lost: stopped; promote v1 to Library"));
+        assert!(svc.resume_left(&v).await.unwrap(), "Resume runs the Library step");
     }
 
     #[tokio::test(flavor = "multi_thread")]
