@@ -259,7 +259,8 @@ fn detail_lines(kind: &Kind, v: &serde_json::Value) -> Vec<String> {
             if !s(v, "error").is_empty() {
                 out.push(format!("ERROR: {}", s(v, "error")));
             }
-            out.push(format!("href: {}", s(v, "pulp_href")));
+            // A workflow row has no Pulp task: its step or notice, which the progress column cuts.
+            out.push(if v.get("pulp_href").is_none() { s(v, "progress") } else { format!("href: {}", s(v, "pulp_href")) });
             for r in v["task"]["progress_reports"].as_array().into_iter().flatten() {
                 out.push(format!("  [{}] {} {}/{}", s(r, "state"), s(r, "message"), s(r, "done"), s(r, "total")));
             }
@@ -669,6 +670,12 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw_form(f, form, f.area())).unwrap();
         t.backend().to_string()
+    }
+
+    #[test]
+    fn task_center_details_of_a_workflow_show_its_whole_step_or_notice() {
+        let row = serde_json::json!({ "id": "job:3", "state": "completed", "progress": "web version 2 published and active in Library" });
+        assert_eq!(&detail_lines(&Kind::Tasks, &row)[..1], ["web version 2 published and active in Library"]);
     }
 
     #[test]

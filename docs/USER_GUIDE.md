@@ -619,7 +619,8 @@ retry, or roll back to the served version to clear the failed attempt.
   lists each repository: new version, no change, failed or skipped. Sync does not publish.
 * **w** preview: the content that the draft selects, compared with the latest version.
 * **P** publishes a new version: notes (and Deb signing) → preview → confirm. The version becomes
-  active in Library. When the Library step fails, the version stays published:
+  active in Library. The Task Center row `publish <view>` shows the publish until its last step
+  ends. When the Library step fails, the version stays published:
   `Library step failed: …; promote v4 to Library`. The Library step changes the Library
   distributions of repositories that the new version does not have, as **M** does; the preview
   names each one under `In Library:`. It also names there each repository that the Library step
@@ -1015,6 +1016,14 @@ The Task Center shows tracked tasks: label (the operation that started it), stat
 what Pulp reports), start time and error. The top box lists the running client operations. A
 native replication or an ACS refresh is one row for its task group. `t` cycles: tracked tasks →
 server tasks → task groups → workers.
+
+* A Content View publish or resume is one more row at the top: `publish web` or `resume web v3`.
+  It stays `running`, with the current step as progress, until every step ends: the repositories,
+  the Library step and the auto publish of composites. Its Pulp tasks are the rows below it, and
+  each one completes by itself. Then the row shows `completed` with the result notice, `failed`
+  with the error, or `stopped` when the client stopped waiting (Pulp tasks continue; **R** on the
+  version resumes it). This row is not a Pulp task: **W** and **X** do not apply, and it does not
+  come back after a restart.
 
 * **W** live view of the task. **i** details with all progress reports.
 * **X** cancels on the server. On a task group, it cancels the whole group; the confirm counts its

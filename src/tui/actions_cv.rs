@@ -1006,25 +1006,21 @@ async fn publish_preview(svc: &CvService, id: i64, name: &str) -> anyhow::Result
 /// The confirmed Publish of view `id` (`name`) under its lock, then the auto publish of the composites that use it.
 /// `repos`: those that the preview showed.
 fn run_publish(app: &mut App, id: i64, name: String, repos: Vec<CvRepo>, notes: String, signing: String) {
-    app.job(format!("publish {name}"), move |ctx| async move {
+    app.workflow(format!("publish {name}"), move |ctx| async move {
         let svc = ctx.cv()?.locked(id, "publish").await?;
         let (v, note) = svc.publish(id, Some(&repos), &notes, &signing, &ctx.log(), &ctx.on_task()).await?;
         drop(svc);
         // After the lock of this view is released; composites take their own locks.
         let auto = ctx.cv()?.auto_publish(id, &ctx.log(), &ctx.on_task()).await;
-        ap(move |app| {
-            let active = if note.is_none() { " and active in Library" } else { "" };
-            let (level, text) = auto_notice(format!("{name} version {} published{active}", v.number), note, auto);
-            app.notify(level, text);
-            app.reload();
-        })
+        let active = if note.is_none() { " and active in Library" } else { "" };
+        Ok(auto_notice(format!("{name} version {} published{active}", v.number), note, auto))
     });
 }
 
 /// Resume the publish of version `vid` (number `number`) of view `cv`, then auto publish its composites. `rows`: those
 /// of the version that the confirmation read (`CvService::resume_sources`).
 fn resume(app: &mut App, cv: i64, name: String, vid: i64, number: String, rows: Vec<CvVersionRepo>) {
-    app.job(format!("resume {name} v{number}"), move |ctx| async move {
+    app.workflow(format!("resume {name} v{number}"), move |ctx| async move {
         let svc = ctx.cv()?.locked(cv, &format!("resume v{number}")).await?;
         let (v, note) = svc.resume(vid, Some(&rows), &ctx.log(), &ctx.on_task()).await?;
         // Composites follow the newest version: an older one gives them nothing new. Only composites that lack it
@@ -1032,11 +1028,7 @@ fn resume(app: &mut App, cv: i64, name: String, vid: i64, number: String, rows: 
         let newest = svc.store.versions(cv).await?.into_iter().find(|n| n.state == "published").is_some_and(|n| n.id == v.id);
         drop(svc); // release the lock of this view; composites take their own
         let auto = if newest { ctx.cv()?.auto_publish(cv, &ctx.log(), &ctx.on_task()).await } else { vec![] };
-        ap(move |app| {
-            let (level, text) = auto_notice(format!("{name} v{} published", v.number), note, auto);
-            app.notify(level, text);
-            app.reload();
-        })
+        Ok(auto_notice(format!("{name} v{} published", v.number), note, auto))
     });
 }
 
@@ -1969,6 +1961,75 @@ mod tests {
         assert!(text.ends_with("; promote v1 to Library; auto publish: rocky9 v1 published"), "{text}");
         assert_eq!(st.version(v1.id).await.unwrap().state, "published");
         assert_eq!(st.versions(c).await.unwrap().len(), 1, "the composite auto published");
+    }
+
+    /// An app connected to `server` with composite `rocky9` of view `web`; `published`: web has a published version.
+    async fn composite_publish_app(
+        server: &MockServer,
+        published: bool,
+    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<crate::tui::app::Msg>, i64) {
+        let (mut app, rx, st) = composite_app().await;
+        app.conn = Some(crate::tui::app::Conn { client: client(server), caps: Default::default(), scope: "lab".into() });
+        let web = st.create_cv("lab", "web", "").await.unwrap();
+        if published {
+            publish_empty(&st, web).await;
+        }
+        let c = st.create_composite("lab", "rocky9", "").await.unwrap();
+        st.set_component(c, web, None).await.unwrap();
+        app.push(Kind::CvVersions { cv: c, name: "rocky9".into() });
+        (app, rx, c)
+    }
+
+    /// The Task Center row of the publish of `rocky9`: (state, progress, error).
+    fn publish_row(app: &App) -> (String, String, String) {
+        let r = app.task_items().into_iter().find(|r| r["label"] == "publish rocky9").expect("no Task Center row");
+        (s(&r, "state"), s(&r, "progress"), s(&r, "error"))
+    }
+
+    #[tokio::test]
+    async fn the_task_center_shows_a_publish_as_running_until_its_library_step_ends() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, c) = composite_publish_app(&server, true).await;
+        run_publish(&mut app, c, "rocky9".into(), vec![], String::new(), String::new());
+        assert_eq!(publish_row(&app).0, "running");
+        drain(&mut app, &mut rx).await;
+        let done = "rocky9 version 1 published and active in Library";
+        assert_eq!(publish_row(&app), ("completed".into(), done.into(), String::new()));
+        assert_eq!(last_notice(&app), (Level::Ok, done));
+    }
+
+    #[tokio::test]
+    async fn the_task_center_row_of_a_failed_publish_says_why() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, c) = composite_publish_app(&server, false).await;
+        run_publish(&mut app, c, "rocky9".into(), vec![], String::new(), String::new());
+        drain(&mut app, &mut rx).await;
+        assert_eq!(publish_row(&app), ("failed".into(), String::new(), "component web has no published version".into()));
+    }
+
+    #[tokio::test]
+    async fn the_task_center_row_of_a_publish_stops_with_the_client() {
+        let server = MockServer::start().await;
+        let (mut app, _rx, c) = composite_publish_app(&server, true).await;
+        run_publish(&mut app, c, "rocky9".into(), vec![], String::new(), String::new());
+        let id = app.jobs.last().unwrap().id;
+        app.handle_msg(crate::tui::app::Msg::JobProgress { id, text: "rocky9 v1 -> Library".into() });
+        assert_eq!(publish_row(&app), ("running".into(), "rocky9 v1 -> Library".into(), String::new()));
+        app.abort_job(id);
+        assert_eq!(publish_row(&app), ("stopped".into(), "rocky9 v1 -> Library".into(), String::new()), "at the last step");
+    }
+
+    #[tokio::test]
+    async fn the_task_center_row_of_a_publish_has_no_pulp_task_to_watch_or_cancel_and_dismisses_when_ended() {
+        let server = MockServer::start().await;
+        let (mut app, mut rx, c) = composite_publish_app(&server, true).await;
+        run_publish(&mut app, c, "rocky9".into(), vec![], String::new(), String::new());
+        let row = app.task_items().remove(0);
+        assert_eq!(Kind::Tasks.item_actions(&row), [Act::Inspect, Act::DismissTasks]);
+        assert_eq!(app.dismiss_finished_tasks(), 0, "a running publish stays");
+        drain(&mut app, &mut rx).await;
+        assert_eq!(app.dismiss_finished_tasks(), 1);
+        assert!(app.task_items().is_empty());
     }
 
     #[tokio::test]

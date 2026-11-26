@@ -4,7 +4,7 @@
 use super::actions::ap;
 use super::form::{FieldKind, Form, FormEvent, PickItem, Source, edit_line, move_key};
 use super::kinds::{self, Act, Kind};
-use super::tasks::{TaskCenter, Tracked};
+use super::tasks::{Flow, TaskCenter, Tracked, Workflow};
 use super::view::help_lines;
 use crate::config::{Config, Database};
 use crate::cv::CvService;
@@ -194,6 +194,18 @@ fn task_row(t: &Tracked) -> Value {
         "pulp_href": t.href, "label": t.label, "state": t.state, "progress": t.progress(),
         "started": t.task.as_ref().map_or(t.started.clone(), |x| x.started_at.clone().unwrap_or_default()),
         "error": t.error, "task": t.task,
+    })
+}
+
+/// Task Center row of a workflow. It has no `pulp_href`: no Pulp task to watch or cancel.
+fn workflow_row(w: &Workflow) -> Value {
+    let (progress, error) = match &w.flow {
+        Flow::Failed(e) => ("", Some(e)),
+        Flow::Running(s) | Flow::Completed(s) | Flow::Stopped(s) => (s.as_str(), None),
+    };
+    serde_json::json!({
+        "id": format!("job:{}", w.job), "label": w.label, "state": w.flow.state(), "progress": progress,
+        "started": w.started, "error": error,
     })
 }
 
@@ -482,6 +494,30 @@ impl App {
         self.server_job(label.into(), true, f);
     }
 
+    /// A `job` with a Task Center row that stays running until the job ends: an operation of many Pulp tasks (a
+    /// Content View publish) is not done when one of them is. `f` returns the notice of the end; the row keeps it.
+    pub fn workflow<F, Fut>(&mut self, label: impl Into<String>, f: F)
+    where
+        F: FnOnce(Ctx) -> Fut,
+        Fut: Future<Output = anyhow::Result<(Level, String)>> + Send + 'static,
+    {
+        let (label, id) = (label.into(), self.next_id);
+        self.job(label.clone(), move |ctx| {
+            let done = f(ctx);
+            async move {
+                let (level, text) = done.await?;
+                ap(move |app| {
+                    app.tasks.end_workflow(id, |_| Flow::Completed(text.clone()));
+                    app.notify(level, text);
+                    app.reload();
+                })
+            }
+        });
+        if self.jobs.iter().any(|j| j.id == id) {
+            self.tasks.start_workflow(id, &label, crate::store::now());
+        }
+    }
+
     fn server_job<F, Fut>(&mut self, label: String, is_load: bool, f: F)
     where
         F: FnOnce(Ctx) -> Fut,
@@ -517,6 +553,7 @@ impl App {
         if let Some(i) = self.jobs.iter().position(|j| j.id == id) {
             let j = self.jobs.remove(i);
             j.abort.abort();
+            self.tasks.end_workflow(id, Flow::Stopped);
             if !j.is_load {
                 self.notify(Level::Warn, format!("stopped waiting for '{}' (server-side tasks continue; see Tasks)", j.label));
             }
@@ -533,6 +570,7 @@ impl App {
     fn abort_all(&mut self) {
         for j in std::mem::take(&mut self.jobs) {
             j.abort.abort();
+            self.tasks.end_workflow(j.id, Flow::Stopped);
             if !j.is_load {
                 self.notify(Level::Warn, format!("stopped waiting for '{}' (Pulp tasks already submitted keep running)", j.label));
             }
@@ -553,6 +591,7 @@ impl App {
                         self.applying = false;
                     }
                     Err(e) => {
+                        self.tasks.end_workflow(id, |_| Flow::Failed(e.clone()));
                         self.error(format!("{}: {e}", job.label));
                         // A notice shows one line: an error of several (a list of failures) opens in the text view too,
                         // as a job result (`applying`): behind an open dialog. Not for a read: a reload fails again
@@ -571,10 +610,14 @@ impl App {
                 self.next_queued();
             }
             Msg::JobProgress { id, text } => {
+                let text = crate::session_log::masked(text); // a progress line can hold an error (audit F64)
+                let step = self.tasks.workflow_step(id, &text);
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
-                    j.progress = crate::session_log::masked(text); // a progress line can hold an error (audit F64)
+                    j.progress = text;
                 }
-                return; // no task changed: the task rows and a watch stay as they are
+                if !step {
+                    return; // no task changed: the task rows and a watch stay as they are
+                }
             }
             // Sent by a job of the previous server that the Connect aborted.
             Msg::Task(..) if self.connecting => {}
@@ -603,7 +646,7 @@ impl App {
 
     /// Task Center rows from the in-memory tracker (no I/O).
     pub fn task_items(&self) -> Vec<Value> {
-        self.tasks.items.iter().map(task_row).collect()
+        self.tasks.workflows.iter().map(workflow_row).chain(self.tasks.items.iter().map(task_row)).collect()
     }
 
     // ---- tasks ---------------------------------------------------------------------

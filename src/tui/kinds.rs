@@ -1032,6 +1032,10 @@ impl Kind {
         if *self == Kind::ContentGuards && guard_type(&s(item, "pulp_href")) != "core/rbac" {
             actions.retain(|a| *a != GuardAccess);
         }
+        // A workflow row (a publish in this client) is no Pulp task.
+        if *self == Kind::Tasks && item.get("pulp_href").is_none() {
+            actions.retain(|a| !matches!(a, WatchTask | CancelTask));
+        }
         actions
     }
 }

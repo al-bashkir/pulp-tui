@@ -53,12 +53,48 @@ impl Tracked {
     }
 }
 
+/// A client operation of many Pulp tasks (a Content View publish): one Task Center row that stays running until the
+/// operation ends, while its Pulp tasks complete one by one. Not stored: a restart cannot re-attach a client
+/// operation (Resume of the version continues it).
+#[derive(Debug, Clone)]
+pub struct Workflow {
+    pub job: u64,
+    pub label: String,
+    pub started: String,
+    pub flow: Flow,
+}
+
+/// The state of a `Workflow` with its text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Flow {
+    /// The current step.
+    Running(String),
+    /// The notice of the end.
+    Completed(String),
+    Failed(String),
+    /// The client stopped waiting (Esc, Connect, quit) at this step; submitted Pulp tasks continue.
+    Stopped(String),
+}
+
+impl Flow {
+    pub fn state(&self) -> &'static str {
+        match self {
+            Flow::Running(_) => "running",
+            Flow::Completed(_) => "completed",
+            Flow::Failed(_) => "failed",
+            Flow::Stopped(_) => "stopped",
+        }
+    }
+}
+
 /// Finished tasks beyond this many are dropped, oldest first: every update rebuilds the rows of all tasks.
 const MAX_TRACKED: usize = 500;
 
 pub struct TaskCenter {
     /// Newest first.
     pub items: Vec<Tracked>,
+    /// Newest first; shown above the Pulp tasks.
+    pub workflows: Vec<Workflow>,
     min: Duration,
     max: Duration,
     max_in_flight: usize,
@@ -67,7 +103,31 @@ pub struct TaskCenter {
 impl TaskCenter {
     /// `(min, max)` polling interval, as `Settings::poll_bounds` gives it.
     pub fn new((min, max): (Duration, Duration)) -> Self {
-        Self { items: vec![], min, max, max_in_flight: 3 }
+        Self { items: vec![], workflows: vec![], min, max, max_in_flight: 3 }
+    }
+
+    pub fn start_workflow(&mut self, job: u64, label: &str, started: String) {
+        self.workflows.insert(0, Workflow { job, label: label.into(), started, flow: Flow::Running(String::new()) });
+    }
+
+    /// Set the current step of the running workflow of `job`. False when `job` has none.
+    pub fn workflow_step(&mut self, job: u64, step: &str) -> bool {
+        match self.workflows.iter_mut().find(|w| w.job == job) {
+            Some(Workflow { flow: Flow::Running(s), .. }) => {
+                *s = step.into();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// End the running workflow of `job`, if it has one: `end` gets its current step.
+    pub fn end_workflow(&mut self, job: u64, end: impl FnOnce(String) -> Flow) {
+        if let Some(w) = self.workflows.iter_mut().find(|w| w.job == job)
+            && let Flow::Running(s) = &w.flow
+        {
+            w.flow = end(s.clone());
+        }
     }
 
     /// A row that exists keeps its label: the operation names it better than a later Track of Pulp's task name.
@@ -169,9 +229,10 @@ impl TaskCenter {
     }
 
     pub fn dismiss_finished(&mut self) -> usize {
-        let before = self.items.len();
+        let before = self.items.len() + self.workflows.len();
         self.items.retain(|t| !t.is_final());
-        before - self.items.len()
+        self.workflows.retain(|w| matches!(w.flow, Flow::Running(_)));
+        before - self.items.len() - self.workflows.len()
     }
 
     pub fn active(&self) -> usize {
