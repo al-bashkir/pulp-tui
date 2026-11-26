@@ -2020,6 +2020,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_open_task_center_shows_each_step_of_a_publish() {
+        let server = MockServer::start().await;
+        let (mut app, _rx, c) = composite_publish_app(&server, true).await;
+        run_publish(&mut app, c, "rocky9".into(), vec![], String::new(), String::new());
+        app.open(crate::tui::app::Screen::List(Kind::Tasks));
+        let id = app.jobs.last().unwrap().id;
+        app.handle_msg(crate::tui::app::Msg::JobProgress { id, text: "rocky9 v1 -> Library".into() });
+        assert_eq!(app.list.items[0]["progress"], "rocky9 v1 -> Library");
+    }
+
+    #[tokio::test]
     async fn the_task_center_row_of_a_publish_has_no_pulp_task_to_watch_or_cancel_and_dismisses_when_ended() {
         let server = MockServer::start().await;
         let (mut app, mut rx, c) = composite_publish_app(&server, true).await;
