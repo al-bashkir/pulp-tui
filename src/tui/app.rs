@@ -579,6 +579,16 @@ impl App {
         self.list.loading = false;
     }
 
+    /// Progress line `text` of job `id`. True when it is the step of a workflow row.
+    fn job_progress(&mut self, id: u64, text: String) -> bool {
+        let text = crate::session_log::masked(text); // a progress line can hold an error (audit F64)
+        let step = self.tasks.workflow_step(id, &text);
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+            j.progress = text;
+        }
+        step
+    }
+
     pub fn handle_msg(&mut self, m: Msg) {
         match m {
             Msg::JobDone { id, result } => {
@@ -610,12 +620,7 @@ impl App {
                 self.next_queued();
             }
             Msg::JobProgress { id, text } => {
-                let text = crate::session_log::masked(text); // a progress line can hold an error (audit F64)
-                let step = self.tasks.workflow_step(id, &text);
-                if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
-                    j.progress = text;
-                }
-                if !step {
+                if !self.job_progress(id, text) {
                     return; // no task changed: the task rows and a watch stay as they are
                 }
             }

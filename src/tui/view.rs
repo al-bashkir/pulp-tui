@@ -229,6 +229,20 @@ fn with_cursor(text: &str, cur: usize) -> String {
     out
 }
 
+/// Detail of a Task Center row: its error, then its href and Pulp's progress reports.
+fn task_detail(v: &serde_json::Value) -> Vec<String> {
+    let mut out = vec![];
+    if !s(v, "error").is_empty() {
+        out.push(format!("ERROR: {}", s(v, "error")));
+    }
+    // A workflow row has no Pulp task: its step or notice, which the progress column cuts.
+    out.push(if v.get("pulp_href").is_none() { s(v, "progress") } else { format!("href: {}", s(v, "pulp_href")) });
+    for r in v["task"]["progress_reports"].as_array().into_iter().flatten() {
+        out.push(format!("  [{}] {} {}/{}", s(r, "state"), s(r, "message"), s(r, "done"), s(r, "total")));
+    }
+    out
+}
+
 fn detail_lines(kind: &Kind, v: &serde_json::Value) -> Vec<String> {
     let mut out = vec![];
     match kind {
@@ -255,17 +269,7 @@ fn detail_lines(kind: &Kind, v: &serde_json::Value) -> Vec<String> {
             }
             out.push(String::new());
         }
-        Kind::Tasks => {
-            if !s(v, "error").is_empty() {
-                out.push(format!("ERROR: {}", s(v, "error")));
-            }
-            // A workflow row has no Pulp task: its step or notice, which the progress column cuts.
-            out.push(if v.get("pulp_href").is_none() { s(v, "progress") } else { format!("href: {}", s(v, "pulp_href")) });
-            for r in v["task"]["progress_reports"].as_array().into_iter().flatten() {
-                out.push(format!("  [{}] {} {}/{}", s(r, "state"), s(r, "message"), s(r, "done"), s(r, "total")));
-            }
-            return out;
-        }
+        Kind::Tasks => return task_detail(v),
         Kind::Logs { .. } => return log_lines(v),
         _ => {}
     }
@@ -676,6 +680,13 @@ mod tests {
     fn task_center_details_of_a_workflow_show_its_whole_step_or_notice() {
         let row = serde_json::json!({ "id": "job:3", "state": "completed", "progress": "web version 2 published and active in Library" });
         assert_eq!(&detail_lines(&Kind::Tasks, &row)[..1], ["web version 2 published and active in Library"]);
+    }
+
+    #[test]
+    fn task_center_details_of_a_pulp_task_show_its_error_href_and_reports() {
+        let row = serde_json::json!({ "pulp_href": "/t/1/", "error": "boom", "task": { "progress_reports": [
+            { "state": "running", "message": "Downloading", "done": 3, "total": 10 } ] } });
+        assert_eq!(detail_lines(&Kind::Tasks, &row), ["ERROR: boom", "href: /t/1/", "  [running] Downloading 3/10"]);
     }
 
     #[test]

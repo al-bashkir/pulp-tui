@@ -1020,11 +1020,7 @@ impl Kind {
         let mut actions = self.actions();
         if *self == Kind::ContentViews {
             let composite = item["composite"] == true;
-            actions.retain(|a| match a {
-                CvAddRepo | CvFilters | CvRemoveRepo | CvSyncRepos => !composite,
-                CvAddComponent | CvRemoveComponent => composite,
-                _ => true,
-            });
+            actions.retain(|a| fits_view(*a, composite));
         }
         if RepoType::from_href(&s(item, "pulp_href")) != Some(RepoType::Rpm) {
             actions.retain(|a| *a != Scan);
@@ -1037,6 +1033,16 @@ impl Kind {
             actions.retain(|a| !matches!(a, WatchTask | CancelTask));
         }
         actions
+    }
+}
+
+/// Whether Content Views action `a` applies to a view that is `composite` (repositories) or not (components).
+fn fits_view(a: Act, composite: bool) -> bool {
+    use Act::*;
+    match a {
+        CvAddRepo | CvFilters | CvRemoveRepo | CvSyncRepos => !composite,
+        CvAddComponent | CvRemoveComponent => composite,
+        _ => true,
     }
 }
 
