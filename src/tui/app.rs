@@ -201,7 +201,7 @@ fn task_row(t: &Tracked) -> Value {
 fn workflow_row(w: &Workflow) -> Value {
     let (progress, error) = match &w.flow {
         Flow::Failed(e) => ("", Some(e)),
-        Flow::Running(s) | Flow::Completed(s) | Flow::Stopped(s) => (s.as_str(), None),
+        Flow::Running(s) | Flow::Completed(s) | Flow::Warning(s) | Flow::Stopped(s) => (s.as_str(), None),
     };
     serde_json::json!({
         "id": format!("job:{}", w.job), "label": w.label, "state": w.flow.state(), "progress": progress,
@@ -495,7 +495,8 @@ impl App {
     }
 
     /// A `job` with a Task Center row that stays running until the job ends: an operation of many Pulp tasks (a
-    /// Content View publish) is not done when one of them is. `f` returns the notice of the end; the row keeps it.
+    /// Content View publish) is not done when one of them is. `f` returns the notice of the end; the row keeps it, as
+    /// `completed` only when the notice is not a warning: then all of it is done.
     pub fn workflow<F, Fut>(&mut self, label: impl Into<String>, f: F)
     where
         F: FnOnce(Ctx) -> Fut,
@@ -507,7 +508,8 @@ impl App {
             async move {
                 let (level, text) = done.await?;
                 ap(move |app| {
-                    app.tasks.end_workflow(id, |_| Flow::Completed(text.clone()));
+                    let end = if matches!(level, Level::Ok | Level::Info) { Flow::Completed } else { Flow::Warning };
+                    app.tasks.end_workflow(id, |_| end(text.clone()));
                     app.notify(level, text);
                     app.reload();
                 })

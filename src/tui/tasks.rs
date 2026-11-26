@@ -69,8 +69,10 @@ pub struct Workflow {
 pub enum Flow {
     /// The current step.
     Running(String),
-    /// The notice of the end.
+    /// The notice of the end: all done (a publish: the version is active in Library).
     Completed(String),
+    /// The warning notice of the end: done in part (Library does not serve the version, an auto publish failed).
+    Warning(String),
     Failed(String),
     /// The client stopped waiting (Esc, Connect, quit) at this step; submitted Pulp tasks continue.
     Stopped(String),
@@ -81,6 +83,7 @@ impl Flow {
         match self {
             Flow::Running(_) => "running",
             Flow::Completed(_) => "completed",
+            Flow::Warning(_) => "warning",
             Flow::Failed(_) => "failed",
             Flow::Stopped(_) => "stopped",
         }

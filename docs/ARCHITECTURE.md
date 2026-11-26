@@ -73,8 +73,9 @@ Pulp tasks are the source of truth.
   a late poll answer) does not change it. A tracked row keeps its label.
 * A CV publish or resume runs as `App::workflow`: a job with one Task Center row
   (`tasks::Workflow`, in memory only) above the Pulp tasks. Its progress messages set the
-  row's step; the end of the job sets `completed` (the notice), `failed` (the error), or
-  `stopped` (abort, Connect). The row has no `pulp_href`, so it is never polled, watched
+  row's step; the end of the job sets `completed` (an ok notice), `warning` (a warning
+  notice: Library does not serve the version, or an auto publish failed), `failed` (the
+  error), or `stopped` (abort, Connect). The row has no `pulp_href`, so it is never polled, watched
   or canceled.
 * A workflow takes only `completed` as done (`ops::wait_task`). `failed`, `canceled` and
   `skipped` stop the step with the state as the error. `ops::settle` does the same for a

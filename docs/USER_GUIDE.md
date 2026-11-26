@@ -1020,10 +1020,12 @@ server tasks → task groups → workers.
 * A Content View publish or resume is one more row at the top: `publish web` or `resume web v3`.
   It stays `running`, with the current step as progress, until every step ends: the repositories,
   the Library step and the auto publish of composites. Its Pulp tasks are the rows below it, and
-  each one completes by itself. Then the row shows `completed` with the result notice, `failed`
-  with the error, or `stopped` when the client stopped waiting (Pulp tasks continue; **R** on the
-  version resumes it). This row is not a Pulp task: **W** and **X** do not apply, and it does not
-  come back after a restart.
+  each one completes by itself. Then the row shows `completed` (the new version is active in
+  Library) with the result notice, `warning` when the version is published but not all of it was
+  done (the Library step failed or did not change Library, or an auto publish failed; the notice
+  says what to do), `failed` with the error, or `stopped` when the client stopped waiting (Pulp
+  tasks continue; **R** on the version resumes it). This row is not a Pulp task: **W** and **X** do
+  not apply, and it does not come back after a restart.
 
 * **W** live view of the task. **i** details with all progress reports.
 * **X** cancels on the server. On a task group, it cancels the whole group; the confirm counts its

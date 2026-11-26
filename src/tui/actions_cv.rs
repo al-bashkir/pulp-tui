@@ -1916,7 +1916,10 @@ mod tests {
         drain(&mut app, &mut rx).await;
         yes(&mut app);
         drain(&mut app, &mut rx).await;
-        assert_eq!(last_notice(&app), (Level::Warn, "web v1 published; Library not changed: v2 is newer (use Rollback to serve v1)"));
+        let notice = "web v1 published; Library not changed: v2 is newer (use Rollback to serve v1)";
+        assert_eq!(last_notice(&app), (Level::Warn, notice));
+        let row = app.task_items().into_iter().find(|r| r["label"] == "resume web v1").expect("no Task Center row");
+        assert_eq!((s(&row, "state"), s(&row, "progress")), ("warning".into(), notice.into()), "Library does not serve v1: not completed");
         assert_eq!(st.binding(lib, web).await.unwrap().unwrap().active(), Some(v2.id));
         assert!(st.versions(c).await.unwrap().is_empty(), "composites follow v2: nothing new to auto publish");
     }
